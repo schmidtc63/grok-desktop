@@ -356,8 +356,46 @@ function httpUrl(value) {
   }
 }
 
+// Electron shows no right-click menu of its own, so build one for the app window and the Browser pane.
+function contextMenuItems(contents, params) {
+	const items = [];
+	if (params.misspelledWord) {
+		for (const word of (params.dictionarySuggestions || []).slice(0, 5)) {
+			items.push({ label: word, click: () => contents.replaceMisspelling(word) });
+		}
+		if (!items.length) { items.push({ label: "No spelling suggestions", enabled: false }); }
+		items.push({ label: "Add to dictionary", click: () => contents.session.addWordToSpellCheckerDictionary(params.misspelledWord) }, { type: "separator" });
+	}
+	if (httpUrl(params.linkURL)) {
+		items.push({ label: "Open link in browser", click: () => shell.openExternal(params.linkURL) }, { label: "Copy link", click: () => clipboard.writeText(params.linkURL) }, { type: "separator" });
+	}
+	const flags = params.editFlags || {};
+	if (params.isEditable) {
+		items.push(
+			{ role: "undo", enabled: !!flags.canUndo },
+			{ role: "redo", enabled: !!flags.canRedo },
+			{ type: "separator" },
+			{ role: "cut", enabled: !!flags.canCut },
+			{ role: "copy", enabled: !!flags.canCopy },
+			{ role: "paste", enabled: !!flags.canPaste },
+			{ type: "separator" },
+			{ role: "selectAll", enabled: !!flags.canSelectAll },
+		);
+	} else if (params.selectionText && params.selectionText.trim()) {
+		items.push({ role: "copy" });
+	}
+	while (items.length && items[items.length - 1].type === "separator") { items.pop(); }
+	return items;
+}
+
 app.on("web-contents-created", (_event, contents) => {
   contents.setWindowOpenHandler(() => ({ action: "deny" }));
+	contents.on("context-menu", (_menuEvent, params) => {
+		const items = contextMenuItems(contents, params);
+		if (!items.length) { return; }
+		const win = BrowserWindow.fromWebContents(contents.hostWebContents || contents);
+		Menu.buildFromTemplate(items).popup(win ? { window: win } : {});
+	});
   contents.on("will-attach-webview", (event, webPreferences, params) => {
     delete webPreferences.preload;
     webPreferences.nodeIntegration = false;
@@ -385,7 +423,22 @@ app.on("web-contents-created", (_event, contents) => {
   });
 });
 
-app.whenReady().then(createWindow);
+// One running copy per profile, so two copies never write the same saved chats. A second launch shows this one.
+if (!app.requestSingleInstanceLock()) {
+	app.quit();
+} else {
+	app.on("second-instance", () => {
+		const win = BrowserWindow.getAllWindows().find((item) => !item.isDestroyed());
+		if (!win) {
+			app.whenReady().then(() => createWindow());
+			return;
+		}
+		if (win.isMinimized()) { win.restore(); }
+		win.show();
+		win.focus();
+	});
+	app.whenReady().then(createWindow);
+}
 
 app.on("before-quit", () => {
   host.kill();

@@ -18,10 +18,14 @@ class TestWindow {
 		windows.push(this);
 	}
 	static getAllWindows() { return windows; }
+	static fromWebContents(contents) { return windows.find((win) => win.webContents === contents) || null; }
 	isDestroyed() { return false; }
 	setIcon() {}
 	setAppDetails() {}
-	show() {}
+	show() { this.shown = (this.shown || 0) + 1; }
+	isMinimized() { return !!this.minimized; }
+	restore() { this.minimized = false; }
+	focus() { this.focused = (this.focused || 0) + 1; }
 	loadFile(file, options) { this.navigation = { file, options }; return Promise.resolve(); }
 	loadURL() { return Promise.resolve(); }
 }
@@ -53,14 +57,18 @@ app.setName = () => {};
 app.setAppUserModelId = () => {};
 app.getPath = () => root;
 app.whenReady = () => ({ then: (callback) => callback() });
+app.requestSingleInstanceLock = () => true;
+app.quit = () => { app.quitCalls = (app.quitCalls || 0) + 1; };
 let dialogChoice = 1;
+const popups = [];
 const partitions = new Map();
 const electron = {
 	app,
 	BrowserWindow: TestWindow,
 	ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
 	nativeImage: { createFromPath: () => ({ isEmpty: () => true }) },
-	Menu: { buildFromTemplate: (template) => template, setApplicationMenu: () => {} },
+	Menu: { buildFromTemplate: (template) => Object.assign([...template], { popup: (options) => popups.push({ template, options }) }), setApplicationMenu: () => {} },
+	clipboard: { writeText: (text) => { written = ["clipboard", text]; } },
 	powerMonitor: { isOnBatteryPower: () => false },
 	powerSaveBlocker: { start: () => 1, stop: () => {} },
 	shell: { openExternal: () => Promise.resolve(), openPath: () => Promise.resolve("") },
@@ -194,7 +202,75 @@ async function main() {
 	guest.request(null, "fullscreen", (value) => { fullscreen = value; }, {});
 	assert.equal(fullscreen, true);
 	assert.equal(guest.check(null, "clipboard-sanitized-write"), true);
-	console.log("Main ownership, session bootstrap, folder policy, version bridge, question/plan ownership, close dialog, and Browser permission checks passed.");
+
+	const page = windows[0].webContents;
+	const replaced = [];
+	const added = [];
+	page.replaceMisspelling = (word) => replaced.push(word);
+	page.session = { addWordToSpellCheckerDictionary: (word) => added.push(word) };
+	page.setWindowOpenHandler = () => {};
+	app.emit("web-contents-created", {}, page);
+	const menuFor = (params) => {
+		const before = popups.length;
+		page.emit("context-menu", {}, params);
+		return popups.length > before ? popups.at(-1) : null;
+	};
+	const labels = (menu) => Array.from(menu.template, (item) => item.label || item.role || item.type);
+	assert.equal(menuFor({ isEditable: false, selectionText: "", editFlags: {} }), null, "no menu where there is nothing to do");
+	const editMenu = menuFor({ isEditable: true, editFlags: { canPaste: true, canSelectAll: true } });
+	assert.deepEqual(labels(editMenu), ["undo", "redo", "separator", "cut", "copy", "paste", "separator", "selectAll"]);
+	assert.equal(editMenu.template.find((item) => item.role === "cut").enabled, false, "Cut is greyed out with no selection");
+	assert.equal(editMenu.template.find((item) => item.role === "paste").enabled, true);
+	assert.equal(editMenu.options.window, windows[0], "the menu opens on its own window");
+	const spellMenu = menuFor({ isEditable: true, misspelledWord: "teh", dictionarySuggestions: ["the", "tea"], editFlags: {} });
+	assert.deepEqual(labels(spellMenu).slice(0, 4), ["the", "tea", "Add to dictionary", "separator"]);
+	spellMenu.template[0].click();
+	spellMenu.template[2].click();
+	assert.deepEqual([replaced, added], [["the"], ["teh"]], "a suggestion replaces the word; Add to dictionary saves it");
+	assert.equal(menuFor({ isEditable: true, misspelledWord: "zzq", dictionarySuggestions: [], editFlags: {} }).template[0].enabled, false);
+	const linkMenu = menuFor({ isEditable: false, selectionText: "", linkURL: "https://x.ai/", editFlags: {} });
+	assert.deepEqual(labels(linkMenu), ["Open link in browser", "Copy link"]);
+	linkMenu.template[1].click();
+	assert.deepEqual(written, ["clipboard", "https://x.ai/"]);
+	assert.equal(menuFor({ isEditable: false, selectionText: "", linkURL: "file:///C:/secret.txt", editFlags: {} }), null, "only web links get link items");
+	assert.deepEqual(labels(menuFor({ isEditable: false, selectionText: "some text", editFlags: {} })), ["copy"]);
+	const guestPage = new EventEmitter();
+	guestPage.setWindowOpenHandler = () => {};
+	guestPage.hostWebContents = windows[1].webContents;
+	app.emit("web-contents-created", {}, guestPage);
+	guestPage.emit("context-menu", {}, { isEditable: false, selectionText: "page text", editFlags: {} });
+	assert.equal(popups.at(-1).options.window, windows[1], "a Browser pane menu opens on the window that holds the pane");
+
+	windows[0].minimized = true;
+	app.emit("second-instance");
+	assert.equal(windows[0].minimized, false, "a second launch restores the minimized window");
+	assert.equal(windows[0].focused, 1, "and brings it forward");
+	const windowCount = windows.length;
+	const secondCopy = Object.assign(new EventEmitter(), {
+		setPath: app.setPath,
+		setName: app.setName,
+		setAppUserModelId: app.setAppUserModelId,
+		getPath: app.getPath,
+		whenReady: app.whenReady,
+		requestSingleInstanceLock: () => false,
+		quitCalls: 0,
+	});
+	secondCopy.quit = () => { secondCopy.quitCalls += 1; };
+	vm.runInNewContext(fs.readFileSync(path.join(root, "electron/main.cjs"), "utf8"), {
+		__dirname: path.join(root, "electron"),
+		process,
+		URL,
+		require(name) {
+			if (name === "electron") { return { ...electron, app: secondCopy, ipcMain: { handle: () => {} } }; }
+			if (name === "./agent.cjs") { return { AgentHost: TestHost }; }
+			if (name === "./diff.cjs" || name === "./git.cjs" || name === "./usage.cjs" || name === "./files.cjs") { return {}; }
+			if (name === "./terminal.cjs") { return { TerminalHost: class { closeAll() {} } }; }
+			return require(name);
+		},
+	});
+	assert.equal(secondCopy.quitCalls, 1, "a second copy quits");
+	assert.equal(windows.length, windowCount, "and opens no window of its own");
+	console.log("Main ownership, session bootstrap, folder policy, version bridge, question/plan ownership, close dialog, Browser permission, right-click menu and single-instance checks passed.");
 }
 
 main().catch((error) => { console.error(error); process.exitCode = 1; });
