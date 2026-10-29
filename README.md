@@ -34,6 +34,7 @@ npm run desktop
 
 ## Limits
 
+- Open only folders you trust. Grok and Git run that folder's own Git settings and hooks.
 - Windows only for now. The terminal is PowerShell, processes are stopped with `taskkill`, and paths are handled the Windows way.
 - The Context card's breakdown and the seven-day spend are read from the files Grok keeps under `%USERPROFILE%\.grok\sessions`. Grok does not document those files, so a Grok update can change them. When that happens the card falls back to the single total Grok reports.
 - The spend covers Grok sessions on this computer only. It is not your account allowance, which Grok shows only in its own terminal app.
