@@ -1,0 +1,214 @@
+/* Terminal pane (tp-) and Browser pane (bp-). Load after styles.css. */
+
+.tp-pane .pane-x,
+.bp-pane .pane-x,
+.tp-new,
+.bp-new,
+.bp-icon,
+.tp-tab-x,
+.bp-tab-x {
+	border: 0;
+	background: transparent;
+	color: var(--muted);
+	border-radius: 6px;
+	padding: 2px 7px;
+	line-height: 1.4;
+}
+.tp-pane .pane-x:hover,
+.bp-pane .pane-x:hover,
+.tp-new:hover,
+.bp-new:hover,
+.bp-icon:hover:not(:disabled),
+.tp-tab-x:hover,
+.bp-tab-x:hover {
+	background: var(--hover);
+	color: var(--text);
+}
+.bp-icon:disabled { color: var(--faint); cursor: default; }
+
+/* Tab strips */
+.tp-tabs,
+.bp-tabs {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	min-width: 0;
+	overflow-x: auto;
+}
+.tp-tabs { flex: 0 1 auto; }
+.bp-tabs {
+	flex: none;
+	padding: 4px 8px;
+	border-bottom: 1px solid var(--line);
+}
+.tp-tab,
+.bp-tab {
+	display: flex;
+	align-items: center;
+	flex: none;
+	max-width: 180px;
+	border-radius: 8px;
+	color: var(--muted);
+}
+.tp-tab.on,
+.bp-tab.on {
+	background: var(--panel-2);
+	color: var(--text);
+}
+.tp-tab-name,
+.bp-tab-name {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	min-width: 0;
+	border: 0;
+	background: transparent;
+	padding: 3px 4px 3px 8px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.tp-tab-x,
+.bp-tab-x { padding: 0 6px; }
+
+/* Running dot */
+.tp-dot,
+.bp-dot {
+	display: inline-block;
+	flex: none;
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: var(--green);
+}
+
+/* Terminal output and input */
+.tp-out {
+	flex: 1;
+	min-height: 0;
+	margin: 0;
+	padding: 10px 12px;
+	overflow: auto;
+	background: var(--code);
+	color: var(--code-text);
+	font-family: Consolas, "Cascadia Mono", monospace;
+	font-size: 12.5px;
+	line-height: 1.45;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+.tp-notes { padding: 0 12px 6px; background: var(--code); }
+.tp-row {
+	display: flex;
+	padding: 8px;
+	border-top: 1px solid var(--line);
+}
+.tp-row input {
+	flex: 1;
+	background: var(--input);
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	padding: 7px 10px;
+	color: var(--text);
+	font-family: Consolas, "Cascadia Mono", monospace;
+	font-size: 12.5px;
+}
+.tp-row input:disabled { color: var(--faint); }
+
+/* Browser header menus */
+.bp-menus { display: flex; align-items: center; gap: 4px; }
+.bp-menu-wrap { position: relative; }
+.bp-btn {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	border: 1px solid var(--line-strong);
+	background: transparent;
+	border-radius: 8px;
+	padding: 3px 9px;
+}
+.bp-menu {
+	position: absolute;
+	top: calc(100% + 6px);
+	right: 0;
+	z-index: 30;
+	min-width: 240px;
+	max-width: 420px;
+	padding: 6px;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	background: var(--panel-2);
+	border: 1px solid var(--line-strong);
+	border-radius: 10px;
+	box-shadow: var(--shadow);
+	color: var(--text);
+}
+.bp-item {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	width: 100%;
+	text-align: left;
+	border: 0;
+	background: transparent;
+	border-radius: 6px;
+	padding: 6px 8px;
+	cursor: pointer;
+}
+.bp-item:hover:not(:disabled) { background: var(--hover); }
+.bp-item:disabled { color: var(--faint); cursor: default; }
+.bp-empty { margin: 4px 8px; color: var(--muted); }
+.bp-server {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 4px 4px 4px 8px;
+}
+.bp-server-name {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-family: Consolas, "Cascadia Mono", monospace;
+	font-size: 12px;
+}
+.bp-server .texty { padding: 3px 9px; }
+
+/* Browser toolbar and pages */
+.bp-bar {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	padding: 6px 8px;
+	border-bottom: 1px solid var(--line);
+}
+.bp-addr { display: flex; flex: 1; gap: 6px; min-width: 0; }
+.bp-addr input {
+	flex: 1;
+	min-width: 0;
+	background: var(--input);
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	padding: 5px 10px;
+	color: var(--text);
+}
+.bp-views {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+}
+.bp-note { margin: 0; padding: 6px 12px; }
+.bp-view {
+	flex: 1;
+	min-height: 0;
+	width: 100%;
+	border: 0;
+	background: #fff;
+}
+.bp-view.bp-off { display: none; }

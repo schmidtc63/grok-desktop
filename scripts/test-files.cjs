@@ -1,0 +1,344 @@
+const assert = require("assert/strict");
+const fs = require("fs");
+const path = require("path");
+const childProcess = require("child_process");
+const { execFileSync } = childProcess;
+const { createHash } = require("crypto");
+const { readText, writeText, runCommand } = require("../electron/files.cjs");
+const { readDiff, parseUnified, revertFile } = require("../electron/diff.cjs");
+
+const tempBase = path.join(require("os").tmpdir(), "grokdesk-grokcode-files");
+fs.mkdirSync(tempBase, { recursive: true });
+const root = fs.mkdtempSync(path.join(tempBase, "grokdesk-files-"));
+const nativeExec = childProcess.execFileSync;
+const nativeWrite = fs.writeFileSync;
+if (process.platform === "win32") {
+	childProcess.execFileSync = (command, args, options) => {
+		if (options?.env?.GROK_SAVE_TEMP) {
+			assert.equal(options.windowsHide, true);
+			assert.equal(options.timeout, 8000);
+			if (args.at(-1).includes("CreateNew")) { nativeWrite(options.env.GROK_SAVE_TEMP, "", { flag: "wx" }); }
+			else { fs.renameSync(options.env.GROK_SAVE_TEMP, options.env.GROK_SAVE_TARGET); }
+			return Buffer.alloc(0);
+		}
+		return nativeExec(command, args, options);
+	};
+}
+
+function git(args, cwd = root) {
+	return execFileSync("git", args, { cwd, windowsHide: true, encoding: "utf8", stdio: "pipe" });
+}
+
+function write(file, text) {
+	fs.writeFileSync(path.join(root, file), text);
+}
+
+function read(file) {
+	return fs.readFileSync(path.join(root, file), "utf8");
+}
+
+async function main() {
+	git(["init", "--quiet"]);
+	git(["config", "core.autocrlf", "false"]);
+	write("report[1].txt", "selected original\n");
+	write("report1.txt", "other original\n");
+	write("binary.bin", Buffer.from([0, 1, 2]));
+	write("old name.txt", "rename content\n");
+	git(["add", "--all"]);
+	git(["-c", "user.name=GrokCode test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "--no-gpg-sign", "-m", "Fixture"]);
+
+	write("report[1].txt", "selected dirty\n");
+	write("report1.txt", "other dirty\n");
+	assert.equal((await revertFile(root, "report[1].txt")).ok, true);
+	assert.equal(read("report[1].txt"), "selected original\n");
+	assert.equal(read("report1.txt"), "other dirty\n");
+	write("new.txt", "staged content\n");
+	git(["add", "--", "new.txt"]);
+	write("new.txt", "newer unstaged content\n");
+	assert.equal((await revertFile(root, "new.txt")).ok, false);
+	assert.equal(read("new.txt"), "newer unstaged content\n");
+	assert.equal(git(["ls-files", "--", "new.txt"]).trim(), "new.txt");
+	console.log("PASS CR01/CR15: literal revert preserves neighboring work and staged additions");
+
+	const legacy = Buffer.from([0x63, 0x61, 0x66, 0xe9]);
+	write("legacy.txt", legacy);
+	assert.equal(readText(root, "legacy.txt").ok, false);
+	assert.equal(writeText(root, "legacy.txt", "replacement", createHash("sha256").update(legacy).digest("hex")).ok, false);
+	assert.deepEqual(fs.readFileSync(path.join(root, "legacy.txt")), legacy);
+	write("editor.txt", "\ufeffcafé\r\n");
+	let loaded = readText(root, "editor.txt");
+	assert.equal(loaded.ok, true);
+	assert.equal(loaded.text, "\ufeffcafé\r\n");
+	assert.equal(typeof loaded.version, "string");
+	write("editor.txt", "agent changed it\n");
+	assert.equal(writeText(root, "editor.txt", "stale buffer", loaded.version).ok, false);
+	assert.equal(read("editor.txt"), "agent changed it\n");
+	loaded = readText(root, "editor.txt");
+	const saved = writeText(root, "editor.txt", "fresh save\n", loaded.version);
+	assert.equal(saved.ok, true);
+	assert.equal(readText(root, "editor.txt").version, saved.version);
+	const originalWrite = fs.writeFileSync;
+	const originalRename = fs.renameSync;
+	const prior = read("editor.txt");
+	try {
+		fs.writeFileSync = (file, text, options) => {
+			if (typeof file === "number") {
+				originalWrite(file, "PARTIAL", "utf8");
+				throw Object.assign(new Error("Injected storage exhaustion"), { code: "ENOSPC" });
+			}
+			return originalWrite(file, text, options);
+		};
+		assert.equal(writeText(root, "editor.txt", "should not replace original", saved.version).ok, false);
+	} finally {
+		fs.writeFileSync = originalWrite;
+	}
+	assert.equal(read("editor.txt"), prior, "a partial temporary write preserves original bytes");
+	assert.equal(fs.readdirSync(root).some((name) => name.includes(".grok-save-")), false);
+	if (process.platform === "win32") {
+		const simulatedExec = childProcess.execFileSync;
+		try {
+			childProcess.execFileSync = (command, args, options) => {
+				if (options?.env?.GROK_SAVE_TEMP) { throw Object.assign(new Error("Injected native staging failure"), { code: "EACCES" }); }
+				return simulatedExec(command, args, options);
+			};
+			assert.equal(writeText(root, "editor.txt", "should not replace original", saved.version).ok, false);
+		} finally {
+			childProcess.execFileSync = simulatedExec;
+		}
+		assert.equal(read("editor.txt"), prior, "failed secure staging preserves original bytes");
+	}
+	try {
+		fs.renameSync = () => { throw Object.assign(new Error("Injected replacement failure"), { code: "EACCES" }); };
+		assert.equal(writeText(root, "editor.txt", "should not replace original", saved.version).ok, false);
+	} finally {
+		fs.renameSync = originalRename;
+	}
+	assert.equal(read("editor.txt"), prior, "failed replacement preserves original bytes");
+	assert.equal(fs.readdirSync(root).some((name) => name.includes(".grok-save-")), false);
+	try {
+		fs.writeFileSync = (file, text, options) => {
+			const result = originalWrite(file, text, options);
+			if (typeof file === "number") { originalWrite(path.join(root, "editor.txt"), "new concurrent edit\n", "utf8"); }
+			return result;
+		};
+		assert.equal(writeText(root, "editor.txt", "should not replace concurrent edit", saved.version).ok, false);
+	} finally {
+		fs.writeFileSync = originalWrite;
+	}
+	assert.equal(read("editor.txt"), "new concurrent edit\n", "version is rechecked immediately before replacement");
+	assert.equal(fs.readdirSync(root).some((name) => name.includes(".grok-save-")), false);
+	assert.equal(writeText(root, "editor.txt", "missing version").ok, false);
+	fs.unlinkSync(path.join(root, "editor.txt"));
+	assert.equal(writeText(root, "editor.txt", "deleted stale buffer", saved.version).ok, false);
+	assert.equal(fs.existsSync(path.join(root, "editor.txt")), false);
+	console.log("PASS CR04/CR06: stale/missing saves and legacy encodings are rejected; UTF-8 save versions round-trip");
+
+	write("binary.bin", Buffer.from([0, 4, 5]));
+	git(["mv", "--", "old name.txt", "renamed name.txt"]);
+	let snapshot = await readDiff(root);
+	assert.equal(snapshot.ok, true);
+	assert.equal(snapshot.truncated, false);
+	const binary = snapshot.files.find((file) => file.path === "binary.bin");
+	const renamed = snapshot.files.find((file) => file.path === "renamed name.txt");
+	assert.ok(binary);
+	assert.ok(binary.hunks.some((hunk) => hunk.lines.some((line) => line.text === "Binary file")));
+	assert.ok(renamed);
+	assert.ok(renamed.hunks.some((hunk) => hunk.lines.some((line) => line.text === "Renamed from old name.txt")));
+	const oldTextId = snapshot.files.find((file) => file.path === "report1.txt").hunks[0].id;
+	const oldBinaryId = binary.hunks[0].id;
+	write("report1.txt", "different dirty text\n");
+	write("binary.bin", Buffer.from([0, 8, 9]));
+	snapshot = await readDiff(root);
+	assert.notEqual(snapshot.files.find((file) => file.path === "report1.txt").hunks[0].id, oldTextId);
+	assert.notEqual(snapshot.files.find((file) => file.path === "binary.bin").hunks[0].id, oldBinaryId);
+	console.log("PASS CR11/CR12: binary and rename changes remain visible; changed text/binary content gets new hunk IDs");
+	write("large.txt", "a".repeat(50000));
+	let large = (await readDiff(root)).files.find((file) => file.path === "large.txt");
+	assert.equal(large.hunks[0].reviewable, false, "oversized contents cannot receive content review decisions");
+	write("large.txt", "b".repeat(50000));
+	large = (await readDiff(root)).files.find((file) => file.path === "large.txt");
+	assert.equal(large.hunks[0].reviewable, false);
+	write("unreadable.txt", "unreadable fixture\n");
+	const originalRead = fs.readFileSync;
+	try {
+		fs.readFileSync = (file, options) => {
+			if (file === path.join(root, "unreadable.txt")) { throw Object.assign(new Error("Injected unreadable file"), { code: "EACCES" }); }
+			return originalRead(file, options);
+		};
+		const unreadable = (await readDiff(root)).files.find((file) => file.path === "unreadable.txt");
+		assert.equal(unreadable.hunks[0].reviewable, false);
+		assert.match(unreadable.hunks[0].lines[0].text, /could not be read/);
+	} finally {
+		fs.readFileSync = originalRead;
+	}
+	const conflictRoot = path.join(root, "grokdesk-conflict");
+	fs.mkdirSync(conflictRoot);
+	git(["init", "--quiet"], conflictRoot);
+	git(["config", "core.autocrlf", "false"], conflictRoot);
+	const commit = (message) => git(["-c", "user.name=GrokCode test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "--no-gpg-sign", "-am", message], conflictRoot);
+	fs.writeFileSync(path.join(conflictRoot, "conflict.txt"), "base\n");
+	fs.writeFileSync(path.join(conflictRoot, "z-ordinary.txt"), "ordinary base\n");
+	git(["add", "--all"], conflictRoot);
+	commit("Base");
+	const baseBranch = git(["branch", "--show-current"], conflictRoot).trim();
+	git(["branch", "other"], conflictRoot);
+	fs.writeFileSync(path.join(conflictRoot, "conflict.txt"), "ours\n");
+	commit("Ours");
+	git(["checkout", "--quiet", "other"], conflictRoot);
+	fs.writeFileSync(path.join(conflictRoot, "conflict.txt"), "theirs\n");
+	commit("Theirs");
+	git(["checkout", "--quiet", baseBranch], conflictRoot);
+	assert.throws(() => git(["merge", "--no-edit", "other"], conflictRoot));
+	fs.writeFileSync(path.join(conflictRoot, "z-ordinary.txt"), "ordinary changed\n");
+	const conflicted = await readDiff(conflictRoot);
+	assert.equal(conflicted.ok, true);
+	const conflict = conflicted.files.find((file) => file.path === "conflict.txt");
+	assert.equal(conflict.hunks.length, 1, "staged and unstaged conflict metadata share one explicit notice");
+	assert.ok(conflict.hunks.some((hunk) => hunk.lines.some((line) => /Unresolved merge conflict/.test(line.text))));
+	assert.ok(conflict.hunks.every((hunk) => hunk.reviewable === false));
+	const ordinary = conflicted.files.find((file) => file.path === "z-ordinary.txt");
+	assert.ok(ordinary.hunks.some((hunk) => hunk.lines.some((line) => line.kind === "add" && line.text === "ordinary changed")), "mixed conflict output retains ordinary patch attribution");
+	console.log("PASS R2-03/R2-04/R2-05: failed saves preserve originals; conflicts and unreviewable contents are explicit");
+
+	const kindRoot = path.join(root, "grokdesk-kinds");
+	fs.mkdirSync(path.join(kindRoot, "mode b"), { recursive: true });
+	git(["init", "--quiet"], kindRoot);
+	git(["config", "core.autocrlf", "false"], kindRoot);
+	git(["config", "diff.mnemonicPrefix", "true"], kindRoot);
+	for (const name of ["a.txt", "b.txt", "z.txt", "mode b/run.sh"]) { fs.writeFileSync(path.join(kindRoot, name), `${name} original\n`); }
+	git(["add", "--all"], kindRoot);
+	git(["-c", "user.name=GrokCode test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "--no-gpg-sign", "-m", "Kinds"], kindRoot);
+	const stageBlob = (name, text, mode = "100644") => {
+		const blob = execFileSync("git", ["hash-object", "-w", "--stdin"], { cwd: kindRoot, input: text, encoding: "utf8" }).trim();
+		git(["-c", "core.protectNTFS=false", "update-index", "--add", "--cacheinfo", `${mode},${blob},${name}`], kindRoot);
+	};
+	stageBlob("a.txt", "link-target", "120000");
+	fs.writeFileSync(path.join(kindRoot, "b.txt"), "b.txt changed\n");
+	fs.writeFileSync(path.join(kindRoot, "z.txt"), "z.txt changed\n");
+	fs.writeFileSync(path.join(kindRoot, "café.txt"), "café.txt staged\n");
+	git(["add", "--", "b.txt", "z.txt", "café.txt"], kindRoot);
+	git(["update-index", "--chmod=+x", "--", "mode b/run.sh"], kindRoot);
+	const quotedNames = ["tab\there.txt", "quote\"name.txt", "ctl\u0001x.txt"];
+	for (const name of quotedNames) { stageBlob(name, `${name} staged\n`); }
+	fs.writeFileSync(path.join(kindRoot, " lead.txt"), "space-led file\n");
+	fs.writeFileSync(path.join(kindRoot, "lead.txt"), "plain file\n");
+	const kinds = await readDiff(kindRoot);
+	assert.equal(kinds.ok, true);
+	assert.equal(kinds.truncated, false);
+	assert.deepEqual(kinds.files.map((file) => file.path).sort(), [" lead.txt", "a.txt", "b.txt", "café.txt", "lead.txt", "mode b/run.sh", "z.txt", ...quotedNames].sort());
+	const shown = (name) => kinds.files.find((file) => file.path === name).hunks.flatMap((hunk) => hunk.lines.map((line) => `${line.kind}:${line.text}`));
+	assert.deepEqual(shown("b.txt"), ["del:b.txt original", "add:b.txt changed"]);
+	assert.deepEqual(shown("z.txt"), ["del:z.txt original", "add:z.txt changed"]);
+	assert.deepEqual(shown("a.txt"), ["del:link-target", "add:a.txt original", "del:a.txt original", "add:link-target"], "both type-change halves stay on a.txt");
+	assert.deepEqual(shown("café.txt"), ["add:café.txt staged"]);
+	for (const name of quotedNames) { assert.deepEqual(shown(name), [`del:${name} staged`, `add:${name} staged`], JSON.stringify(name)); }
+	assert.deepEqual([...new Set(shown("mode b/run.sh"))], ["context:File metadata changed."]);
+	assert.deepEqual(shown(" lead.txt"), ["add:space-led file"]);
+	assert.deepEqual(shown("lead.txt"), ["add:plain file"]);
+	const octal = parseUnified(git(["-c", "core.quotepath=true", "diff", "--cached", "--no-color", "--src-prefix=a/", "--dst-prefix=b/"], kindRoot), "Staged");
+	assert.deepEqual(octal.files.map((file) => file.path).sort(), ["a.txt", "b.txt", "café.txt", "z.txt", ...quotedNames].sort(), "C-quoted and octal-escaped names decode to the real path");
+	assert.equal(octal.files.find((file) => file.path === "a.txt").hunks.length, 2);
+	console.log("PASS 6.3/6.5: diff blocks keep their own paths (type change, C-quoted, octal, mode-only, configured prefixes); untracked names keep leading spaces");
+
+	const junctionRoot = path.join(root, "grokdesk-junction");
+	fs.mkdirSync(path.join(junctionRoot, "sub"), { recursive: true });
+	fs.mkdirSync(path.join(junctionRoot, "gone"));
+	git(["init", "--quiet"], junctionRoot);
+	git(["config", "core.autocrlf", "false"], junctionRoot);
+	fs.writeFileSync(path.join(junctionRoot, "sub", "a.txt"), "from HEAD\n");
+	fs.writeFileSync(path.join(junctionRoot, "gone", "c.txt"), "restore me\n");
+	git(["add", "--all"], junctionRoot);
+	git(["-c", "user.name=GrokCode test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "--no-gpg-sign", "-m", "Junction"], junctionRoot);
+	fs.rmSync(path.join(junctionRoot, "gone"), { recursive: true });
+	assert.equal((await revertFile(junctionRoot, "gone/c.txt")).ok, true, "a file whose folder was deleted is still restorable");
+	assert.equal(fs.readFileSync(path.join(junctionRoot, "gone", "c.txt"), "utf8"), "restore me\n");
+	console.log("PASS 6.1: Revert still restores a tracked file whose folder was deleted");
+	if (process.platform === "win32") {
+		const outsideRoot = path.join(root, "grokdesk-outside");
+		fs.mkdirSync(outsideRoot);
+		fs.rmSync(path.join(junctionRoot, "sub"), { recursive: true });
+		fs.symlinkSync(outsideRoot, path.join(junctionRoot, "sub"), "junction");
+		assert.deepEqual(await revertFile(junctionRoot, "sub/a.txt"), { ok: false, error: "That file is not in this folder." });
+		assert.equal(fs.existsSync(path.join(outsideRoot, "a.txt")), false, "Revert must not write through a junction");
+		console.log("PASS 6.1 Windows: Revert refuses a deleted file behind a junction that leaves the folder");
+	}
+	if (process.platform === "win32" && process.argv.includes("--acl")) {
+		const aclFile = path.join(root, "acl-target.txt");
+		write("acl-target.txt", "private original");
+		const shell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+		const inspect = (script, file = aclFile) => nativeExec(shell, ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'; ${script}`], { windowsHide: true, timeout: 8000, encoding: "utf8", env: { ...process.env, GROK_TEST_FILE: file } }).trim();
+		const initialSddl = inspect("$security = [Security.AccessControl.FileSecurity]::new(); $security.SetAccessRuleProtection($true, $false); $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User; $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)); [IO.File]::SetAccessControl($env:GROK_TEST_FILE, $security); [IO.File]::GetAccessControl($env:GROK_TEST_FILE).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)");
+		const accessScript = "$acl = [IO.File]::GetAccessControl($env:GROK_TEST_FILE); $acl.AreAccessRulesProtected; foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) { [string]::Join(':', @($rule.IdentityReference.Value, [string][int]$rule.FileSystemRights, [string]$rule.AccessControlType, [string]$rule.IsInherited)) }";
+		const initialAccess = inspect(accessScript);
+		const simulatedExec = childProcess.execFileSync;
+		let checkedStage = false;
+		try {
+			childProcess.execFileSync = nativeExec;
+			fs.writeFileSync = (file, text, options) => {
+				if (typeof file === "number") {
+					const temporary = fs.readdirSync(root).find((name) => name.startsWith(".grok-save-"));
+					const access = inspect(accessScript, path.join(root, temporary));
+					assert.ok(access.startsWith("True"));
+					assert.equal(access, initialAccess, "stage access rules match the private target before writing plaintext");
+					assert.equal(fs.statSync(path.join(root, temporary)).size, 0);
+					checkedStage = true;
+				}
+				return nativeWrite(file, text, options);
+			};
+			const loadedAcl = readText(root, "acl-target.txt");
+			assert.equal(writeText(root, "acl-target.txt", "private replacement", loadedAcl.version).ok, true);
+		} finally {
+			fs.writeFileSync = nativeWrite;
+			childProcess.execFileSync = simulatedExec;
+		}
+		assert.equal(checkedStage, true);
+		assert.equal(inspect("[IO.File]::GetAccessControl($env:GROK_TEST_FILE).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)"), initialSddl, "native replacement preserves the exact original security descriptor");
+		assert.equal(read("acl-target.txt"), "private replacement");
+		assert.equal(fs.readdirSync(root).some((name) => name.includes(".grok-save-")), false);
+		let checkedNativeVersion = false;
+		try {
+			childProcess.execFileSync = (command, args, options) => {
+				if (options?.env?.GROK_SAVE_VERSION) {
+					nativeWrite(aclFile, "late concurrent edit");
+					checkedNativeVersion = true;
+				}
+				return nativeExec(command, args, options);
+			};
+			const loadedAcl = readText(root, "acl-target.txt");
+			assert.equal(writeText(root, "acl-target.txt", "must not replace late edit", loadedAcl.version).ok, false);
+		} finally {
+			childProcess.execFileSync = simulatedExec;
+		}
+		assert.equal(checkedNativeVersion, true);
+		assert.equal(read("acl-target.txt"), "late concurrent edit", "native child rechecks the version after its launch boundary");
+		assert.equal(fs.readdirSync(root).some((name) => name.includes(".grok-save-")), false);
+		console.log("PASS R2-03 actual Windows ACL/version: protected staging precedes plaintext, replacement retains descriptor, late edits reject");
+	}
+
+	if (process.argv.includes("--terminal")) {
+		const childFile = path.join(root, "grokdesk-timeout-child.cjs");
+		const marker = path.join(root, "grokdesk-survived.txt");
+		fs.writeFileSync(childFile, `setTimeout(() => require("fs").writeFileSync(${JSON.stringify(marker)}, "survived"), 23000);`);
+		const escapePs = (text) => `'${text.replace(/'/g, "''")}'`;
+		const started = Date.now();
+		const result = await runCommand(root, `& ${escapePs(process.execPath)} ${escapePs(childFile)}`);
+		assert.equal(result.ok, true, JSON.stringify(result));
+		assert.equal(result.code, -1);
+		assert.equal(result.timedOut, true);
+		assert.match(result.output, /20-second limit/);
+		assert.ok(Date.now() - started < 23000, "Timeout must settle before the child marker deadline");
+		await new Promise((resolve) => setTimeout(resolve, Math.max(0, 24500 - (Date.now() - started))));
+		assert.equal(fs.existsSync(marker), false, "Descendant must be stopped before it writes its marker");
+		console.log("PASS CR10: real PowerShell/Node descendant stopped at timeout without writing its delayed marker");
+	}
+}
+
+main().catch((error) => {
+	console.error(error);
+	process.exitCode = 1;
+}).finally(() => {
+	childProcess.execFileSync = nativeExec;
+	assert.equal(path.dirname(root), tempBase);
+	assert.ok(path.basename(root).startsWith("grokdesk-files-"));
+	fs.rmSync(root, { recursive: true, force: true });
+});
