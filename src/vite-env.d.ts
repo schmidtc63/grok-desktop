@@ -59,6 +59,24 @@ interface GrokMcpServer {
 	status: string;
 }
 
+// What `grok inspect`, `grok mcp list` and `grok plugin list` report for one folder.
+interface GrokInventory {
+	ok: boolean;
+	error?: string;
+	trusted?: boolean;
+	skills?: { name: string; command: string; description: string; source: string; path: string; disabled: boolean }[];
+	servers?: { name: string; detail: string; source: string; enabled: boolean; removable: boolean }[];
+	plugins?: { name: string; version: string; description: string; marketplace: string; installed: boolean; enabled: boolean }[];
+	otherPlugins?: { name: string; detail: string }[];
+	marketplaces?: { name: string; source: string }[];
+}
+
+type GrokCustomizeChange =
+	| { action: "mcp-add"; name: string; transport: "stdio" | "http" | "sse"; target: string; env?: string; headers?: string; scope: "user" | "project" }
+	| { action: "mcp-remove" | "mcp-enable" | "mcp-disable" | "plugin-uninstall" | "plugin-enable" | "plugin-disable" | "plugin-update"; name: string }
+	| { action: "plugin-install" | "marketplace-add" | "marketplace-remove"; source: string }
+	| { action: "marketplace-update" };
+
 interface GrokToolEvent {
   id: string;
   kind?: string;
@@ -79,15 +97,23 @@ interface GrokToolEvent {
 	todos?: GrokTodo[];
 }
 
+interface GrokAccount {
+	email: string;
+	plan: string;
+	team: string;
+	version: string;
+}
+
 interface GrokEvent {
-	type: "chunk" | "thought" | "tool" | "done" | "error" | "mode" | "usage" | "context" | "commands" | "models" | "mcp" | "mcp-status" | "terminal-data" | "terminal-exit";
+	type: "chunk" | "thought" | "tool" | "done" | "error" | "mode" | "usage" | "context" | "commands" | "models" | "mcp" | "mcp-status" | "terminal-data" | "terminal-exit" | "account";
+	account?: GrokAccount | null;
   uiSessionId: string;
 	turnId: string;
   text?: string;
   tool?: GrokToolEvent;
   stopReason?: string;
   message?: string;
-	mode?: "Plan" | "Manual";
+	mode?: "Plan" | "Normal" | "Auto-review" | "Always-approve";
 	usage?: GrokUsage;
 	contextTokens?: number;
 	contextWindow?: number;
@@ -146,8 +172,8 @@ interface DiffHunk {
 
 interface DiffFile {
   path: string;
-  additions: number;
-  deletions: number;
+  additions?: number;
+  deletions?: number;
   hunks: DiffHunk[];
 }
 
@@ -187,6 +213,7 @@ interface WriteResult {
   ok: boolean;
   error?: string;
 	version?: string;
+	message?: string;
 }
 
 interface GrokCodeApi {
@@ -203,9 +230,11 @@ interface GrokCodeApi {
 		attachments?: string[];
   }) => Promise<GrokSendResult>;
   cancel: (uiSessionId: string) => Promise<void>;
+	stopSession?: (uiSessionId: string) => Promise<void>;
+	forgetSession?: (uiSessionId: string) => Promise<void>;
   decide: (payload: { uiSessionId: string; toolId: string; decision: "allow" | "deny" | "always" }) => Promise<GrokSendResult>;
 	answerQuestion: (payload: { uiSessionId: string; toolId: string; answers: Record<string, string> | null }) => Promise<GrokSendResult>;
-	answerPlan: (payload: { uiSessionId: string; toolId: string; outcome: "approved" | "feedback" | "abandoned"; feedback?: string; mode?: "Accept edits" | "Manual" }) => Promise<GrokSendResult>;
+	answerPlan: (payload: { uiSessionId: string; toolId: string; outcome: "approved" | "feedback" | "abandoned"; feedback?: string; mode?: "Normal" | "Auto-review" | "Always-approve" }) => Promise<GrokSendResult>;
 	setAllowedFolders: (payload: { uiSessionId: string; allowedFolders: string[] }) => Promise<GrokSendResult>;
   pickFolder: () => Promise<string | null>;
   diff: (cwd: string) => Promise<DiffSnapshot>;
@@ -219,7 +248,6 @@ interface GrokCodeApi {
   reveal: (cwd: string, file: string) => Promise<WriteResult>;
   run: (payload: { cwd: string; command: string }) => Promise<CommandResult>;
   onEvent: (callback: (event: GrokEvent) => void) => () => void;
-	defaultFolder?: string;
 	pathForFile: (file: File) => string;
 	openExternal: (url: string) => Promise<WriteResult>;
 	openIn: (payload: { target: "explorer" | "vscode"; cwd: string; file?: string; line?: number }) => Promise<WriteResult>;
@@ -227,9 +255,15 @@ interface GrokCodeApi {
 	attention: () => Promise<WriteResult>;
 	keepAwake: (payload: { working: boolean; onBattery: boolean }) => Promise<WriteResult>;
 	saveImage: (base64: string) => Promise<WriteResult & { path?: string }>;
+	openImage: (file: string) => Promise<WriteResult>;
 	appInfo: () => Promise<{ ok: boolean; version?: string; electron?: string }>;
 	contextBreakdown?: (agentSessionId: string) => Promise<{ ok: boolean; error?: string } & Partial<ContextBreakdown>>;
 	recentSpend?: () => Promise<{ ok: boolean; error?: string; usd?: number }>;
+	homeDir?: string;
+	customize?: (cwd: string) => Promise<GrokInventory>;
+	customizeChange?: (cwd: string, input: GrokCustomizeChange) => Promise<{ ok: boolean; error?: string; message?: string }>;
+	account?: () => Promise<GrokAccount | null | undefined>;
+	signOut?: () => Promise<WriteResult>;
 	devScripts: (cwd: string) => Promise<{ ok: boolean; scripts?: { script: string; command: string }[] }>;
 	terminalOpen?: (payload: { cwd: string }) => Promise<WriteResult & { id?: string }>;
 	terminalWrite?: (id: string, text: string) => Promise<WriteResult>;
@@ -239,10 +273,11 @@ interface GrokCodeApi {
 	scopedDiff?: (cwd: string, scope: string) => Promise<DiffSnapshot>;
 	listCommits?: (cwd: string) => Promise<{ ok: boolean; error?: string; commits?: { sha: string; short: string; subject: string; when: string }[] }>;
 	prStatus?: (cwd: string) => Promise<PrStatus>;
-	prCreate?: (cwd: string) => Promise<WriteResult & { url?: string }>;
-	prMergeWhenReady?: (cwd: string) => Promise<WriteResult>;
+	prCreate?: (cwd: string, expected?: string) => Promise<WriteResult & { url?: string; message?: string }>;
+	prMergeWhenReady?: (cwd: string, number: number) => Promise<WriteResult>;
 	addWorktree?: (cwd: string, payload: { name: string; prefix: string }) => Promise<WriteResult & { folder?: string; branch?: string }>;
-	removeWorktree?: (cwd: string, folder: string, payload: { force: boolean }) => Promise<WriteResult & { dirty?: boolean }>;
+	restoreWorktree?: (folder: string, branch: string) => Promise<WriteResult & { folder?: string; branch?: string }>;
+	removeWorktree?: (cwd: string, folder: string, payload: { force: boolean }) => Promise<WriteResult & { dirty?: boolean; ignored?: string[] }>;
 }
 
 interface Window {

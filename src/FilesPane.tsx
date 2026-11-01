@@ -97,14 +97,14 @@ export function FilesPane(props: FilesPaneProps) {
 	});
 
 	// Debounced auto save. `saving` is left out of the keys on purpose: a failed save must not retry in a loop;
-	// the next edit re-arms the timer. The textarea is read-only while saving, so no edit can land mid-save.
+	// the next edit or a successful save's updated base text re-arms the timer.
 	useEffect(() => {
 		if (!shouldAutoSave(autoState)) {
 			return undefined;
 		}
 		const timer = window.setTimeout(() => saveRef.current(), AUTO_SAVE_MS);
 		return () => window.clearTimeout(timer);
-	}, [draft?.text, autoSave, dirty, conflict, readOnly]);
+	}, [draft?.text, draft?.baseText, autoSave, dirty, conflict, readOnly]);
 
 	useEffect(() => {
 		target.current = { tick: lineTick, file };
@@ -235,7 +235,7 @@ export function FilesPane(props: FilesPaneProps) {
 							wrap="off"
 							spellCheck={false}
 							value={text}
-							readOnly={readOnly || saving || !editable}
+							readOnly={readOnly || !editable}
 							onChange={(event) => onEdit(event.target.value)}
 							onScroll={(event) => {
 								if (gutter.current) {

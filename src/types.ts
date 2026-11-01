@@ -14,11 +14,17 @@ export type SessionStatus = "running" | "needs-you" | "idle" | "scheduled";
 export type Environment = "Local" | "SSH" | "Cloud";
 
 export type PermissionMode =
-  | "Manual"
-  | "Accept edits"
+  | "Normal"
   | "Plan"
-  | "Auto"
-  | "Bypass permissions";
+  | "Auto-review"
+  | "Always-approve";
+
+export function mapMode(mode: string | undefined): PermissionMode | undefined {
+  if (mode === "Manual" || mode === "Accept edits") { return "Normal"; }
+  if (mode === "Auto" || mode === "Bypass permissions") { return "Always-approve"; }
+  if (mode === "Normal" || mode === "Plan" || mode === "Auto-review" || mode === "Always-approve") { return mode; }
+  return undefined;
+}
 
 export type TranscriptView = "normal" | "thinking" | "verbose";
 
@@ -45,6 +51,8 @@ export interface Session {
   archived: boolean;
   source: "desktop" | "phone";
 	agentSessionId?: string;
+	model?: string;
+	effort?: string;
 	allowedFolders?: string[];
 	createdAt?: number;
 	lastActivityAt?: number;
@@ -106,14 +114,24 @@ export const MENU_PANES: { id: SidePaneId; label: string }[] = [
 ];
 
 export const MODES: { id: PermissionMode; detail: string }[] = [
-  { id: "Manual", detail: "Ask before edits and commands." },
-  { id: "Accept edits", detail: "Auto-accept file edits in the session's folders. Still ask before other commands." },
-  { id: "Plan", detail: "Explore and propose a plan. No source edits." },
-  { id: "Auto", detail: "Run tools without asking. Grok Desktop has no safety classifier for this mode." },
-  { id: "Bypass permissions", detail: "No prompts. Meant for a sandbox or a VM." },
+  { id: "Normal", detail: "Ask before edits and commands." },
+	{ id: "Plan", detail: "Explore and write a plan. Commands ask, unless you chose Always allow earlier in this session. Only the plan file can be edited." },
+  { id: "Auto-review", detail: "Grok's safety check runs the call. A call it will not allow asks you." },
+  { id: "Always-approve", detail: "Run tools without asking. Deny rules and safety hooks still apply." },
 ];
 
 export const MODELS: string[] = ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"];
 export const EFFORTS = ["low", "medium", "high", "xhigh"] as const;
+export const EFFORT_DETAIL: Record<string, string> = {
+	low: "Fastest. Least reasoning.",
+	medium: "Balanced speed and reasoning.",
+	high: "More reasoning. Slower.",
+	xhigh: "Most reasoning. Slowest, and uses the most tokens.",
+};
 export type Effort = (typeof EFFORTS)[number];
 export const FAST_MODEL: Record<string, string> = { "grok-4.7": "grok-4.7-build-fast" };
+
+// The page loads from file://, so an attached image's own path serves as its thumbnail.
+export function imageSrc(file: string) {
+	return /\.(png|jpe?g|gif|webp)$/i.test(file) ? `file:///${encodeURI(file.replace(/\\/g, "/")).replace(/#/g, "%23")}` : "";
+}

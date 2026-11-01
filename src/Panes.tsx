@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { Markdown } from "./Markdown";
-import type { ChatMessage, Session, ToolCard, TranscriptView } from "./types";
+import { imageSrc, type ChatMessage, type Session, type ToolCard, type TranscriptView } from "./types";
 
 export interface FolderFiles {
   status: "loading" | "ready" | "error";
@@ -45,12 +45,14 @@ export interface PaneModel {
 	busy: boolean;
 	decide: (toolId: string, decision: "allow" | "deny" | "always") => void;
 	answerQuestion: (toolId: string, answers: Record<string, string> | null) => Promise<GrokSendResult>;
-	answerPlan: (toolId: string, choice: { outcome: "approved" | "feedback" | "abandoned"; feedback?: string; mode?: "Accept edits" | "Manual" }) => Promise<GrokSendResult>;
+	answerPlan: (toolId: string, choice: { outcome: "approved" | "feedback" | "abandoned"; feedback?: string; mode?: "Normal" | "Auto-review" | "Always-approve" }) => Promise<GrokSendResult>;
+	resumeMode: "Normal" | "Auto-review" | "Always-approve";
   folderFiles: FolderFiles | undefined;
 	openFile: (file: string, line?: number) => void;
 	fileMenu: (file: string, event: MouseEvent) => void;
 	openLink: (href: string, event: MouseEvent) => void;
 	copyText: (text: string) => void;
+	openImage: (file: string) => void;
 	runInTerminal: (code: string) => void;
 	closePane: (id: "plan" | "tasks") => void;
 }
@@ -265,6 +267,7 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 							placeholder="Other"
 							maxLength={4000}
 							value={picks[index]?.other ?? ""}
+							onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); } }}
 							onChange={(event) => {
 								const value = event.target.value;
 								setPicks((current) => ({ ...current, [index]: { picked: [], other: value, typed: true } }));
@@ -292,14 +295,14 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 				{toolId && (
 					<>
 						<div className="actions">
-							<button type="button" className="yes" disabled={busy} onClick={() => run(m.answerPlan(toolId, { outcome: "approved", mode: "Accept edits" }))}>Approve · auto-accept edits</button>
-							<button type="button" disabled={busy} onClick={() => run(m.answerPlan(toolId, { outcome: "approved", mode: "Manual" }))}>Approve · ask before edits</button>
+							<button type="button" className="yes" disabled={busy} onClick={() => run(m.answerPlan(toolId, { outcome: "approved", mode: m.resumeMode }))}>Approve</button>
 							<button type="button" disabled={busy} aria-expanded={feedback !== null} onClick={() => setFeedback((value) => (value === null ? "" : null))}>Keep planning</button>
-							<button type="button" disabled={busy} onClick={() => run(m.answerPlan(toolId, { outcome: "abandoned" }))}>Abandon</button>
+							<button type="button" disabled={busy} onClick={() => run(m.answerPlan(toolId, { outcome: "abandoned", mode: m.resumeMode }))}>Abandon</button>
 						</div>
+						<p className="note">Approve or Abandon switches this session to {m.resumeMode}.</p>
 						{feedback !== null && (
 							<div className="tool-feedback">
-								<textarea aria-label="What should change in the plan" rows={3} maxLength={8000} value={feedback} onChange={(event) => setFeedback(event.target.value)} />
+								<textarea aria-label="What should change in the plan" rows={3} maxLength={8000} value={feedback} onChange={(event) => setFeedback(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); } }} />
 								<div className="actions">
 									<button type="button" disabled={busy || !feedback.trim()} onClick={() => run(m.answerPlan(toolId, { outcome: "feedback", feedback }))}>Send</button>
 								</div>
@@ -317,7 +320,7 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 				{toolId && (
 					<div className="actions">
 						<button type="button" onClick={() => m.decide(toolId, "deny")}>Deny</button>
-						<button type="button" title="Allow this tool (or this command) for the rest of the session" onClick={() => m.decide(toolId, "always")}>Always allow</button>
+						{!toolId.startsWith("native-permission:") && <button type="button" title="Allow this tool, or this exact command, for the rest of this conversation" onClick={() => m.decide(toolId, "always")}>Always allow</button>}
 						<button type="button" className="yes" onClick={() => m.decide(toolId, "allow")}>Allow</button>
 					</div>
 				)}
@@ -420,17 +423,26 @@ function MessageBody({ message, m }: { message: ChatMessage; m: PaneModel }) {
 		if (!file || !(hitFiles.includes(file) || known.includes(file))) { return null; }
 		return <code key={key}><FileButton file={file} label={code} line={match?.[2] ? Number(match[2]) : undefined} onOpen={m.openFile} onMenu={m.fileMenu} /></code>;
 	};
-	const markdown = (text: string, key: string) => <Markdown key={key} text={text} renderText={renderText} renderCode={renderCode} onLink={m.openLink} onCopy={m.copyText} onRun={m.runInTerminal} />;
+	const markdown = (text: string, key: string) => <Markdown key={key} text={text} renderText={renderText} renderCode={renderCode} onLink={m.openLink} onCopy={m.copyText} onRun={message.streaming ? undefined : m.runInTerminal} />;
 	if (message.role === "user") {
+		const files = message.attachments ?? [];
+		const others = files.filter((file) => !imageSrc(file));
 		return (
-			<div className="user-bubble">
-				<div className="message-text">{message.text}</div>
-				{!!message.attachments?.length && (
-					<div className="attach-list">
-						{message.attachments.map((file) => <span className="attach-chip" key={file} title={file}>{file.split(/[\\/]/).pop()}</span>)}
-					</div>
-				)}
-			</div>
+			<>
+				{files.filter((file) => imageSrc(file)).map((file) => (
+					<button type="button" className="msg-image" key={file} title={file} aria-label={`View ${file.split(/[\\/]/).pop()}`} onClick={() => m.openImage(file)}>
+						<img src={imageSrc(file)} alt={file.split(/[\\/]/).pop()} />
+					</button>
+				))}
+				<div className="user-bubble">
+					<div className="message-text">{message.text}</div>
+					{!!others.length && (
+						<div className="attach-list">
+							{others.map((file) => <span className="attach-chip" key={file} title={file}>{file.split(/[\\/]/).pop()}</span>)}
+						</div>
+					)}
+				</div>
+			</>
 		);
 	}
 	const tools = message.tools ?? [];

@@ -62,29 +62,31 @@ export function SessionRail({
 	onOpenDiff: (file?: string) => void;
 	onCompact: () => void;
 	onOpenUrl: (url: string) => void;
-	onCreatePr: () => Promise<{ ok: boolean; error?: string }>;
-	onMergeWhenReady: () => Promise<{ ok: boolean; error?: string }>;
+	onCreatePr: () => Promise<{ ok: boolean; error?: string; message?: string }>;
+	onMergeWhenReady: () => Promise<{ ok: boolean; error?: string; message?: string }>;
 }) {
 	const [prMenu, setPrMenu] = useState(false);
 	const [prNote, setPrNote] = useState("");
 	const [working, setWorking] = useState(false);
 	const files = diff?.files ?? [];
-	const additions = files.reduce((sum, file) => sum + file.additions, 0);
-	const deletions = files.reduce((sum, file) => sum + file.deletions, 0);
+	const hasCounts = files.every((file) => file.additions !== undefined && file.deletions !== undefined);
+	const additions = files.reduce((sum, file) => sum + (file.additions ?? 0), 0);
+	const deletions = files.reduce((sum, file) => sum + (file.deletions ?? 0), 0);
 	const open = pr?.ok ? pr.pr : null;
 	const failed = open?.checks.filter((check) => check.state === "fail").length ?? 0;
 	const running = open?.checks.filter((check) => check.state === "run" || check.state === "wait").length ?? 0;
+	const passed = open?.checks.filter((check) => check.state === "pass").length ?? 0;
 	const percent = usage ? Math.min(100, Math.round((usage.contextTokens / Math.max(1, usage.contextWindow)) * 100)) : null;
 
-	function act(run: () => Promise<{ ok: boolean; error?: string }>, done: string) {
+	function act(run: () => Promise<{ ok: boolean; error?: string; message?: string }>, done: string) {
 		setWorking(true);
 		setPrMenu(false);
-		void run().then((result) => setPrNote(result.ok ? done : (result.error || "That did not work."))).finally(() => setWorking(false));
+		void run().then((result) => setPrNote(result.ok ? (result.message || done) : (result.error || "That did not work."))).finally(() => setWorking(false));
 	}
 
 	return (
 		<aside className="session-rail" aria-label="Session details">
-			<RailCard title="Changes" extra={files.length ? <span className="meta"><span className="add">+{additions}</span> <span className="del">−{deletions}</span></span> : null}>
+			<RailCard title="Changes" extra={files.length && hasCounts ? <span className="meta"><span className="add">+{additions}</span> <span className="del">−{deletions}</span></span> : null}>
 				{!diff && <p className="meta">Reading the working tree…</p>}
 				{diff && !diff.ok && <p className="note">{diff.error}</p>}
 				{diff?.ok && diff.repo === false && <p className="note">This folder is not a git checkout.</p>}
@@ -92,14 +94,14 @@ export function SessionRail({
 				{files.length > 0 && (
 					<>
 						<button className="rail-counts" onClick={() => onOpenDiff()}>
-							<span className="add">+{additions}</span>
-							<span className="del">−{deletions}</span>
+							{hasCounts && <span className="add">+{additions}</span>}
+							{hasCounts && <span className="del">−{deletions}</span>}
 							<span className="meta">{files.length === 1 ? "1 file" : `${files.length} files`}</span>
 						</button>
 						{files.slice(0, 5).map((file) => (
 							<button key={file.path} className="rail-file" title={file.path} onClick={() => onOpenDiff(file.path)}>
 								<span>{file.path}</span>
-								<span className="meta">+{file.additions} −{file.deletions}</span>
+								{file.additions !== undefined && file.deletions !== undefined && <span className="meta">+{file.additions} −{file.deletions}</span>}
 							</button>
 						))}
 						{files.length > 5 && <button className="texty" onClick={() => onOpenDiff()}>{files.length - 5} more</button>}
@@ -116,7 +118,7 @@ export function SessionRail({
 						<span className="rail-pr-title">{open.title}</span>
 						{open.checks.length > 0 && (
 							<span className={failed ? "meta del" : "meta"}>
-								{failed ? `${failed} check${failed === 1 ? "" : "s"} failed` : running ? `${running} check${running === 1 ? "" : "s"} running` : "Checks passed"}
+								{failed ? `${failed} check${failed === 1 ? "" : "s"} failed` : running ? `${running} check${running === 1 ? "" : "s"} running` : passed > 0 ? "Checks passed" : "Checks skipped"}
 							</span>
 						)}
 						{open.checks.filter((check) => check.state === "fail").slice(0, 3).map((check) => (

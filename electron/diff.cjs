@@ -1,6 +1,7 @@
 const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const { createHash } = require("crypto");
 const { folderProblem, resolvedEditPath, killTree } = require("./agent.cjs");
 
@@ -8,8 +9,9 @@ const MAX_BYTES = 180000;
 const MAX_LINES = 700;
 const MAX_FILES = 40;
 const MAX_UNTRACKED_BYTES = 48 * 1024;
+const FILTER_NOT_OFF = "This repository's git config names a filter the app cannot turn off.";
 
-function runGit(args, cwd) {
+function runGit(args, cwd, timeout = 8000) {
   return new Promise((resolve) => {
     let settled = false;
     let truncated = false;
@@ -24,7 +26,8 @@ function runGit(args, cwd) {
       resolve(value);
     };
     // A repo's own config must not start a program just because the Changes pane opened.
-    const child = spawn("git", ["-c", "core.fsmonitor=false", ...args], { cwd, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+		// core.hooksPath stops hook files only; a hook set in config ignores it, so the event an index refresh fires is off too.
+		const child = spawn("git", ["-c", "core.fsmonitor=false", "-c", "diff.suppressBlankEmpty=false", "-c", `core.hooksPath=${os.devNull}`, "-c", "hook.post-index-change.enabled=false", ...args], { cwd, env: { ...process.env, GROK_CODE_EMPTY: "", GROK_CODE_FALSE: "false" }, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     child.on("error", (error) => {
       finish({
         code: -1,
@@ -59,8 +62,29 @@ function runGit(args, cwd) {
     timer = setTimeout(() => {
       truncated = true;
       killTree(child);
-    }, 8000);
+		}, timeout);
   });
+}
+
+async function localFilterOff(cwd) {
+	const config = await runGit(["config", "--show-scope", "--name-only", "--get-regexp", "^filter\\..*\\.(clean|smudge|process)$"], cwd);
+	// A cut-off listing could miss a driver, so it is refused like a name that cannot be turned off.
+	if (config.truncated) { return null; }
+	const names = new Set();
+	for (const line of config.out.split(/\r?\n/)) {
+		// The s flag lets "." match U+2028 and U+2029, which a driver name may hold.
+		const found = /^(?:local|worktree)\s+filter\.(.*)\.(?:clean|smudge|process)$/s.exec(line);
+		if (found) { names.add(found[1]); }
+	}
+	// A name that is not valid UTF-8 decodes with U+FFFD, so --config-env would name a different driver.
+	if ([...names].some((name) => name.includes("\uFFFD"))) { return null; }
+	// `-c` splits at the first "=", so a driver named "a=b" would stay on; --config-env splits at the last.
+	return [...names].flatMap((name) => [
+		`--config-env=filter.${name}.clean=GROK_CODE_EMPTY`,
+		`--config-env=filter.${name}.smudge=GROK_CODE_EMPTY`,
+		`--config-env=filter.${name}.process=GROK_CODE_EMPTY`,
+		`--config-env=filter.${name}.required=GROK_CODE_FALSE`,
+	]);
 }
 
 const ESCAPES = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13 };
@@ -105,11 +129,11 @@ function parseNames(text) {
 	return names;
 }
 
-function parseGitDiff(text, label) {
+function parseGitDiff(text, label, inputTruncated = false) {
 	const boundary = text.indexOf("\0\0");
 	const inventory = parseNames(boundary < 0 ? text : text.slice(0, boundary + 1));
 	const unmerged = new Set(inventory.filter((change) => change.unmerged).map((change) => change.path));
-	const parsed = parseUnified(boundary < 0 ? "" : text.slice(boundary + 2), label, inventory.filter((change) => !unmerged.has(change.path)));
+	const parsed = parseUnified(boundary < 0 ? "" : text.slice(boundary + 2), label, inventory.filter((change) => !unmerged.has(change.path)), inputTruncated);
 	for (const file of unmerged) {
 		if (parsed.files.length >= MAX_FILES) { parsed.truncated = true; break; }
 		parsed.files.push({ path: file, additions: 0, deletions: 0, conflicted: true, hunks: [{ id: "", loc: "Unresolved merge conflict", reviewable: false, lines: [{ kind: "context", text: "Unresolved merge conflict. Combined conflict content is not shown here; resolve it in the editor or a Git merge tool." }] }] });
@@ -117,7 +141,7 @@ function parseGitDiff(text, label) {
 	return parsed;
 }
 
-function parseUnified(text, label, inventory = []) {
+function parseUnified(text, label, inventory = [], inputTruncated = false) {
   const files = [];
 	const fingerprints = new Map();
   let file = null;
@@ -136,8 +160,8 @@ function parseUnified(text, label, inventory = []) {
 			found = { path: name, additions: 0, deletions: 0, hunks: [] };
 			files.push(found);
 		}
-		found.additions += file.additions;
-		found.deletions += file.deletions;
+		found.additions = file.isBinary || found.additions === undefined ? undefined : found.additions + file.additions;
+		found.deletions = file.isBinary || found.deletions === undefined ? undefined : found.deletions + file.deletions;
 		found.hunks.push(...file.hunks);
 		if (file.index) { fingerprints.set(found, file.index); }
 	};
@@ -161,6 +185,7 @@ function parseUnified(text, label, inventory = []) {
 			} else if (line.startsWith("rename to ") || line.startsWith("copy to ")) {
 				file.moved = unquote(line.slice(line.indexOf(" to ") + 4));
 			} else if (line.startsWith("Binary files ")) {
+				file.isBinary = true;
 				const pair = line.slice(13).replace(/ differ$/, "");
 				file.binary = pair.startsWith("/dev/null and ") ? gitPath(pair.slice(14)) : pairPath(pair, " and ");
 				file.hunks.push({ id: file.index || "", loc: label || "Binary", lines: [{ kind: "context", text: "Binary file" }] });
@@ -202,11 +227,29 @@ function parseUnified(text, label, inventory = []) {
 			files.push(item);
 		}
 		if (!item.hunks.length) {
-			const detail = change.from ? `Renamed from ${change.from}` : (truncated ? "Diff content was left out." : "File metadata changed.");
+			const detail = change.from ? `Renamed from ${change.from}` : (truncated || inputTruncated ? "Diff content was left out." : "File metadata changed.");
 			item.hunks.push({ id: fingerprints.get(item) || "", loc: label || "Change", lines: [{ kind: "context", text: detail }] });
 		}
 	}
-	return { files: files.filter((item) => item.path && item.hunks.length > 0), truncated };
+	return { files: files.filter((item) => item.path && item.hunks.length > 0), truncated: truncated || inputTruncated };
+}
+
+function parseNumstat(text) {
+	const parts = text.split("\0");
+	const counts = new Map();
+	for (let index = 0; index < parts.length - 1;) {
+		const entry = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(parts[index++]);
+		if (!entry) { continue; }
+		let file = entry[3];
+		if (!file) {
+			index += 1;
+			file = parts[index++];
+		}
+		if (file && entry[1] !== "-" && entry[2] !== "-") {
+			counts.set(file, { additions: Number(entry[1]), deletions: Number(entry[2]) });
+		}
+	}
+	return counts;
 }
 
 function mergeFiles(into, files) {
@@ -220,8 +263,8 @@ function mergeFiles(into, files) {
 			if (file.conflicted) { Object.assign(found, file); }
 			continue;
 		}
-    found.additions += file.additions;
-    found.deletions += file.deletions;
+		found.additions = found.additions === undefined || file.additions === undefined ? undefined : found.additions + file.additions;
+		found.deletions = found.deletions === undefined || file.deletions === undefined ? undefined : found.deletions + file.deletions;
     found.hunks.push(...file.hunks);
   }
 }
@@ -292,13 +335,16 @@ async function readDiff(cwd) {
   if (probe.code !== 0 || probe.out.trim() !== "true") return { ok: true, repo: false, files: [] };
 
   const top = await runGit(["rev-parse", "--show-toplevel"], cwd);
-  const toplevel = path.resolve(top.code === 0 ? top.out.trim() : cwd);
-  const folder = path.resolve(cwd);
+	const toplevel = fs.realpathSync(top.code === 0 ? top.out.trim() : cwd);
+	const folder = fs.realpathSync(cwd);
   let spec = path.relative(toplevel, folder);
   if (!spec) spec = ".";
   else spec = spec.split(path.sep).join("/");
   if (spec.startsWith("..") || path.isAbsolute(spec)) return { ok: true, repo: true, truncated: false, files: [] };
-	const diffArgs = ["--literal-pathspecs", "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short"];
+	const filterOff = await localFilterOff(cwd);
+	if (filterOff === null) { return { ok: false, error: FILTER_NOT_OFF }; }
+	// A dirty-submodule check runs git status inside the submodule, which loads that submodule's own filters.
+	const diffArgs = [...filterOff, "--literal-pathspecs", "-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short", "--ignore-submodules=dirty"];
 	const [unstaged, staged] = await Promise.all([
 		runGit([...diffArgs, "--raw", "-z", "-p", "-U3", "--", spec], toplevel),
 		runGit([...diffArgs, "--cached", "--raw", "-z", "-p", "-U3", "--", spec], toplevel),
@@ -306,8 +352,18 @@ async function readDiff(cwd) {
 	for (const result of [unstaged, staged]) {
 		if (result.code !== 0 && !result.truncated) { return { ok: false, error: "The working tree diff could not be read." }; }
 	}
-	const parsedUnstaged = parseGitDiff(unstaged.out, "");
-	const parsedStaged = parseGitDiff(staged.out, "Staged");
+	const parsedUnstaged = parseGitDiff(unstaged.out, "", unstaged.truncated);
+	const parsedStaged = parseGitDiff(staged.out, "Staged", staged.truncated);
+	await Promise.all([[parsedUnstaged, []], [parsedStaged, ["--cached"]]].map(async ([parsed, stagedArgs]) => {
+		if (!parsed.truncated) { return; }
+		const result = await runGit([...diffArgs, ...stagedArgs, "--numstat", "-z", "--", spec], toplevel);
+		const counts = result.code === 0 && !result.truncated ? parseNumstat(result.out) : new Map();
+		for (const file of parsed.files) {
+			const count = counts.get(file.path);
+			file.additions = count?.additions;
+			file.deletions = count?.deletions;
+		}
+	}));
   const files = [];
   mergeFiles(files, parsedUnstaged.files);
   mergeFiles(files, parsedStaged.files);
@@ -355,8 +411,8 @@ async function revertFile(cwd, relative) {
   if (probe.code !== 0 || probe.out.trim() !== "true") return { ok: false, error: "This folder is not a git checkout." };
   const top = await runGit(["rev-parse", "--show-toplevel"], cwd);
   if (top.code !== 0 || !top.out.trim()) return { ok: false, error: "This folder is not a git checkout." };
-  const toplevel = path.resolve(top.out.trim());
-  const folder = path.resolve(cwd);
+	const toplevel = fs.realpathSync(top.out.trim());
+	const folder = fs.realpathSync(cwd);
   const absolute = path.resolve(folder, relative);
   if (!fileInside(folder, absolute)) return { ok: false, error: "That file is not in this folder." };
   if (fs.existsSync(absolute)) {
@@ -390,9 +446,10 @@ async function revertFile(cwd, relative) {
 	} catch {
 		return { ok: false, error: "That file is not in this folder." };
 	}
-	const restored = await runGit(["--literal-pathspecs", "restore", "--source=HEAD", "--staged", "--worktree", "--", gitRelative], toplevel);
+	const restored = await runGit(["--literal-pathspecs", "restore", "--source=HEAD", "--staged", "--worktree", "--", gitRelative], toplevel, 60000);
+	if (restored.truncated) { return { ok: false, error: "Git took too long and was stopped. The file may be partly restored; check it before trying again." }; }
   if (restored.code !== 0) return { ok: false, error: "That file could not be restored." };
   return { ok: true };
 }
 
-module.exports = { readDiff, parseUnified, revertFile };
+module.exports = { readDiff, parseUnified, revertFile, localFilterOff, FILTER_NOT_OFF };

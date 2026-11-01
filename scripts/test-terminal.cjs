@@ -51,6 +51,12 @@ async function main() {
 	assert.equal(opened.ok, true, opened.error);
 	const id = opened.id;
 	assert.deepEqual(host.list(), [{ id, cwd: tmp, running: true }]);
+	host.write(id, "Import-Module \"$PSHOME/Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1\"; Get-ExecutionPolicy");
+	await waitFor(() => hasLine(id, "RemoteSigned"), "RemoteSigned execution policy");
+	console.log("PASS terminal execution policy is RemoteSigned");
+	host.write(id, "foreach ($i in 1..2) {\n  \"n$i\"\n}");
+	await waitFor(() => hasLine(id, "n1") && hasLine(id, "n2"), "multiline foreach output");
+	console.log("PASS multiline command completes without another write");
 	assert.equal(host.write(id, "$x = 41").ok, true);
 	assert.equal(host.write(id, "$x + 1\n").ok, true);
 	await waitFor(() => hasLine(id, "42"), "42");

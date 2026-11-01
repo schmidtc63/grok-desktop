@@ -5,18 +5,21 @@ import { DiffPane, type DiffComment, type PrInfo } from "./DiffPane";
 import { FilesPane } from "./FilesPane";
 import { PaneView, SideLog, type BackgroundTask, type EditorDraft, type FolderFiles, type OpenFile, type PaneModel } from "./Panes";
 import { SessionRail } from "./SessionRail";
-import { DEFAULT_SETTINGS, readSettings, settingsKey, SettingsPage, type AppSettings } from "./Settings";
+import { DEFAULT_SETTINGS, readSettings, settingsKey, SettingsPage, type AppSettings, type SettingsTab } from "./Settings";
 import { Sidebar } from "./Sidebar";
 import { TerminalPane, type TerminalTab } from "./TerminalPane";
 import {
+	EFFORT_DETAIL,
 	EFFORTS,
 	FAST_MODEL,
+	imageSrc,
 	MENU_PANES,
 	MODES,
 	MODELS,
 	PANES,
 	type ChatMessage,
 	type Environment,
+	mapMode,
 	type PermissionMode,
 	type ProjectSeed,
 	type Session,
@@ -28,6 +31,7 @@ type Menu = string | null;
 
 const historyKey = "grok-code.history.v1";
 const commandsKey = "grok-code.commands.v1";
+const accountKey = "grok-code.account.v1";
 const SIDE_BUSY = "The side chat is still answering. Wait for it to finish.";
 const VIEWS: TranscriptView[] = ["normal", "thinking", "verbose"];
 const VIEW_LABEL: Record<TranscriptView, string> = { normal: "Normal", thinking: "Thinking", verbose: "Verbose" };
@@ -35,14 +39,17 @@ const PROTECTED = [/^\.mcp\.json$/i, /^\.claude\/settings(\.local)?\.json$/i, /^
 const BUILT_INS: GrokCommand[] = [
 	{ name: "btw", description: "Ask a side question that does not join this conversation", hint: "question" },
 	{ name: "config", description: "Open Settings", hint: "" },
-	{ name: "status", description: "Show Grok Desktop's version, model, mode and folder", hint: "" },
+	{ name: "status", description: "Show the app's version, model, mode and folder", hint: "" },
 ];
 
 interface History {
 	sessions: Session[];
 	extraChats: Record<string, ChatMessage[]>;
 	modes: Record<string, PermissionMode>;
+	prePlan: Record<string, PermissionMode>;
 	editorDrafts: Record<string, EditorDraft | undefined>;
+	composerDrafts?: Record<string, string>;
+	newSessionDraft?: { session: Session; useWorktree: boolean; text: string };
 	deleted: string[];
 }
 
@@ -62,9 +69,14 @@ interface TurnTarget {
 function readHistory(): History | null {
 	try {
 		const value = JSON.parse(localStorage.getItem(historyKey) ?? "null");
-		if (!value || !Array.isArray(value.sessions) || !value.sessions.length) { return null; }
+		if (!value || !Array.isArray(value.sessions)) { return null; }
 		if (value.sessions.some((item: Session) => !item || typeof item.id !== "string" || typeof item.folder !== "string")) { return null; }
-		return { sessions: value.sessions, extraChats: value.extraChats ?? {}, modes: value.modes ?? {}, editorDrafts: value.editorDrafts ?? {}, deleted: Array.isArray(value.deleted) ? value.deleted : [] };
+		const draft = value.newSessionDraft;
+		const newSessionDraft = draft && typeof draft.text === "string" && draft.text && typeof draft.session?.id === "string" && typeof draft.session?.folder === "string" ? draft : undefined;
+		if (!value.sessions.length && !newSessionDraft) { return null; }
+		const modes = Object.fromEntries(Object.entries(value.modes ?? {}).map(([id, mode]) => [id, mapMode(String(mode)) ?? "Always-approve"]));
+		const prePlan = Object.fromEntries(Object.entries(value.prePlan ?? {}).map(([id, mode]) => [id, mapMode(String(mode)) ?? "Normal"]).filter(([, mode]) => mode !== "Plan"));
+		return { sessions: value.sessions, extraChats: value.extraChats ?? {}, modes, prePlan, editorDrafts: value.editorDrafts ?? {}, composerDrafts: value.composerDrafts ?? {}, newSessionDraft, deleted: Array.isArray(value.deleted) ? value.deleted : [] };
 	} catch {
 		return null;
 	}
@@ -117,8 +129,22 @@ function mergeDrafts(saved: History["editorDrafts"], current: History["editorDra
 	return merged;
 }
 
+// Only drafts that hold the user's own text are saved, and never a deleted session's.
+function keptDrafts(store: History["editorDrafts"], gone: Set<string>) {
+	return Object.fromEntries(Object.entries(store).filter(([key, draft]) => {
+		if (!draft || (draft.text === draft.baseText && !draft.recoveryTexts?.length)) { return false; }
+		let id = "";
+		try { id = String(JSON.parse(key)[0]); } catch { return true; }
+		return !gone.has(id);
+	}));
+}
+
+// Named so a save that works again can clear them.
+const HISTORY_FULL = "Chat history is full and is not being saved. Delete old sessions to free space.";
+const HISTORY_FAILED = "Chat history could not be saved on this computer.";
+
 function newSession(seed?: Partial<ProjectSeed>): Session {
-	const folder = seed?.folder ?? (window.grokCode?.defaultFolder || "C:\\");
+	const folder = seed?.folder ?? window.grokCode?.homeDir ?? "";
 	const project = seed?.project ?? shortPath(folder);
 	const now = Date.now();
 	return {
@@ -134,9 +160,8 @@ function fileKey(session: Session, file: string) {
 	return JSON.stringify([session.id, session.folder, file]);
 }
 
-// With Bypass turned off in Settings, a session, folder or default still set to Bypass runs as Manual.
-function allowedMode(mode: PermissionMode, settings: AppSettings): PermissionMode {
-	return mode === "Bypass permissions" && !settings.allowBypass ? "Manual" : mode;
+function knownMode(mode: string | undefined, settings: AppSettings): PermissionMode {
+	return mapMode(mode) ?? mapMode(settings.defaultMode) ?? "Always-approve";
 }
 
 function folderKey(folder: string) {
@@ -174,6 +199,18 @@ function readCommands(): GrokCommand[] {
 	}
 }
 
+// The account Grok last reported, shown at launch until Grok starts and reports again.
+function readAccount(): GrokAccount | null | undefined {
+	try {
+		const saved = localStorage.getItem(accountKey);
+		if (saved === null) { return undefined; }
+		const value = JSON.parse(saved);
+		return value === null || typeof value?.email === "string" ? value : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 export function App() {
 	const [history] = useState(readHistory);
 	const [settings, setSettings] = useState<AppSettings>(readSettings);
@@ -182,18 +219,24 @@ export function App() {
 		const requested = new URLSearchParams(window.location?.search ?? "").get("session");
 		return history?.sessions.find((item) => item.id === requested)?.id ?? history?.sessions.find((item) => !item.archived)?.id ?? "";
 	});
-	const [pending, setPending] = useState<Session | null>(null);
-	const [useWorktree, setUseWorktree] = useState(false);
+	// A fresh id each time, so two windows that both restore the form cannot send into one session.
+	const [restoredForm] = useState<Session | null>(() => (history?.newSessionDraft ? { ...history.newSessionDraft.session, id: `new-${crypto.randomUUID()}` } : null));
+	const [pending, setPending] = useState<Session | null>(() => restoredForm ?? (history ? null : sessions[0]));
+	const [useWorktree, setUseWorktree] = useState(history?.newSessionDraft?.useWorktree ?? false);
 	const [panes, setPanes] = useState<SidePaneId[]>([]);
 	const [focusedPane, setFocusedPane] = useState<SidePaneId | null>(null);
 	const [menu, setMenu] = useState<Menu>(null);
 	const [fileMenu, setFileMenu] = useState<{ file: string; x: number; y: number } | null>(null);
 	const [query, setQuery] = useState("");
-	const [drafts, setDrafts] = useState<Record<string, string>>({});
+	const [drafts, setDrafts] = useState<Record<string, string>>(() => ({
+		...Object.fromEntries(Object.entries(history?.composerDrafts ?? {}).filter(([id, text]) => typeof text === "string" && sessions.some((item) => item.id === id))),
+		...(restoredForm && history?.newSessionDraft ? { [restoredForm.id]: history.newSessionDraft.text } : {}),
+	}));
 	const [attachments, setAttachments] = useState<Record<string, string[]>>({});
 	const [queued, setQueued] = useState<Record<string, Queued[]>>({});
 	const [held, setHeld] = useState<Record<string, boolean>>({});
 	const [popIndex, setPopIndex] = useState(0);
+	const popupList = useRef<HTMLDivElement>(null);
 	const [popClosed, setPopClosed] = useState("");
 	const [sideOpen, setSideOpen] = useState(false);
 	const [sideText, setSideText] = useState("");
@@ -202,7 +245,7 @@ export function App() {
 	const sideSeen = useRef<Record<string, string>>({});
 	const [notice, setNotice] = useState("");
 	const [shortcuts, setShortcuts] = useState(false);
-	const [settingsOpen, setSettingsOpen] = useState(false);
+	const [settingsOpen, setSettingsOpen] = useState<SettingsTab | null>(null);
 	const [renaming, setRenaming] = useState<string | null>(null);
 	const [extraChats, setExtraChats] = useState<Record<string, ChatMessage[]>>(() => restoredChats(history?.extraChats ?? {}));
 	const [deleted, setDeleted] = useState<string[]>(history?.deleted ?? []);
@@ -234,40 +277,66 @@ export function App() {
 	const [devTabs, setDevTabs] = useState<Record<string, string>>({});
 	const [selectTick, setSelectTick] = useState(0);
 	const [modes, setModes] = useState<Record<string, PermissionMode>>(history?.modes ?? {});
+	const [prePlan, setPrePlan] = useState<Record<string, PermissionMode>>(history?.prePlan ?? {});
+	const modesRef = useRef(modes);
 	const [busy, setBusy] = useState<Record<string, boolean>>({});
 	const [breakdown, setBreakdown] = useState<(ContextBreakdown & { id: string }) | null>(null);
 	const [recentUsd, setRecentUsd] = useState<number | null>(null);
+	const [account, setAccount] = useState<GrokAccount | null | undefined>(readAccount);
 	const [addingFolder, setAddingFolder] = useState(false);
 	const [windowWidth, setWindowWidth] = useState(() => window.innerWidth ?? 1400);
 	const turnTargets = useRef<Record<string, TurnTarget>>({});
 	const sessionsRef = useRef(sessions);
 	const activeIdRef = useRef(activeId);
 	const pendingRef = useRef(pending);
+	const draftsRef = useRef(drafts);
+	const useWorktreeRef = useRef(useWorktree);
 	const creatingWorktree = useRef(false);
+	const autoArchiving = useRef(new Set<string>());
 	const settingsRef = useRef(settings);
 	const keyActions = useRef<Record<string, () => void>>({});
 	const overlayOpen = useRef(false);
+	const settingsShown = useRef(false);
 	const editorDraftsRef = useRef(editorDrafts);
+	const queuedRef = useRef(queued);
 	const promptRef = useRef<HTMLTextAreaElement | null>(null);
 	const appVersion = useRef("");
 	sessionsRef.current = sessions;
-	overlayOpen.current = menu !== null || fileMenu !== null || shortcuts || settingsOpen;
+	overlayOpen.current = menu !== null || fileMenu !== null || shortcuts || settingsOpen !== null;
+	settingsShown.current = settingsOpen !== null;
 	pendingRef.current = pending;
+	draftsRef.current = drafts;
+	useWorktreeRef.current = useWorktree;
 	settingsRef.current = settings;
+	modesRef.current = modes;
 	editorDraftsRef.current = editorDrafts;
+	queuedRef.current = queued;
 	const persistedDrafts = useRef(editorDrafts);
-	const lastSaved = useRef<History | null>(history ? { sessions, extraChats, modes, editorDrafts, deleted } : null);
-	const saveHistory = useRef(() => {});
+	const lastSaved = useRef<History | null>(history ? { sessions, extraChats, modes, prePlan, editorDrafts, composerDrafts: drafts, newSessionDraft: history.newSessionDraft, deleted } : null);
+	const saveHistory = useRef<() => boolean>(() => true);
 
 	function changeSettings(patch: Partial<AppSettings>) {
 		setSettings((current) => ({ ...current, ...patch }));
 	}
 
+	function changeMode(id: string, next: PermissionMode) {
+		const previous = knownMode(modesRef.current[id], settingsRef.current);
+		if (next === "Plan" && previous !== "Plan") { setPrePlan((current) => ({ ...current, [id]: previous })); }
+		modesRef.current = { ...modesRef.current, [id]: next };
+		setModes(modesRef.current);
+	}
+
+	useEffect(() => {
+		const reload = (event: StorageEvent) => { if (event.key === settingsKey) { setSettings(readSettings()); } };
+		window.addEventListener("storage", reload);
+		return () => window.removeEventListener("storage", reload);
+	}, []);
+
 	useEffect(() => {
 		try {
 			localStorage.setItem(settingsKey, JSON.stringify(settings));
 		} catch {
-			// Settings stay in memory when storage is unavailable.
+			setNotice("Settings could not be saved. Changes last until the app closes.");
 		}
 	}, [settings]);
 
@@ -280,9 +349,11 @@ export function App() {
 	useEffect(() => {
 		const guard = (event: BeforeUnloadEvent) => {
 			// ponytail: saved here without the lock, so a write from another window in the same instant can lose its last change.
-			saveHistory.current();
+			const saved = saveHistory.current();
 			const current = editorDraftsRef.current;
-			if (current !== persistedDrafts.current && Object.values(current).some((draft) => draft && (draft.text !== draft.baseText || draft.recoveryTexts?.length))) {
+			const unsavedMessage = !saved && Object.entries(draftsRef.current).some(([id, text]) => text && (pendingRef.current?.id === id || sessionsRef.current.some((item) => item.id === id)));
+			// The queue is never saved, so a close or reload would drop a queued message.
+			if (unsavedMessage || (current !== persistedDrafts.current && Object.values(current).some((draft) => draft && (draft.text !== draft.baseText || draft.recoveryTexts?.length))) || Object.values(queuedRef.current).some((items) => items.length)) {
 				event.preventDefault();
 				event.returnValue = false;
 			}
@@ -294,7 +365,11 @@ export function App() {
 	// Set on every render, so a close saves what is on screen even before the effect below runs.
 	saveHistory.current = () => {
 		const last = lastSaved.current;
-		if (last && last.sessions === sessions && last.extraChats === extraChats && last.modes === modes && last.editorDrafts === editorDrafts && last.deleted === deleted) { return; }
+		const currentDrafts = draftsRef.current;
+		const form = pendingRef.current;
+		const newSessionDraft = form && currentDrafts[form.id] ? { session: form, useWorktree: useWorktreeRef.current, text: currentDrafts[form.id] } : undefined;
+		const sameForm = last?.newSessionDraft?.session === newSessionDraft?.session && last?.newSessionDraft?.useWorktree === newSessionDraft?.useWorktree && last?.newSessionDraft?.text === newSessionDraft?.text;
+		if (last && last.sessions === sessions && last.extraChats === extraChats && last.modes === modes && last.prePlan === prePlan && last.editorDrafts === editorDrafts && last.composerDrafts === currentDrafts && sameForm && last.deleted === deleted) { return true; }
 		try {
 			const saved = readHistory();
 			const previous = saved ? last : null;
@@ -305,29 +380,49 @@ export function App() {
 			for (const item of sessions) {
 				const old = oldSessions.get(item.id);
 				const changes = Object.fromEntries(Object.entries(item).filter(([key, value]) => value !== old?.[key as keyof Session]));
-				currentSessions.set(item.id, { ...currentSessions.get(item.id), ...changes } as Session);
+				currentSessions.set(item.id, currentSessions.has(item.id) ? { ...currentSessions.get(item.id), ...changes } as Session : item);
 			}
-			const order = [...sessions.filter((item) => !savedIds.has(item.id)).map((item) => item.id), ...savedIds].filter((id) => !gone.has(id));
+			const order = [...sessions.filter((item) => !savedIds.has(item.id)).map((item) => item.id), ...savedIds].filter((id) => !gone.has(id) && id !== newSessionDraft?.session.id);
 			const chats = slimChats(mergeChats(saved?.extraChats ?? {}, extraChats, previous?.extraChats ?? {}));
 			for (const id of gone) { delete chats[id]; }
+			const composerDrafts = { ...saved?.composerDrafts };
+			for (const [id, text] of Object.entries(currentDrafts)) {
+				if (text === previous?.composerDrafts?.[id]) { continue; }
+				if (text) { composerDrafts[id] = text; } else { delete composerDrafts[id]; }
+			}
+			for (const id of Object.keys(composerDrafts)) { if (!order.includes(id)) { delete composerDrafts[id]; } }
 			localStorage.setItem(historyKey, JSON.stringify({
 				sessions: order.map((id) => currentSessions.get(id)),
 				extraChats: chats,
 				modes: { ...saved?.modes, ...Object.fromEntries(Object.entries(modes).filter(([id, value]) => value !== previous?.modes[id])) },
-				editorDrafts: mergeDrafts(saved?.editorDrafts ?? {}, editorDrafts, previous?.editorDrafts ?? {}),
+				prePlan: { ...saved?.prePlan, ...Object.fromEntries(Object.entries(prePlan).filter(([id, value]) => value !== previous?.prePlan[id])) },
+				editorDrafts: keptDrafts(mergeDrafts(saved?.editorDrafts ?? {}, editorDrafts, previous?.editorDrafts ?? {}), gone),
+				composerDrafts,
+				newSessionDraft,
 				deleted: [...gone].slice(-500),
 			}));
 			persistedDrafts.current = editorDrafts;
-			lastSaved.current = { sessions, extraChats, modes, editorDrafts, deleted };
-		} catch {
-			setNotice("Chat history could not be saved on this computer.");
+			lastSaved.current = { sessions, extraChats, modes, prePlan, editorDrafts, composerDrafts: currentDrafts, newSessionDraft, deleted };
+			setNotice((current) => (current === HISTORY_FULL || current === HISTORY_FAILED ? "" : current));
+			return true;
+		} catch (error) {
+			setNotice(error instanceof DOMException && error.name === "QuotaExceededError" ? HISTORY_FULL : HISTORY_FAILED);
+			return false;
 		}
 	};
 
 	useEffect(() => {
 		if (!navigator.locks) { setNotice("Chat history could not be saved on this computer."); return; }
 		void navigator.locks.request(historyKey, () => saveHistory.current()).catch(() => setNotice("Chat history could not be saved on this computer."));
-	}, [sessions, extraChats, modes, editorDrafts, deleted]);
+	}, [sessions, extraChats, modes, prePlan, editorDrafts, deleted, pending, useWorktree]);
+
+	useEffect(() => {
+		const timer = setTimeout(() => {
+			if (!navigator.locks) { setNotice(HISTORY_FAILED); return; }
+			void navigator.locks.request(historyKey, () => saveHistory.current()).catch(() => setNotice(HISTORY_FAILED));
+		}, 500);
+		return () => clearTimeout(timer);
+	}, [drafts]);
 
 	const writeReply = useCallback((uiSessionId: string, recipe: (message: ChatMessage) => ChatMessage) => {
 		const target = turnTargets.current[uiSessionId];
@@ -350,7 +445,7 @@ export function App() {
 		if (!away) { return; }
 		if (current.attention) { void window.grokCode?.attention?.(); }
 		if (level !== "banner" || typeof Notification === "undefined") { return; }
-		const title = sessionsRef.current.find((item) => item.id === sessionId)?.title ?? "Grok Desktop";
+		const title = sessionsRef.current.find((item) => item.id === sessionId)?.title ?? "Codewomplers Grok Desktop";
 		try {
 			const shown = new Notification(title, { body, silent: current.sound === "none" });
 			shown.onclick = () => { window.focus(); setActiveId(sessionId); setPending(null); };
@@ -370,6 +465,12 @@ export function App() {
 				return;
 			}
 			if (event.type === "models" && event.models) { setModels(event.models); return; }
+			if (event.type === "account") {
+				const value = event.account ?? null;
+				setAccount(value);
+				try { localStorage.setItem(accountKey, JSON.stringify(value)); } catch { /* cache only */ }
+				return;
+			}
 			if (event.type === "mcp" && event.servers) { setServers(event.servers); return; }
 			if (event.type === "mcp-status" && event.name) {
 				const name = event.name;
@@ -394,7 +495,7 @@ export function App() {
 			const sessionId = target.sessionId;
 			if (event.type === "mode") {
 				const nextMode = event.mode;
-				if (nextMode && target.where === "main") { setModes((current) => ({ ...current, [sessionId]: nextMode })); }
+				if (nextMode && target.where === "main") { changeMode(sessionId, nextMode); }
 				return;
 			}
 			if (event.type === "usage" && event.usage) {
@@ -484,12 +585,14 @@ export function App() {
 	const session = visible;
 	// The session on screen, which is the first one before any is picked; a new-session page is none.
 	activeIdRef.current = pending ? "" : session.id;
-	const mode = allowedMode(modes[session.id] ?? settings.modeByFolder[folderKey(session.folder)] ?? settings.defaultMode, settings);
+	const mode = knownMode(modes[session.id] ?? settings.defaultMode, settings);
 	const view = views[session.id] ?? "normal";
 	const prompt = drafts[session.id] ?? "";
 	const setPrompt = (next: string | ((current: string) => string)) => {
 		const sessionId = session.id;
-		setDrafts((current) => ({ ...current, [sessionId]: typeof next === "function" ? next(current[sessionId] ?? "") : next }));
+		const current = draftsRef.current;
+		draftsRef.current = { ...current, [sessionId]: typeof next === "function" ? next(current[sessionId] ?? "") : next };
+		setDrafts(draftsRef.current);
 	};
 	const messages = extraChats[session.id] ?? [];
 	const scope = diffScope[session.id] ?? "uncommitted";
@@ -497,8 +600,8 @@ export function App() {
 	const railOpen = settings.railOpen;
 	// Like Claude's rail, it steps aside when the chat column would get too narrow.
 	const railShown = railOpen && windowWidth - (settings.sidebarCollapsed ? 0 : 260) - (panes.length ? settings.sideWidth : 0) - 280 >= 560;
-	const model = settings.model;
-	const effort = settings.effort;
+	const model = session.model ?? settings.model;
+	const effort = session.effort ?? settings.effort;
 	const modelInfo = models.find((item) => item.id === model);
 	const efforts = modelInfo?.efforts.length ? modelInfo.efforts : EFFORTS.filter((item) => model !== "grok-4.5" || item !== "xhigh");
 	const modelList = models.length ? models.map((item) => item.id).filter((id) => !Object.values(FAST_MODEL).includes(id)) : MODELS.filter((id) => !Object.values(FAST_MODEL).includes(id));
@@ -537,6 +640,8 @@ export function App() {
 	}, []);
 
 	useEffect(() => {
+		// Before Grok starts the host has no account, so the remembered one stays.
+		void window.grokCode?.account?.().then((value) => { if (value !== undefined) { setAccount(value); } }).catch(() => {});
 		const load = window.grokCode?.appInfo;
 		if (!load) { return; }
 		void load().then((info) => { if (info?.version) { appVersion.current = info.version; } }).catch(() => {});
@@ -545,13 +650,13 @@ export function App() {
 	function createPr() {
 		const api = window.grokCode;
 		if (!api?.prCreate) { return Promise.resolve({ ok: false, error: "Reopen this window to create a pull request." }); }
-		return api.prCreate(session.folder).then((result) => { setDiffTick((value) => value + 1); return result; });
+		return api.prCreate(session.folder, branches[session.id]?.branch).then((result) => { setDiffTick((value) => value + 1); return result; });
 	}
 
 	function mergeWhenReady() {
 		const api = window.grokCode;
 		if (!api?.prMergeWhenReady) { return Promise.resolve({ ok: false, error: "Reopen this window to merge." }); }
-		return api.prMergeWhenReady(session.folder).then((result) => { setDiffTick((value) => value + 1); return result; });
+		return api.prMergeWhenReady(session.folder, prs[session.id]?.pr?.number ?? 0).then((result) => { setDiffTick((value) => value + 1); return result; });
 	}
 
 	const popup = useMemo(() => {
@@ -564,7 +669,7 @@ export function App() {
 				if (names.has(item.name) || !item.name.toLowerCase().includes(needle)) { return false; }
 				names.add(item.name);
 				return true;
-			}).slice(0, 14);
+			});
 			return { kind: "slash" as const, needle, items: list.map((item) => ({ value: `/${item.name} `, label: `/${item.name}`, detail: item.description, hint: item.hint })) };
 		}
 		const mention = /(?:^|\s)@([\w./-]*)$/.exec(prompt);
@@ -577,6 +682,9 @@ export function App() {
 	}, [prompt, popClosed, commands, folderLists, session.id]);
 
 	useEffect(() => { setPopIndex(0); }, [popup?.kind, popup?.needle]);
+	useEffect(() => {
+		popupList.current?.querySelector<HTMLElement>("[aria-selected='true']")?.scrollIntoView({ block: "nearest" });
+	}, [popIndex, popup?.kind, popup?.needle]);
 
 	// Opening a session reads it; "Mark as unread" on the open session stays until you leave it.
 	useEffect(() => {
@@ -673,13 +781,24 @@ export function App() {
 		void window.grokCode?.keepAwake?.({ working: Object.values(busy).some(Boolean), onBattery: settings.keepAwakeOnBattery });
 	}, [busy, settings.keepAwake, settings.keepAwakeOnBattery]);
 
+	// Runs at launch and when the setting changes, not on every session change, so Unarchive is not undone at once.
 	useEffect(() => {
 		const days = settings.autoArchiveDays;
 		if (!days) { return; }
 		const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-		setSessions((current) => (current.some((item) => !item.archived && !item.pinned && (item.lastActivityAt ?? Date.now()) < cutoff)
-			? current.map((item) => (!item.archived && !item.pinned && (item.lastActivityAt ?? Date.now()) < cutoff ? { ...item, archived: true } : item))
-			: current));
+		for (const item of sessions) {
+			if (item.archived || item.pinned || busy[item.id] || (item.lastActivityAt ?? Date.now()) >= cutoff || autoArchiving.current.has(item.id)) { continue; }
+			const api = window.grokCode;
+			if (!item.worktreeFolder || !api?.removeWorktree) {
+				updateSession(item.id, { archived: true });
+				continue;
+			}
+			autoArchiving.current.add(item.id);
+			void api.removeWorktree(item.folder, item.worktreeFolder, { force: false }).catch(() => {}).finally(() => {
+				updateSession(item.id, { archived: true });
+				autoArchiving.current.delete(item.id);
+			});
+		}
 	}, [settings.autoArchiveDays]);
 
 	useEffect(() => {
@@ -689,6 +808,7 @@ export function App() {
 	}, [panes, session.id, session.folder]);
 
 	function togglePane(id: SidePaneId) {
+		if (id === "editor" && panes.includes("editor")) { flushEditor(); }
 		setPanes((current) => (current.includes(id) ? current.filter((pane) => pane !== id) : [...current, id]));
 		setFocusedPane(id);
 		setMenu(null);
@@ -700,11 +820,13 @@ export function App() {
 	}
 
 	function closePane(id: SidePaneId) {
+		if (id === "editor") { flushEditor(); }
 		setPanes((current) => current.filter((pane) => pane !== id));
 		setFocusedPane((current) => (current === id ? null : current));
 	}
 
 	function selectSession(id: string) {
+		flushEditor();
 		setPending(null);
 		setActiveId(id);
 		setMenu(null);
@@ -712,6 +834,7 @@ export function App() {
 	}
 
 	function createSession(seed?: Partial<ProjectSeed>) {
+		flushEditor();
 		const base = seed?.folder ? seed : { folder: session.folder, project: session.project, branch: session.branch, worktree: session.project, environment: "Local" as Environment };
 		const created = newSession(base);
 		setPending(created);
@@ -736,7 +859,6 @@ export function App() {
 
 	keyActions.current = {
 		newSession: () => createSession(),
-		closeSession: () => createSession(),
 		next: () => stepSession(1),
 		previous: () => stepSession(-1),
 		stop: () => { if (busy[session.id]) { stop(session.id); } },
@@ -755,11 +877,14 @@ export function App() {
 			const key = event.key.toLowerCase();
 			if (event.key === "Escape") {
 				// Esc closes whatever is open; only with nothing open does it stop Grok.
+				const target = event.target as Element | null;
+				if (target?.closest?.(".side-q")) { setSideOpen(false); return; }
+				if (target?.closest?.(".side-col, .session-rail")) { return; }
 				if (overlayOpen.current) {
 					setMenu(null);
 					setFileMenu(null);
 					setShortcuts(false);
-					setSettingsOpen(false);
+					setSettingsOpen(null);
 				} else {
 					keyActions.current.stop?.();
 				}
@@ -772,6 +897,8 @@ export function App() {
 				return;
 			}
 			if (!event.ctrlKey) { return; }
+			// Settings covers the sessions, so its shortcuts must not change them unseen.
+			if (settingsShown.current) { return; }
 			if (event.key === "Tab") { run(event.shiftKey ? "previous" : "next"); return; }
 			if (event.shiftKey && (event.code === "BracketRight" || event.key === "}")) { run("next"); return; }
 			if (event.shiftKey && (event.code === "BracketLeft" || event.key === "{")) { run("previous"); return; }
@@ -787,10 +914,9 @@ export function App() {
 				return;
 			}
 			if (key === "n") { run("newSession"); return; }
-			if (key === "w") { run("closeSession"); return; }
 			if (key === "o") { run("cycleView"); return; }
 			if (key === "/") { event.preventDefault(); setShortcuts(true); return; }
-			if (key === ",") { event.preventDefault(); setSettingsOpen(true); return; }
+			if (key === ",") { event.preventDefault(); setSettingsOpen("general"); return; }
 			if (key === ";") { run("side"); return; }
 			if (event.code === "Backquote" || key === "`") { run("terminal"); return; }
 			if (key === "\\") { run("closePane"); }
@@ -848,9 +974,9 @@ export function App() {
 		const uiId = side ? `side-${sessionId}` : sessionId;
 		const folder = target.folder;
 		const current = settingsRef.current;
-		const chosenModel = current.model;
-		const chosenEffort = current.effort;
-		const chosenMode = side ? "Manual" : allowedMode(modes[sessionId] ?? current.modeByFolder[folderKey(folder)] ?? current.defaultMode, current);
+		const chosenModel = target.model ?? current.model;
+		const chosenEffort = target.effort ?? current.effort;
+		const chosenMode = side ? "Normal" : knownMode(modes[sessionId] ?? current.defaultMode, current);
 		if (target.environment !== "Local") {
 			setNotice("SSH and Cloud execution are not available. Choose Local before sending.");
 			return false;
@@ -864,9 +990,10 @@ export function App() {
 			setHeld((list) => ({ ...list, [sessionId]: false }));
 			return true;
 		}
+		if (!target.model) { updateSession(sessionId, { model: chosenModel, effort: chosenEffort }); }
 		if (!side) {
 			setHeld((list) => ({ ...list, [sessionId]: false }));
-			if (!modes[sessionId]) { setModes((list) => ({ ...list, [sessionId]: chosenMode })); }
+			if (!modes[sessionId]) { changeMode(sessionId, chosenMode); }
 		}
 		if (!side && target.title === "New session") {
 			const title = body.replace(/\s+/g, " ").slice(0, 48);
@@ -908,7 +1035,9 @@ export function App() {
 		}).then((result) => {
 			if (result.agentSessionId) {
 				const agentId = result.agentSessionId;
-				if (side) { setSideAgents((list) => ({ ...list, [sessionId]: agentId })); } else { setSessions((list) => list.map((item) => (item.id === sessionId && item.folder === folder ? { ...item, agentSessionId: agentId } : item))); }
+				// A reply that lands after Choose a folder must not bring the old folder's side conversation back.
+				const now = sessionsRef.current.find((item) => item.id === sessionId) ?? (pendingRef.current?.id === sessionId ? pendingRef.current : undefined);
+				if (side) { if (now?.folder === folder) { setSideAgents((list) => ({ ...list, [sessionId]: agentId })); } } else { setSessions((list) => list.map((item) => (item.id === sessionId && item.folder === folder ? { ...item, agentSessionId: agentId } : item))); }
 			}
 			if (result.lostSession && side) {
 				setSideAgents((list) => Object.fromEntries(Object.entries(list).filter(([id]) => id !== sessionId)));
@@ -960,26 +1089,36 @@ export function App() {
 			if (creatingWorktree.current) { return null; }
 			const name = `${(prompt.toLowerCase().match(/[a-z0-9]+/g) ?? ["session"]).slice(0, 4).join("-").slice(0, 28)}-${Math.random().toString(36).slice(2, 6)}`;
 			creatingWorktree.current = true;
+			setNotice("Creating the worktree…");
 			const result = await api.addWorktree(draft.folder, { name, prefix: settingsRef.current.branchPrefix }).finally(() => { creatingWorktree.current = false; });
 			if (!result.ok || !result.folder) {
 				setNotice(result.error || "The worktree could not be created.");
 				return null;
 			}
+			setNotice((current) => current === "Creating the worktree…" ? "" : current);
 			created = { ...draft, folder: result.folder, branch: result.branch ?? draft.branch, worktree: shortPath(result.folder), worktreeFolder: result.folder };
 			setDrafts((current) => ({ ...current, [created.id]: current[draft.id] ?? "" }));
 		}
-		sessionsRef.current = [created, ...sessionsRef.current];
-		setSessions((current) => [created, ...current]);
+		sessionsRef.current = [created, ...sessionsRef.current.filter((item) => item.id !== created.id)];
+		setSessions((current) => [created, ...current.filter((item) => item.id !== created.id)]);
 		setActiveId(created.id);
 		pendingRef.current = null;
 		setPending(null);
 		return created;
 	}
 
+	// A command picked in Settings, such as /create-skill, goes to this session and leaves its draft alone.
+	async function runFromSettings(text: string) {
+		setSettingsOpen(null);
+		const target = await commitPending();
+		if (target) { send(text, false, target.id); }
+	}
+
 	async function submit(value = prompt) {
 		const text = value.trim();
 		if (!text) { return; }
-		if (text === "/config") { setSettingsOpen(true); setPrompt(""); return; }
+		if (text === "/config") { setSettingsOpen("general"); setPrompt(""); return; }
+		if (text.startsWith("!") && text.length > 1 && pending) { setNotice("Send a first message to start this session, then run terminal commands with !."); return; }
 		if (text.startsWith("!") && text.length > 1 && !pending) {
 			setPrompt("");
 			await runInTerminal(text.slice(1).trim());
@@ -989,7 +1128,7 @@ export function App() {
 			const sessionId = session.id;
 			const percent = session.usage?.contextWindow ? Math.min(100, Math.round((session.usage.contextTokens / Math.max(1, session.usage.contextWindow)) * 100)) : null;
 			const lines = [
-				appVersion.current ? `Grok Desktop ${appVersion.current}` : "Grok Desktop",
+				appVersion.current ? `Codewomplers Grok Desktop ${appVersion.current}` : "Codewomplers Grok Desktop",
 				`${model} · ${effort} · ${mode}`,
 				session.folder,
 				...(percent != null ? [`Context ${percent}% · $${(session.costUsd ?? 0).toFixed(2)}`] : []),
@@ -1009,7 +1148,7 @@ export function App() {
 		if (!target) { return; }
 		const files = attachments[session.id] ?? [];
 		if (send(text, false, target.id, files)) {
-			setDrafts((current) => ({ ...current, [session.id]: "", [target.id]: "" }));
+			setDrafts((current) => ((current[target.id] ?? "") === prompt ? { ...current, [session.id]: "", [target.id]: "" } : current));
 			setAttachments((current) => ({ ...current, [session.id]: [], [target.id]: [] }));
 		}
 	}
@@ -1057,10 +1196,18 @@ export function App() {
 	}
 
 	function openFile(file: string, line?: number) {
+		if (file !== editorFile) { flushEditor(); }
 		setEditorFile(file);
 		setEditorLine((current) => ({ line, tick: current.tick + 1 }));
 		showPane("editor");
 		setFileMenu(null);
+	}
+
+	function signOut() {
+		const api = window.grokCode;
+		if (!api?.signOut) { return; }
+		if (!window.confirm("Sign out of Grok on this computer? Grok in a terminal signs out too. Grok's background commands will stop.")) { return; }
+		void api.signOut().then((result) => setNotice(result.ok ? "Signed out. Grok asks you to sign in when you next send a message." : result.error || "Grok could not sign out."));
 	}
 
 	function openUrl(url: string, external: boolean) {
@@ -1080,7 +1227,7 @@ export function App() {
 		let url: URL | null = null;
 		try { url = new URL(href); } catch { url = null; }
 		// `C:/project/foo.ts` parses as a URL with a `c:` scheme; it is a file path.
-		if (url && /^[a-z]:$/i.test(url.protocol)) { url = null; }
+		if (url && (/^[a-z]:$/i.test(url.protocol) || url.protocol.includes("."))) { url = null; }
 		if (!url) {
 			const match = /^(.+?)(?::(\d+))?$/.exec(href);
 			if (!match) { return; }
@@ -1095,7 +1242,7 @@ export function App() {
 		}
 		const external = event.ctrlKey || event.metaKey;
 		if (!settingsRef.current.linkAsked && !external) {
-			const inside = window.confirm("Open chat links in Grok Desktop's Browser pane? Choose Cancel to open them in your default browser. You can change this in Settings.");
+			const inside = window.confirm("Open chat links in the Browser pane? Choose Cancel to open them in your default browser. You can change this in Settings.");
 			changeSettings({ linkAsked: true, linksInBuiltIn: inside });
 			settingsRef.current = { ...settingsRef.current, linkAsked: true, linksInBuiltIn: inside };
 		}
@@ -1109,6 +1256,15 @@ export function App() {
 			return;
 		}
 		void api.copyText(text).then((result) => setNotice(result.ok ? label : (result.error || "That could not be copied.")));
+	}
+
+	function openImage(file: string) {
+		const api = window.grokCode;
+		if (!api?.openImage) {
+			setNotice("Reopen this window to view images.");
+			return;
+		}
+		void api.openImage(file).then((result) => { if (!result.ok) { setNotice(result.error || "That image could not open."); } });
 	}
 
 	async function openTerminal(sessionId = session.id, folder = session.folder, title = "") {
@@ -1131,7 +1287,7 @@ export function App() {
 
 	async function runInTerminal(code: string) {
 		showPane("terminal");
-		const tabs = (terminals[session.id] ?? []).filter((tab) => tab.running);
+		const tabs = (terminals[session.id] ?? []).filter((tab) => tab.running && folderKey(tab.cwd) === folderKey(session.folder) && !Object.values(devTabs).includes(tab.id));
 		const id = tabs.find((tab) => tab.id === activeTerminal[session.id])?.id ?? tabs[0]?.id ?? await openTerminal();
 		if (!id) { return; }
 		setActiveTerminal((current) => ({ ...current, [session.id]: id }));
@@ -1179,8 +1335,10 @@ export function App() {
 				});
 			},
 			answerQuestion: (toolId, answers) => answerTool(uiId, toolId, (api, uiSessionId) => api.answerQuestion({ uiSessionId, toolId, answers })),
+			resumeMode: (prePlan[session.id] ?? "Normal") as "Normal" | "Auto-review" | "Always-approve",
 			answerPlan: (toolId, choice) => answerTool(uiId, toolId, (api, uiSessionId) => api.answerPlan({ uiSessionId, toolId, ...choice }), () => {
-				const next = choice.outcome === "approved" ? choice.mode : choice.outcome === "abandoned" ? "Manual" : undefined;
+				const resume = prePlan[session.id] ?? "Normal";
+				const next = choice.outcome === "approved" || choice.outcome === "abandoned" ? (choice.mode ?? (resume === "Plan" ? "Normal" : resume)) : undefined;
 				if (next && uiId === session.id) { setModes((current) => ({ ...current, [session.id]: next })); }
 			}),
 			folderFiles: folderFiles ? { ...folderFiles, files: [...new Set([...folderFiles.files, ...dirtyDraftFiles])] } : undefined,
@@ -1188,6 +1346,7 @@ export function App() {
 			fileMenu: (file, event) => setFileMenu({ file, x: event.clientX, y: event.clientY }),
 			openLink,
 			copyText: (text) => copyText(text),
+			openImage,
 			runInTerminal: (code) => { void runInTerminal(code); },
 			closePane: (id) => closePane(id),
 		};
@@ -1209,6 +1368,8 @@ export function App() {
 		const key = fileKey(session, file);
 		const draft = editorDraftsRef.current[key];
 		if (!api?.writeFile || !draft || draft.saving || editorReadOnly) { return; }
+		// A second save in the same event, such as the Files pane's flush and then flushEditor, must see this one before React renders.
+		editorDraftsRef.current = { ...editorDraftsRef.current, [key]: { ...draft, saving: true } };
 		const original = draft.baseText;
 		const savedText = /\r\n/.test(original) && !/(?<!\r)\n/.test(original) ? draft.text.replace(/\r?\n/g, "\r\n") : draft.text;
 		setEditorDrafts((current) => (current[key] ? { ...current, [key]: { ...current[key]!, saving: true, note: "Saving…" } } : current));
@@ -1228,6 +1389,13 @@ export function App() {
 		}).catch(() => {
 			setEditorDrafts((current) => (current[key] ? { ...current, [key]: { ...current[key]!, saving: false, note: "That file could not be saved." } } : current));
 		});
+	}
+
+	// The Files pane flushes its own pending save; changes made from here would drop it with the debounce timer.
+	function flushEditor() {
+		if (settings.autoSave && editorDirty && !editorConflict && !editorReadOnly && !editorDraft?.saving) {
+			saveEditor();
+		}
 	}
 
 	// Loads the disk version; the dropped draft stays under "Retained draft" until the user discards it.
@@ -1325,6 +1493,7 @@ export function App() {
 		if (id === "diff") {
 			body = (
 				<DiffPane
+					key={session.id}
 					snapshot={diffs[session.id]}
 					scope={scope}
 					onScope={(value) => setDiffScope((current) => ({ ...current, [session.id]: value }))}
@@ -1386,7 +1555,7 @@ export function App() {
 			body = (
 				<TerminalPane
 					tabs={sessionTerminals}
-					activeId={activeTerminal[session.id] ?? sessionTerminals[0]?.id ?? ""}
+					activeId={sessionTerminals.find((tab) => tab.id === activeTerminal[session.id])?.id ?? sessionTerminals[0]?.id ?? ""}
 					error={terminalError}
 					onActivate={(tabId) => setActiveTerminal((current) => ({ ...current, [session.id]: tabId }))}
 					onNew={() => { void openTerminal(); }}
@@ -1404,7 +1573,7 @@ export function App() {
 			body = (
 				<BrowserPane
 					tabs={browserList}
-					activeId={activeBrowser[session.id] ?? browserList[0]?.id ?? ""}
+					activeId={browserList.find((tab) => tab.id === activeBrowser[session.id])?.id ?? browserList[0]?.id ?? ""}
 					onActivate={(tabId) => setActiveBrowser((current) => ({ ...current, [session.id]: tabId }))}
 					onNewTab={() => {
 						const tabId = crypto.randomUUID();
@@ -1476,33 +1645,52 @@ export function App() {
 					onArchive={(id) => {
 						const target = sessions.find((item) => item.id === id);
 						if (target && !target.archived && target.worktreeFolder && window.grokCode?.removeWorktree) {
+							setHeld((current) => ({ ...current, [id]: true }));
 							void window.grokCode.removeWorktree(target.folder, target.worktreeFolder, { force: false }).then((result) => {
 								if (result.ok) { updateSession(id, { archived: true, pinned: false }); return; }
-								if (result.dirty && window.confirm("This session's worktree has uncommitted changes. Archive anyway? The worktree stays on disk.")) { updateSession(id, { archived: true, pinned: false }); return; }
-								if (!result.dirty) { updateSession(id, { archived: true, pinned: false }); setNotice(`Archived. The worktree stays on disk: ${result.error || "it could not be removed."}`); }
+								if (result.dirty && window.confirm(result.ignored?.length ? `This worktree has files git ignores that removal would delete: ${result.ignored.join(", ")}. Archive anyway? The worktree stays on disk.` : "This session's worktree has uncommitted changes. Archive anyway? The worktree stays on disk.")) { updateSession(id, { archived: true, pinned: false }); return; }
+								if (result.dirty === false) { updateSession(id, { archived: true, pinned: false }); setNotice(`Archived, but the worktree folder could not be removed: ${result.error || "unknown error"}. Close any terminal open in it and delete the folder.`); return; }
+								if (!result.dirty) { updateSession(id, { archived: true, pinned: false }); setNotice(`Archived. The worktree could not be checked, so it stays on disk: ${result.error || "unknown error"}`); }
 							});
 							return;
 						}
-						setSessions((current) => current.map((item) => (item.id === id ? { ...item, archived: !item.archived, pinned: false } : item)));
+						if (target?.archived && target.worktreeFolder) {
+							if (!window.grokCode?.restoreWorktree) { setNotice("Reopen this window to restore the worktree."); return; }
+							void window.grokCode.restoreWorktree(target.worktreeFolder, target.branch).then((result) => {
+								if (result.ok) { updateSession(id, { archived: false, pinned: false, lastActivityAt: Date.now() }); } else { setNotice(result.error || "The worktree could not be restored."); }
+							}).catch(() => setNotice("The worktree could not be restored."));
+							return;
+						}
+						if (target && !target.archived) { setHeld((current) => ({ ...current, [id]: true })); void window.grokCode?.stopSession?.(id); }
+						// Unarchive counts as activity, so automatic archiving does not archive it again at the next launch.
+						setSessions((current) => current.map((item) => (item.id === id ? { ...item, archived: !item.archived, pinned: false, ...(item.archived ? { lastActivityAt: Date.now() } : {}) } : item)));
 					}}
 					onRename={(id, title) => updateSession(id, { title })}
 					onDelete={(id) => {
+						void window.grokCode?.stopSession?.(id);
 						setDeleted((current) => [...current, id]);
-						// The window always has a session, so deleting the last one leaves a new one in the same folder.
+						// The window always has an unarchived session, so deleting the last one leaves a new one in the same folder.
 						setSessions((current) => {
 							const rest = current.filter((item) => item.id !== id);
 							const gone = current.find((item) => item.id === id);
-							return rest.length ? rest : [newSession(gone ? { folder: gone.folder, project: gone.project } : undefined)];
+							return rest.some((item) => !item.archived) ? rest : [newSession(gone ? { folder: gone.folder, project: gone.project } : undefined), ...rest];
 						});
 						setExtraChats((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id)));
+						// A queue that Stop held would stay unsent forever and make every close warn about it.
+						setQueued((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id)));
 					}}
 					onMarkUnread={(id, unread) => updateSession(id, { unread })}
 					onMarkCompleted={(id, completed) => updateSession(id, { completed })}
 					onMove={(id, sectionId) => updateSession(id, { sectionId })}
 					onOpenWindow={openSessionWindow}
-					onSettings={() => setSettingsOpen(true)}
+					onSettings={() => setSettingsOpen("general")}
 					onCollapse={() => changeSettings({ sidebarCollapsed: true })}
 					onNotice={setNotice}
+					account={account}
+					recentUsd={recentUsd}
+					onShortcuts={() => setShortcuts(true)}
+					onOpenUrl={(url) => openUrl(url, true)}
+					onSignOut={signOut}
 				/>
 			)}
 			<main className="workspace">
@@ -1547,7 +1735,7 @@ export function App() {
 							<button type="button" className="item" onClick={() => openIn("explorer")}>File Explorer</button>
 							<button type="button" className="item" onClick={() => openIn("vscode")}>VS Code</button>
 							<hr />
-							<button type="button" className="item" onClick={() => { changeSettings({ railOpen: !railOpen }); setMenu(null); }}>{railOpen ? "Hide session rail" : "Show session rail"}</button>
+							<button type="button" className="item" disabled={railOpen && !railShown} onClick={() => { changeSettings({ railOpen: !railOpen }); setMenu(null); }}>{railOpen && !railShown ? "Session rail (window too narrow)" : railShown ? "Hide session rail" : "Show session rail"}</button>
 							<button type="button" className="item" disabled={!!pending} onClick={() => { setRenaming(session.id); setMenu(null); }}>Rename</button>
 						</div>
 					)}
@@ -1560,9 +1748,9 @@ export function App() {
 								</button>
 							))}
 							<hr />
-							<button type="button" className="item" onClick={() => { changeSettings({ railOpen: !railOpen }); setMenu(null); }}>{railOpen ? "Hide session rail" : "Show session rail"}</button>
+							<button type="button" className="item" disabled={railOpen && !railShown} onClick={() => { changeSettings({ railOpen: !railOpen }); setMenu(null); }}>{railOpen && !railShown ? "Session rail (window too narrow)" : railShown ? "Hide session rail" : "Show session rail"}</button>
 							<button type="button" className="item" onClick={() => { setShortcuts(true); setMenu(null); }}>Keyboard shortcuts<small>Ctrl+/</small></button>
-							<button type="button" className="item" onClick={() => { setSettingsOpen(true); setMenu(null); }}>Settings</button>
+							<button type="button" className="item" onClick={() => { setSettingsOpen("general"); setMenu(null); }}>Settings</button>
 						</div>
 					)}
 				</header>
@@ -1610,7 +1798,7 @@ export function App() {
 						<div className="dock" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}>
 							{sideOpen && (
 								<div className="side-q" role="dialog" aria-label="Side chat">
-									<div className="side-q-hd"><b>Side chat</b><span className="meta">Reads this session; nothing goes back into it, and it is not saved.</span><span className="spacer" /><button type="button" className="pane-x" aria-label="Close side chat" onClick={() => setSideOpen(false)}>×</button></div>
+									<div className="side-q-hd"><b>Side chat</b><span className="meta">Reads this session; nothing goes back into it. It is not added to this chat's history; Grok keeps its own copy in ~/.grok/sessions.</span><span className="spacer" /><button type="button" className="pane-x" aria-label="Close side chat" onClick={() => setSideOpen(false)}>×</button></div>
 									<SideLog messages={sideChats[session.id] ?? []} model={sideModel} />
 									<textarea
 										aria-label="Side question"
@@ -1643,14 +1831,14 @@ export function App() {
 									<div className="attach-list">
 										{files.map((file) => (
 											<span className="attach-chip" key={file} title={file}>
-												{file.split(/[\\/]/).pop()}
+												{imageSrc(file) ? <button type="button" className="thumb" aria-label={`View ${file.split(/[\\/]/).pop()}`} onClick={() => openImage(file)}><img src={imageSrc(file)} alt={file.split(/[\\/]/).pop()} /></button> : file.split(/[\\/]/).pop()}
 												<button type="button" aria-label={`Remove ${file.split(/[\\/]/).pop()}`} onClick={() => setAttachments((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((item) => item !== file) }))}>×</button>
 											</span>
 										))}
 									</div>
 								)}
 								{popup && (
-									<div className="mention pop-list" role="listbox" aria-label={popup.kind === "slash" ? "Commands" : "Files"}>
+									<div className="mention pop-list" role="listbox" ref={popupList} aria-label={popup.kind === "slash" ? "Commands" : "Files"}>
 										{popup.kind === "mention" && folderFiles?.status === "loading" && <div className="item">Reading this folder…</div>}
 										{popup.kind === "mention" && folderFiles?.status === "error" && <div className="item">{folderFiles.error}</div>}
 										{popup.items.map((item, index) => (
@@ -1722,9 +1910,9 @@ export function App() {
 										>
 											Add files or photos
 										</button>
-										<button type="button" className="item" disabled={addingFolder} onClick={() => void addFolder()}>{addingFolder ? "Adding folder…" : "Add folder"}<small>Edits there are auto-accepted in Accept edits</small></button>
+										<button type="button" className="item" disabled={addingFolder} onClick={() => void addFolder()}>{addingFolder ? "Adding folder…" : "Add folder"}<small>Grok can also work in this folder.</small></button>
 										<button type="button" className="item" onClick={() => { setPrompt("/"); setPopClosed(""); setMenu(null); promptRef.current?.focus?.(); }}>Slash commands</button>
-										<button type="button" className="item" onClick={() => { setSettingsOpen(true); setMenu(null); }}>Connectors and skills<small>{servers.length ? `${servers.length} MCP servers from Grok` : "Managed in Grok's configuration"}</small></button>
+										<button type="button" className="item" onClick={() => { setSettingsOpen("skills"); setMenu(null); }}>Connectors and skills<small>{servers.length ? `${servers.length} MCP servers from Grok` : "Managed in Grok's configuration"}</small></button>
 										{!!session.allowedFolders?.length && <div className="menu-label">Added folders</div>}
 										{session.allowedFolders?.map((folder) => <div className="item" key={folder}>{folder}</div>)}
 									</div>
@@ -1734,7 +1922,7 @@ export function App() {
 										{(["Local", "SSH", "Cloud"] as Environment[]).map((environment) => (
 											<button key={environment} type="button" className={session.environment === environment ? "item on" : "item"} disabled={environment !== "Local"} onClick={() => setMenu(null)}>
 												{environment}
-												<small>{environment === "Local" ? "This computer" : "Not available in Grok Desktop"}</small>
+												<small>{environment === "Local" ? "This computer" : "Not available yet"}</small>
 											</button>
 										))}
 									</div>
@@ -1757,22 +1945,27 @@ export function App() {
 												void api.pickFolder().then((picked) => {
 													if (!picked) { return; }
 													const name = shortPath(picked);
-													const update = (item: Session) => (item.id === sessionId ? { ...item, folder: picked, project: name, worktree: name, agentSessionId: undefined } : item);
+													const update = (item: Session) => (item.id === sessionId ? { ...item, folder: picked, project: name, worktree: name, agentSessionId: undefined, allowedFolders: undefined } : item);
 													setSessions((current) => current.map(update));
 													setPending((item) => (item ? update(item) : item));
+													// The side chat's Grok conversation keeps the old folder's approvals, so it starts over with the main chat.
+													setSideAgents((list) => Object.fromEntries(Object.entries(list).filter(([id]) => id !== sessionId)));
+													delete sideSeen.current[sessionId];
+													// Without this, a return to the old folder would reload the old conversation and its Always allow rules.
+													void api.forgetSession?.(sessionId);
 													setMenu(null);
 												});
 											}}
 										>
 											Choose a folder
-											<small>The next message starts in that folder.</small>
+											<small>The next message starts a new Grok conversation in that folder.</small>
 										</button>
 									</div>
 								)}
 								{menu === "mode" && (
 									<div className="pop up">
 										{isBusy && <div className="menu-label">Stop or finish this turn before changing mode.</div>}
-										{MODES.filter((item) => item.id !== "Bypass permissions" || settings.allowBypass || mode === item.id).map((item) => (
+										{MODES.map((item) => (
 											<button
 												key={item.id}
 												type="button"
@@ -1780,7 +1973,7 @@ export function App() {
 												disabled={isBusy}
 												onClick={() => {
 													if (turnTargets.current[session.id]) { return; }
-													setModes((current) => ({ ...current, [session.id]: item.id }));
+													changeMode(session.id, item.id);
 													if (item.id !== "Plan") { changeSettings({ modeByFolder: { ...settings.modeByFolder, [folderKey(session.folder)]: item.id } }); }
 													setMenu(null);
 												}}
@@ -1789,7 +1982,6 @@ export function App() {
 												<small>{item.detail}</small>
 											</button>
 										))}
-										{!settings.allowBypass && <div className="menu-label">Bypass permissions is off in Settings.</div>}
 									</div>
 								)}
 								{(menu === "model" || menu === "effort") && (
@@ -1801,7 +1993,9 @@ export function App() {
 													<button key={item} type="button" className={baseModel === item ? "item on" : "item"} onClick={() => {
 														const next = fastOn && FAST_MODEL[item] ? FAST_MODEL[item] : item;
 														const allowed = models.find((entry) => entry.id === next)?.efforts;
-														changeSettings({ model: next, effort: allowed?.length && !allowed.includes(effort) ? allowed[allowed.length > 1 ? 1 : 0] : (next === "grok-4.5" && effort === "xhigh" ? "high" : effort) });
+														const choice = { model: next, effort: allowed?.length && !allowed.includes(effort) ? allowed[allowed.length > 1 ? 1 : 0] : (next === "grok-4.5" && effort === "xhigh" ? "high" : effort) };
+														changeSettings(choice);
+														if (pending) { setPending((current) => current ? { ...current, ...choice } : current); } else { updateSession(session.id, choice); }
 													}}>
 														{models.find((entry) => entry.id === item)?.name ?? item}
 														<small>{models.find((entry) => entry.id === item)?.description ?? ""}</small>
@@ -1809,7 +2003,11 @@ export function App() {
 												))}
 												{FAST_MODEL[baseModel] && (
 													<label className="item toggle">
-														<input type="checkbox" checked={fastOn} onChange={(event) => changeSettings({ model: event.target.checked ? FAST_MODEL[baseModel] : baseModel })} /> Fast mode
+														<input type="checkbox" checked={fastOn} onChange={(event) => {
+															const choice = { model: event.target.checked ? FAST_MODEL[baseModel] : baseModel, effort };
+															changeSettings(choice);
+															if (pending) { setPending((current) => current ? { ...current, ...choice } : current); } else { updateSession(session.id, choice); }
+														}} /> Fast mode
 														<small>Grok's faster build of this model</small>
 													</label>
 												)}
@@ -1817,7 +2015,12 @@ export function App() {
 										)}
 										<div className="menu-label">Effort</div>
 										{efforts.map((item) => (
-											<button key={item} type="button" className={effort === item ? "item on" : "item"} onClick={() => { changeSettings({ effort: item }); setMenu(null); }}>{item}</button>
+											<button key={item} type="button" className={effort === item ? "mode-row on" : "mode-row"} onClick={() => {
+												const choice = { model, effort: item };
+												changeSettings(choice);
+												if (pending) { setPending((current) => current ? { ...current, ...choice } : current); } else { updateSession(session.id, choice); }
+												setMenu(null);
+											}}>{item}<small>{EFFORT_DETAIL[item] ?? ""}</small></button>
 										))}
 									</div>
 								)}
@@ -1827,6 +2030,7 @@ export function App() {
 					</div>
 					{railShown && (
 						<SessionRail
+							key={session.id}
 							session={session}
 							diff={diffs[session.id]}
 							branch={branch}
@@ -1876,7 +2080,7 @@ export function App() {
 					</div>
 				</div>
 			)}
-			{settingsOpen && <SettingsPage settings={settings} onChange={changeSettings} onClose={() => setSettingsOpen(false)} commands={commands} servers={servers} />}
+			{settingsOpen && <SettingsPage settings={settings} onChange={changeSettings} onClose={() => setSettingsOpen(null)} servers={servers} folder={session.folder} onRun={(text) => void runFromSettings(text)} initialTab={settingsOpen} />}
 		</div>
 	);
 }

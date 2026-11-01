@@ -1,9 +1,6 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
-const folderArg = process.argv.find((arg) => arg.startsWith("--grok-default-folder="));
-
 contextBridge.exposeInMainWorld("grokCode", {
-	defaultFolder: folderArg ? folderArg.slice("--grok-default-folder=".length) : "",
 	pathForFile(file) {
 		try {
 			return webUtils.getPathForFile(file) || "";
@@ -29,6 +26,9 @@ contextBridge.exposeInMainWorld("grokCode", {
 	saveImage(base64) {
 		return ipcRenderer.invoke("grok:save-image", base64);
 	},
+	openImage(file) {
+		return ipcRenderer.invoke("grok:open-image", file);
+	},
 	contextBreakdown(agentSessionId) {
 		return ipcRenderer.invoke("grok:context-breakdown", agentSessionId);
 	},
@@ -37,6 +37,19 @@ contextBridge.exposeInMainWorld("grokCode", {
 	},
 	appInfo() {
 		return ipcRenderer.invoke("grok:app-info");
+	},
+	homeDir: ipcRenderer.sendSync("grok:home-dir"),
+	customize(cwd) {
+		return ipcRenderer.invoke("grok:customize", cwd);
+	},
+	customizeChange(cwd, input) {
+		return ipcRenderer.invoke("grok:customize-change", cwd, input);
+	},
+	account() {
+		return ipcRenderer.invoke("grok:account");
+	},
+	signOut() {
+		return ipcRenderer.invoke("grok:sign-out");
 	},
 	devScripts(cwd) {
 		return ipcRenderer.invoke("grok:dev-scripts", cwd);
@@ -65,14 +78,17 @@ contextBridge.exposeInMainWorld("grokCode", {
 	prStatus(cwd) {
 		return ipcRenderer.invoke("grok:pr-status", cwd);
 	},
-	prCreate(cwd) {
-		return ipcRenderer.invoke("grok:pr-create", cwd);
+	prCreate(cwd, expected) {
+		return ipcRenderer.invoke("grok:pr-create", cwd, expected);
 	},
-	prMergeWhenReady(cwd) {
-		return ipcRenderer.invoke("grok:pr-merge", cwd);
+	prMergeWhenReady(cwd, number) {
+		return ipcRenderer.invoke("grok:pr-merge", cwd, number);
 	},
 	addWorktree(cwd, payload) {
 		return ipcRenderer.invoke("grok:add-worktree", cwd, payload);
+	},
+	restoreWorktree(folder, branch) {
+		return ipcRenderer.invoke("grok:restore-worktree", folder, branch);
 	},
 	removeWorktree(cwd, folder, payload) {
 		return ipcRenderer.invoke("grok:remove-worktree", cwd, folder, payload);
@@ -83,6 +99,12 @@ contextBridge.exposeInMainWorld("grokCode", {
   cancel(uiSessionId) {
     return ipcRenderer.invoke("grok:cancel", uiSessionId);
   },
+	stopSession(uiSessionId) {
+		return ipcRenderer.invoke("grok:stop-session", uiSessionId);
+	},
+	forgetSession(uiSessionId) {
+		return ipcRenderer.invoke("grok:forget-session", uiSessionId);
+	},
   decide(payload) {
     return ipcRenderer.invoke("grok:decide", payload);
   },

@@ -1,9 +1,10 @@
 const assert = require("assert/strict");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { contextBreakdown, recentSpend, autoCompactPercent } = require("../electron/usage.cjs");
 
-const tempBase = path.join(require("os").tmpdir(), "grokcode-usage");
+const tempBase = path.resolve(os.tmpdir(), process.env.CODEX_THREAD_ID || "grokcode-usage");
 fs.mkdirSync(tempBase, { recursive: true });
 const root = fs.mkdtempSync(path.join(tempBase, "sessions-"));
 const id = "01a18843-d800-74f1-ab16-67f5d5375a3a";

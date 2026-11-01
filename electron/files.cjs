@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const { createHash, randomUUID } = require("crypto");
 const { isUtf8 } = require("buffer");
+const { promisify } = require("util");
 const { folderProblem } = require("./agent.cjs");
 
 const SKIP = new Set(["node_modules", ".git", "dist", "build", "coverage", ".vite"]);
@@ -30,9 +31,11 @@ function listFiles(cwd) {
   const files = [];
   const seen = new Set();
   let truncated = false;
+  let tooDeep = false;
 
   function walk(dir, depth) {
-    if (truncated || depth > MAX_DEPTH) return;
+		if (depth > MAX_DEPTH) { tooDeep = true; return; }
+		if (truncated) { return; }
     let real;
     try {
       real = fs.realpathSync(dir);
@@ -70,7 +73,7 @@ function listFiles(cwd) {
 
   walk(root, 0);
   files.sort();
-  return { ok: true, files, truncated };
+  return { ok: true, files, truncated: truncated || tooDeep };
 }
 
 function locateFile(cwd, relative) {
@@ -127,9 +130,9 @@ function revealFile(cwd, relative) {
   return { ok: true };
 }
 
-function windowsSaveStep(command, temporary, target, expectedVersion = "") {
+async function windowsSaveStep(command, temporary, target, expectedVersion = "") {
 	const shell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-	childProcess.execFileSync(shell, ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'; ${command}`], {
+	await promisify(childProcess.execFile)(shell, ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'; ${command}`], {
 		windowsHide: true,
 		timeout: 8000,
 		stdio: "pipe",
@@ -137,7 +140,7 @@ function windowsSaveStep(command, temporary, target, expectedVersion = "") {
 	});
 }
 
-function writeText(cwd, relative, text, expectedVersion) {
+async function writeText(cwd, relative, text, expectedVersion) {
   const problem = folderProblem(cwd);
   if (problem) return { ok: false, error: problem };
   if (typeof relative !== "string" || !relative.trim() || /[\0\r\n]/.test(relative)) {
@@ -201,7 +204,7 @@ function writeText(cwd, relative, text, expectedVersion) {
 		let replaced = false;
 		try {
 			if (process.platform === "win32") {
-				windowsSaveStep("$security = [IO.File]::GetAccessControl($env:GROK_SAVE_TARGET, [Security.AccessControl.AccessControlSections]::Access); $stream = [IO.FileStream]::new($env:GROK_SAVE_TEMP, [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $security); $stream.Dispose()", temporary, target);
+				await windowsSaveStep("$security = [IO.File]::GetAccessControl($env:GROK_SAVE_TARGET, [Security.AccessControl.AccessControlSections]::Access); $stream = [IO.FileStream]::new($env:GROK_SAVE_TEMP, [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $security); $stream.Dispose()", temporary, target);
 				created = true;
 				descriptor = fs.openSync(temporary, "r+");
 			} else {
@@ -217,7 +220,7 @@ function writeText(cwd, relative, text, expectedVersion) {
 				return { ok: false, error: "This file changed on disk. Your draft was not saved. Reload the file and reconcile your changes." };
 			}
 			if (process.platform === "win32") {
-				windowsSaveStep("$hash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($env:GROK_SAVE_TARGET))).Replace('-', '').ToLowerInvariant(); if ($hash -ne $env:GROK_SAVE_VERSION) { throw 'The file changed on disk before replacement.' }; [IO.File]::Replace($env:GROK_SAVE_TEMP, $env:GROK_SAVE_TARGET, [NullString]::Value)", temporary, target, expectedVersion);
+				await windowsSaveStep("$hash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($env:GROK_SAVE_TARGET))).Replace('-', '').ToLowerInvariant(); if ($hash -ne $env:GROK_SAVE_VERSION) { throw 'The file changed on disk before replacement.' }; [IO.File]::Replace($env:GROK_SAVE_TEMP, $env:GROK_SAVE_TARGET, [NullString]::Value)", temporary, target, expectedVersion);
 			} else {
 				fs.renameSync(temporary, target);
 			}

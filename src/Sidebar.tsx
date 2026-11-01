@@ -146,6 +146,11 @@ export function Sidebar({
 	onSettings,
 	onCollapse,
 	onNotice,
+	account,
+	recentUsd,
+	onShortcuts,
+	onOpenUrl,
+	onSignOut,
 }: {
 	sessions: Session[];
 	activeId: string;
@@ -166,21 +171,34 @@ export function Sidebar({
 	onSettings: () => void;
 	onCollapse: () => void;
 	onNotice: (text: string) => void;
+	account: GrokAccount | null | undefined;
+	recentUsd: number | null;
+	onShortcuts: () => void;
+	onOpenUrl: (url: string) => void;
+	onSignOut: () => void;
 }) {
 	const [view, setView] = useState<SidebarView>(readView);
 	const [sections, setSections] = useState<Section[]>(readSections);
-	const [searchOpen, setSearchOpen] = useState(false);
+	const [searchOpen, setSearchOpen] = useState(() => query !== "");
 	const [menu, setMenu] = useState<{ top: number; left: number } | null>(null);
 	const [sub, setSub] = useState<{ kind: Submenu; top: number; left: number } | null>(null);
 	const [rowMenu, setRowMenu] = useState<{ id: string; top: number; left: number } | null>(null);
 	const [renaming, setRenaming] = useState<string | null>(null);
 	const [sectionMenu, setSectionMenu] = useState<{ id: string; top: number; left: number } | null>(null);
+	const [accountMenu, setAccountMenu] = useState<{ bottom: number; left: number } | null>(null);
 
 	useEffect(() => { store(viewKey, view); }, [view]);
 	useEffect(() => { store(sectionsKey, sections); }, [sections]);
+	useEffect(() => {
+		function onStorage(event: StorageEvent) {
+			if (event.key === sectionsKey) { setSections(readSections()); }
+		}
+		window.addEventListener("storage", onStorage);
+		return () => window.removeEventListener("storage", onStorage);
+	}, []);
 
 	useEffect(() => {
-		if (!menu && !rowMenu && !sectionMenu) { return; }
+		if (!menu && !rowMenu && !sectionMenu && !accountMenu) { return; }
 		function onKey(event: KeyboardEvent) {
 			if (event.key !== "Escape") { return; }
 			event.stopPropagation();
@@ -188,7 +206,7 @@ export function Sidebar({
 		}
 		window.addEventListener("keydown", onKey, true);
 		return () => window.removeEventListener("keydown", onKey, true);
-	}, [menu, rowMenu, sectionMenu]);
+	}, [menu, rowMenu, sectionMenu, accountMenu]);
 
 	const needle = query.trim().toLowerCase();
 	const cutoff = view.days ? Date.now() - view.days * DAY : 0;
@@ -217,6 +235,7 @@ export function Sidebar({
 		setSub(null);
 		setRowMenu(null);
 		setSectionMenu(null);
+		setAccountMenu(null);
 	}
 
 	function place(event: React.MouseEvent, width: number, height: number) {
@@ -344,14 +363,41 @@ export function Sidebar({
 				{nothing && <p className="note">{needle ? "No sessions match." : view.status === "archived" ? "No archived sessions." : "No sessions yet."}</p>}
 			</div>
 			<div className="side-foot">
-				<button className="side-icon" aria-label="Settings" title="Settings (Ctrl+,)" onClick={onSettings}>
-					<GearIcon />
+				<button
+					className="account-btn"
+					aria-label="Account and settings"
+					aria-expanded={accountMenu !== null}
+					onClick={(event) => {
+						const rect = event.currentTarget.getBoundingClientRect();
+						closeAll();
+						setAccountMenu({ bottom: window.innerHeight - rect.top + 4, left: rect.left });
+					}}
+				>
+					<span className="avatar">{(account?.email || "G").charAt(0).toUpperCase()}</span>
+					<span className="who">{account?.email || (account === null ? "Signed out" : "Grok")}{account?.plan && <small>{account.plan}</small>}</span>
 				</button>
-				<span className="spacer" />
 				<button className="side-icon" aria-label="Collapse sidebar" title="Collapse sidebar" onClick={onCollapse}>«</button>
 			</div>
-			{(menu || rowMenu || sectionMenu) && (
+			{(menu || rowMenu || sectionMenu || accountMenu) && (
 				<button className="menu-back" aria-label="Close menu" onClick={closeAll} />
+			)}
+			{accountMenu && (
+				<div className="row-pop account-menu" style={{ bottom: accountMenu.bottom, left: accountMenu.left }} role="menu" aria-label="Account">
+					<div className="account-head">
+						<b>{account ? account.email || "Signed in to Grok" : account === null ? "Signed out" : "Grok account"}</b>
+						{account && <span>{[account.plan, account.team].filter(Boolean).join(" · ")}</span>}
+						{account === undefined && <span>Your account shows once Grok starts. Send a message to start it.</span>}
+						{account === null && <span>Grok asks you to sign in when you next send a message.</span>}
+						{recentUsd !== null && <span>Grok on this computer, last 7 days: ${recentUsd.toFixed(2)}</span>}
+					</div>
+					<hr />
+					<button onClick={() => { closeAll(); onSettings(); }}>Settings<small>Ctrl+,</small></button>
+					<button onClick={() => { closeAll(); onShortcuts(); }}>Keyboard shortcuts<small>Ctrl+/</small></button>
+					<button onClick={() => { closeAll(); onOpenUrl("https://console.x.ai"); }}>Get xAI API keys<small>↗</small></button>
+					<hr />
+					<button disabled={account === null} onClick={() => { closeAll(); onSignOut(); }}>Sign out</button>
+					{account?.version && <div className="account-foot">Grok {account.version}</div>}
+				</div>
 			)}
 			{menu && (
 				<div className="row-pop side-menu" style={{ top: menu.top, left: menu.left }} role="menu" aria-label="Filter and group">
@@ -403,7 +449,7 @@ export function Sidebar({
 							const id = rowSession.id;
 							closeAll();
 							if (activity[id]) { onNotice("Stop this session before deleting it."); return; }
-							if (window.confirm(`Delete "${rowSession.title}"? Its transcript is removed from Grok Desktop and cannot be restored.`)) { onDelete(id); }
+							if (window.confirm(`Delete "${rowSession.title}"? Its transcript is removed from this app and cannot be restored.`)) { onDelete(id); }
 						}}
 					>
 						Delete…
@@ -537,15 +583,6 @@ function SearchIcon() {
 		<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
 			<circle cx="7" cy="7" r="4.2" fill="none" stroke="currentColor" strokeWidth="1.4" />
 			<path d="M10.2 10.2 13 13" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-		</svg>
-	);
-}
-
-function GearIcon() {
-	return (
-		<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-			<circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" strokeWidth="1.4" />
-			<path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M3.6 12.4 5 11M11 5l1.4-1.4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
 		</svg>
 	);
 }

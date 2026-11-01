@@ -1,4 +1,4 @@
-import { Fragment, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 
 export interface DiffComment { id: string; file: string; line: number; side: "old" | "new"; text: string }
 
@@ -28,8 +28,8 @@ export interface DiffPaneProps {
 	branch: { branch: string; base: string; ahead: number } | undefined;
 	pr: PrInfo | null | undefined;
 	prError?: string;
-	onCreatePr: () => Promise<{ ok: boolean; error?: string; url?: string }>;
-	onMergeWhenReady: () => Promise<{ ok: boolean; error?: string }>;
+	onCreatePr: () => Promise<{ ok: boolean; error?: string; url?: string; message?: string }>;
+	onMergeWhenReady: () => Promise<{ ok: boolean; error?: string; message?: string }>;
 	onOpenFile: (file: string, line?: number) => void;
 	onFileMenu: (file: string, event: React.MouseEvent) => void;
 	onClose: () => void;
@@ -105,6 +105,7 @@ function PrStrip({ branch, pr, prError, onCreatePr, onMergeWhenReady }: Pick<Dif
 		void onCreatePr().then((result) => {
 			if (result.ok) {
 				setCreated(result.url ?? ``);
+				setNote(result.message || ``);
 			} else {
 				setNote(result.error || `The pull request could not be created.`);
 			}
@@ -116,7 +117,7 @@ function PrStrip({ branch, pr, prError, onCreatePr, onMergeWhenReady }: Pick<Dif
 		setMerging(true);
 		setNote(``);
 		void onMergeWhenReady().then((result) => {
-			setNote(result.ok ? `Auto-merge is on. GitHub merges this pull request when its checks pass.` : (result.error || `Auto-merge could not be turned on.`));
+			setNote(result.ok ? (result.message || `Auto-merge is on. GitHub merges this pull request when its checks pass.`) : (result.error || `Auto-merge could not be turned on.`));
 		}, () => setNote(`Auto-merge could not be turned on.`)).finally(() => setMerging(false));
 	}
 
@@ -126,7 +127,7 @@ function PrStrip({ branch, pr, prError, onCreatePr, onMergeWhenReady }: Pick<Dif
 		<div className="dp-pr" onKeyDown={(event) => { if (event.key === `Escape` && menu) { setMenu(null); } }}>
 			{!pr && <span className="meta dp-branch" title={`${branch.branch} into ${branch.base}`}>{branch.branch} → {branch.base}{branch.ahead > 0 ? ` · ${branch.ahead} ahead` : ``}</span>}
 			{pr === undefined && <span className="meta">Checking for a pull request…</span>}
-			{pr === null && created === null && (
+			{pr === null && created === null && branch.ahead > 0 && (
 				<button className="texty" disabled={creating} onClick={create}>{creating ? `Creating…` : `Create PR`}</button>
 			)}
 			{pr === null && created !== null && <span className="dp-link" title={created}>{createdNumber ? `Opened #${createdNumber}` : `Opened the pull request`}</span>}
@@ -168,6 +169,13 @@ export function DiffPane(props: DiffPaneProps) {
 	const [note, setNote] = useState(``);
 	const [reverting, setReverting] = useState(false);
 	const [compose, setCompose] = useState<Compose | null>(null);
+	const sendAfterAdd = useRef(false);
+	useEffect(() => {
+		if (sendAfterAdd.current) {
+			sendAfterAdd.current = false;
+			onSendComments();
+		}
+	}, [comments]);
 	const files = snapshot?.files ?? [];
 	const selected = files.some((file) => file.path === selectedFile) ? selectedFile : files[0]?.path ?? ``;
 	const current = files.find((file) => file.path === selected);
@@ -205,6 +213,7 @@ export function DiffPane(props: DiffPaneProps) {
 		event.preventDefault();
 		event.stopPropagation();
 		if (text) {
+			if (event.ctrlKey) { sendAfterAdd.current = true; }
 			onAddComment({ file: draft.file, line: draft.line, side: draft.side, text });
 			setCompose(null);
 		}
@@ -298,7 +307,7 @@ export function DiffPane(props: DiffPaneProps) {
 					<button className="menu-back" aria-label="Close menu" onClick={() => setMenu(null)} />
 					<div className="row-pop" role="menu" aria-label="Changes menu" style={{ top: menu.top, left: menu.left }}>
 						<button role="menuitem" onClick={() => { setMenu(null); onRefresh(); }}>Refresh</button>
-						<button role="menuitem" disabled={!selected || reverting} onClick={revert}>{reverting ? `Restoring…` : `Revert file…`}</button>
+						<button role="menuitem" disabled={!selected || reverting || scope !== `uncommitted`} title={scope !== `uncommitted` ? `Switch to Uncommitted changes to revert a file` : undefined} onClick={revert}>{reverting ? `Restoring…` : `Revert file…`}</button>
 					</div>
 				</>
 			)}
@@ -322,7 +331,7 @@ export function DiffPane(props: DiffPaneProps) {
 								onContextMenu={(event) => { event.preventDefault(); onFileMenu(file.path, event); }}
 							>
 								<span>{file.path}</span>
-								<span className="dp-stat"><span className="dp-adds">+{file.additions}</span> <span className="dp-dels">−{file.deletions}</span></span>
+								{file.additions !== undefined && file.deletions !== undefined && <span className="dp-stat"><span className="dp-adds">+{file.additions}</span> <span className="dp-dels">−{file.deletions}</span></span>}
 							</button>
 						))}
 					</div>

@@ -1,21 +1,34 @@
-const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, powerMonitor, powerSaveBlocker, session, shell } = require("electron");
+const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, powerMonitor, powerSaveBlocker, screen, session, shell } = require("electron");
 const { spawn, spawnSync } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+process.env.NoDefaultCurrentDirectoryInExePath = "1";
+// `npm run desktop` puts this app's node_modules\.bin folders and node-gyp-bin first on PATH and adds npm_* variables.
+// Grok and every terminal would inherit them, so a bare tsc or vite in the user's project would run this app's copy.
+if (process.env.npm_lifecycle_event) {
+	const entries = (process.env.PATH || "").split(path.delimiter);
+	const gyp = entries.findLastIndex((entry) => /[\\/]node-gyp-bin$/i.test(entry));
+	if (gyp !== -1) { process.env.PATH = entries.slice(gyp + 1).join(path.delimiter); }
+	for (const key of Object.keys(process.env)) {
+		if (/^npm_/i.test(key) || key === "INIT_CWD") { delete process.env[key]; }
+	}
+}
 app.setPath("userData", path.join(app.getPath("appData"), "grok-code"));
-app.setName("Grok");
+app.setName("Codewomplers Grok Desktop");
 if (process.platform === "win32") app.setAppUserModelId("Grok.Code");
-const appIcon = nativeImage.createFromPath(process.execPath);
+const appIcon = nativeImage.createFromPath(path.join(__dirname, "..", "assets", "codewomplers-grok-desktop.png"));
 const { AgentHost } = require("./agent.cjs");
 const { readDiff, revertFile } = require("./diff.cjs");
 const git = require("./git.cjs");
 const { TerminalHost } = require("./terminal.cjs");
-const { listFiles, readText, writeText, runCommand, revealFile, locateFile } = require("./files.cjs");
+const { listFiles, readText, writeText, runCommand, locateFile } = require("./files.cjs");
 const usage = require("./usage.cjs");
+const customize = require("./customize.cjs");
 
 const owners = new Map();
+const terminalOwners = new Map();
 const host = new AgentHost((event) => {
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) win.webContents.send("grok:event", event);
@@ -23,6 +36,7 @@ const host = new AgentHost((event) => {
 });
 
 const terminals = new TerminalHost((event) => {
+	if (event.type === "terminal-exit") { terminalOwners.delete(event.id); }
 	for (const win of BrowserWindow.getAllWindows()) {
 		if (!win.isDestroyed()) { win.webContents.send("grok:event", event); }
 	}
@@ -30,6 +44,40 @@ const terminals = new TerminalHost((event) => {
 
 const appDir = path.resolve(__dirname, "..");
 const pageFile = path.join(appDir, "dist", "index.html");
+const appIconFile = path.join(appDir, "assets", "codewomplers-grok-desktop.ico");
+
+// The taskbar pin starts Electron directly, skipping the build in `npm run desktop`, so it passes --build-if-stale.
+// The page is rebuilt when the source is newer. If that fails, the old page loads as before.
+function buildIfStale() {
+	try {
+		const built = fs.statSync(pageFile, { throwIfNoEntry: false })?.mtimeMs ?? 0;
+		const src = path.join(appDir, "src");
+		const inputs = [path.join(appDir, "index.html"), path.join(appDir, "vite.config.ts"), ...fs.readdirSync(src, { recursive: true }).map((name) => path.join(src, name))];
+		if (inputs.every((file) => fs.statSync(file).mtimeMs <= built)) { return; }
+		spawnSync(process.execPath, [path.join(appDir, "node_modules", "vite", "bin", "vite.js"), "build"], { cwd: appDir, env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" }, stdio: "ignore", windowsHide: true, timeout: 60000 });
+	} catch {}
+}
+
+// Windows starts the pin through a Start menu shortcut with this app's id, and that shortcut has none of relaunchCommand's
+// arguments, so the pin opened Electron's welcome screen. At launch and at quit, every such shortcut gets the full command and the app's icon.
+function repairShortcuts() {
+	if (process.platform !== "win32") { return; }
+	const args = `"${appDir}" --build-if-stale`;
+	for (const parts of [["Windows", "Start Menu", "Programs"], ["Internet Explorer", "Quick Launch", "User Pinned", "TaskBar"]]) {
+		const folder = path.join(app.getPath("appData"), "Microsoft", ...parts);
+		let names = [];
+		try { names = fs.readdirSync(folder).filter((name) => /\.lnk$/i.test(name)); } catch {}
+		for (const name of names) {
+			const file = path.join(folder, name);
+			try {
+				const link = shell.readShortcutLink(file);
+				if (link.appUserModelId === "Grok.Code" && path.resolve(link.target).toLowerCase() === process.execPath.toLowerCase() && (link.args !== args || link.icon?.toLowerCase() !== appIconFile.toLowerCase())) {
+					shell.writeShortcutLink(file, "update", { target: process.execPath, args, icon: appIconFile, iconIndex: 0 });
+				}
+			} catch {}
+		}
+	}
+}
 
 function createWindow(uiSessionId) {
   const win = new BrowserWindow({
@@ -39,7 +87,7 @@ function createWindow(uiSessionId) {
     minHeight: 720,
     show: false,
     backgroundColor: "#161513",
-    title: "Grok Desktop",
+    title: "Codewomplers Grok Desktop",
     icon: appIcon.isEmpty() ? undefined : appIcon,
     autoHideMenuBar: true,
     webPreferences: {
@@ -48,28 +96,57 @@ function createWindow(uiSessionId) {
       nodeIntegration: false,
       sandbox: true,
       webviewTag: true,
-      // The first session starts in the user's Documents folder.
-      additionalArguments: [`--grok-default-folder=${app.getPath("documents")}`],
     },
   });
 
 	const contents = win.webContents;
+	// Ctrl+R in the app's own page would reload the window and stop its turns. View > Reload stays, and a focused Browser-pane page still refreshes.
+	contents.on("before-input-event", (event, input) => {
+		if (input.type === "keyDown" && input.control && !input.alt && !input.meta && input.key.toLowerCase() === "r") { event.preventDefault(); }
+	});
+	const closeOwnedTerminals = () => {
+		for (const [id, owner] of terminalOwners) {
+			if (owner === contents) { terminals.close(id); }
+		}
+	};
+	contents.on("did-navigate", closeOwnedTerminals);
+	contents.on("destroyed", closeOwnedTerminals);
+	contents.on("render-process-gone", closeOwnedTerminals);
 	const stopOwnedTurn = () => {
 		for (const [uiSessionId, owner] of owners) {
 			if (owner.contents === contents && owner.turn === host.turns.get(uiSessionId)) { host.cancel(uiSessionId); }
 		}
 	};
+	// The question is async so the main process keeps answering approvals, and their auto-deny keeps running, while it is open.
+	// Without preventDefault the unload is cancelled, so "Close anyway" repeats the close or reload with `leave` set.
+	let asking = false;
+	let leave = false;
+	let closing = false;
+	win.on("close", () => { closing = true; });
+	win.webContents.on("did-finish-load", () => { leave = false; });
 	win.webContents.on("will-prevent-unload", (event) => {
-		const choice = dialog.showMessageBoxSync(win, {
+		const wasClosing = closing;
+		closing = false;
+		if (leave) {
+			event.preventDefault();
+			return;
+		}
+		if (asking) { return; }
+		asking = true;
+		dialog.showMessageBox(win, {
 			type: "warning",
 			buttons: ["Close anyway", "Keep window open"],
 			defaultId: 1,
 			cancelId: 1,
-			title: "Grok Desktop",
-			message: "Some editor text is not saved yet.",
-			detail: "Keep the window open and try again in a moment. If it closes now, that text is lost.",
-		});
-		if (choice === 0) { event.preventDefault(); }
+			title: "Codewomplers Grok Desktop",
+			message: "Some text is not saved or sent yet.",
+			detail: "Keep the window open to finish saving or to send the queued message. If it closes now, that text is lost.",
+		}).then(({ response }) => {
+			asking = false;
+			if (response !== 0 || win.isDestroyed()) { return; }
+			leave = true;
+			if (wasClosing) { win.close(); } else { win.webContents.reload(); }
+		}, () => { asking = false; });
 	});
 	win.webContents.on("destroyed", stopOwnedTurn);
 	win.webContents.on("render-process-gone", stopOwnedTurn);
@@ -83,10 +160,10 @@ function createWindow(uiSessionId) {
     win.setIcon(appIcon);
     win.setAppDetails({
       appId: "Grok.Code",
-      appIconPath: process.execPath,
+      appIconPath: appIconFile,
       appIconIndex: 0,
-      relaunchCommand: `"${process.execPath}" "${appDir}"`,
-      relaunchDisplayName: "Grok",
+      relaunchCommand: `"${process.execPath}" "${appDir}" --build-if-stale`,
+      relaunchDisplayName: "Codewomplers Grok Desktop",
     });
   }
   const failed = "data:text/html," + encodeURIComponent(
@@ -137,6 +214,14 @@ ipcMain.handle("grok:cancel", (event, uiSessionId) => {
 	if (ownsTurn(event, uiSessionId)) {
 		host.cancel(uiSessionId);
 	}
+});
+
+ipcMain.handle("grok:stop-session", (_event, uiSessionId) => {
+	if (typeof uiSessionId === "string" && uiSessionId) { host.stopSession(uiSessionId); }
+});
+
+ipcMain.handle("grok:forget-session", (_event, uiSessionId) => {
+	if (typeof uiSessionId === "string" && uiSessionId) { host.forgetSession(uiSessionId); }
 });
 
 ipcMain.handle("grok:decide", (event, payload) => {
@@ -217,9 +302,18 @@ ipcMain.handle("grok:copy", (_event, text) => {
   return { ok: true };
 });
 
-ipcMain.handle("grok:reveal", (_event, cwd, file) => revealFile(cwd, file));
+ipcMain.handle("grok:reveal", (_event, cwd, file) => {
+	const located = locateFile(cwd, file);
+	if (!located.ok) { return { ok: false, error: located.error }; }
+	shell.showItemInFolder(located.target);
+	return { ok: true };
+});
 
-ipcMain.handle("grok:terminal-open", (_event, payload) => terminals.open({ cwd: payload && payload.cwd }));
+ipcMain.handle("grok:terminal-open", (event, payload) => {
+	const result = terminals.open({ cwd: payload && payload.cwd });
+	if (result.ok) { terminalOwners.set(result.id, event.sender); }
+	return result;
+});
 ipcMain.handle("grok:terminal-write", (_event, id, text) => terminals.write(id, text));
 ipcMain.handle("grok:terminal-close", (_event, id) => terminals.close(id));
 ipcMain.handle("grok:terminal-history", (_event, id) => terminals.history(id));
@@ -228,10 +322,14 @@ ipcMain.handle("grok:branch-info", (_event, cwd) => git.branchInfo(cwd));
 ipcMain.handle("grok:scoped-diff", (_event, cwd, scope) => git.readScopedDiff(cwd, scope));
 ipcMain.handle("grok:list-commits", (_event, cwd) => git.listCommits(cwd));
 ipcMain.handle("grok:pr-status", (_event, cwd) => git.prStatus(cwd));
-ipcMain.handle("grok:pr-create", (_event, cwd) => git.prCreate(cwd, {}));
-ipcMain.handle("grok:pr-merge", (_event, cwd) => git.prMergeWhenReady(cwd));
+ipcMain.handle("grok:pr-create", (_event, cwd, expected) => git.prCreate(cwd, { expected: typeof expected === "string" ? expected : undefined }));
+ipcMain.handle("grok:pr-merge", (_event, cwd, number) => git.prMergeWhenReady(cwd, number));
 ipcMain.handle("grok:add-worktree", (_event, cwd, payload) => git.addWorktree(cwd, { name: payload && payload.name, prefix: payload && payload.prefix }));
-ipcMain.handle("grok:remove-worktree", (_event, cwd, folder, payload) => git.removeWorktree(cwd, folder, { force: !!(payload && payload.force) }));
+ipcMain.handle("grok:restore-worktree", (_event, folder, branch) => git.restoreWorktree(folder, branch));
+ipcMain.handle("grok:remove-worktree", async (_event, cwd, folder, payload) => {
+	await host.stopFolder(folder);
+	return git.removeWorktree(cwd, folder, { force: !!(payload && payload.force) });
+});
 
 ipcMain.handle("grok:open-external", (_event, url) => {
 	if (!httpUrl(url)) { return { ok: false, error: "Only http and https links open outside." }; }
@@ -293,14 +391,25 @@ ipcMain.handle("grok:attention", (event) => {
 });
 
 let awakeId = -1;
-ipcMain.handle("grok:keep-awake", (_event, payload) => {
+let awakeRequest = null;
+function applyKeepAwake() {
+	const payload = awakeRequest;
 	const want = !!(payload && payload.working) && (payload.onBattery !== false || !powerMonitor.isOnBatteryPower());
 	if (want && awakeId < 0) { awakeId = powerSaveBlocker.start("prevent-app-suspension"); }
 	if (!want && awakeId >= 0) {
 		powerSaveBlocker.stop(awakeId);
 		awakeId = -1;
 	}
+}
+ipcMain.handle("grok:keep-awake", (_event, payload) => {
+	awakeRequest = payload;
+	applyKeepAwake();
 	return { ok: true };
+});
+// A switch between battery and mains power rechecks the last request, so "Keep awake on battery power" follows the power source.
+app.whenReady().then(() => {
+	powerMonitor.on("on-battery", applyKeepAwake);
+	powerMonitor.on("on-ac", applyKeepAwake);
 });
 
 ipcMain.handle("grok:save-image", (_event, base64) => {
@@ -314,9 +423,47 @@ ipcMain.handle("grok:save-image", (_event, base64) => {
 	}
 });
 
+// Clicking an attached image opens it full size in its own window. Only an image file loads, sandboxed and with no preload.
+ipcMain.handle("grok:open-image", (event, file) => {
+	if (typeof file !== "string" || !path.isAbsolute(file) || !/\.(png|jpe?g|gif|webp)$/i.test(file) || !fs.existsSync(file)) {
+		return { ok: false, error: "That image is no longer on this computer." };
+	}
+	const size = nativeImage.createFromPath(file).getSize();
+	const area = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea;
+	const width = Math.min(Math.max(size.width, 400), Math.round(area.width * 0.9));
+	const height = Math.min(Math.max(size.height, 300), Math.round(area.height * 0.9));
+	const win = new BrowserWindow({
+		parent: BrowserWindow.fromWebContents(event.sender) || undefined,
+		x: Math.round(area.x + (area.width - width) / 2),
+		y: Math.round(area.y + (area.height - height) / 2),
+		width,
+		height,
+		useContentSize: true,
+		title: path.basename(file),
+		backgroundColor: "#0e0e0e",
+		autoHideMenuBar: true,
+		icon: appIcon.isEmpty() ? undefined : appIcon,
+		webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+	});
+	win.loadFile(file).catch(() => {});
+	return { ok: true };
+});
+
 ipcMain.handle("grok:app-info", () => ({ ok: true, version: app.getVersion(), electron: process.versions.electron }));
 ipcMain.handle("grok:context-breakdown", (_event, agentSessionId) => usage.contextBreakdown(String(agentSessionId || "")));
 ipcMain.handle("grok:recent-spend", () => usage.recentSpend());
+ipcMain.handle("grok:customize", (_event, cwd) => customize.inventory(cwd));
+ipcMain.handle("grok:customize-change", (_event, cwd, input) => customize.change(cwd, input));
+// Undefined until Grok first starts in this app; null after signing out.
+ipcMain.handle("grok:account", () => host.account);
+ipcMain.handle("grok:sign-out", async () => {
+	if ([...host.turns.values()].some((turn) => !turn.finished)) { return { ok: false, error: "Grok is still answering. Press Stop or wait, then sign out." }; }
+	const result = await customize.signOut();
+	if (result.ok) { host.signedOut(); }
+	return result;
+});
+// Read once by the preload: the folder a first session opens in.
+ipcMain.on("grok:home-dir", (event) => { event.returnValue = os.homedir(); });
 
 const DEV_SCRIPTS = ["dev", "start", "serve", "preview", "storybook"];
 ipcMain.handle("grok:dev-scripts", (_event, cwd) => {
@@ -330,9 +477,10 @@ ipcMain.handle("grok:dev-scripts", (_event, cwd) => {
 });
 
 function aboutDialog(win) {
-	const detail = `Version ${app.getVersion()}\nElectron ${process.versions.electron}`;
-	const choice = dialog.showMessageBoxSync(win, { type: "info", title: "About Grok Desktop", message: "Grok Desktop", detail, buttons: ["Copy version", "Close"], defaultId: 1, cancelId: 1 });
-	if (choice === 0) { clipboard.writeText(app.getVersion()); }
+	const detail = `Version ${app.getVersion()}\nElectron ${process.versions.electron}\n\nCopyright (c) 2026 Codewomplers. MIT License.\nNot affiliated with or endorsed by xAI. Grok is a trademark of its owner.`;
+	dialog.showMessageBox(win, { type: "info", title: "About Codewomplers Grok Desktop", message: "Codewomplers Grok Desktop", detail, buttons: ["Copy version", "Close"], defaultId: 1, cancelId: 1 }).then(({ response }) => {
+		if (response === 0) { clipboard.writeText(app.getVersion()); }
+	});
 }
 
 Menu.setApplicationMenu(Menu.buildFromTemplate([
@@ -340,8 +488,8 @@ Menu.setApplicationMenu(Menu.buildFromTemplate([
 	{ role: "editMenu" },
 	{ label: "View", submenu: [{ role: "reload" }, { role: "toggleDevTools" }, { type: "separator" }, { role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" }, { type: "separator" }, { role: "togglefullscreen" }] },
 	{ label: "Help", submenu: [
-		{ label: "About Grok Desktop", click: (_item, win) => aboutDialog(win) },
-		{ label: "Check for Updates…", click: (_item, win) => dialog.showMessageBox(win, { type: "info", title: "Check for Updates", message: "Grok Desktop updates come from its git checkout.", detail: `Version ${app.getVersion()}. Pull the latest commit and run npm run desktop to update.` }) },
+		{ label: "About Codewomplers Grok Desktop", click: (_item, win) => aboutDialog(win) },
+		{ label: "Check for Updates…", click: (_item, win) => dialog.showMessageBox(win, { type: "info", title: "Check for Updates", message: "Codewomplers Grok Desktop updates come from its git checkout.", detail: `Version ${app.getVersion()}. To update, quit Codewomplers Grok Desktop, then in its folder run git pull, npm install and npm run desktop.` }) },
 	] },
 ]));
 
@@ -427,6 +575,8 @@ app.on("web-contents-created", (_event, contents) => {
 if (!app.requestSingleInstanceLock()) {
 	app.quit();
 } else {
+	// The DevTools port is for local automation only: it opens when GROK_CODE_DEBUG_PORT names one, never by default, since any process on the computer could drive the app through it.
+	if (/^\d+$/.test(process.env.GROK_CODE_DEBUG_PORT || "")) { app.commandLine.appendSwitch("remote-debugging-port", process.env.GROK_CODE_DEBUG_PORT); }
 	app.on("second-instance", () => {
 		const win = BrowserWindow.getAllWindows().find((item) => !item.isDestroyed());
 		if (!win) {
@@ -437,12 +587,16 @@ if (!app.requestSingleInstanceLock()) {
 		win.show();
 		win.focus();
 	});
+	if (process.argv.includes("--build-if-stale")) { buildIfStale(); }
 	app.whenReady().then(createWindow);
+	app.whenReady().then(repairShortcuts);
 }
 
-app.on("before-quit", () => {
-  host.kill();
+// After every window has closed, so a quit that a window's unsaved-text question cancels leaves Grok running.
+app.on("will-quit", () => {
 	terminals.closeAll();
+	host.kill();
+	repairShortcuts();
 });
 
 app.on("window-all-closed", () => {

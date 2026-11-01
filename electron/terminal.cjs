@@ -32,7 +32,7 @@ class TerminalHost {
 		const shell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 		let child;
 		try {
-			child = spawn(shell, ["-NoLogo", "-NoProfile", "-NoExit", "-Command", INIT], { cwd, windowsHide: true, stdio: "pipe" });
+			child = spawn(shell, ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "RemoteSigned", "-NoExit", "-Command", INIT], { cwd, windowsHide: true, stdio: "pipe" });
 		} catch {
 			return { ok: false, error: "PowerShell could not start." };
 		}
@@ -70,7 +70,7 @@ class TerminalHost {
 		if (!tab) { return { ok: false, error: "That terminal is closed." }; }
 		if (typeof text !== "string" || text.includes("\0")) { return { ok: false, error: "That text cannot be sent to the terminal." }; }
 		if (text.length > MAX_WRITE) { return { ok: false, error: "That command is too long." }; }
-		tab.child.stdin.write(text.endsWith("\n") ? text : `${text}\n`);
+		tab.child.stdin.write(text.includes("\n") ? `${text.replace(/\n+$/, "")}\n\n` : `${text}\n`);
 		return { ok: true };
 	}
 

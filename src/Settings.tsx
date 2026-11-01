@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { MODES, type PermissionMode } from "./types";
+import { Customize } from "./Customize";
+import { mapMode, MODES, type PermissionMode } from "./types";
 
 export interface AppSettings {
 	appearance: "system" | "light" | "dark";
@@ -18,6 +19,8 @@ export interface AppSettings {
 	branchPrefix: string;
 	defaultMode: PermissionMode;
 	allowBypass: boolean;
+	// Set once so an older saved Manual default is not applied again after this choice.
+	bypassDefaultApplied: boolean;
 	model: string;
 	effort: string;
 	sideWidth: number;
@@ -41,8 +44,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
 	keepAwakeOnBattery: true,
 	autoArchiveDays: 14,
 	branchPrefix: "grok",
-	defaultMode: "Manual",
-	allowBypass: false,
+	defaultMode: "Normal",
+	allowBypass: true,
+	bypassDefaultApplied: true,
 	model: "grok-4.7",
 	effort: "high",
 	sideWidth: 560,
@@ -56,7 +60,10 @@ export const settingsKey = "grok-code.settings.v1";
 export function readSettings(): AppSettings {
 	try {
 		const saved = JSON.parse(localStorage.getItem(settingsKey) ?? "null");
-		return saved && typeof saved === "object" ? { ...DEFAULT_SETTINGS, ...saved } : { ...DEFAULT_SETTINGS };
+		const settings: AppSettings = saved && typeof saved === "object" ? { ...DEFAULT_SETTINGS, ...saved } : { ...DEFAULT_SETTINGS };
+		settings.defaultMode = mapMode(settings.defaultMode) ?? "Normal";
+		settings.modeByFolder = Object.fromEntries(Object.entries(settings.modeByFolder).map(([folder, mode]) => [folder, mapMode(mode) ?? "Normal"]));
+		return settings;
 	} catch {
 		return { ...DEFAULT_SETTINGS };
 	}
@@ -66,21 +73,23 @@ export function validPrefix(value: string) {
 	return /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(value) && !/^(main|master|staging|warm|prod-.*|release.*)$/i.test(value);
 }
 
-type Tab = "general" | "notifications" | "sessions" | "customize" | "about";
+export type SettingsTab = "general" | "notifications" | "sessions" | "skills" | "connectors" | "plugins" | "about";
 
-export function SettingsPage({ settings, onChange, onClose, commands, servers }: {
+export function SettingsPage({ settings, onChange, onClose, servers, folder, onRun, initialTab = "general" }: {
 	settings: AppSettings;
 	onChange: (patch: Partial<AppSettings>) => void;
 	onClose: () => void;
-	commands: GrokCommand[];
 	servers: GrokMcpServer[];
+	folder: string;
+	onRun: (text: string) => void;
+	initialTab?: SettingsTab;
 }) {
-	const [tab, setTab] = useState<Tab>("general");
+	const [tab, setTab] = useState<SettingsTab>(initialTab);
 	const [prefix, setPrefix] = useState(settings.branchPrefix);
 	const [info, setInfo] = useState("");
 	useEffect(() => {
 		void window.grokCode?.appInfo?.().then((result) => {
-			if (result.ok) { setInfo(`Grok Desktop ${result.version} · Electron ${result.electron}`); }
+			if (result.ok) { setInfo(`Codewomplers Grok Desktop ${result.version} · Electron ${result.electron}`); }
 		});
 	}, []);
 	const row = (label: string, detail: string, control: React.ReactNode) => (
@@ -104,8 +113,8 @@ export function SettingsPage({ settings, onChange, onClose, commands, servers }:
 		<div className="settings-page" role="dialog" aria-label="Settings">
 			<nav className="settings-nav">
 				<h2>Settings</h2>
-				{([["general", "General"], ["notifications", "Notifications"], ["sessions", "Sessions"], ["customize", "Customize"], ["about", "About"]] as [Tab, string][]).map(([id, label]) => (
-					<button key={id} type="button" className={tab === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>
+				{([["general", "General"], ["notifications", "Notifications"], ["sessions", "Sessions"], ["skills", "Skills"], ["connectors", "Connectors"], ["plugins", "Plugins"], ["about", "About"]] as [SettingsTab, string][]).map(([id, label]) => (
+					<button key={id} type="button" autoFocus={tab === id} className={tab === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>
 				))}
 				<span className="spacer" />
 				<button type="button" className="texty" onClick={onClose}>Done</button>
@@ -116,7 +125,7 @@ export function SettingsPage({ settings, onChange, onClose, commands, servers }:
 						<h3>General</h3>
 						{row("Appearance", "Follow the system, or always light or dark.", choose("appearance", "Appearance", [["system", "System"], ["light", "Light"], ["dark", "Dark"]]))}
 						{row("Keep computer awake while Grok works", "Prevents idle sleep while any session is working. A closed lid still sleeps.", toggle("keepAwake", "Keep computer awake while Grok works"))}
-						{row("Keep awake on battery power", "When off, the hold drops while on battery.", toggle("keepAwakeOnBattery", "Keep awake on battery power"))}
+						{row("Keep awake on battery power", "When off, the hold drops while on battery. On battery, Windows may still sleep a few minutes after its own sleep timeout.", toggle("keepAwakeOnBattery", "Keep awake on battery power"))}
 						{row("Auto save in the Files pane", "Save edits shortly after you stop typing.", toggle("autoSave", "Auto save"))}
 						<h3>Browser</h3>
 						{row("Keep cookies", "Sign-ins in the Browser pane survive restarts.", toggle("keepCookies", "Keep cookies"))}
@@ -136,12 +145,11 @@ export function SettingsPage({ settings, onChange, onClose, commands, servers }:
 				{tab === "sessions" && (
 					<>
 						<h3>Sessions</h3>
-						{row("Default permission mode", "The mode new sessions start in. A folder you used before keeps its last mode, except Plan.", choose("defaultMode", "Default permission mode", MODES.filter((item) => item.id !== "Bypass permissions" || settings.allowBypass).map((item) => [item.id, item.id])))}
-						{row("Allow bypass permissions mode", "Show Bypass permissions in the mode menu.", toggle("allowBypass", "Allow bypass permissions mode"))}
-						{row("Archive inactive sessions", "Archive sessions with no activity for this long. Pinned and running sessions stay.", choose("autoArchiveDays", "Archive inactive sessions", [[0, "Never"], [1, "1 day"], [2, "2 days"], [7, "7 days"], [14, "14 days"], [30, "30 days"]]))}
+						{row("Default permission mode", `The mode each new session starts in. ${MODES.find((item) => item.id === settings.defaultMode)?.detail ?? ""}`, choose("defaultMode", "Default permission mode", MODES.map((item) => [item.id, item.id])))}
+						{row("Archive inactive sessions", "Archive sessions with no activity for this long. Clean worktree folders are removed; their branches stay. Pinned and running sessions stay.", choose("autoArchiveDays", "Archive inactive sessions", [[0, "Never"], [1, "1 day"], [2, "2 days"], [7, "7 days"], [14, "14 days"], [30, "30 days"]]))}
 						{row("Branch prefix", "Added to the branch names of new worktree sessions.", (
 							<span className="set-inline">
-								<input aria-label="Branch prefix" value={prefix} onChange={(event) => setPrefix(event.target.value)} />
+								<input aria-label="Branch prefix" value={prefix} onChange={(event) => setPrefix(event.target.value)} onBlur={() => { if (validPrefix(prefix) && prefix !== settings.branchPrefix) { onChange({ branchPrefix: prefix }); } }} />
 								<button type="button" className="texty" disabled={!validPrefix(prefix) || prefix === settings.branchPrefix} onClick={() => onChange({ branchPrefix: prefix })}>Save</button>
 							</span>
 						))}
@@ -149,21 +157,12 @@ export function SettingsPage({ settings, onChange, onClose, commands, servers }:
 						{row("Worktree location", "New session worktrees are created inside the project.", <code>{"<repo>/.grok/worktrees"}</code>)}
 					</>
 				)}
-				{tab === "customize" && (
-					<>
-						<h3>Connectors</h3>
-						<p className="meta">MCP servers Grok loaded from its own configuration. Manage them with Grok's /plugins and its config files.</p>
-						{servers.length === 0 && <p className="note">Grok has not reported any MCP servers yet. Send a message first.</p>}
-						{servers.map((server) => <div className="set-row" key={server.name}><div><b>{server.name}</b><small>{server.source}</small></div><span className="meta">{server.status || "configured"}</span></div>)}
-						<h3>Commands and skills</h3>
-						{commands.length === 0 && <p className="note">Grok lists its commands after the first message in a session.</p>}
-						{commands.map((command) => <div className="set-row" key={command.name}><div><b>/{command.name}</b><small>{command.description}</small></div></div>)}
-					</>
-				)}
+				{(tab === "skills" || tab === "connectors" || tab === "plugins") && <Customize key={folder} view={tab} folder={folder} live={servers} onRun={onRun} />}
 				{tab === "about" && (
 					<>
 						<h3>About</h3>
-						<p>{info || "Grok Desktop"}</p>
+						<p>{info || "Codewomplers Grok Desktop"}</p>
+						<p className="meta">Copyright (c) 2026 Codewomplers. Not affiliated with or endorsed by xAI. Grok is a trademark of its owner.</p>
 						<p className="meta">Help → Check for Updates explains how this build updates.</p>
 					</>
 				)}

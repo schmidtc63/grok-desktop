@@ -391,6 +391,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   flex-direction: column;
   overflow: hidden;
 }
+.bp-pane { overflow: visible; }
+.bp-views { overflow: hidden; border-radius: 0 0 12px 12px; }
 .pane-hd {
   display: flex;
   align-items: center;
@@ -884,7 +886,19 @@ select {
 }
 .side-filter { display: flex; align-items: center; gap: 8px; padding: 2px 16px; font-size: 12px; }
 .side-filter .texty { padding: 1px 6px; font-size: 11px; }
-.side-foot { display: flex; align-items: center; border-top: 1px solid var(--line); }
+.side-foot { display: flex; align-items: center; gap: 4px; border-top: 1px solid var(--line); }
+.account-btn { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; border: 0; background: transparent; color: var(--text); border-radius: 8px; padding: 4px 6px; text-align: left; }
+.account-btn:hover { background: var(--hover); }
+.account-btn .avatar { flex: none; width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; background: var(--accent); color: var(--accent-ink); font-size: 12px; font-weight: 600; }
+.account-btn .who { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-btn small { display: block; color: var(--muted); font-size: 11px; }
+.row-pop.account-menu { min-width: 248px; }
+.account-menu button { display: flex; justify-content: space-between; gap: 16px; }
+.account-menu button small { color: var(--muted); }
+.account-menu button:disabled { color: var(--faint); background: transparent; }
+.account-head { display: grid; gap: 2px; padding: 6px 8px; overflow-wrap: anywhere; }
+.account-head span, .account-foot { color: var(--muted); font-size: 12px; }
+.account-foot { padding: 2px 8px 4px; }
 .session .dot { flex: none; width: 7px; height: 7px; margin: 0 2px 0 4px; background: transparent; }
 .session .dot.running { background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
 .session .dot.needs-you { background: var(--amber); }
@@ -1036,7 +1050,7 @@ select {
 .md-code { margin: 0 0 12px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--code); }
 .md-code-hd { display: flex; align-items: center; gap: 6px; padding: 3px 6px 3px 10px; color: var(--muted); font-size: 11px; border-bottom: 1px solid var(--line); }
 .md-code-hd .texty { padding: 1px 8px; font-size: 11px; border-color: transparent; }
-.md-code pre { margin: 0; padding: 8px 10px; overflow: auto; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; color: var(--code-text); }
+.md-code pre { margin: 0; padding: 8px 10px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; color: var(--code-text); }
 .md-code pre code { background: transparent; padding: 0; }
 .md-table { overflow: auto; margin: 0 0 12px; }
 .md-table table { border-collapse: collapse; }
@@ -1047,7 +1061,7 @@ select {
 .dock { padding: 0 16px 12px; }
 .dock > .composer, .dock > .side-q, .dock > .composer-note { max-width: 760px; margin-left: auto; margin-right: auto; }
 .composer { border-color: var(--line-strong); border-radius: 16px; padding: 6px 8px; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08); }
-.composer textarea { min-height: 48px; max-height: 40vh; }
+.composer textarea { field-sizing: content; min-height: 48px; max-height: 40vh; }
 .composer-row { flex-wrap: nowrap; }
 .composer-row .chip { border: 0; background: transparent; padding: 4px 8px; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
 .composer-row .chip:hover, .composer-row .chip.hot { background: var(--hover); color: var(--text); }
@@ -1087,6 +1101,11 @@ select {
 	text-overflow: ellipsis;
 }
 .attach-chip button { border: 0; background: transparent; color: var(--muted); padding: 0 4px; }
+.attach-chip:has(> img) { max-width: none; padding: 3px; }
+.attach-chip img { display: block; height: 64px; max-width: 160px; border-radius: 6px; object-fit: cover; }
+.attach-chip .thumb { padding: 0; cursor: zoom-in; }
+.msg-image { display: block; max-width: 100%; margin: 0 0 6px; padding: 0; border: 0; border-radius: 12px; overflow: hidden; background: none; cursor: zoom-in; }
+.msg-image img { display: block; max-width: 480px; max-height: 360px; }
 .mention.pop-list { flex-direction: column; align-items: stretch; flex-wrap: nowrap; max-height: 280px; overflow: auto; }
 .pop-list .item {
 	display: block;
@@ -1171,3 +1190,12 @@ select {
 .set-inline { display: flex; gap: 6px; align-items: center; }
 .set-inline input { background: var(--input); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; width: 140px; }
 .set-row input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); }
+.set-row > div:first-child { min-width: 0; }
+.set-row .cz-clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.cz-side { display: flex; align-items: center; gap: 8px; flex: none; max-width: 45%; text-align: right; }
+.cz-tools { margin: 10px 0; }
+.cz-tools input { flex: 1; width: auto; }
+.cz-form { display: grid; grid-template-columns: 110px 1fr; gap: 8px 12px; align-items: center; margin: 8px 0; }
+.cz-form input, .cz-form textarea, .cz-form select { background: var(--input); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; color: inherit; font: inherit; min-width: 0; }
+.cz-form textarea { min-height: 54px; resize: vertical; }
+.note.bad { color: var(--red); }

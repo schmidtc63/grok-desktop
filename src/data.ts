@@ -2,7 +2,6 @@
 export const SHORTCUTS: [string, string][] = [
 	["Ctrl+/", "Show keyboard shortcuts"],
 	["Ctrl+N", "New session"],
-	["Ctrl+W", "Close session"],
 	["Ctrl+Tab", "Next session"],
 	["Ctrl+Shift+Tab", "Previous session"],
 	["Ctrl+Shift+]", "Next session"],

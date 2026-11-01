@@ -1,17 +1,25 @@
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const { StringDecoder } = require("string_decoder");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { pathToFileURL } = require("url");
 
-// Grok's installer puts the CLI here; GROK_BIN points somewhere else.
-const GROK = process.env.GROK_BIN || path.join(os.homedir(), ".grok", "bin", "grok.exe");
-const MODELS = new Set(["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"]);
+function grokHome() {
+	return process.env.GROK_HOME || path.join(os.homedir(), ".grok");
+}
+
+// GROK_PATH wins; otherwise the installer's copy under GROK_HOME (default ~/.grok), else `grok` on PATH.
+function grokPath() {
+	if (process.env.GROK_PATH) { return process.env.GROK_PATH; }
+	const installed = path.join(grokHome(), "bin", process.platform === "win32" ? "grok.exe" : "grok");
+	return fs.existsSync(installed) ? installed : "grok";
+}
+
 const IMAGE_TYPES = new Map(Object.entries({ ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" }));
 const IMAGE_LIMIT = 5 * 1024 * 1024;
 const EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
-const MODES = new Set(["Manual", "Accept edits", "Plan", "Auto", "Bypass permissions"]);
+const MODES = new Set(["Normal", "Plan", "Auto-review", "Always-approve"]);
 
 // Headless `grok -p` cannot wait for a click. `session/set_mode` accepts a
 // mode id and does not change permission. The saved config is always-approve,
@@ -20,6 +28,7 @@ const MODES = new Set(["Manual", "Accept edits", "Plan", "Auto", "Bypass permiss
 // denies the call itself before that deadline.
 const HOOK_TIMEOUT_SEC = 600;
 const AUTO_DENY_MS = 8 * 60 * 1000;
+const IDLE_MS = 10 * 60 * 1000;
 const HOOKS = {
   PreToolUse: [{ matcher: ".*", hookCallbackIds: ["gate"], timeout: HOOK_TIMEOUT_SEC }],
 };
@@ -85,19 +94,27 @@ function editIsAllowed(turn, input) {
 		if (targets.some((target) => path.relative(targets[0], target) !== "")) { return false; }
 		return [turn.cwd, ...(turn.allowedFolders || []), os.tmpdir()].some((folder) => {
 			const relative = path.relative(canonical(folder), targets[0]);
-			return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
+			const inside = relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
+			// Repository and Grok metadata run as code later (git hooks, .git/config, .grok, .mcp.json, and the .claude and .cursor hooks and MCP servers Grok also loads), so a write there always asks.
+			// Windows ignores case and trailing dots or spaces in a name, and "name:stream" writes "name", so each part is compared in that form.
+			// Windows also opens a short name such as GIT~1 as the long name, so a part with "~" and a digit asks too.
+			const names = relative.split(path.sep).map((part) => part.split(":")[0].replace(/[. ]+$/, "").toLowerCase());
+			return inside && !names.some((name) => name === ".git" || name === ".grok" || name === ".mcp.json" || name === ".claude" || name === ".cursor" || /~[0-9]/.test(name));
 		});
 	} catch {
 		return false;
 	}
 }
 
-function killTree(child) {
-  if (!child || child.pid == null) return;
+// Takes one process or a list; one taskkill ends every tree. `sync` waits for it, so Grok's own child processes
+// are gone before the app exits or a folder is removed.
+function killTree(children, sync = false) {
+	const list = (Array.isArray(children) ? children : [children]).filter((child) => child && child.pid != null);
+	if (!list.length) { return; }
   if (process.platform === "win32") {
-    spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+		(sync ? spawnSync : spawn)("taskkill", [...list.flatMap((child) => ["/PID", String(child.pid)]), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
   } else {
-    child.kill();
+		for (const child of list) { child.kill(); }
   }
 }
 
@@ -142,11 +159,31 @@ function classify(toolName) {
 	return TOOL_KINDS.get(String(toolName || "").toLowerCase()) || "other";
 }
 
+function permissionOf(mode) {
+	if (mode === "Always-approve") { return "yolo"; }
+	if (mode === "Auto-review") { return "auto"; }
+	return "ask";
+}
+
+function permissionMeta(mode) {
+	return {
+		"x.ai/hooks": HOOKS,
+		...(mode === "Always-approve" ? { yoloMode: true } : {}),
+		...(mode === "Auto-review" ? { autoMode: true } : {}),
+	};
+}
+
+// Only what the account menu shows; Grok's authenticate reply also carries ids and flags.
+function accountOf(auth, version) {
+	const meta = (auth && auth._meta) || {};
+	const text = (value) => (typeof value === "string" ? value.slice(0, 200) : "");
+	return { email: text(meta.email), plan: text(meta.subscription_tier), team: text(meta.team_name), version: text(version) };
+}
+
 function actionFor(mode, kind) {
 	if (kind === "read" || kind === "internal") { return "allow"; }
-	if (mode === "Auto" || mode === "Bypass permissions") { return "allow"; }
-	if (mode === "Plan") { return "deny"; }
-	if (mode === "Accept edits" && kind === "edit") { return "allow"; }
+	if (mode === "Always-approve" || mode === "Auto-review") { return "allow"; }
+	if (mode === "Plan" && kind === "edit") { return "deny"; }
 	return "ask";
 }
 
@@ -154,7 +191,7 @@ function isPlanFile(turn, input) {
 	const target = input && typeof input === "object" ? input.file_path : "";
 	if (!turn || !turn.agentSessionId || typeof target !== "string" || !path.isAbsolute(target)) { return false; }
 	const resolved = path.resolve(target);
-	const sessions = path.join(os.homedir(), ".grok", "sessions");
+	const sessions = path.join(grokHome(), "sessions");
 	const relative = path.relative(sessions, resolved);
 	return path.basename(resolved).toLowerCase() === "plan.md"
 		&& path.basename(path.dirname(resolved)) === turn.agentSessionId
@@ -199,15 +236,13 @@ function todosOf(input) {
 	}).filter(Boolean);
 }
 
-// "Always allow" remembers a command by its first two words (like "npm test"), and never one that chains, pipes or redirects.
+// "Always allow" remembers a command exactly as Grok sent it (outer spaces aside), and never one that chains, pipes or redirects.
 // An MCP call through use_tool is remembered by the MCP tool it names, and never when that name is inside a file.
 function alwaysKey(kind, toolName, command, input) {
 	if (kind === "command") {
 		const text = String(command || "").trim();
 		if (!text || /[;&|`$<>()\r\n]/.test(text)) { return ""; }
-		const words = text.split(/\s+/);
-		// A flag as the second word (`powershell -Command`, `node -e`, `cmd /c`) runs whatever follows, so the whole command is remembered.
-		return `command:${(/^[-/]/.test(words[1] || "") ? words : words.slice(0, 2)).join(" ").toLowerCase()}`;
+		return `command:${text}`;
 	}
 	const name = String(toolName || "").toLowerCase();
 	if (name === "use_tool") {
@@ -215,6 +250,11 @@ function alwaysKey(kind, toolName, command, input) {
 		return target ? `tool:use_tool:${target}` : "";
 	}
 	return `tool:${name}`;
+}
+
+// A rule lasts for one Grok conversation in one folder, so Choose a folder, which starts a new conversation, clears it.
+function ruleScope(turn) {
+	return `${turn.uiSessionId}|${pathKey(turn.cwd)}|${turn.agentSessionId}`;
 }
 
 function attachmentsProblem(list) {
@@ -279,19 +319,14 @@ function chunkText(update) {
 }
 
 class AgentHost {
-  constructor(emit) {
+  constructor(emit, { idleMs = IDLE_MS } = {}) {
     this.emit = emit;
-    this.child = null;
-    this.ready = false;
-    this.starting = null;
-    this.buf = "";
-    this.decoder = new StringDecoder("utf8");
+		// Each app session, side chats included, has its own Grok process, keyed by uiSessionId.
+		this.procs = new Map();
+		this.idleMs = idleMs;
     this.nextId = 1;
-    this.pending = new Map();
     this.sessions = new Map();
 		this.turns = new Map();
-		this.parents = new Map();
-		this.stale = new Map();
     this.gates = new Map();
     this.outcomes = new Map();
 		this.cardKinds = new Map();
@@ -309,7 +344,7 @@ class AgentHost {
 		}
     const missing = folderProblem(input.cwd);
     if (missing) return Promise.resolve({ ok: false, error: missing });
-    const mode = MODES.has(input.mode) ? input.mode : "Manual";
+    const mode = MODES.has(input.mode) ? input.mode : "Normal";
 		const turn = {
       uiSessionId: input.uiSessionId,
 			turnId: input.turnId,
@@ -335,32 +370,29 @@ class AgentHost {
 		if (this.turns.get(turn.uiSessionId) !== turn || turn.cancelled || turn.finished) { throw new Error("Stopped."); }
 	}
 
-	checkStart() {
-		if (![...this.turns.values()].some((turn) => !turn.cancelled && !turn.finished)) { throw new Error("Stopped."); }
-	}
-
-	turnFor(sessionId) {
+	// A process serves one app session, so only its Grok session, or a subagent that session started, reaches the turn.
+	turnFor(proc, sessionId) {
 		let id = String(sessionId || "");
-		for (let hops = 0; hops < 8 && this.parents.has(id); hops += 1) { id = this.parents.get(id); }
-		if (this.pending.has(this.stale.get(id))) { return null; }
-		const live = [...this.turns.values()].filter((turn) => !turn.finished);
-		const owner = live.find((turn) => turn.agentSessionId === id);
-		if (owner) { return owner; }
-		return !id && live.length === 1 ? live[0] : null;
+		for (let hops = 0; hops < 8 && proc.parents.has(id); hops += 1) { id = proc.parents.get(id); }
+		const turn = this.turns.get(proc.uiSessionId);
+		if (!turn || turn.finished || turn.proc !== proc) { return null; }
+		return !id || id === turn.agentSessionId ? turn : null;
 	}
 
 	async dispatch(input, turn) {
     try {
-			await this.ensureChild(input);
+			turn.proc = this.procFor(input, turn);
+			this.touch(turn.proc);
+			await turn.proc.ready;
 			this.checkTurn(turn);
-      const session = await this.ensureSession(input);
+			const session = await this.ensureSession(turn.proc, input);
 			this.checkTurn(turn);
 			turn.agentSessionId = session.sessionId;
 			await this.applyConfig(session, input, turn);
 			this.checkTurn(turn);
 			await this.applyMode(session, turn);
 			this.checkTurn(turn);
-      const sent = this.request("session/prompt", {
+			const sent = this.request(turn.proc, "session/prompt", {
         sessionId: session.sessionId,
 				// ponytail: Grok's /context prints only in its own terminal UI; /session-info carries the same context numbers over ACP.
 				prompt: promptBlocks(turn.slash && input.text.trim() === "/context" ? "/session-info" : input.text, input.attachments),
@@ -385,13 +417,13 @@ class AgentHost {
 		if (!gate || gate.uiSessionId !== input.uiSessionId || gate.type) { return { ok: false, error: "That approval already closed." }; }
 		if (input.decision === "always") {
 			const key = alwaysKey(gate.kind, gate.rawName || gate.toolName, gate.command, gate.toolInput);
-			if (key) {
-				const keys = this.always.get(gate.uiSessionId) || new Set();
+			if (key && gate.scope) {
+				const keys = this.always.get(gate.scope) || new Set();
 				keys.add(key);
-				this.always.set(gate.uiSessionId, keys);
+				this.always.set(gate.scope, keys);
 			}
 		}
-    this.answerGate(gate, input.decision === "deny" ? "deny" : "allow", input.decision === "deny" ? "Denied in Grok Desktop." : "");
+    this.answerGate(gate, input.decision === "deny" ? "deny" : "allow", input.decision === "deny" ? "Denied by the user." : "");
     return { ok: true };
   }
 
@@ -416,9 +448,9 @@ class AgentHost {
 		const found = this.turns.get(gate.uiSessionId);
 		const turn = found && !found.finished ? found : null;
 		if (input.outcome === "approved") {
-			if (input.mode !== "Accept edits" && input.mode !== "Manual") { return { ok: false, error: "Choose how to handle edits." }; }
-			if (turn) { turn.mode = input.mode; }
-			this.settleGate(gate, { outcome: "approved" }, `Approved · ${input.mode}`);
+			const next = MODES.has(input.mode) && input.mode !== "Plan" ? input.mode : "Normal";
+			if (turn) { turn.mode = next; }
+			this.settleGate(gate, { outcome: "approved" }, `Approved · ${next}`);
 			return { ok: true };
 		}
 		if (input.outcome === "feedback") {
@@ -427,7 +459,8 @@ class AgentHost {
 			return { ok: true };
 		}
 		if (input.outcome === "abandoned") {
-			if (turn) { turn.mode = "Manual"; }
+			const next = MODES.has(input.mode) && input.mode !== "Plan" ? input.mode : "Normal";
+			if (turn) { turn.mode = next; }
 			this.settleGate(gate, { outcome: "abandoned" }, "Abandoned");
 			return { ok: true };
 		}
@@ -449,46 +482,64 @@ class AgentHost {
 		turn.cancelled = true;
     this.denyOpen(uiSessionId, "Stopped.");
     const session = this.sessions.get(uiSessionId);
-    if (session && this.child && this.child.stdin.writable) {
-      this.child.stdin.write(JSON.stringify({
-        jsonrpc: "2.0",
-        method: "session/cancel",
-        params: { sessionId: session.sessionId },
-      }) + "\n");
-    }
-    const child = this.child;
+		if (session && session.proc && session.proc === turn.proc) {
+			this.write(turn.proc, { jsonrpc: "2.0", method: "session/cancel", params: { sessionId: session.sessionId } });
+		}
+		// If Grok has not ended the turn after the grace period, stop this session's Grok; the next message reloads the conversation.
     setTimeout(() => {
-			if (this.child !== child || this.turns.get(uiSessionId) !== turn || turn.finished) { return; }
-			const others = [...this.turns.values()].filter((other) => other !== turn && !other.finished);
-			if (turn.promptId == null) {
-				if (!others.some((other) => other.promptId != null)) { killTree(child); }
-				return;
-			}
-			if (others.length) {
-				// Grok still owes an answer to the stopped prompt; ignore that Grok session until it comes.
-				this.stale.set(turn.agentSessionId, turn.promptId);
-				this.finishPrompt(turn, turn.promptId, null, "");
-				return;
-			}
-			killTree(child);
+			if (this.turns.get(uiSessionId) === turn && !turn.finished && turn.proc) { this.stopProc(turn.proc, "Stopped."); }
     }, 5000);
   }
 
+	// App quit: end every session's Grok and the processes it started before the app exits.
   kill() {
     this.denyOpen("", "Closed.");
-    const child = this.child;
-    this.child = null;
-    this.ready = false;
+		const procs = [...this.procs.values()];
+		for (const proc of procs) { this.loseProc(proc, "Closed."); }
+		killTree(procs.map((proc) => proc.child), true);
 		this.turns.clear();
-		this.parents.clear();
     this.sessions.clear();
-    if (child) killTree(child);
   }
+
+	// grok.exe keeps its startup folder open, so Grok must stop before that folder (a worktree) is removed.
+	stopFolder(folder) {
+		if (typeof folder !== "string" || !folder.trim()) { return Promise.resolve(); }
+		const root = pathKey(folder);
+		const procs = [...this.procs.values()].filter((proc) => pathKey(proc.cwd) === root || pathKey(proc.cwd).startsWith(`${root}\\`));
+		for (const proc of procs) {
+			const turn = this.turns.get(proc.uiSessionId);
+			if (turn && turn.proc === proc) { turn.cancelled = true; }
+			this.loseProc(proc, "Stopped.");
+		}
+		killTree(procs.map((proc) => proc.child), true);
+		return Promise.all(procs.map((proc) => Promise.race([proc.exited, new Promise((resolve) => setTimeout(resolve, 3000))])));
+	}
+
+	// A deleted or archived session no longer needs its Grok, or its side chat's.
+	stopSession(uiSessionId) {
+		for (const id of [uiSessionId, `side-${uiSessionId}`]) {
+			const proc = this.procs.get(id);
+			if (!proc) { continue; }
+			const turn = this.turns.get(id);
+			if (turn && turn.proc === proc) { turn.cancelled = true; }
+			this.stopProc(proc, "Stopped.");
+		}
+	}
+
+	// Choose a folder starts a new conversation, so a return to the old folder must not reload the cached one or its rules.
+	forgetSession(uiSessionId) {
+		for (const id of [uiSessionId, `side-${uiSessionId}`]) {
+			this.sessions.delete(id);
+			for (const scope of this.always.keys()) {
+				if (scope.startsWith(`${id}|`)) { this.always.delete(scope); }
+			}
+		}
+	}
 
   inputProblem(input) {
     if (!input || typeof input.uiSessionId !== "string" || !input.uiSessionId) return "Missing session.";
     if (typeof input.text !== "string" || !input.text.trim()) return "Write a prompt first.";
-    if (!MODELS.has(input.model) && !this.models.some((item) => item.id === input.model)) return "Pick a model from the list.";
+    if (typeof input.model !== "string" || !/^[A-Za-z0-9][\w.:-]{0,79}$/.test(input.model)) { return "Pick a model from the list."; }
     if (!EFFORTS.has(input.effort)) return "Pick an effort from the list.";
 		if (input.model === "grok-4.5" && input.effort === "xhigh") { return "Grok 4.5 supports Low, Medium, or High effort."; }
 		if (input.agentSessionId != null && (typeof input.agentSessionId !== "string" || !input.agentSessionId.trim())) { return "Invalid saved Grok session."; }
@@ -498,17 +549,23 @@ class AgentHost {
 		return attachmentsProblem(input.attachments);
   }
 
-	ensureChild(input) {
-    if (this.child && this.ready) return Promise.resolve();
-    if (this.starting) return this.starting;
-		this.starting = this.start(input).finally(() => {
-      this.starting = null;
-    });
-    return this.starting;
-  }
+	// Grok fixes a session's permission when the session opens, so a new permission or folder gets a new Grok process.
+	procFor(input, turn) {
+		const permission = permissionOf(turn.mode);
+		const current = this.procs.get(input.uiSessionId);
+		if (current && current.permission === permission && pathKey(current.cwd) === pathKey(input.cwd)) { return current; }
+		if (current) {
+			this.stopProc(current, "Grok restarted.");
+			// Stopping that Grok also stopped what it left running in the background, such as a dev server.
+			this.emitTurn(turn, { type: "chunk", text: `Grok restarted ${pathKey(current.cwd) === pathKey(input.cwd) ? "to apply the new permission mode" : "in the new folder"}. Commands it left running in the background were stopped.\n\n` });
+		}
+		return this.start(input, permission);
+	}
 
-	start(input) {
-    const child = spawn(GROK, [
+	start(input, permission) {
+    const child = spawn(grokPath(), [
+      "--permission-mode",
+      "default",
       "agent",
       "--no-leader",
       "--model",
@@ -521,74 +578,104 @@ class AgentHost {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
-    this.child = child;
-    this.ready = false;
-    this.buf = "";
-    this.decoder = new StringDecoder("utf8");
-		child.stdout.on("data", (chunk) => { if (this.child === child) { this.onData(chunk); } });
+		const proc = { uiSessionId: input.uiSessionId, cwd: input.cwd, permission, child, lost: false, buf: "", decoder: new StringDecoder("utf8"), pending: new Map(), parents: new Map() };
+		proc.exited = new Promise((resolve) => {
+			child.once("exit", resolve);
+			child.once("error", resolve);
+		});
+		this.procs.set(input.uiSessionId, proc);
+		// A write can race Grok's exit; the exit handler reports that.
+		child.stdin.on("error", () => {});
+		child.stdout.on("data", (chunk) => { if (!proc.lost) { this.onData(proc, chunk); } });
 		let stderr = "";
 		const stderrDecoder = new StringDecoder("utf8");
 		child.stderr.on("data", (chunk) => { stderr = (stderr + stderrDecoder.write(chunk)).slice(-4096); });
-		child.on("error", () => this.loseChild(child, this.processFailure("Grok could not start.", stderr)));
-		child.on("exit", () => this.loseChild(child, this.processFailure("Grok exited.", stderr)));
-    return this.request("initialize", {
+		child.on("error", (error) => this.loseProc(proc, this.processFailure(error && error.code === "ENOENT" ? "Grok is not installed, or not on PATH. Set GROK_PATH to its full path." : `Grok could not start${error && error.message ? `: ${error.message}` : "."}`, stderr)));
+		child.on("exit", () => this.loseProc(proc, this.processFailure("Grok exited.", stderr)));
+		let version = "";
+		proc.ready = this.request(proc, "initialize", {
       protocolVersion: 1,
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
       clientInfo: { name: "grok-code", version: "0.1.0" },
       _meta: { "x.ai/hooks": HOOKS },
     }).promise
-			.then(() => {
-				this.checkStart();
-				return this.request("authenticate", { methodId: "cached_token" }).promise;
+			.then((init) => {
+				version = init && init._meta && init._meta.agentVersion;
+				return this.request(proc, "authenticate", { methodId: "cached_token" }).promise;
 			})
-      .then(() => {
-        if (this.child !== child) throw new Error("Grok exited.");
-				this.checkStart();
-        this.ready = true;
+      .then((auth) => {
+				if (proc.lost) { throw new Error("Grok exited."); }
+				this.account = accountOf(auth, version);
+				this.emit({ type: "account", account: this.account });
       })
       .catch((error) => {
-        this.loseChild(child, error.message || "Grok could not start.");
-				killTree(child);
+				if (!proc.lost) { this.stopProc(proc, error.message || "Grok could not start."); }
         throw error;
       });
+		return proc;
   }
 
-  loseChild(child, message) {
-    if (this.child !== child) return;
-    this.child = null;
-    this.ready = false;
-		for (const session of this.sessions.values()) {
-			session.child = null;
+	// After `grok logout` a running Grok still holds the old token, so the next message starts a new Grok, which asks to sign in.
+	signedOut() {
+		this.account = null;
+		this.emit({ type: "account", account: null });
+		for (const proc of [...this.procs.values()]) { this.stopProc(proc, "Signed out."); }
+	}
+
+	stopProc(proc, message, sync = false) {
+		this.loseProc(proc, message);
+		killTree(proc.child, sync);
+	}
+
+	// A turn or any message from Grok, a background subagent's included, restarts the idle clock. An idle Grok
+	// stops and the next message reloads the conversation. One with a background command still running keeps running, or its command would stop too.
+	touch(proc) {
+		clearTimeout(proc.idle);
+		if (proc.lost || proc.background) { return; }
+		proc.idle = setTimeout(() => {
+			const turn = this.turns.get(proc.uiSessionId);
+			if ((turn && !turn.finished) || [...this.gates.values()].some((gate) => gate.proc === proc)) { this.touch(proc); } else { this.stopProc(proc, "Grok stopped while idle."); }
+		}, this.idleMs);
+	}
+
+	// Only this process's session loses its turn and approvals; other sessions keep running.
+	loseProc(proc, message) {
+		if (proc.lost) { return; }
+		proc.lost = true;
+		clearTimeout(proc.idle);
+		if (this.procs.get(proc.uiSessionId) === proc) { this.procs.delete(proc.uiSessionId); }
+		const session = this.sessions.get(proc.uiSessionId);
+		if (session && session.proc === proc) {
+			session.proc = null;
 			session.model = "";
 			session.effort = "";
 			session.grokMode = "";
 		}
-    for (const waiter of this.pending.values()) waiter.reject(new Error(message));
-    this.pending.clear();
-		for (const gate of [...this.gates.values()]) { this.answerGate(gate, "deny", "Grok exited.", false); }
-		const turns = [...this.turns.values()];
-		this.turns.clear();
-		this.parents.clear();
-		for (const turn of turns) {
-			if (turn.finished || turn.promptId == null) { continue; }
-			turn.finished = true;
-			if (turn.cancelled) { this.emitTurn(turn, { type: "done", stopReason: "cancelled" }); } else { this.emitTurn(turn, { type: "error", message }); }
+		for (const waiter of proc.pending.values()) { waiter.reject(new Error(message)); }
+		proc.pending.clear();
+		for (const gate of [...this.gates.values()]) {
+			if (gate.proc === proc) { this.answerGate(gate, "deny", "Grok exited.", false); }
 		}
-  }
+		const turn = this.turns.get(proc.uiSessionId);
+		if (!turn || turn.proc !== proc) { return; }
+		this.turns.delete(proc.uiSessionId);
+		if (turn.finished || turn.promptId == null) { return; }
+		turn.finished = true;
+		if (turn.cancelled) { this.emitTurn(turn, { type: "done", stopReason: "cancelled" }); } else { this.emitTurn(turn, { type: "error", message }); }
+	}
 
-  async ensureSession(input) {
+	async ensureSession(proc, input) {
     const existing = this.sessions.get(input.uiSessionId);
 		const sameFolder = existing && pathKey(existing.cwd) === pathKey(input.cwd);
-		if (sameFolder && existing.child === this.child) { return existing; }
+		if (sameFolder && existing.proc === proc) { return existing; }
 		const savedId = sameFolder ? existing.sessionId : input.agentSessionId;
-		const child = this.child;
 		let created;
 		try {
-			created = await this.request(savedId ? "session/load" : "session/new", {
+			created = await this.request(proc, savedId ? "session/load" : "session/new", {
 				...(savedId ? { sessionId: savedId } : {}),
 				cwd: input.cwd,
 				mcpServers: [],
-				_meta: { "x.ai/hooks": HOOKS },
+				_meta: permissionMeta(MODES.has(input.mode) ? input.mode : "Normal"),
 			}).promise;
 		} catch (error) {
 			if (error.fromGrok && savedId) {
@@ -597,13 +684,13 @@ class AgentHost {
 			}
 			throw error;
 		}
-		if (this.child !== child) { throw new Error("Grok exited."); }
+		if (proc.lost) { throw new Error("Grok exited."); }
 		const sessionId = savedId || (created && created.sessionId);
 		if (!sessionId) { throw new Error("Grok did not open a session."); }
     const session = {
 			sessionId: String(sessionId),
       cwd: input.cwd,
-			child,
+			proc,
       model: "",
       effort: "",
 			configOptions: [],
@@ -628,19 +715,21 @@ class AgentHost {
 		const mode = turn.mode === "Plan" ? "plan" : "default";
 		if (session.grokMode === mode) { return; }
 		try {
-			await this.request("session/set_mode", { sessionId: session.sessionId, modeId: mode }).promise;
+			await this.request(session.proc, "session/set_mode", { sessionId: session.sessionId, modeId: mode }).promise;
 			session.grokMode = mode;
 		} catch (error) {
 			if (!error.fromGrok) { throw error; }
+			// The app's own approvals still follow the chosen mode; say that Grok's side did not change.
+			this.emitTurn(turn, { type: "chunk", text: `Grok did not switch this session ${mode === "plan" ? "into" : "out of"} plan mode (${error.message}). The app's approvals still follow the mode you chose.\n\n` });
 		}
 	}
 
-	onModeUpdate(sessionId, modeId) {
-		const session = [...this.sessions.values()].find((item) => item.sessionId === sessionId);
-		if (session) { session.grokMode = modeId; }
-		const turn = [...this.turns.values()].find((item) => !item.finished && item.agentSessionId === sessionId);
-		if (!turn) { return; }
-		const mode = modeId === "plan" ? "Plan" : (turn.mode === "Plan" ? "Manual" : "");
+	onModeUpdate(proc, sessionId, modeId) {
+		const session = this.sessions.get(proc.uiSessionId);
+		if (session && session.proc === proc && session.sessionId === sessionId) { session.grokMode = modeId; }
+		const turn = this.turnFor(proc, sessionId);
+		if (!turn || turn.agentSessionId !== sessionId) { return; }
+		const mode = modeId === "plan" ? "Plan" : (turn.mode === "Plan" ? "Normal" : "");
 		if (!mode || mode === turn.mode) { return; }
 		turn.mode = mode;
 		this.emitTurn(turn, { type: "mode", mode });
@@ -663,11 +752,12 @@ class AgentHost {
 		if (option && Array.isArray(option.options) && !option.options.some((item) => item.value === value)) {
 			throw new Error(`Grok does not support ${configId}: ${value}.`);
 		}
-		const sent = this.request("session/set_config_option", { sessionId: session.sessionId, configId, value });
+		const proc = session.proc;
+		const sent = this.request(proc, "session/set_config_option", { sessionId: session.sessionId, configId, value });
     let timer;
 		const timeout = new Promise((_resolve, reject) => {
       timer = setTimeout(() => {
-        this.pending.delete(sent.id);
+				if (proc) { proc.pending.delete(sent.id); }
 				session.model = "";
 				session.effort = "";
 				session.configOptions = [];
@@ -690,22 +780,26 @@ class AgentHost {
     }
   }
 
-  request(method, params) {
-    if (!this.child || !this.child.stdin.writable) return { id: 0, promise: Promise.reject(new Error("Grok is not running.")) };
+	request(proc, method, params) {
+		if (!proc || proc.lost || !proc.child.stdin.writable) { return { id: 0, promise: Promise.reject(new Error("Grok is not running.")) }; }
     const id = this.nextId++;
     const promise = new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
+			proc.pending.set(id, { resolve, reject, method });
     });
-    this.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+		proc.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
     return { id, promise };
   }
 
-  onData(chunk) {
-    this.buf += this.decoder.write(chunk);
+	write(proc, message) {
+		if (proc && !proc.lost && proc.child.stdin.writable) { proc.child.stdin.write(JSON.stringify(message) + "\n"); }
+	}
+
+	onData(proc, chunk) {
+		proc.buf += proc.decoder.write(chunk);
     let nl;
-    while ((nl = this.buf.indexOf("\n")) >= 0) {
-      const line = this.buf.slice(0, nl).trim();
-      this.buf = this.buf.slice(nl + 1);
+		while ((nl = proc.buf.indexOf("\n")) >= 0) {
+			const line = proc.buf.slice(0, nl).trim();
+			proc.buf = proc.buf.slice(nl + 1);
       if (!line) continue;
       let msg;
       try {
@@ -713,30 +807,31 @@ class AgentHost {
       } catch {
         continue;
       }
-      this.onMessage(msg);
+			this.onMessage(proc, msg);
     }
+		this.touch(proc);
   }
 
-  onMessage(msg) {
+	onMessage(proc, msg) {
     if (msg.method === "session/update") {
-      this.onUpdate(msg.params || {});
+			this.onUpdate(proc, msg.params || {});
       return;
     }
     if (msg.method && String(msg.method).endsWith("hooks/run")) {
-      this.onHook(msg);
+			this.onHook(proc, msg);
       return;
     }
     if (msg.method === "session/request_permission") {
-      this.onPermission(msg);
+			this.onPermission(proc, msg);
       return;
     }
 		if (msg.id != null && (msg.method === "_x.ai/ask_user_question" || msg.method === "_x.ai/exit_plan_mode")) {
-			this.onInteraction(msg);
+			this.onInteraction(proc, msg);
 			return;
 		}
 		if (msg.method === "_x.ai/models/update") {
 			this.onModels(msg.params || {});
-			if (msg.id != null) { this.reply(msg.id, null); }
+			if (msg.id != null) { this.reply(proc, msg.id, null); }
 			return;
 		}
 		if (msg.method === "_x.ai/mcp/servers_updated" || msg.method === "_x.ai/mcp/server_status") {
@@ -746,16 +841,20 @@ class AgentHost {
 			} else if (typeof params.name === "string") {
 				this.emit({ type: "mcp-status", name: params.name, status: String(params.status || "") });
 			}
-			if (msg.id != null) { this.reply(msg.id, null); }
+			if (msg.id != null) { this.reply(proc, msg.id, null); }
 			return;
 		}
 		if (msg.method === "_x.ai/session_notification") {
 			const update = (msg.params && msg.params.update) || {};
 			if (update.sessionUpdate === "subagent_spawned" && update.child_session_id && update.parent_session_id) {
-				this.parents.set(String(update.child_session_id), String(update.parent_session_id));
+				proc.parents.set(String(update.child_session_id), String(update.parent_session_id));
 			}
 			const sessionId = String((msg.params && msg.params.sessionId) || "");
-			const turn = this.turnFor(sessionId);
+			// Grok lists its background commands here. While one runs, the idle stop would kill it along with this Grok.
+			if (update.sessionUpdate === "background_tasks" && Array.isArray(update.tasks) && !proc.parents.has(sessionId)) {
+				proc.background = update.tasks.some((task) => task && task.status === "running");
+			}
+			const turn = this.turnFor(proc, sessionId);
 			const live = turn && turn.promptId != null ? turn : null;
 			const note = commandNote(update);
 			if (live && note && live.slash) {
@@ -763,26 +862,26 @@ class AgentHost {
 				this.emitTurn(live, { type: "chunk", text: note });
 			}
 			const tokens = contextOf(update);
-			if (live && tokens != null && !this.parents.has(sessionId)) {
+			if (live && tokens != null && !proc.parents.has(sessionId)) {
 				live.contextTokens = tokens;
 				const session = this.sessions.get(live.uiSessionId);
 				this.emitTurn(live, { type: "context", contextTokens: tokens, contextWindow: this.windowOf(session ? session.model : "") });
 			}
-			if (msg.id != null) { this.reply(msg.id, null); }
+			if (msg.id != null) { this.reply(proc, msg.id, null); }
 			return;
 		}
     if (msg.id != null && msg.method) {
-      this.reply(msg.id, null, { code: -32601, message: "not handled" });
+			this.reply(proc, msg.id, null, { code: -32601, message: "not handled" });
       return;
     }
-    if (msg.id != null && this.pending.has(msg.id)) {
-      const waiter = this.pending.get(msg.id);
-      this.pending.delete(msg.id);
+		if (msg.id != null && proc.pending.has(msg.id)) {
+			const waiter = proc.pending.get(msg.id);
+			proc.pending.delete(msg.id);
 			if (msg.error) { waiter.reject(Object.assign(new Error(this.clip(msg.error.message)), { fromGrok: true })); } else { waiter.resolve(msg.result); }
     }
   }
 
-	onUpdate(params) {
+	onUpdate(proc, params) {
 		const update = params.update || {};
 		if (update.sessionUpdate === "available_commands_update") {
 			const list = Array.isArray(update.availableCommands) ? update.availableCommands : [];
@@ -795,14 +894,14 @@ class AgentHost {
 			return;
 		}
 		if (update.sessionUpdate === "current_mode_update") {
-			this.onModeUpdate(String(params.sessionId || ""), String(update.currentModeId || ""));
+			this.onModeUpdate(proc, String(params.sessionId || ""), String(update.currentModeId || ""));
 			return;
 		}
-		const turn = this.turnFor(params.sessionId);
+		const turn = this.turnFor(proc, params.sessionId);
 		if (!turn || turn.promptId == null) { return; }
 		if (update.sessionUpdate === "agent_message_chunk" || update.sessionUpdate === "agent_thought_chunk") {
 			const text = chunkText(update);
-			if (text && !this.parents.has(String(params.sessionId || ""))) {
+			if (text && !proc.parents.has(String(params.sessionId || ""))) {
 				if (update.sessionUpdate === "agent_message_chunk") { turn.said = true; }
 				this.emitTurn(turn, { type: update.sessionUpdate === "agent_message_chunk" ? "chunk" : "thought", text });
 			}
@@ -814,24 +913,25 @@ class AgentHost {
 		}
 	}
 
-	onHook(msg) {
+	onHook(proc, msg) {
 		const params = msg.params || {};
 		const toolId = String(params.toolUseId || params.hookCallbackId || "tool");
 		const toolName = String(params.toolName || "tool");
 		const kind = classify(toolName);
-		const found = this.turnFor(params.sessionId);
+		const found = this.turnFor(proc, params.sessionId);
 		const turn = found && !found.cancelled ? found : null;
-		const mode = turn ? turn.mode : "Manual";
+		const mode = turn ? turn.mode : "Normal";
 		let action = "deny";
 		if (turn) {
 			action = actionFor(mode, kind);
-			if (action === "allow" && mode === "Accept edits" && kind === "edit" && !editIsAllowed(turn, params.toolInput)) { action = "ask"; }
+			// Auto-review leaves the call to Grok's own review only when Grok says that review is on; otherwise the card asks.
+			if (action === "allow" && mode === "Auto-review" && kind !== "read" && kind !== "internal" && params.permissionMode !== "auto") { action = "ask"; }
 			if (kind === "edit" && isPlanFile(turn, params.toolInput)) { action = "allow"; }
 			if (mode === "Plan" && toolName === "enter_plan_mode") { action = "allow"; }
 		}
 		if (action !== "ask") {
-			const reason = action === "deny" && mode === "Plan" ? "Plan mode does not change files or run commands." : "";
-			this.reply(msg.id, { decision: action, reason });
+			const reason = action === "deny" && mode === "Plan" ? "Plan mode only edits its plan file." : "";
+			this.reply(proc, msg.id, { decision: action, reason });
 			this.outcomes.set(toolId, action);
 			if (action === "deny" && turn) {
 				this.outcomes.set(`${toolId}:detail`, "Not run · plan mode");
@@ -841,8 +941,8 @@ class AgentHost {
 		}
 		const command = params.toolInput && typeof params.toolInput.command === "string" ? params.toolInput.command : "";
 		const key = alwaysKey(kind, toolName, command, params.toolInput);
-		if (key && (this.always.get(turn.uiSessionId) || new Set()).has(key) && (kind !== "edit" || editIsAllowed(turn, params.toolInput))) {
-			this.reply(msg.id, { decision: "allow", reason: "" });
+		if (key && (this.always.get(ruleScope(turn)) || new Set()).has(key) && (kind !== "edit" || editIsAllowed(turn, params.toolInput))) {
+			this.reply(proc, msg.id, { decision: "allow", reason: "" });
 			this.outcomes.set(toolId, "allow");
 			this.outcomes.set(`${toolId}:detail`, "Allowed");
 			return;
@@ -852,9 +952,11 @@ class AgentHost {
 		this.openGate({
 			rawName: toolName,
 			toolInput: params.toolInput,
+			proc,
 			rpcId: msg.id,
 			toolId,
 			uiSessionId: turn.uiSessionId,
+			scope: ruleScope(turn),
 			turnId: turn.turnId,
 			toolName,
 			kind,
@@ -866,10 +968,10 @@ class AgentHost {
 		});
 	}
 
-	onInteraction(msg) {
+	onInteraction(proc, msg) {
 		const params = msg.params || {};
 		const question = msg.method === "_x.ai/ask_user_question";
-		const found = this.turnFor(params.sessionId);
+		const found = this.turnFor(proc, params.sessionId);
 		const turn = found && !found.cancelled ? found : null;
 		const questions = question && Array.isArray(params.questions) ? params.questions.filter((item) => item && typeof item.question === "string" && item.question.trim()).slice(0, 20).map((item) => ({
 			question: item.question,
@@ -880,14 +982,16 @@ class AgentHost {
 			...(typeof item.header === "string" && item.header.trim() ? { header: clipText(item.header.trim(), 40) } : {}),
 		})) : [];
 		if (!turn || (question && !questions.length)) {
-			this.reply(msg.id, question ? { outcome: "cancelled" } : { outcome: "feedback", feedback: "Grok Desktop could not show this plan. Ask the user what to change." });
+			this.reply(proc, msg.id, question ? { outcome: "cancelled" } : { outcome: "feedback", feedback: "The app could not show this plan. Ask the user what to change." });
 			return;
 		}
-		const toolId = typeof params.toolCallId === "string" && params.toolCallId ? params.toolCallId : `${question ? "question" : "plan"}:${msg.id}`;
+		// Request ids count up in each Grok process, so a fallback id also names the session.
+		const toolId = typeof params.toolCallId === "string" && params.toolCallId ? params.toolCallId : `${question ? "question" : "plan"}:${turn.uiSessionId}:${msg.id}`;
 		const previous = this.gates.get(toolId);
 		if (previous) { this.answerGate(previous, "deny", "Replaced by a newer approval."); }
 		this.openGate({
 			type: question ? "question" : "plan",
+			proc,
 			rpcId: msg.id,
 			toolId,
 			uiSessionId: turn.uiSessionId,
@@ -923,26 +1027,25 @@ class AgentHost {
 		});
 	}
 
-	onPermission(msg) {
+	onPermission(proc, msg) {
 		const params = msg.params || {};
 		const tool = params.toolCall || {};
 		const toolName = String(tool.title || tool.kind || "tool");
-		const found = this.turnFor(params.sessionId);
+		const found = this.turnFor(proc, params.sessionId);
 		const turn = found && !found.cancelled ? found : null;
-		const mode = turn ? turn.mode : "Manual";
+		const mode = turn ? turn.mode : "Normal";
 		const kind = PERMISSION_KINDS.get(String(tool.kind || "")) || classify(toolName);
 		const userAllowed = tool.toolCallId != null && this.outcomes.get(`${tool.toolCallId}:detail`) === "Allowed";
-		let action = !turn ? "deny" : (userAllowed ? "allow" : actionFor(mode, kind));
-		// The same folder rule as the hook: Accept edits asks before an edit outside the session's folders.
-		if (action === "allow" && !userAllowed && mode === "Accept edits" && kind === "edit" && !editIsAllowed(turn, tool.rawInput)) { action = "ask"; }
+		let action = !turn ? "deny" : (userAllowed ? "allow" : (mode === "Auto-review" ? "ask" : actionFor(mode, kind)));
 		if (action !== "ask") {
-			this.reply(msg.id, this.permissionResult(params, action));
+			this.reply(proc, msg.id, this.permissionResult(params, action));
 			return;
 		}
 		const command = tool.rawInput && typeof tool.rawInput.command === "string" ? tool.rawInput.command : "";
 		this.openGate({
+			proc,
 			rpcId: msg.id,
-			toolId: `native-permission:${msg.id}`,
+			toolId: `native-permission:${turn.uiSessionId}:${msg.id}`,
 			uiSessionId: turn.uiSessionId,
 			turnId: turn.turnId,
 			toolName: `Permission: ${toolName}`,
@@ -957,8 +1060,7 @@ class AgentHost {
 	}
 
 	answerGate(gate, decision, reason, respond = true) {
-		const current = this.gates.get(gate.toolId);
-		if (!current || current.rpcId !== gate.rpcId) { return; }
+		if (this.gates.get(gate.toolId) !== gate) { return; }
 		if (gate.type) {
 			const detail = reason === "Grok exited." ? "Closed · Grok exited" : (reason === "Stopped." ? "Closed · Stopped" : "Closed");
 			const reply = gate.type === "question" ? { outcome: "cancelled" } : { outcome: "feedback", feedback: "The user closed the plan without answering. Ask what to change." };
@@ -972,7 +1074,7 @@ class AgentHost {
 			? "Allowed"
 			: (reason === "No answer before the approval window closed." ? "Denied · timed out" : "Denied");
 		this.outcomes.set(`${gate.toolId}:detail`, detail);
-		if (respond) { this.reply(gate.rpcId, gate.permission ? this.permissionResult(gate.permission, decision) : { decision, reason: reason || "" }); }
+		if (respond) { this.reply(gate.proc, gate.rpcId, gate.permission ? this.permissionResult(gate.permission, decision) : { decision, reason: reason || "" }); }
 		this.emit({
 			type: "tool",
 			uiSessionId: gate.uiSessionId,
@@ -993,7 +1095,7 @@ class AgentHost {
 		this.gates.delete(gate.toolId);
 		this.outcomes.set(gate.toolId, "answered");
 		this.outcomes.set(`${gate.toolId}:detail`, detail);
-		if (reply) { this.reply(gate.rpcId, reply); }
+		if (reply) { this.reply(gate.proc, gate.rpcId, reply); }
 		this.emit({
 			type: "tool",
 			uiSessionId: gate.uiSessionId,
@@ -1016,12 +1118,12 @@ class AgentHost {
     return { outcome: { outcome: "selected", optionId: option.optionId } };
   }
 
-  reply(id, result, error) {
-    if (!this.child || !this.child.stdin.writable || id == null) return;
+	reply(proc, id, result, error) {
+		if (id == null) { return; }
     const message = { jsonrpc: "2.0", id };
     if (error) message.error = error;
     else message.result = result;
-    this.child.stdin.write(JSON.stringify(message) + "\n");
+		this.write(proc, message);
   }
 
 	finishPrompt(turn, id, result, error) {
@@ -1029,6 +1131,8 @@ class AgentHost {
 		turn.finished = true;
 		this.turns.delete(turn.uiSessionId);
 		this.denyOpen(turn.uiSessionId, "The turn ended.");
+		const usage = this.usageOf(result, turn);
+		if (usage) { this.emitTurn(turn, { type: "usage", usage }); }
 		if (turn.cancelled) {
 			this.emitTurn(turn, { type: "done", stopReason: "cancelled" });
 			return;
@@ -1038,9 +1142,8 @@ class AgentHost {
 			return;
 		}
 		if (turn.slash && !turn.said) { this.emitTurn(turn, { type: "chunk", text: "Grok ran the command. It sent no output." }); }
-		const usage = this.usageOf(result, turn);
-		if (usage) { this.emitTurn(turn, { type: "usage", usage }); }
 		const stopReason = result && result.stopReason ? String(result.stopReason) : "end_turn";
+		if (["max_tokens", "max_turn_requests"].includes(stopReason)) { this.emitTurn(turn, { type: "chunk", text: `\n\nGrok stopped early (${stopReason.replace(/_/g, " ")}).` }); }
 		this.emitTurn(turn, { type: "done", stopReason });
 	}
 
@@ -1137,4 +1240,4 @@ class AgentHost {
   }
 }
 
-module.exports = { AgentHost, folderProblem, resolvedEditPath, killTree };
+module.exports = { AgentHost, folderProblem, resolvedEditPath, killTree, grokHome, grokPath, accountOf };

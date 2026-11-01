@@ -4,17 +4,34 @@ const path = require("node:path");
 const vm = require("node:vm");
 const { transformSync } = require("esbuild");
 
-// Hooks stub: enough to render a component once and read the element tree. Effects never run.
+let hooks;
 const react = {
 	Fragment: "fragment",
-	useState(initial) { return [typeof initial === "function" ? initial() : initial, () => {}]; },
-	useRef(value) { return { current: value }; },
+	useState(initial) {
+		if (!hooks) { return [typeof initial === "function" ? initial() : initial, () => {}]; }
+		const current = hooks;
+		const index = current.cursor++;
+		if (!(index in current.values)) { current.values[index] = typeof initial === "function" ? initial() : initial; }
+		return [current.values[index], (next) => { current.values[index] = typeof next === "function" ? next(current.values[index]) : next; }];
+	},
+	useRef(value) {
+		if (!hooks) { return { current: value }; }
+		const index = hooks.cursor++;
+		if (!(index in hooks.values)) { hooks.values[index] = { current: value }; }
+		return hooks.values[index];
+	},
 	useMemo(fn) { return fn(); },
-	useEffect() {},
+	useEffect(run, dependencies) {
+		if (!hooks) { return; }
+		const index = hooks.cursor++;
+		const previous = hooks.values[index];
+		if (!previous || !dependencies || dependencies.some((value, offset) => value !== previous[offset])) { hooks.effects.push(run); }
+		hooks.values[index] = dependencies;
+	},
 };
 const jsx = (type, props) => ({ type, props: props ?? {} });
 
-function load(name) {
+function load(name, globals = {}) {
 	const file = path.join(__dirname, "..", "src", name);
 	const source = transformSync(fs.readFileSync(file, "utf8"), { loader: "tsx", format: "cjs", jsx: "automatic" }).code;
 	const module = { exports: {} };
@@ -23,7 +40,7 @@ function load(name) {
 		if (id === "react/jsx-runtime") { return { jsx, jsxs: jsx, Fragment: "fragment" }; }
 		throw new Error(`Unexpected import ${id}`);
 	};
-	vm.runInNewContext(source, { require: imports, module, exports: module.exports }, { filename: file });
+	vm.runInNewContext(source, { require: imports, module, exports: module.exports, ...globals }, { filename: file });
 	return module.exports;
 }
 
@@ -35,6 +52,22 @@ function flatten(node, out = { elements: [], text: [] }) {
 	if (typeof node.type === "function") { return flatten(node.type(node.props), out); }
 	out.elements.push(node);
 	return flatten(node.props.children, out);
+}
+
+function renderer(component, props) {
+	const state = { cursor: 0, values: [], effects: [] };
+	return () => {
+		hooks = state;
+		state.cursor = 0;
+		state.effects = [];
+		try {
+			const tree = flatten(component(props));
+			state.effects.forEach((run) => run());
+			return tree;
+		} finally {
+			hooks = undefined;
+		}
+	};
 }
 
 let failures = 0;
@@ -49,6 +82,7 @@ function check(label, fn) {
 }
 
 const { numberLines, checksSummary, DiffPane } = load("DiffPane.tsx");
+const { SessionRail } = load("SessionRail.tsx");
 const filesPane = load("FilesPane.tsx");
 const { shouldAutoSave, FilesPane } = filesPane;
 // The vm realm has its own Object prototype; copy results into this realm so deepEqual compares values only.
@@ -144,6 +178,17 @@ check("DiffPane renders gutter numbers, line comments, Create PR and the send ba
 	assert.ok(!text.includes("Accept") && !text.includes("Reject"));
 });
 
+check("Revert is available only in Uncommitted changes", () => {
+	const { DiffPane: MenuPane } = load("DiffPane.tsx", { window: { innerWidth: 800 } });
+	for (const scope of ["abc123", "branch", "uncommitted"]) {
+		const render = renderer(MenuPane, { ...diffProps, scope });
+		render().elements.find((node) => node.props["aria-label"] === "Changes menu" && node.type === "button").props.onClick({ currentTarget: { getBoundingClientRect: () => ({ bottom: 40, right: 400 }) } });
+		const item = render().elements.find((node) => node.props.role === "menuitem" && node.props.children === "Revert file…");
+		assert.equal(item.props.disabled, scope !== "uncommitted");
+		assert.equal(item.props.title, scope !== "uncommitted" ? "Switch to Uncommitted changes to revert a file" : undefined);
+	}
+});
+
 check("DiffPane shows an existing pull request with state and checks", () => {
 	const pr = { number: 7, title: "Fix tax", url: "https://example.test/pull/7", state: "OPEN", isDraft: true, autoMerge: false, checks: [{ name: "a", state: "pass" }, { name: "b", state: "run" }] };
 	const text = flatten(DiffPane({ ...diffProps, pr, comments: [] })).text.join("");
@@ -151,6 +196,103 @@ check("DiffPane shows an existing pull request with state and checks", () => {
 	assert.ok(text.includes("Draft"));
 	assert.ok(text.includes("1 passed · 1 running"));
 	assert.ok(!text.includes("Send to Grok"));
+});
+
+check("Ctrl+Enter adds the draft before sending the updated comments", () => {
+	const calls = [];
+	const props = {
+		...diffProps, comments: [],
+		onAddComment: (comment) => { calls.push("add"); props.comments = [{ id: "sent", ...comment }]; },
+		onSendComments: () => calls.push(`send:${props.comments.at(-1).text}`),
+	};
+	const render = renderer(DiffPane, props);
+	let tree = render();
+	tree.elements.find((node) => node.props["aria-label"] === "Comment on line 10").props.onClick();
+	tree = render();
+	tree.elements.find((node) => node.type === "textarea").props.onChange({ target: { value: "Why?" } });
+	tree = render();
+	tree.elements.find((node) => node.type === "textarea").props.onKeyDown({ key: "Enter", ctrlKey: true, nativeEvent: {}, preventDefault() {}, stopPropagation() {} });
+	assert.deepEqual(calls, ["add"]);
+	render();
+	assert.deepEqual(calls, ["add", "send:Why?"]);
+	render();
+	assert.equal(calls.length, 2, "the comment sends once");
+});
+
+const railProps = {
+	session: { folder: "C:/project", branch: "feature", environment: "Local" },
+	diff: { ok: true, files: [] }, branch: { ok: true, branch: "feature", base: "main", ahead: 1 },
+	pr: { ok: true, pr: null }, recentUsd: null,
+	onOpenDiff: noop, onCompact: noop, onOpenUrl: noop, onCreatePr: asyncOk, onMergeWhenReady: asyncOk,
+};
+check("SessionRail labels all-skipped checks as skipped", () => {
+	const pr = { number: 7, title: "Fix", state: "OPEN", url: "https://example.test/pull/7", checks: [{ name: "conditional", state: "skip" }] };
+	const text = flatten(SessionRail({ ...railProps, pr: { ok: true, pr } })).text.join("");
+	assert.ok(text.includes("Checks skipped"));
+	assert.ok(!text.includes("Checks passed"));
+	pr.checks[0].state = "pass";
+	assert.ok(flatten(SessionRail({ ...railProps, pr: { ok: true, pr } })).text.join("").includes("Checks passed"));
+});
+
+check("Create PR reports uncommitted files in both panes", () => {
+	const message = "Pull request opened. 2 uncommitted files are not in this pull request.";
+	const onCreatePr = () => ({ then(run) { run({ ok: true, message, url: "https://example.test/pull/7" }); return { finally: (done) => done() }; } });
+	for (const [component, props] of [[DiffPane, diffProps], [SessionRail, railProps]]) {
+		const render = renderer(component, { ...props, onCreatePr });
+		render().elements.find((node) => node.type === "button" && node.props.children === "Create PR").props.onClick();
+		assert.ok(render().text.join("").includes(message));
+	}
+});
+
+check("Merge when ready shows the message the merge reports", () => {
+	const { DiffPane: MenuPane } = load("DiffPane.tsx", { window: { innerWidth: 800 } });
+	const pr = { number: 7, title: "Fix tax", url: "https://example.test/pull/7", state: "OPEN", isDraft: false, autoMerge: false, checks: [] };
+	const onMergeWhenReady = () => ({ then(run) { run({ ok: true, message: "Merged." }); return { finally: (done) => done() }; } });
+	const render = renderer(MenuPane, { ...diffProps, pr, comments: [], onMergeWhenReady });
+	render().elements.find((node) => node.type === "button" && node.props["aria-label"] === "Pull request menu").props.onClick({ currentTarget: { getBoundingClientRect: () => ({ bottom: 40, right: 400 }) } });
+	render().elements.find((node) => node.props.role === "menuitem" && node.props.children === "Merge when ready").props.onClick();
+	assert.ok(render().text.join("").includes("Merged."));
+});
+
+check("FilesPane saves edits typed during a save after that save succeeds, without retrying failures", () => {
+	const timers = new Map();
+	let nextTimer = 0;
+	let saves = 0;
+	const { FilesPane: TimedFilesPane } = load("FilesPane.tsx", { window: {
+		setTimeout(run) { const id = ++nextTimer; timers.set(id, run); return id; },
+		clearTimeout(id) { timers.delete(id); },
+	} });
+	const props = {
+		files: { status: "ready", files: ["a.txt"] }, file: "a.txt", onSelectFile: noop, lineTick: 0,
+		open: { status: "ready", text: "base", version: "v1" },
+		draft: { text: "first edit", baseText: "base", version: "v1", saving: false },
+		readOnly: false, autoSave: true, onAutoSave: noop, onEdit: noop, onSave: () => { saves++; }, onCancel: noop,
+		conflict: false, onOverride: noop, onDiscard: noop, onClearRecovery: noop, onFileMenu: noop, onClose: noop,
+	};
+	const render = renderer(TimedFilesPane, props);
+	const fire = () => {
+		assert.equal(timers.size, 1);
+		const [id, run] = timers.entries().next().value;
+		timers.delete(id);
+		run();
+	};
+	render();
+	fire();
+	props.draft = { ...props.draft, saving: true };
+	const savingTree = render();
+	assert.equal(savingTree.elements.find((node) => node.props["aria-label"] === "File text").props.readOnly, false);
+	props.draft = { ...props.draft, text: "second edit" };
+	render();
+	assert.equal(timers.size, 0, "typing during a save does not start an overlapping save");
+	props.draft = { ...props.draft, baseText: "first edit", version: "v2", saving: false };
+	render();
+	fire();
+	assert.equal(saves, 2, "the successful save re-arms auto save for the later text");
+	props.draft = { ...props.draft, saving: true, text: "third edit" };
+	render();
+	props.draft = { ...props.draft, saving: false };
+	render();
+	assert.equal(timers.size, 0, "a failed save with the same base does not retry in a loop");
 });
 
 check("FilesPane renders the conflict banner, gutter and view-only note", () => {

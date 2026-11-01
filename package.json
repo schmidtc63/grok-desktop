@@ -1,9 +1,11 @@
 {
-  "name": "grok-desktop",
-  "productName": "Grok Desktop",
+  "name": "grok-code",
   "version": "0.1.0",
   "private": true,
-  "description": "Unofficial Windows desktop app for the Grok CLI, laid out like Claude Code Desktop.",
+  "os": ["win32"],
+  "license": "MIT",
+  "description": "Codewomplers Grok Desktop: an unofficial desktop app for the Grok CLI on Windows.",
+  "author": "Codewomplers",
   "main": "electron/main.cjs",
   "type": "module",
   "scripts": {
@@ -11,7 +13,7 @@
     "build": "vite build",
     "desktop": "vite build && node scripts/windows-name.mjs && electron .",
     "typecheck": "tsc --noEmit",
-    "test": "node scripts/test-agent.cjs && node scripts/test-files.cjs && node scripts/test-main.cjs && node scripts/test-renderer.cjs && node scripts/test-sidebar.cjs && node scripts/test-git.cjs && node scripts/test-terminal.cjs && node scripts/test-diff-files.cjs && node scripts/test-terminal-browser.cjs && node scripts/test-usage.cjs"
+    "test": "node scripts/test-agent.cjs && node scripts/test-files.cjs && node scripts/test-main.cjs && node scripts/test-renderer.cjs && node scripts/test-sidebar.cjs && node scripts/test-git.cjs && node scripts/test-terminal.cjs && node scripts/test-diff-files.cjs && node scripts/test-terminal-browser.cjs && node scripts/test-usage.cjs && node scripts/test-customize.cjs"
   },
   "dependencies": {
     "marked": "^16.4.1",
@@ -28,6 +30,5 @@
     "typescript": "^7.0.2",
     "vite": "^6.4.5",
     "wait-on": "^9.5.1"
-  },
-  "license": "MIT"
+  }
 }

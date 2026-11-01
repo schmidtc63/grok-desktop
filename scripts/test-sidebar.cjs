@@ -5,10 +5,24 @@ const vm = require("node:vm");
 const { transformSync } = require("esbuild");
 
 const states = [];
+const effects = [];
+const storage = new Map();
+const listeners = new Map();
 let cursor = 0;
+let effectCursor = 0;
+let pendingEffects = [];
 const jsx = (type, props) => ({ type, props: props || {} });
 const react = {
-	useEffect() {},
+	useEffect(run, dependencies) {
+		const index = effectCursor++;
+		const previous = effects[index];
+		if (!previous || dependencies.some((value, offset) => value !== previous.dependencies[offset])) {
+			pendingEffects.push(() => {
+				previous?.cleanup?.();
+				effects[index] = { dependencies, cleanup: run() };
+			});
+		}
+	},
 	useState(initial) {
 		const index = cursor++;
 		if (!(index in states)) { states[index] = typeof initial === "function" ? initial() : initial; }
@@ -21,7 +35,12 @@ vm.runInNewContext(source, {
 	module: loaded,
 	exports: loaded.exports,
 	require: (name) => name === "react" ? react : { jsx, jsxs: jsx, Fragment: "fragment" },
-	window: { innerHeight: 1000, innerWidth: 1400, confirm: () => confirmed, addEventListener() {}, removeEventListener() {} },
+	localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
+	window: {
+		innerHeight: 1000, innerWidth: 1400, confirm: () => confirmed,
+		addEventListener: (name, listener) => listeners.set(name, listener),
+		removeEventListener: (name, listener) => { if (listeners.get(name) === listener) { listeners.delete(name); } },
+	},
 });
 let confirmed = true;
 const sessions = [
@@ -47,7 +66,14 @@ function materialize(node) {
 	if (typeof node.type === "function") { return materialize(node.type(node.props)); }
 	return { ...node, props: { ...node.props, children: materialize(node.props.children) } };
 }
-function render() { cursor = 0; return materialize(loaded.exports.Sidebar(props)); }
+function render() {
+	cursor = 0;
+	effectCursor = 0;
+	pendingEffects = [];
+	const tree = materialize(loaded.exports.Sidebar(props));
+	pendingEffects.forEach((run) => run());
+	return tree;
+}
 function findAll(node, predicate, found = []) {
 	if (!node || typeof node !== "object") { return found; }
 	if (Array.isArray(node)) { node.forEach((value) => findAll(value, predicate, found)); return found; }
@@ -114,5 +140,18 @@ tree = render();
 findAll(tree, (node) => node.props?.["aria-label"] === "Section name")[0].props.onBlur({ target: { value: "Reviews" } });
 tree = render();
 assert.ok(findAll(tree, (node) => node.props?.className === "group-label" && text(node) === "Reviews").length === 1, "a renamed section groups its sessions");
+storage.set("grok-code.sections.v1", JSON.stringify([{ id: "shared", name: "Shared reviews" }]));
+listeners.get("storage")({ key: "grok-code.sections.v1" });
+props.sessions = sessions.map((item) => item.id === "second" ? { ...item, sectionId: "shared" } : item);
+tree = render();
+assert.ok(findAll(tree, (node) => node.props?.className === "group-label" && text(node) === "Shared reviews").length === 1, "another window's sections reach this sidebar");
+rowMenu();
+menuButton("Move to section").props.onClick({ currentTarget: { getBoundingClientRect: () => ({ top: 10, left: 10, right: 200, bottom: 30 }) } });
+tree = render();
+menuButton("New section").props.onClick();
+render();
+assert.ok(JSON.parse(storage.get("grok-code.sections.v1")).some((section) => section.id === "shared"), "adding a section preserves the other window's section");
+effects.forEach((effect) => effect?.cleanup?.());
+assert.equal(listeners.has("storage"), false, "the shared-section listener is removed on cleanup");
 console.log("Sidebar row actions passed: unread, completed, delete with confirm, Ctrl+click window, sections.");
-console.log("Sidebar regressions passed: live approval badges and selected new-window identity.");
+console.log("Sidebar regressions passed: live approval badges, selected new-window identity, cross-window sections.");

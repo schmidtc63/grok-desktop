@@ -1,27 +1,34 @@
 const assert = require("assert/strict");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const childProcess = require("child_process");
 const { execFileSync } = childProcess;
 const { createHash } = require("crypto");
-const { readText, writeText, runCommand } = require("../electron/files.cjs");
+const { listFiles, readText, writeText, runCommand } = require("../electron/files.cjs");
 const { readDiff, parseUnified, revertFile } = require("../electron/diff.cjs");
 
-const tempBase = path.join(require("os").tmpdir(), "grokdesk-grokcode-files");
+const tempBase = path.resolve(os.tmpdir(), process.env.CODEX_THREAD_ID || "codex-grokcode-files");
 fs.mkdirSync(tempBase, { recursive: true });
-const root = fs.mkdtempSync(path.join(tempBase, "grokdesk-files-"));
+const root = fs.mkdtempSync(path.join(tempBase, "codex-files-"));
 const nativeExec = childProcess.execFileSync;
+const nativeExecFile = childProcess.execFile;
 const nativeWrite = fs.writeFileSync;
 if (process.platform === "win32") {
-	childProcess.execFileSync = (command, args, options) => {
+	childProcess.execFile = (command, args, options, callback) => {
 		if (options?.env?.GROK_SAVE_TEMP) {
 			assert.equal(options.windowsHide, true);
 			assert.equal(options.timeout, 8000);
-			if (args.at(-1).includes("CreateNew")) { nativeWrite(options.env.GROK_SAVE_TEMP, "", { flag: "wx" }); }
-			else { fs.renameSync(options.env.GROK_SAVE_TEMP, options.env.GROK_SAVE_TARGET); }
-			return Buffer.alloc(0);
+			setImmediate(() => {
+				try {
+					if (args.at(-1).includes("CreateNew")) { nativeWrite(options.env.GROK_SAVE_TEMP, "", { flag: "wx" }); }
+					else { fs.renameSync(options.env.GROK_SAVE_TEMP, options.env.GROK_SAVE_TARGET); }
+					callback(null, "", "");
+				} catch (error) { callback(error); }
+			});
+			return;
 		}
-		return nativeExec(command, args, options);
+		return nativeExecFile(command, args, options, callback);
 	};
 }
 
@@ -63,7 +70,7 @@ async function main() {
 	const legacy = Buffer.from([0x63, 0x61, 0x66, 0xe9]);
 	write("legacy.txt", legacy);
 	assert.equal(readText(root, "legacy.txt").ok, false);
-	assert.equal(writeText(root, "legacy.txt", "replacement", createHash("sha256").update(legacy).digest("hex")).ok, false);
+	assert.equal((await writeText(root, "legacy.txt", "replacement", createHash("sha256").update(legacy).digest("hex"))).ok, false);
 	assert.deepEqual(fs.readFileSync(path.join(root, "legacy.txt")), legacy);
 	write("editor.txt", "\ufeffcafé\r\n");
 	let loaded = readText(root, "editor.txt");
@@ -71,10 +78,13 @@ async function main() {
 	assert.equal(loaded.text, "\ufeffcafé\r\n");
 	assert.equal(typeof loaded.version, "string");
 	write("editor.txt", "agent changed it\n");
-	assert.equal(writeText(root, "editor.txt", "stale buffer", loaded.version).ok, false);
+	assert.equal((await writeText(root, "editor.txt", "stale buffer", loaded.version)).ok, false);
 	assert.equal(read("editor.txt"), "agent changed it\n");
 	loaded = readText(root, "editor.txt");
-	const saved = writeText(root, "editor.txt", "fresh save\n", loaded.version);
+	const pendingSave = writeText(root, "editor.txt", "fresh save\n", loaded.version);
+	assert.equal(typeof pendingSave.then, "function", "saving yields while native work is pending");
+	if (process.platform === "win32") { assert.equal(read("editor.txt"), "agent changed it\n", "the editor remains available before the async save completes"); }
+	const saved = await pendingSave;
 	assert.equal(saved.ok, true);
 	assert.equal(readText(root, "editor.txt").version, saved.version);
 	const originalWrite = fs.writeFileSync;
@@ -88,28 +98,28 @@ async function main() {
 			}
 			return originalWrite(file, text, options);
 		};
-		assert.equal(writeText(root, "editor.txt", "should not replace original", saved.version).ok, false);
+		assert.equal((await writeText(root, "editor.txt", "should not replace original", saved.version)).ok, false);
 	} finally {
 		fs.writeFileSync = originalWrite;
 	}
 	assert.equal(read("editor.txt"), prior, "a partial temporary write preserves original bytes");
 	assert.equal(fs.readdirSync(root).some((name) => name.includes(".grok-save-")), false);
 	if (process.platform === "win32") {
-		const simulatedExec = childProcess.execFileSync;
+		const simulatedExec = childProcess.execFile;
 		try {
-			childProcess.execFileSync = (command, args, options) => {
-				if (options?.env?.GROK_SAVE_TEMP) { throw Object.assign(new Error("Injected native staging failure"), { code: "EACCES" }); }
-				return simulatedExec(command, args, options);
+			childProcess.execFile = (command, args, options, callback) => {
+				if (options?.env?.GROK_SAVE_TEMP) { callback(Object.assign(new Error("Injected native staging failure"), { code: "EACCES" })); return; }
+				return simulatedExec(command, args, options, callback);
 			};
-			assert.equal(writeText(root, "editor.txt", "should not replace original", saved.version).ok, false);
+			assert.equal((await writeText(root, "editor.txt", "should not replace original", saved.version)).ok, false);
 		} finally {
-			childProcess.execFileSync = simulatedExec;
+			childProcess.execFile = simulatedExec;
 		}
 		assert.equal(read("editor.txt"), prior, "failed secure staging preserves original bytes");
 	}
 	try {
 		fs.renameSync = () => { throw Object.assign(new Error("Injected replacement failure"), { code: "EACCES" }); };
-		assert.equal(writeText(root, "editor.txt", "should not replace original", saved.version).ok, false);
+		assert.equal((await writeText(root, "editor.txt", "should not replace original", saved.version)).ok, false);
 	} finally {
 		fs.renameSync = originalRename;
 	}
@@ -121,17 +131,30 @@ async function main() {
 			if (typeof file === "number") { originalWrite(path.join(root, "editor.txt"), "new concurrent edit\n", "utf8"); }
 			return result;
 		};
-		assert.equal(writeText(root, "editor.txt", "should not replace concurrent edit", saved.version).ok, false);
+		assert.equal((await writeText(root, "editor.txt", "should not replace concurrent edit", saved.version)).ok, false);
 	} finally {
 		fs.writeFileSync = originalWrite;
 	}
 	assert.equal(read("editor.txt"), "new concurrent edit\n", "version is rechecked immediately before replacement");
 	assert.equal(fs.readdirSync(root).some((name) => name.includes(".grok-save-")), false);
-	assert.equal(writeText(root, "editor.txt", "missing version").ok, false);
+	assert.equal((await writeText(root, "editor.txt", "missing version")).ok, false);
 	fs.unlinkSync(path.join(root, "editor.txt"));
-	assert.equal(writeText(root, "editor.txt", "deleted stale buffer", saved.version).ok, false);
+	assert.equal((await writeText(root, "editor.txt", "deleted stale buffer", saved.version)).ok, false);
 	assert.equal(fs.existsSync(path.join(root, "editor.txt")), false);
 	console.log("PASS CR04/CR06: stale/missing saves and legacy encodings are rejected; UTF-8 save versions round-trip");
+
+	const depthRoot = path.join(root, "codex-depth");
+	const deepFolder = path.join(depthRoot, "one", "two", "three", "four", "five", "six", "seven");
+	fs.mkdirSync(deepFolder, { recursive: true });
+	fs.writeFileSync(path.join(deepFolder, "deep.txt"), "past the file tree limit\n");
+	fs.mkdirSync(path.join(depthRoot, "z"));
+	fs.writeFileSync(path.join(depthRoot, "z", "late.txt"), "after the deep folder\n");
+	const deepFiles = listFiles(depthRoot);
+	assert.equal(deepFiles.ok, true);
+	assert.equal(deepFiles.truncated, true, "a file below depth 6 triggers the left-out note");
+	assert.equal(deepFiles.files.includes("one/two/three/four/five/six/seven/deep.txt"), false);
+	assert.equal(deepFiles.files.includes("z/late.txt"), true, "folders after a too-deep one are still listed");
+	console.log("PASS R19: the file tree reports files omitted beyond its depth limit");
 
 	write("binary.bin", Buffer.from([0, 4, 5]));
 	git(["mv", "--", "old name.txt", "renamed name.txt"]);
@@ -171,7 +194,7 @@ async function main() {
 	} finally {
 		fs.readFileSync = originalRead;
 	}
-	const conflictRoot = path.join(root, "grokdesk-conflict");
+	const conflictRoot = path.join(root, "codex-conflict");
 	fs.mkdirSync(conflictRoot);
 	git(["init", "--quiet"], conflictRoot);
 	git(["config", "core.autocrlf", "false"], conflictRoot);
@@ -200,7 +223,7 @@ async function main() {
 	assert.ok(ordinary.hunks.some((hunk) => hunk.lines.some((line) => line.kind === "add" && line.text === "ordinary changed")), "mixed conflict output retains ordinary patch attribution");
 	console.log("PASS R2-03/R2-04/R2-05: failed saves preserve originals; conflicts and unreviewable contents are explicit");
 
-	const kindRoot = path.join(root, "grokdesk-kinds");
+	const kindRoot = path.join(root, "codex-kinds");
 	fs.mkdirSync(path.join(kindRoot, "mode b"), { recursive: true });
 	git(["init", "--quiet"], kindRoot);
 	git(["config", "core.autocrlf", "false"], kindRoot);
@@ -240,7 +263,7 @@ async function main() {
 	assert.equal(octal.files.find((file) => file.path === "a.txt").hunks.length, 2);
 	console.log("PASS 6.3/6.5: diff blocks keep their own paths (type change, C-quoted, octal, mode-only, configured prefixes); untracked names keep leading spaces");
 
-	const junctionRoot = path.join(root, "grokdesk-junction");
+	const junctionRoot = path.join(root, "codex-junction");
 	fs.mkdirSync(path.join(junctionRoot, "sub"), { recursive: true });
 	fs.mkdirSync(path.join(junctionRoot, "gone"));
 	git(["init", "--quiet"], junctionRoot);
@@ -253,8 +276,17 @@ async function main() {
 	assert.equal((await revertFile(junctionRoot, "gone/c.txt")).ok, true, "a file whose folder was deleted is still restorable");
 	assert.equal(fs.readFileSync(path.join(junctionRoot, "gone", "c.txt"), "utf8"), "restore me\n");
 	console.log("PASS 6.1: Revert still restores a tracked file whose folder was deleted");
+	const linkedRepo = path.join(root, "codex-linked-repo");
+	fs.symlinkSync(junctionRoot, linkedRepo, process.platform === "win32" ? "junction" : "dir");
+	fs.writeFileSync(path.join(junctionRoot, "sub", "a.txt"), "changed through the link\n");
+	const linkedChanges = await readDiff(linkedRepo);
+	assert.equal(linkedChanges.ok, true);
+	assert.ok(linkedChanges.files.some((file) => file.path === "sub/a.txt"), "a linked session folder shows its changed files");
+	assert.equal((await revertFile(linkedRepo, "sub/a.txt")).ok, true);
+	assert.equal(fs.readFileSync(path.join(junctionRoot, "sub", "a.txt"), "utf8"), "from HEAD\n", "Revert works through the session folder link");
+	console.log("PASS P4: linked session folders show changes and allow Revert within the repository");
 	if (process.platform === "win32") {
-		const outsideRoot = path.join(root, "grokdesk-outside");
+		const outsideRoot = path.join(root, "codex-outside");
 		fs.mkdirSync(outsideRoot);
 		fs.rmSync(path.join(junctionRoot, "sub"), { recursive: true });
 		fs.symlinkSync(outsideRoot, path.join(junctionRoot, "sub"), "junction");
@@ -270,10 +302,10 @@ async function main() {
 		const initialSddl = inspect("$security = [Security.AccessControl.FileSecurity]::new(); $security.SetAccessRuleProtection($true, $false); $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User; $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)); [IO.File]::SetAccessControl($env:GROK_TEST_FILE, $security); [IO.File]::GetAccessControl($env:GROK_TEST_FILE).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)");
 		const accessScript = "$acl = [IO.File]::GetAccessControl($env:GROK_TEST_FILE); $acl.AreAccessRulesProtected; foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) { [string]::Join(':', @($rule.IdentityReference.Value, [string][int]$rule.FileSystemRights, [string]$rule.AccessControlType, [string]$rule.IsInherited)) }";
 		const initialAccess = inspect(accessScript);
-		const simulatedExec = childProcess.execFileSync;
+		const simulatedExec = childProcess.execFile;
 		let checkedStage = false;
 		try {
-			childProcess.execFileSync = nativeExec;
+			childProcess.execFile = nativeExecFile;
 			fs.writeFileSync = (file, text, options) => {
 				if (typeof file === "number") {
 					const temporary = fs.readdirSync(root).find((name) => name.startsWith(".grok-save-"));
@@ -286,10 +318,10 @@ async function main() {
 				return nativeWrite(file, text, options);
 			};
 			const loadedAcl = readText(root, "acl-target.txt");
-			assert.equal(writeText(root, "acl-target.txt", "private replacement", loadedAcl.version).ok, true);
+			assert.equal((await writeText(root, "acl-target.txt", "private replacement", loadedAcl.version)).ok, true);
 		} finally {
 			fs.writeFileSync = nativeWrite;
-			childProcess.execFileSync = simulatedExec;
+			childProcess.execFile = simulatedExec;
 		}
 		assert.equal(checkedStage, true);
 		assert.equal(inspect("[IO.File]::GetAccessControl($env:GROK_TEST_FILE).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)"), initialSddl, "native replacement preserves the exact original security descriptor");
@@ -297,17 +329,17 @@ async function main() {
 		assert.equal(fs.readdirSync(root).some((name) => name.includes(".grok-save-")), false);
 		let checkedNativeVersion = false;
 		try {
-			childProcess.execFileSync = (command, args, options) => {
+			childProcess.execFile = (command, args, options, callback) => {
 				if (options?.env?.GROK_SAVE_VERSION) {
 					nativeWrite(aclFile, "late concurrent edit");
 					checkedNativeVersion = true;
 				}
-				return nativeExec(command, args, options);
+				return nativeExecFile(command, args, options, callback);
 			};
 			const loadedAcl = readText(root, "acl-target.txt");
-			assert.equal(writeText(root, "acl-target.txt", "must not replace late edit", loadedAcl.version).ok, false);
+			assert.equal((await writeText(root, "acl-target.txt", "must not replace late edit", loadedAcl.version)).ok, false);
 		} finally {
-			childProcess.execFileSync = simulatedExec;
+			childProcess.execFile = simulatedExec;
 		}
 		assert.equal(checkedNativeVersion, true);
 		assert.equal(read("acl-target.txt"), "late concurrent edit", "native child rechecks the version after its launch boundary");
@@ -316,8 +348,8 @@ async function main() {
 	}
 
 	if (process.argv.includes("--terminal")) {
-		const childFile = path.join(root, "grokdesk-timeout-child.cjs");
-		const marker = path.join(root, "grokdesk-survived.txt");
+		const childFile = path.join(root, "codex-timeout-child.cjs");
+		const marker = path.join(root, "codex-survived.txt");
 		fs.writeFileSync(childFile, `setTimeout(() => require("fs").writeFileSync(${JSON.stringify(marker)}, "survived"), 23000);`);
 		const escapePs = (text) => `'${text.replace(/'/g, "''")}'`;
 		const started = Date.now();
@@ -338,7 +370,8 @@ main().catch((error) => {
 	process.exitCode = 1;
 }).finally(() => {
 	childProcess.execFileSync = nativeExec;
+	childProcess.execFile = nativeExecFile;
 	assert.equal(path.dirname(root), tempBase);
-	assert.ok(path.basename(root).startsWith("grokdesk-files-"));
+	assert.ok(path.basename(root).startsWith("codex-files-"));
 	fs.rmSync(root, { recursive: true, force: true });
 });

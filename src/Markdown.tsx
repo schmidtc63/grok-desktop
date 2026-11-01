@@ -12,7 +12,7 @@ export interface MarkdownProps {
 	onRun?: (code: string) => void;
 }
 
-const SHELLS = new Set(["bash", "sh", "shell", "zsh", "powershell", "pwsh", "ps1", "ps", "cmd", "bat", "console"]);
+const SHELLS = new Set(["powershell", "pwsh", "ps1", "ps"]);
 
 export function isShell(lang: string | undefined) {
 	return SHELLS.has(String(lang || "").trim().split(/\s+/)[0].toLowerCase());

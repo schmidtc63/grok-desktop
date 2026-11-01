@@ -1,8 +1,8 @@
 // Context breakdown and recent spend, read from the files Grok keeps for each session under ~/.grok/sessions.
 // ponytail: these are Grok's internal files, not a documented interface; any change there makes both reads fail soft.
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
+const { grokHome } = require("./agent.cjs");
 
 // Measured on a Grok 1.0.70 session: 92k characters of stored context were 25.2k tokens.
 const CHARS_PER_TOKEN = 3.7;
@@ -10,7 +10,7 @@ const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
 function sessionsRoot() {
-	return path.join(os.homedir(), ".grok", "sessions");
+	return path.join(grokHome(), "sessions");
 }
 
 // Grok names each folder after the session's working directory, so the session is found by its id.
@@ -58,7 +58,7 @@ function contextBreakdown(agentSessionId, root = sessionsRoot()) {
 }
 
 // `[session] auto_compact_threshold_percent` in ~/.grok/config.toml, 85 when unset.
-function autoCompactPercent(file = path.join(os.homedir(), ".grok", "config.toml")) {
+function autoCompactPercent(file = path.join(grokHome(), "config.toml")) {
 	try {
 		const text = fs.readFileSync(file, "utf8");
 		const section = /^\[session\][^\S\n]*$([\s\S]*?)(?=^\[|(?![\s\S]))/m.exec(text);
