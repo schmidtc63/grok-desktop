@@ -220,6 +220,19 @@ ipcMain.handle("grok:stop-session", (_event, uiSessionId) => {
 	if (typeof uiSessionId === "string" && uiSessionId) { host.stopSession(uiSessionId); }
 });
 
+ipcMain.handle("grok:suggest-prompt", (_event, uiSessionId) => host.suggestPrompt(String(uiSessionId || "")));
+
+ipcMain.handle("grok:kill-task", (_event, uiSessionId, taskId) => host.killTask(String(uiSessionId || ""), String(taskId || "")));
+
+ipcMain.handle("grok:rewind", (_event, payload) => host.rewind(payload));
+
+ipcMain.handle("grok:fork", (_event, payload) => host.fork(payload));
+
+ipcMain.handle("grok:steer", (event, uiSessionId, text) => {
+	const id = String(uiSessionId || "");
+	return ownsTurn(event, id) ? host.steer(id, text) : { ok: false, error: "Grok has finished this turn." };
+});
+
 ipcMain.handle("grok:forget-session", (_event, uiSessionId) => {
 	if (typeof uiSessionId === "string" && uiSessionId) { host.forgetSession(uiSessionId); }
 });
@@ -451,7 +464,10 @@ ipcMain.handle("grok:open-image", (event, file) => {
 
 ipcMain.handle("grok:app-info", () => ({ ok: true, version: app.getVersion(), electron: process.versions.electron }));
 ipcMain.handle("grok:context-breakdown", (_event, agentSessionId) => usage.contextBreakdown(String(agentSessionId || "")));
+ipcMain.handle("grok:task-output", (_event, file) => usage.taskOutput(String(file || "")));
+ipcMain.handle("grok:subagent-transcript", (_event, id) => usage.subagentTranscript(String(id || "")));
 ipcMain.handle("grok:recent-spend", () => usage.recentSpend());
+ipcMain.handle("grok:readiness", () => customize.readiness());
 ipcMain.handle("grok:customize", (_event, cwd) => customize.inventory(cwd));
 ipcMain.handle("grok:customize-change", (_event, cwd, input) => customize.change(cwd, input));
 // Undefined until Grok first starts in this app; null after signing out.

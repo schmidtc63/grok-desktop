@@ -57,6 +57,7 @@
 .dp-wait { color: var(--muted); }
 .dp-skip { color: var(--faint); }
 .dp-stat { flex-shrink: 0; }
+.dp-commit { display: flex; gap: 8px; margin-bottom: 8px; }
 .dp-adds { color: var(--green); }
 .dp-dels { color: var(--red); }
 .dp-hunk {
@@ -152,6 +153,9 @@
 .dp-send { margin-left: auto; }
 
 /* Files pane: fp- prefix */
+.pane.fp-expanded { position: fixed; inset: 24px; z-index: 20; box-shadow: var(--shadow); }
+.pane.fp-expanded .fp-list { max-height: 20vh; }
+.fp-backdrop { position: fixed; inset: 0; z-index: 19; background: rgba(0, 0, 0, 0.45); }
 .fp-body { display: flex; flex-direction: column; gap: 8px; }
 .fp-body > .note, .fp-body > .meta { margin: 0; }
 .fp-name {
@@ -203,8 +207,10 @@
 .fp-row:hover { background: var(--hover); }
 .fp-row.on { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--text); }
 .fp-none { margin: 4px 8px; }
+.fp-preview { flex: 1; min-height: 0; overflow: auto; padding: 8px 12px; }
 .fp-editor {
 	display: flex;
+	flex-direction: column;
 	flex: 1;
 	min-height: 240px;
 	border: 1px solid var(--line);
@@ -213,35 +219,25 @@
 	overflow: hidden;
 }
 .fp-editor:focus-within { border-color: color-mix(in srgb, var(--accent) 60%, transparent); }
-/* Gutter and textarea share font, size, line-height and top padding so each number sits on its line. */
-.fp-gutter, .fp-text {
-	margin: 0;
-	font-family: Consolas, "Cascadia Mono", monospace;
-	font-size: 12px;
-	line-height: 19px;
-	padding-top: 10px;
-}
-.fp-gutter {
-	flex: none;
-	min-width: 44px;
-	padding: 10px 8px 40px;
-	text-align: right;
-	color: var(--faint);
-	background: #151412;
-	border-right: 1px solid var(--line);
-	user-select: none;
-	overflow: hidden;
-}
-.fp-text {
+.ce-wrap {
+	position: relative;
+	display: flex;
+	flex-direction: column;
 	flex: 1;
+	min-height: 0;
 	min-width: 0;
-	resize: none;
-	border: 0;
-	outline: none;
-	background: transparent;
-	color: var(--text);
-	padding: 10px;
-	white-space: pre;
-	overflow: auto;
-	tab-size: 4;
+}
+.ce-host { flex: 1; min-height: 0; min-width: 0; }
+.ce-host .cm-editor { height: 100%; }
+.ce-lang {
+	align-self: flex-end;
+	max-width: 200px;
+	margin: 4px 6px;
+	padding: 2px 6px;
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	background: var(--input);
+	color: var(--muted);
+	font: inherit;
+	font-size: 11px;
 }

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { askConfirm, type ConfirmAsk } from "./confirm";
 
 export type CustomizeView = "skills" | "connectors" | "plugins";
 
@@ -34,8 +35,9 @@ export function Customize({ view, folder, live, onRun }: {
 	useEffect(() => { void load(true); }, [folder]);
 	useEffect(() => { setFilter(""); }, [view]);
 
-	async function apply(input: GrokCustomizeChange, question = "") {
-		if (busy || (question && !window.confirm(question))) { return false; }
+	async function apply(input: GrokCustomizeChange, ask?: ConfirmAsk) {
+		if (busy) { return false; }
+		if (ask && !(await askConfirm(ask))) { return false; }
 		setBusy(true);
 		setNotice(null);
 		let result: { ok: boolean; error?: string; message?: string };
@@ -117,7 +119,7 @@ export function Customize({ view, folder, live, onRun }: {
 						<span className="cz-side">
 							{item.enabled && statusOf(item.name) && <span className="meta">{statusOf(item.name)}</span>}
 							<input type="checkbox" aria-label={`Use ${item.name}`} title={item.enabled ? "On" : "Off"} checked={item.enabled} disabled={busy} onChange={() => void apply({ action: item.enabled ? "mcp-disable" : "mcp-enable", name: item.name })} />
-							{item.removable && <button type="button" className="texty" disabled={busy} onClick={() => void apply({ action: "mcp-remove", name: item.name }, `Remove the MCP server ${item.name} from Grok's config?`)}>Remove</button>}
+							{item.removable && <button type="button" className="texty" disabled={busy} onClick={() => void apply({ action: "mcp-remove", name: item.name }, { title: `Remove the MCP server ${item.name} from Grok's config?`, ok: "Remove", danger: true })}>Remove</button>}
 						</span>
 					</div>
 				))}
@@ -169,7 +171,7 @@ export function Customize({ view, folder, live, onRun }: {
 					<span className="cz-side">
 						<input type="checkbox" aria-label={`Use ${item.name}`} checked={item.enabled} disabled={busy} onChange={() => void apply({ action: item.enabled ? "plugin-disable" : "plugin-enable", name: item.name })} />
 						<button type="button" className="texty" disabled={busy} onClick={() => void apply({ action: "plugin-update", name: item.name })}>Update</button>
-						<button type="button" className="texty" disabled={busy} onClick={() => void apply({ action: "plugin-uninstall", name: item.name }, `Uninstall ${item.name}?`)}>Uninstall</button>
+						<button type="button" className="texty" disabled={busy} onClick={() => void apply({ action: "plugin-uninstall", name: item.name }, { title: `Uninstall ${item.name}?`, ok: "Uninstall", danger: true })}>Uninstall</button>
 					</span>
 				</div>
 			))}
@@ -179,13 +181,13 @@ export function Customize({ view, folder, live, onRun }: {
 			{available.slice(0, BROWSE_LIMIT).map((item) => (
 				<div className="set-row" key={`${item.marketplace}|${item.name}`}>
 					<div><b>{item.name}</b><small className="cz-clamp">{[item.marketplace, item.description].filter(Boolean).join(" · ")}</small></div>
-					<span className="cz-side"><button type="button" className="texty" disabled={busy} onClick={() => void apply({ action: "plugin-install", source: item.name }, trustQuestion(item.name))}>Install</button></span>
+					<span className="cz-side"><button type="button" className="texty" disabled={busy} onClick={() => void apply({ action: "plugin-install", source: item.name }, { title: trustQuestion(item.name), ok: "Install", danger: false })}>Install</button></span>
 				</div>
 			))}
 			{available.length > BROWSE_LIMIT && <p className="note">{available.length - BROWSE_LIMIT} more. Filter to narrow the list.</p>}
 			<form className="set-inline cz-tools" onSubmit={(event) => {
 				event.preventDefault();
-				void apply({ action: "plugin-install", source: pluginSource }, trustQuestion(pluginSource.trim())).then((ok) => { if (ok) { setPluginSource(""); } });
+				void apply({ action: "plugin-install", source: pluginSource }, { title: trustQuestion(pluginSource.trim()), ok: "Install", danger: false }).then((ok) => { if (ok) { setPluginSource(""); } });
 			}}>
 				<input aria-label="Plugin source" placeholder="Install from owner/repo, a git URL or a folder" value={pluginSource} onChange={(event) => setPluginSource(event.target.value)} />
 				<button type="submit" className="texty" disabled={busy || !pluginSource.trim()}>Install</button>
@@ -194,7 +196,7 @@ export function Customize({ view, folder, live, onRun }: {
 			{(inventory.marketplaces ?? []).map((item) => (
 				<div className="set-row" key={item.name}>
 					<div><b>{item.name}</b><small>{item.source}</small></div>
-					<span className="cz-side"><button type="button" className="texty" disabled={busy} onClick={() => void apply({ action: "marketplace-remove", source: item.name }, `Remove the marketplace ${item.name}? Grok also uninstalls the plugins you installed from it.`)}>Remove</button></span>
+					<span className="cz-side"><button type="button" className="texty" disabled={busy} onClick={() => void apply({ action: "marketplace-remove", source: item.name }, { title: `Remove the marketplace ${item.name}? Grok also uninstalls the plugins you installed from it.`, ok: "Remove", danger: true })}>Remove</button></span>
 				</div>
 			))}
 			<form className="set-inline cz-tools" onSubmit={(event) => {

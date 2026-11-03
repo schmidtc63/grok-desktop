@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type MouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type MouseEvent, type SetStateAction } from "react";
 import { SHORTCUTS } from "./data";
 import { BrowserPane, type BrowserTab, type DevServer } from "./BrowserPane";
+import { askConfirm, setConfirmHost, type PendingConfirm } from "./confirm";
 import { DiffPane, type DiffComment, type PrInfo } from "./DiffPane";
 import { FilesPane } from "./FilesPane";
 import { PaneView, SideLog, type BackgroundTask, type EditorDraft, type FolderFiles, type OpenFile, type PaneModel } from "./Panes";
 import { SessionRail } from "./SessionRail";
+import { Setup } from "./Setup";
 import { DEFAULT_SETTINGS, readSettings, settingsKey, SettingsPage, type AppSettings, type SettingsTab } from "./Settings";
 import { Sidebar } from "./Sidebar";
 import { TerminalPane, type TerminalTab } from "./TerminalPane";
@@ -28,6 +30,8 @@ import {
 } from "./types";
 
 type Menu = string | null;
+type ConfirmItem = PendingConfirm & { id: number };
+type BackgroundWork = Record<string, { tasks: GrokBgTask[]; agents: GrokSubagent[] }>;
 
 const historyKey = "grok-code.history.v1";
 const commandsKey = "grok-code.commands.v1";
@@ -49,6 +53,9 @@ interface History {
 	prePlan: Record<string, PermissionMode>;
 	editorDrafts: Record<string, EditorDraft | undefined>;
 	composerDrafts?: Record<string, string>;
+	queued?: Record<string, Queued[]>;
+	attachments?: Record<string, string[]>;
+	backgroundWork?: BackgroundWork;
 	newSessionDraft?: { session: Session; useWorktree: boolean; text: string };
 	deleted: string[];
 }
@@ -76,7 +83,21 @@ function readHistory(): History | null {
 		if (!value.sessions.length && !newSessionDraft) { return null; }
 		const modes = Object.fromEntries(Object.entries(value.modes ?? {}).map(([id, mode]) => [id, mapMode(String(mode)) ?? "Always-approve"]));
 		const prePlan = Object.fromEntries(Object.entries(value.prePlan ?? {}).map(([id, mode]) => [id, mapMode(String(mode)) ?? "Normal"]).filter(([, mode]) => mode !== "Plan"));
-		return { sessions: value.sessions, extraChats: value.extraChats ?? {}, modes, prePlan, editorDrafts: value.editorDrafts ?? {}, composerDrafts: value.composerDrafts ?? {}, newSessionDraft, deleted: Array.isArray(value.deleted) ? value.deleted : [] };
+		const queued: Record<string, Queued[]> = {};
+		for (const [id, items] of Object.entries(value.queued ?? {})) {
+			if (!Array.isArray(items)) { continue; }
+			const valid = items.filter((item: Queued) => item && typeof item.id === "string" && typeof item.text === "string" && item.text.trim() && Array.isArray(item.attachments) && item.attachments.every((file) => typeof file === "string"));
+			if (valid.length) { queued[id] = valid; }
+		}
+		const attachments = Object.fromEntries(Object.entries(value.attachments ?? {}).filter(([, files]) => Array.isArray(files) && files.length && files.every((file) => typeof file === "string"))) as Record<string, string[]>;
+		const backgroundWork: BackgroundWork = {};
+		for (const [id, entry] of Object.entries(value.backgroundWork ?? {})) {
+			const work = entry as BackgroundWork[string] | null;
+			if (!work || !Array.isArray(work.tasks) || !Array.isArray(work.agents)) { continue; }
+			const valid = (item: GrokBgTask | GrokSubagent) => item && typeof item.id === "string" && typeof item.status === "string" && item.status !== "running";
+			backgroundWork[id] = { tasks: recentTasks(work.tasks.filter(valid)), agents: recentAgents(work.agents.filter(valid)) };
+		}
+		return { sessions: value.sessions, extraChats: value.extraChats ?? {}, modes, prePlan, editorDrafts: value.editorDrafts ?? {}, composerDrafts: value.composerDrafts ?? {}, queued, attachments, backgroundWork, newSessionDraft, deleted: Array.isArray(value.deleted) ? value.deleted : [] };
 	} catch {
 		return null;
 	}
@@ -93,24 +114,39 @@ function restoredChats(store: Record<string, ChatMessage[]>) {
 	}))]));
 }
 
+function sameRecords(previous: Record<string, unknown> | undefined, current: Record<string, unknown>) {
+	return previous === current || Object.keys({ ...previous, ...current }).every((id) => previous?.[id] === current[id]);
+}
+
+function recentTasks(tasks: GrokBgTask[]) {
+	return [...tasks.filter((task) => task.status === "running"), ...tasks.filter((task) => task.status !== "running").sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0)).slice(0, 20)];
+}
+
+function recentAgents(agents: GrokSubagent[]) {
+	return [...agents.filter((agent) => agent.status === "running"), ...agents.filter((agent) => agent.status !== "running").sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0)).slice(0, 20)];
+}
+
 function mergeChats(saved: Record<string, ChatMessage[]>, current: Record<string, ChatMessage[]>, previous: Record<string, ChatMessage[]>) {
 	const merged = { ...saved };
 	for (const [id, messages] of Object.entries(current)) {
 		if (messages === previous[id]) { continue; }
 		const old = new Map((previous[id] ?? []).map((message) => [message.id, message]));
+		const kept = new Set(messages.map((message) => message.id));
+		const removed = new Set([...old.keys()].filter((key) => !kept.has(key)));
 		const changed = new Map(messages.filter((message) => old.get(message.id) !== message).map((message) => [message.id, message]));
 		const savedMessages = saved[id] ?? [];
 		const savedIds = new Set(savedMessages.map((message) => message.id));
-		merged[id] = [...savedMessages.map((message) => changed.get(message.id) ?? message), ...messages.filter((message) => changed.has(message.id) && !savedIds.has(message.id))];
+		merged[id] = [...savedMessages.filter((message) => !removed.has(message.id)).map((message) => changed.get(message.id) ?? message), ...messages.filter((message) => changed.has(message.id) && !savedIds.has(message.id))];
 	}
 	return merged;
 }
 
 function slimChats(store: Record<string, ChatMessage[]>) {
 	const cut = (value: string | undefined, size: number) => (value && value.length > size ? `${value.slice(0, size)}…` : value);
-	return Object.fromEntries(Object.entries(store).map(([id, messages]) => [id, messages.map((message) => (message.tools
-		? { ...message, tools: message.tools.map((tool) => ({ ...tool, output: undefined, input: undefined, command: cut(tool.command, 2000), plan: cut(tool.plan, 20000) })) }
-		: message))]));
+	return Object.fromEntries(Object.entries(store).map(([id, messages]) => [id, messages.map((message) => {
+		const slim = message.thought && message.thought.length > 20000 ? { ...message, thought: cut(message.thought, 20000) } : message;
+		return slim.tools ? { ...slim, tools: slim.tools.map((tool) => ({ ...tool, output: undefined, input: undefined, command: cut(tool.command, 2000), plan: cut(tool.plan, 20000), diff: tool.diff && tool.diff.oldText.length + tool.diff.newText.length <= 8000 ? tool.diff : undefined })) } : slim;
+	})]));
 }
 
 function mergeDrafts(saved: History["editorDrafts"], current: History["editorDrafts"], previous: History["editorDrafts"]) {
@@ -162,6 +198,11 @@ function fileKey(session: Session, file: string) {
 
 function knownMode(mode: string | undefined, settings: AppSettings): PermissionMode {
 	return mapMode(mode) ?? mapMode(settings.defaultMode) ?? "Always-approve";
+}
+
+// The same grouping as permissionOf in electron/agent.cjs: a change between groups restarts Grok.
+function permissionGroup(mode: PermissionMode) {
+	return mode === "Always-approve" ? "yolo" : mode === "Auto-review" ? "auto" : "ask";
 }
 
 function folderKey(folder: string) {
@@ -232,9 +273,23 @@ export function App() {
 		...Object.fromEntries(Object.entries(history?.composerDrafts ?? {}).filter(([id, text]) => typeof text === "string" && sessions.some((item) => item.id === id))),
 		...(restoredForm && history?.newSessionDraft ? { [restoredForm.id]: history.newSessionDraft.text } : {}),
 	}));
-	const [attachments, setAttachments] = useState<Record<string, string[]>>({});
-	const [queued, setQueued] = useState<Record<string, Queued[]>>({});
-	const [held, setHeld] = useState<Record<string, boolean>>({});
+	const [attachments, setAttachmentsState] = useState<Record<string, string[]>>(() => Object.fromEntries(Object.entries(history?.attachments ?? {}).filter(([id]) => sessions.some((item) => item.id === id))));
+	const [queued, setQueuedState] = useState<Record<string, Queued[]>>(() => Object.fromEntries(Object.entries(history?.queued ?? {}).filter(([id]) => sessions.some((item) => item.id === id))));
+	const [held, setHeld] = useState<Record<string, boolean>>(() => Object.fromEntries(Object.keys(queued).map((id) => [id, true])));
+	const [grokTasks, setGrokTasks] = useState<Record<string, GrokBgTask[]>>(() => Object.fromEntries(Object.entries(history?.backgroundWork ?? {}).filter(([id]) => sessions.some((item) => item.id === (id.startsWith("side-") ? id.slice(5) : id))).map(([id, work]) => [id, work.tasks])));
+	const [subagents, setSubagents] = useState<Record<string, GrokSubagent[]>>(() => Object.fromEntries(Object.entries(history?.backgroundWork ?? {}).filter(([id]) => sessions.some((item) => item.id === (id.startsWith("side-") ? id.slice(5) : id))).map(([id, work]) => [id, work.agents])));
+	const backgroundWorkRef = useRef<BackgroundWork>(history?.backgroundWork ?? {});
+	const backgroundWork = useMemo(() => Object.fromEntries([...new Set([...Object.keys(grokTasks), ...Object.keys(subagents)])].map((id) => {
+		const previous = backgroundWorkRef.current[id];
+		const tasks = grokTasks[id] ?? [];
+		const agents = subagents[id] ?? [];
+		const sameTasks = previous && (previous.tasks === tasks || (!previous.tasks.length && !tasks.length));
+		const sameAgents = previous && (previous.agents === agents || (!previous.agents.length && !agents.length));
+		return [id, sameTasks && sameAgents ? previous : { tasks, agents }];
+	})), [grokTasks, subagents]);
+	backgroundWorkRef.current = backgroundWork;
+	const [suggestions, setSuggestions] = useState<Record<string, string>>({});
+	const suggestionGeneration = useRef<Record<string, number>>({});
 	const [popIndex, setPopIndex] = useState(0);
 	const popupList = useRef<HTMLDivElement>(null);
 	const [popClosed, setPopClosed] = useState("");
@@ -245,11 +300,27 @@ export function App() {
 	const sideSeen = useRef<Record<string, string>>({});
 	const [notice, setNotice] = useState("");
 	const [shortcuts, setShortcuts] = useState(false);
+	const [rewindAsk, setRewindAsk] = useState<{ sessionId: string; message: ChatMessage; files: string[]; conflicts: string[] } | null>(null);
+	const [branching, setBranching] = useState<string | null>(null);
 	const [settingsOpen, setSettingsOpen] = useState<SettingsTab | null>(null);
+	const [setup, setSetup] = useState<{ result?: GrokReadiness; open: boolean; checking: boolean }>({ open: false, checking: false });
+	const setupCheck = useRef(0);
+	const [confirms, setConfirms] = useState<ConfirmItem[]>([]);
+	const confirmQueue = useRef<ConfirmItem[]>([]);
+	const confirmIds = useRef(0);
+	const confirmReturn = useRef<HTMLElement | null>(null);
+	const confirmShown = useRef(false);
+	const answerRef = useRef<(yes: boolean) => void>(() => {});
 	const [renaming, setRenaming] = useState<string | null>(null);
-	const [extraChats, setExtraChats] = useState<Record<string, ChatMessage[]>>(() => restoredChats(history?.extraChats ?? {}));
+	const [extraChats, setChatState] = useState<Record<string, ChatMessage[]>>(() => restoredChats(history?.extraChats ?? {}));
+	const urgentSave = useRef(false);
+	const setExtraChats = useCallback((update: SetStateAction<Record<string, ChatMessage[]>>) => {
+		urgentSave.current = true;
+		setChatState(update);
+	}, []);
 	const [deleted, setDeleted] = useState<string[]>(history?.deleted ?? []);
 	const [views, setViews] = useState<Record<string, TranscriptView>>({});
+	const [findTick, setFindTick] = useState(0);
 	const [commands, setCommands] = useState<GrokCommand[]>(readCommands);
 	const [models, setModels] = useState<GrokModel[]>([]);
 	const [servers, setServers] = useState<GrokMcpServer[]>([]);
@@ -260,6 +331,7 @@ export function App() {
 	const [comments, setComments] = useState<Record<string, DiffComment[]>>({});
 	const [diffFile, setDiffFile] = useState("");
 	const [diffTick, setDiffTick] = useState(0);
+	const [remoteTick, setRemoteTick] = useState(0);
 	const [diffs, setDiffs] = useState<Record<string, DiffSnapshot | undefined>>({});
 	const [folderLists, setFolderLists] = useState<Record<string, FolderFiles | undefined>>({});
 	const [openFiles, setOpenFiles] = useState<Record<string, OpenFile | undefined>>({});
@@ -279,12 +351,14 @@ export function App() {
 	const [modes, setModes] = useState<Record<string, PermissionMode>>(history?.modes ?? {});
 	const [prePlan, setPrePlan] = useState<Record<string, PermissionMode>>(history?.prePlan ?? {});
 	const modesRef = useRef(modes);
+	const sentModes = useRef<Record<string, PermissionMode>>({});
 	const [busy, setBusy] = useState<Record<string, boolean>>({});
 	const [breakdown, setBreakdown] = useState<(ContextBreakdown & { id: string }) | null>(null);
 	const [recentUsd, setRecentUsd] = useState<number | null>(null);
 	const [account, setAccount] = useState<GrokAccount | null | undefined>(readAccount);
 	const [addingFolder, setAddingFolder] = useState(false);
 	const [windowWidth, setWindowWidth] = useState(() => window.innerWidth ?? 1400);
+	const sideCol = useRef<HTMLDivElement | null>(null);
 	const turnTargets = useRef<Record<string, TurnTarget>>({});
 	const sessionsRef = useRef(sessions);
 	const activeIdRef = useRef(activeId);
@@ -299,11 +373,13 @@ export function App() {
 	const settingsShown = useRef(false);
 	const editorDraftsRef = useRef(editorDrafts);
 	const queuedRef = useRef(queued);
+	const attachmentsRef = useRef(attachments);
 	const promptRef = useRef<HTMLTextAreaElement | null>(null);
 	const appVersion = useRef("");
 	sessionsRef.current = sessions;
-	overlayOpen.current = menu !== null || fileMenu !== null || shortcuts || settingsOpen !== null;
+	overlayOpen.current = menu !== null || fileMenu !== null || shortcuts || settingsOpen !== null || rewindAsk !== null || setup.open;
 	settingsShown.current = settingsOpen !== null;
+	confirmShown.current = confirms.length > 0;
 	pendingRef.current = pending;
 	draftsRef.current = drafts;
 	useWorktreeRef.current = useWorktree;
@@ -311,13 +387,66 @@ export function App() {
 	modesRef.current = modes;
 	editorDraftsRef.current = editorDrafts;
 	queuedRef.current = queued;
+	attachmentsRef.current = attachments;
 	const persistedDrafts = useRef(editorDrafts);
-	const lastSaved = useRef<History | null>(history ? { sessions, extraChats, modes, prePlan, editorDrafts, composerDrafts: drafts, newSessionDraft: history.newSessionDraft, deleted } : null);
+	const lastSaved = useRef<History | null>(history ? { sessions, extraChats, modes, prePlan, editorDrafts, composerDrafts: drafts, queued, attachments, backgroundWork, newSessionDraft: history.newSessionDraft, deleted } : null);
 	const saveHistory = useRef<() => boolean>(() => true);
 
+	function answerConfirm(yes: boolean, id = confirmQueue.current[0]?.id) {
+		const first = confirmQueue.current[0];
+		if (!first || first.id !== id) { return; }
+		const next = confirmQueue.current.slice(1);
+		confirmQueue.current = next;
+		confirmShown.current = next.length > 0;
+		setConfirms(next);
+		first.resolve(yes);
+	}
+	answerRef.current = answerConfirm;
+
+	useEffect(() => setConfirmHost((pending) => {
+		if (!confirmQueue.current.length && !confirmReturn.current) { confirmReturn.current = document.activeElement as HTMLElement | null; }
+		const next = [...confirmQueue.current, { ...pending, id: ++confirmIds.current }];
+		confirmQueue.current = next;
+		confirmShown.current = true;
+		setConfirms(next);
+	}), []);
+
+	useEffect(() => {
+		if (confirms.length) { return; }
+		const target = confirmReturn.current;
+		confirmReturn.current = null;
+		if (target && document.contains?.(target)) { target.focus?.(); }
+	}, [confirms.length]);
+
+	function setQueued(update: SetStateAction<Record<string, Queued[]>>) {
+		queuedRef.current = typeof update === "function" ? update(queuedRef.current) : update;
+		setQueuedState(queuedRef.current);
+	}
+
+	function setAttachments(update: SetStateAction<Record<string, string[]>>) {
+		attachmentsRef.current = typeof update === "function" ? update(attachmentsRef.current) : update;
+		setAttachmentsState(attachmentsRef.current);
+	}
+
 	function changeSettings(patch: Partial<AppSettings>) {
+		settingsRef.current = { ...settingsRef.current, ...patch };
+		if (patch.promptSuggestions === false) { clearSuggestions(); }
 		setSettings((current) => ({ ...current, ...patch }));
 	}
+
+	function invalidateSuggestion(id: string) {
+		suggestionGeneration.current[id] = (suggestionGeneration.current[id] ?? 0) + 1;
+		setSuggestions((current) => (current[id] ? { ...current, [id]: "" } : current));
+	}
+
+	function clearSuggestions() {
+		for (const id of Object.keys(suggestionGeneration.current)) { suggestionGeneration.current[id] += 1; }
+		setSuggestions({});
+	}
+
+	useEffect(() => {
+		if (!settings.promptSuggestions) { clearSuggestions(); }
+	}, [settings.promptSuggestions]);
 
 	function changeMode(id: string, next: PermissionMode) {
 		const previous = knownMode(modesRef.current[id], settingsRef.current);
@@ -326,8 +455,63 @@ export function App() {
 		setModes(modesRef.current);
 	}
 
+	function restartStops(next: PermissionMode) {
+		const sent = sentModes.current[session.id];
+		if (!sent || permissionGroup(sent) === permissionGroup(next)) { return 0; }
+		return (grokTasks[session.id] ?? []).filter((task) => task.status === "running").length + (subagents[session.id] ?? []).filter((agent) => agent.status === "running").length;
+	}
+
+	function checkSetup(open = true) {
+		const api = window.grokCode;
+		if (!api?.readiness) { return; }
+		const check = ++setupCheck.current;
+		setSetup((current) => ({ ...current, open: open || current.open, checking: true }));
+		void api.readiness().then((result) => {
+			if (check !== setupCheck.current) { return; }
+			setSetup((current) => ({ result, open: current.open || !result.grok.ok || !result.grok.signedIn, checking: false }));
+		}).catch(() => {
+			if (check !== setupCheck.current) { return; }
+			setSetup((current) => ({ ...current, checking: false }));
+			setNotice("Setup could not be checked. Try again.");
+		});
+	}
+
+	useEffect(() => { checkSetup(false); }, []);
+
 	useEffect(() => {
-		const reload = (event: StorageEvent) => { if (event.key === settingsKey) { setSettings(readSettings()); } };
+		const reload = (event: StorageEvent) => {
+			if (event.key === settingsKey) { setSettings(readSettings()); }
+			if (event.key === historyKey) {
+				const saved = readHistory();
+				const manual = new Map((saved?.sessions ?? []).filter((item) => item.titleAuto === false).map((item) => [item.id, item.title]));
+				const previous = new Map((lastSaved.current?.sessions ?? []).map((item) => [item.id, item.title]));
+				const changed = (item: Session) => manual.has(item.id) && (item.titleAuto === true || item.title === previous.get(item.id)) && (item.titleAuto !== false || item.title !== manual.get(item.id));
+				setSessions((current) => current.some(changed)
+					? current.map((item) => changed(item) ? { ...item, title: manual.get(item.id)!, titleAuto: false } : item)
+					: current);
+				const last = lastSaved.current;
+				if (!last) { return; }
+				const savedQueue = saved?.queued ?? {};
+				const mine = queuedRef.current;
+				const adopt = [...new Set([...Object.keys(mine), ...Object.keys(savedQueue)])].filter((id) => mine[id] === last.queued?.[id] && JSON.stringify(mine[id] ?? []) !== JSON.stringify(savedQueue[id] ?? []));
+				if (adopt.length) {
+					const next = { ...mine };
+					for (const id of adopt) { if (savedQueue[id]) { next[id] = savedQueue[id]; } else { delete next[id]; } }
+					lastSaved.current = { ...lastSaved.current!, queued: { ...last.queued, ...Object.fromEntries(adopt.map((id) => [id, next[id]])) } };
+					setQueued(next);
+					setHeld((current) => ({ ...current, ...Object.fromEntries(adopt.filter((id) => next[id]).map((id) => [id, true])) }));
+				}
+				const savedAttachments = saved?.attachments ?? {};
+				const staged = attachmentsRef.current;
+				const take = [...new Set([...Object.keys(staged), ...Object.keys(savedAttachments)])].filter((id) => staged[id] === last.attachments?.[id] && JSON.stringify(staged[id] ?? []) !== JSON.stringify(savedAttachments[id] ?? []));
+				if (take.length) {
+					const next = { ...staged };
+					for (const id of take) { if (savedAttachments[id]) { next[id] = savedAttachments[id]; } else { delete next[id]; } }
+					lastSaved.current = { ...lastSaved.current!, attachments: { ...last.attachments, ...Object.fromEntries(take.map((id) => [id, next[id]])) } };
+					setAttachments(next);
+				}
+			}
+		};
 		window.addEventListener("storage", reload);
 		return () => window.removeEventListener("storage", reload);
 	}, []);
@@ -352,8 +536,8 @@ export function App() {
 			const saved = saveHistory.current();
 			const current = editorDraftsRef.current;
 			const unsavedMessage = !saved && Object.entries(draftsRef.current).some(([id, text]) => text && (pendingRef.current?.id === id || sessionsRef.current.some((item) => item.id === id)));
-			// The queue is never saved, so a close or reload would drop a queued message.
-			if (unsavedMessage || (current !== persistedDrafts.current && Object.values(current).some((draft) => draft && (draft.text !== draft.baseText || draft.recoveryTexts?.length))) || Object.values(queuedRef.current).some((items) => items.length)) {
+			// Saved queued messages and attachments need a warning only when the save fails.
+			if (unsavedMessage || (current !== persistedDrafts.current && Object.values(current).some((draft) => draft && (draft.text !== draft.baseText || draft.recoveryTexts?.length))) || (!saved && (Object.values(queuedRef.current).some((items) => items.length) || Object.values(attachmentsRef.current).some((files) => files.length)))) {
 				event.preventDefault();
 				event.returnValue = false;
 			}
@@ -366,10 +550,13 @@ export function App() {
 	saveHistory.current = () => {
 		const last = lastSaved.current;
 		const currentDrafts = draftsRef.current;
+		const currentQueue = queuedRef.current;
+		const currentAttachments = attachmentsRef.current;
+		const currentWork = backgroundWorkRef.current;
 		const form = pendingRef.current;
 		const newSessionDraft = form && currentDrafts[form.id] ? { session: form, useWorktree: useWorktreeRef.current, text: currentDrafts[form.id] } : undefined;
 		const sameForm = last?.newSessionDraft?.session === newSessionDraft?.session && last?.newSessionDraft?.useWorktree === newSessionDraft?.useWorktree && last?.newSessionDraft?.text === newSessionDraft?.text;
-		if (last && last.sessions === sessions && last.extraChats === extraChats && last.modes === modes && last.prePlan === prePlan && last.editorDrafts === editorDrafts && last.composerDrafts === currentDrafts && sameForm && last.deleted === deleted) { return true; }
+		if (last && last.sessions === sessions && last.extraChats === extraChats && last.modes === modes && last.prePlan === prePlan && last.editorDrafts === editorDrafts && last.composerDrafts === currentDrafts && sameRecords(last.queued, currentQueue) && sameRecords(last.attachments, currentAttachments) && sameRecords(last.backgroundWork, currentWork) && sameForm && last.deleted === deleted) { return true; }
 		try {
 			const saved = readHistory();
 			const previous = saved ? last : null;
@@ -379,7 +566,8 @@ export function App() {
 			const savedIds = new Set(currentSessions.keys());
 			for (const item of sessions) {
 				const old = oldSessions.get(item.id);
-				const changes = Object.fromEntries(Object.entries(item).filter(([key, value]) => value !== old?.[key as keyof Session]));
+				const remote = currentSessions.get(item.id);
+				const changes = Object.fromEntries(Object.entries(item).filter(([key, value]) => value !== old?.[key as keyof Session] && !(item.titleAuto === true && remote?.titleAuto === false && (key === "title" || key === "titleAuto"))));
 				currentSessions.set(item.id, currentSessions.has(item.id) ? { ...currentSessions.get(item.id), ...changes } as Session : item);
 			}
 			const order = [...sessions.filter((item) => !savedIds.has(item.id)).map((item) => item.id), ...savedIds].filter((id) => !gone.has(id) && id !== newSessionDraft?.session.id);
@@ -391,6 +579,26 @@ export function App() {
 				if (text) { composerDrafts[id] = text; } else { delete composerDrafts[id]; }
 			}
 			for (const id of Object.keys(composerDrafts)) { if (!order.includes(id)) { delete composerDrafts[id]; } }
+			const queue = { ...saved?.queued };
+			for (const [id, items] of Object.entries(currentQueue)) {
+				if (items === previous?.queued?.[id]) { continue; }
+				if (items.length) { queue[id] = items; } else { delete queue[id]; }
+			}
+			const staged = { ...saved?.attachments };
+			for (const [id, files] of Object.entries(currentAttachments)) {
+				if (files === previous?.attachments?.[id]) { continue; }
+				if (files.length) { staged[id] = files; } else { delete staged[id]; }
+			}
+			const work = { ...saved?.backgroundWork };
+			for (const [id, entry] of Object.entries(currentWork)) {
+				if (entry === previous?.backgroundWork?.[id]) { continue; }
+				const tasks = entry.tasks.filter((task) => task.status !== "running");
+				const agents = entry.agents.filter((agent) => agent.status !== "running").map((agent) => agent.output ? { ...agent, output: agent.output.slice(0, 2000) } : agent);
+				if (tasks.length || agents.length) { work[id] = { tasks, agents }; } else { delete work[id]; }
+			}
+			for (const id of Object.keys(queue)) { if (!order.includes(id)) { delete queue[id]; } }
+			for (const id of Object.keys(staged)) { if (!order.includes(id)) { delete staged[id]; } }
+			for (const id of Object.keys(work)) { if (!order.includes(id.startsWith("side-") ? id.slice(5) : id)) { delete work[id]; } }
 			localStorage.setItem(historyKey, JSON.stringify({
 				sessions: order.map((id) => currentSessions.get(id)),
 				extraChats: chats,
@@ -398,11 +606,14 @@ export function App() {
 				prePlan: { ...saved?.prePlan, ...Object.fromEntries(Object.entries(prePlan).filter(([id, value]) => value !== previous?.prePlan[id])) },
 				editorDrafts: keptDrafts(mergeDrafts(saved?.editorDrafts ?? {}, editorDrafts, previous?.editorDrafts ?? {}), gone),
 				composerDrafts,
+				queued: queue,
+				attachments: staged,
+				backgroundWork: work,
 				newSessionDraft,
 				deleted: [...gone].slice(-500),
 			}));
 			persistedDrafts.current = editorDrafts;
-			lastSaved.current = { sessions, extraChats, modes, prePlan, editorDrafts, composerDrafts: currentDrafts, newSessionDraft, deleted };
+			lastSaved.current = { sessions, extraChats, modes, prePlan, editorDrafts, composerDrafts: currentDrafts, queued: currentQueue, attachments: currentAttachments, backgroundWork: currentWork, newSessionDraft, deleted };
 			setNotice((current) => (current === HISTORY_FULL || current === HISTORY_FAILED ? "" : current));
 			return true;
 		} catch (error) {
@@ -411,10 +622,21 @@ export function App() {
 		}
 	};
 
-	useEffect(() => {
+	const streamSave = useRef<ReturnType<typeof setTimeout> | null>(null);
+	function saveNow() {
+		if (streamSave.current) { clearTimeout(streamSave.current); streamSave.current = null; }
 		if (!navigator.locks) { setNotice("Chat history could not be saved on this computer."); return; }
 		void navigator.locks.request(historyKey, () => saveHistory.current()).catch(() => setNotice("Chat history could not be saved on this computer."));
-	}, [sessions, extraChats, modes, prePlan, editorDrafts, deleted, pending, useWorktree]);
+	}
+	useEffect(() => {
+		saveNow();
+	}, [sessions, modes, prePlan, editorDrafts, queued, attachments, grokTasks, subagents, deleted, pending, useWorktree]);
+	useEffect(() => {
+		const urgent = urgentSave.current;
+		urgentSave.current = false;
+		if (urgent || !Object.keys(turnTargets.current).length) { saveNow(); return; }
+		if (!streamSave.current) { streamSave.current = setTimeout(saveNow, 2000); }
+	}, [extraChats, busy]);
 
 	useEffect(() => {
 		const timer = setTimeout(() => {
@@ -424,7 +646,7 @@ export function App() {
 		return () => clearTimeout(timer);
 	}, [drafts]);
 
-	const writeReply = useCallback((uiSessionId: string, recipe: (message: ChatMessage) => ChatMessage) => {
+	const writeReply = useCallback((uiSessionId: string, recipe: (message: ChatMessage) => ChatMessage, streamed = false) => {
 		const target = turnTargets.current[uiSessionId];
 		if (!target) { return; }
 		const apply = (current: Record<string, ChatMessage[]>) => {
@@ -435,7 +657,7 @@ export function App() {
 			copy[index] = recipe(copy[index]);
 			return { ...current, [target.sessionId]: copy };
 		};
-		if (target.where === "side") { setSideChats(apply); } else { setExtraChats(apply); }
+		if (target.where === "side") { setSideChats(apply); } else if (streamed) { setChatState(apply); } else { setExtraChats(apply); }
 	}, []);
 
 	function notify(kind: "permission" | "question" | "done", sessionId: string, body: string) {
@@ -489,6 +711,36 @@ export function App() {
 				setDevTabs((current) => Object.fromEntries(Object.entries(current).filter(([, tabId]) => tabId !== id)));
 				return;
 			}
+			if (event.type === "bg-tasks" && event.uiSessionId) {
+				const id = event.uiSessionId;
+				const incoming = event.tasks ?? [];
+				const now = Date.now();
+				setGrokTasks((current) => {
+					const tasks = new Map((current[id] ?? []).map((task) => [task.id, task.status === "running" && !incoming.some((item) => item.id === task.id) ? { ...task, status: "cancelled", endedAt: now } : task]));
+					for (const task of incoming) { tasks.set(task.id, task); }
+					return { ...current, [id]: recentTasks([...tasks.values()]) };
+				});
+				if (event.reset) { setSubagents((current) => ({ ...current, [id]: recentAgents((current[id] ?? []).map((agent) => agent.status === "running" ? { ...agent, status: "cancelled", endedAt: now } : agent)) })); }
+				return;
+			}
+			if (event.type === "subagent" && event.uiSessionId && event.subagent) {
+				const id = event.uiSessionId;
+				const incoming = event.subagent;
+				setSubagents((current) => {
+					const list = current[id] ?? [];
+					const previous = list.find((item) => item.id === incoming.id);
+					const merged = { ...previous, ...incoming, label: incoming.label || previous?.label || "Subagent", agentType: incoming.agentType || previous?.agentType || "", model: incoming.model || previous?.model || "", childSessionId: incoming.childSessionId || previous?.childSessionId, output: incoming.output || previous?.output, durationMs: incoming.durationMs ?? previous?.durationMs, tokensUsed: incoming.tokensUsed ?? previous?.tokensUsed, toolCalls: incoming.toolCalls ?? previous?.toolCalls, endedAt: incoming.status === "running" ? incoming.endedAt : incoming.endedAt ?? previous?.endedAt ?? Date.now() };
+					return { ...current, [id]: recentAgents([merged, ...list.filter((item) => item.id !== incoming.id)]) };
+				});
+				return;
+			}
+			if (event.type === "title" && event.uiSessionId && event.title) {
+				const id = event.uiSessionId;
+				const title = event.title;
+				const manual = readHistory()?.sessions.find((item) => item.id === id && item.titleAuto === false);
+				setSessions((current) => current.map((item) => (item.id === id && item.titleAuto === true ? manual ? { ...item, title: manual.title, titleAuto: false } : item.title !== title ? { ...item, title } : item : item)));
+				return;
+			}
 			const uiId = event.uiSessionId;
 			const target = uiId ? turnTargets.current[uiId] : undefined;
 			if (!uiId || !target || event.turnId !== target.turnId) { return; }
@@ -519,6 +771,7 @@ export function App() {
 				setBusy((current) => ({ ...current, [uiId]: false }));
 				setNotice((current) => (current === SIDE_BUSY ? "" : current));
 				setDiffTick((value) => value + 1);
+				setRemoteTick((value) => value + 1);
 				setFileTick((value) => value + 1);
 				if (target.where === "main") {
 					const away = sessionId !== activeIdRef.current;
@@ -527,6 +780,9 @@ export function App() {
 				}
 			}
 			writeReply(uiId, (message) => {
+				if (event.type === "steer" && event.text) {
+					return { ...message, pending: false, parts: [...(message.parts ?? []), { kind: "steer", text: event.text }] };
+				}
 				if (event.type === "chunk" && event.text) {
 					const base = message.pending ? "" : message.text;
 					const parts = [...(message.parts ?? [])];
@@ -567,31 +823,45 @@ export function App() {
 				if (event.type === "done") {
 					const stoppedTurn = event.stopReason === "cancelled";
 					if (message.pending && !message.text) {
-						return { ...message, pending: false, streaming: false, text: stoppedTurn ? "Stopped." : "No reply." };
+						return { ...message, at: Date.now(), pending: false, streaming: false, text: stoppedTurn ? "Stopped." : "No reply." };
 					}
-					return { ...message, pending: false, streaming: false };
+					return { ...message, at: Date.now(), pending: false, streaming: false };
 				}
 				if (event.type === "error" && event.message) {
 					const prefix = message.text ? `${message.text}\n` : "";
-					return { ...message, pending: false, streaming: false, text: `${prefix}${event.message}`, parts: [...(message.parts ?? []), { kind: "text", text: `${message.text ? "\n" : ""}${event.message}` }] };
+					return { ...message, at: Date.now(), pending: false, streaming: false, text: `${prefix}${event.message}`, parts: [...(message.parts ?? []), { kind: "text", text: `${message.text ? "\n" : ""}${event.message}` }] };
 				}
 				return message;
-			});
-			if (event.type === "done" || event.type === "error") { delete turnTargets.current[uiId]; }
+			}, event.type === "chunk" || event.type === "thought");
+			if (event.type === "done" || event.type === "error") {
+				delete turnTargets.current[uiId];
+				if (target.where === "main" && event.type === "done" && event.stopReason !== "cancelled" && settingsRef.current.promptSuggestions) {
+					const generation = suggestionGeneration.current[sessionId] ?? 0;
+					suggestionGeneration.current[sessionId] = generation;
+					void api.suggestPrompt?.(sessionId).then((text) => {
+						if (text && settingsRef.current.promptSuggestions && suggestionGeneration.current[sessionId] === generation && !draftsRef.current[sessionId] && !turnTargets.current[sessionId] && sessionsRef.current.some((item) => item.id === sessionId)) {
+							setSuggestions((current) => ({ ...current, [sessionId]: text }));
+						}
+					}).catch(() => {});
+				}
+			}
 		});
 	}, [writeReply]);
 
 	const visible = pending ?? sessions.find((item) => item.id === activeId) ?? sessions.find((item) => !item.archived) ?? sessions[0];
 	const session = visible;
+	useEffect(() => { setRewindAsk(null); }, [session.id]);
 	// The session on screen, which is the first one before any is picked; a new-session page is none.
 	activeIdRef.current = pending ? "" : session.id;
 	const mode = knownMode(modes[session.id] ?? settings.defaultMode, settings);
-	const view = views[session.id] ?? "normal";
+	const view = views[session.id] ?? settings.defaultView;
 	const prompt = drafts[session.id] ?? "";
 	const setPrompt = (next: string | ((current: string) => string)) => {
 		const sessionId = session.id;
 		const current = draftsRef.current;
-		draftsRef.current = { ...current, [sessionId]: typeof next === "function" ? next(current[sessionId] ?? "") : next };
+		const value = typeof next === "function" ? next(current[sessionId] ?? "") : next;
+		if (value !== (current[sessionId] ?? "")) { invalidateSuggestion(sessionId); }
+		draftsRef.current = { ...current, [sessionId]: value };
 		setDrafts(draftsRef.current);
 	};
 	const messages = extraChats[session.id] ?? [];
@@ -626,17 +896,33 @@ export function App() {
 			if (!cancel) { setDiffs((current) => ({ ...current, [id]: { ok: false, error: "The diff could not be read." } })); }
 		});
 		void api.branchInfo?.(folder).then((result) => { if (!cancel) { setBranches((current) => ({ ...current, [id]: result })); } }).catch(() => {});
-		void api.prStatus?.(folder).then((result) => { if (!cancel) { setPrs((current) => ({ ...current, [id]: result })); } }).catch(() => {});
-		if (diffOpen) {
-			void api.listCommits?.(folder).then((result) => { if (!cancel && result.ok) { setCommits((current) => ({ ...current, [id]: result.commits ?? [] })); } }).catch(() => {});
-		}
 		return () => { cancel = true; };
 	}, [diffOpen, railShown, session.id, session.folder, diffTick, scope]);
 
 	useEffect(() => {
-		const resize = () => setWindowWidth(window.innerWidth);
+		if (!diffOpen && !railShown) { return; }
+		const id = session.id;
+		const folder = session.folder;
+		const api = window.grokCode;
+		let cancel = false;
+		void api?.prStatus?.(folder).then((result) => { if (!cancel) { setPrs((current) => ({ ...current, [id]: result })); } }).catch(() => {});
+		if (diffOpen) {
+			void api?.listCommits?.(folder).then((result) => { if (!cancel && result.ok) { setCommits((current) => ({ ...current, [id]: result.commits ?? [] })); } }).catch(() => {});
+		}
+		return () => { cancel = true; };
+	}, [diffOpen, railShown, session.id, session.folder, remoteTick]);
+
+	useEffect(() => {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const resize = () => {
+			clearTimeout(timer);
+			timer = setTimeout(() => setWindowWidth(window.innerWidth), 100);
+		};
 		window.addEventListener("resize", resize);
-		return () => window.removeEventListener("resize", resize);
+		return () => {
+			clearTimeout(timer);
+			window.removeEventListener("resize", resize);
+		};
 	}, []);
 
 	useEffect(() => {
@@ -650,13 +936,13 @@ export function App() {
 	function createPr() {
 		const api = window.grokCode;
 		if (!api?.prCreate) { return Promise.resolve({ ok: false, error: "Reopen this window to create a pull request." }); }
-		return api.prCreate(session.folder, branches[session.id]?.branch).then((result) => { setDiffTick((value) => value + 1); return result; });
+		return api.prCreate(session.folder, branches[session.id]?.branch).then((result) => { setDiffTick((value) => value + 1); setRemoteTick((value) => value + 1); return result; });
 	}
 
 	function mergeWhenReady() {
 		const api = window.grokCode;
 		if (!api?.prMergeWhenReady) { return Promise.resolve({ ok: false, error: "Reopen this window to merge." }); }
-		return api.prMergeWhenReady(session.folder, prs[session.id]?.pr?.number ?? 0).then((result) => { setDiffTick((value) => value + 1); return result; });
+		return api.prMergeWhenReady(session.folder, prs[session.id]?.pr?.number ?? 0).then((result) => { setDiffTick((value) => value + 1); setRemoteTick((value) => value + 1); return result; });
 	}
 
 	const popup = useMemo(() => {
@@ -710,6 +996,10 @@ export function App() {
 		const [id, folder, file] = JSON.parse(key) as string[];
 		return id === session.id && folder === session.folder ? [file] : [];
 	});
+	const draftKey = dirtyDraftFiles.join("\n");
+	const listed = folderFiles?.files;
+	const knownFiles = useMemo(() => (listed && draftKey ? [...new Set([...listed, ...dirtyDraftFiles])] : listed), [listed, draftKey]);
+	const paneFiles = folderFiles && knownFiles ? { ...folderFiles, files: knownFiles } : undefined;
 
 	useEffect(() => {
 		const id = session.id;
@@ -728,7 +1018,11 @@ export function App() {
 				return;
 			}
 			const files = result.files ?? [];
-			setFolderLists((current) => ({ ...current, [id]: { status: "ready", files, truncated: result.truncated } }));
+			setFolderLists((current) => {
+				const previous = current[id]?.files;
+				const same = !!previous && previous.length === files.length && previous.every((file, index) => file === files[index]);
+				return { ...current, [id]: { status: "ready", files: same ? previous : files, truncated: result.truncated } };
+			});
 			setEditorFile((current) => {
 				const draft = editorDraftsRef.current[fileKey(session, current)];
 				return files.includes(current) || (draft && draft.text !== draft.baseText) ? current : files[0] ?? "";
@@ -789,7 +1083,7 @@ export function App() {
 		for (const item of sessions) {
 			if (item.archived || item.pinned || busy[item.id] || (item.lastActivityAt ?? Date.now()) >= cutoff || autoArchiving.current.has(item.id)) { continue; }
 			const api = window.grokCode;
-			if (!item.worktreeFolder || !api?.removeWorktree) {
+			if (!item.worktreeFolder || !api?.removeWorktree || sharesFolder(item)) {
 				updateSession(item.id, { archived: true });
 				continue;
 			}
@@ -857,12 +1151,17 @@ export function App() {
 		void window.grokCode?.cancel(uiId);
 	}
 
+	function sharesFolder(item: Session) {
+		return sessionsRef.current.some((other) => other.id !== item.id && !other.archived && folderKey(other.folder) === folderKey(item.folder));
+	}
+
 	keyActions.current = {
 		newSession: () => createSession(),
 		next: () => stepSession(1),
 		previous: () => stepSession(-1),
 		stop: () => { if (busy[session.id]) { stop(session.id); } },
-		cycleView: () => setViews((current) => ({ ...current, [session.id]: VIEWS[(VIEWS.indexOf(current[session.id] ?? "normal") + 1) % VIEWS.length] })),
+		cycleView: () => setViews((current) => ({ ...current, [session.id]: VIEWS[(VIEWS.indexOf(current[session.id] ?? settingsRef.current.defaultView) + 1) % VIEWS.length] })),
+		find: () => setFindTick((value) => value + 1),
 		side: () => setSideOpen((value) => !value),
 		terminal: () => togglePane("terminal"),
 		diff: () => togglePane("diff"),
@@ -873,6 +1172,13 @@ export function App() {
 
 	useEffect(() => {
 		function onKey(event: KeyboardEvent) {
+			// An open confirm owns the keyboard: Escape cancels it without acting underneath it.
+			if (confirmShown.current) {
+				if (event.key === "Escape") { event.preventDefault(); answerRef.current(false); }
+				return;
+			}
+			// The Files editor handled this key; the app's shortcut must not run too.
+			if (event.defaultPrevented && (event.target as Element | null)?.closest?.(".cm-editor")) { return; }
 			const run = (name: string) => { event.preventDefault(); keyActions.current[name]?.(); };
 			const key = event.key.toLowerCase();
 			if (event.key === "Escape") {
@@ -884,7 +1190,9 @@ export function App() {
 					setMenu(null);
 					setFileMenu(null);
 					setShortcuts(false);
+					setRewindAsk(null);
 					setSettingsOpen(null);
+					setSetup((current) => ({ ...current, open: false }));
 				} else {
 					keyActions.current.stop?.();
 				}
@@ -895,6 +1203,15 @@ export function App() {
 				const item = items[Number(event.key) - 1];
 				if (item) { event.preventDefault(); item.click(); }
 				return;
+			}
+			if (/^[1-9]$/.test(event.key) && !event.ctrlKey && !event.altKey && !event.metaKey && !overlayOpen.current) {
+				const target = event.target as HTMLElement | null;
+				const typing = !(target === promptRef.current && !promptRef.current?.value) && !!target?.closest?.("input, textarea, select, [contenteditable='true']");
+				const own = typing ? null : target?.closest?.(".tool-question:has(.tool-choices)");
+				const blocks = Array.from(document.querySelectorAll(".chat .tool-question:has(.tool-choices)"));
+				const block = typing ? null : own ?? blocks.find((item) => !item.querySelector(".tool-choices .on, .tool-other.on")) ?? blocks[0];
+				const choice = block?.querySelectorAll<HTMLButtonElement>(".tool-choices button:not(:disabled)")[Number(event.key) - 1];
+				if (choice) { event.preventDefault(); choice.click(); return; }
 			}
 			if (!event.ctrlKey) { return; }
 			// Settings covers the sessions, so its shortcuts must not change them unseen.
@@ -913,6 +1230,7 @@ export function App() {
 				if (event.key === "1") { run("newSession"); }
 				return;
 			}
+			if (key === "f") { run("find"); return; }
 			if (key === "n") { run("newSession"); return; }
 			if (key === "o") { run("cycleView"); return; }
 			if (key === "/") { event.preventDefault(); setShortcuts(true); return; }
@@ -981,7 +1299,8 @@ export function App() {
 			setNotice("SSH and Cloud execution are not available. Choose Local before sending.");
 			return false;
 		}
-		if (turnTargets.current[uiId]) {
+		if (!side) { invalidateSuggestion(sessionId); }
+		if (turnTargets.current[uiId] || (!side && branching === sessionId)) {
 			if (side) {
 				setNotice(SIDE_BUSY);
 				return false;
@@ -995,22 +1314,22 @@ export function App() {
 			setHeld((list) => ({ ...list, [sessionId]: false }));
 			if (!modes[sessionId]) { changeMode(sessionId, chosenMode); }
 		}
-		if (!side && target.title === "New session") {
+		if (!side && target.title === "New session" && target.titleAuto !== false) {
 			const title = body.replace(/\s+/g, " ").slice(0, 48);
-			setSessions((list) => list.map((item) => (item.id === sessionId && item.title === "New session" ? { ...item, title, detail: "Live", when: "now" } : item)));
+			setSessions((list) => list.map((item) => (item.id === sessionId && item.title === "New session" ? { ...item, title, titleAuto: true, detail: "Live", when: "now" } : item)));
 		}
 		const stamp = Date.now();
 		const replyId = `${side ? "side-grok" : "grok"}-${stamp}`;
 		const turnId = crypto.randomUUID();
 		turnTargets.current[uiId] = { sessionId, replyId, turnId, where: side ? "side" : "main" };
-		const userMessage: ChatMessage = { id: `${side ? "side-user" : "user"}-${stamp}`, role: "user", text: body, live: true, ...(files.length ? { attachments: files } : {}) };
+		const userMessage: ChatMessage = { id: `${side ? "side-user" : "user"}-${stamp}`, role: "user", text: body, at: stamp, live: true, ...(files.length ? { attachments: files } : {}) };
 		const replyMessage: ChatMessage = { id: replyId, role: "grok", text: "", pending: true, streaming: true, live: true };
 		const store = side ? setSideChats : setExtraChats;
 		store((list) => ({ ...list, [sessionId]: [...(list[sessionId] ?? []), userMessage, replyMessage] }));
 		if (!side) { setSessions((list) => list.map((item) => (item.id === sessionId ? { ...item, lastActivityAt: stamp, completed: false } : item))); }
 		const api = window.grokCode;
 		if (!api) {
-			writeReply(uiId, (message) => ({ ...message, pending: false, streaming: false, text: "Open this window from the desktop app to talk to Grok." }));
+			writeReply(uiId, (message) => ({ ...message, at: Date.now(), pending: false, streaming: false, text: "Open this window from the desktop app to talk to Grok." }));
 			delete turnTargets.current[uiId];
 			return true;
 		}
@@ -1033,11 +1352,16 @@ export function App() {
 			allowedFolders: target.allowedFolders ?? [],
 			...(files.length ? { attachments: files } : {}),
 		}).then((result) => {
+			if (!side && result.ok) { sentModes.current[sessionId] = chosenMode; }
 			if (result.agentSessionId) {
 				const agentId = result.agentSessionId;
 				// A reply that lands after Choose a folder must not bring the old folder's side conversation back.
 				const now = sessionsRef.current.find((item) => item.id === sessionId) ?? (pendingRef.current?.id === sessionId ? pendingRef.current : undefined);
 				if (side) { if (now?.folder === folder) { setSideAgents((list) => ({ ...list, [sessionId]: agentId })); } } else { setSessions((list) => list.map((item) => (item.id === sessionId && item.folder === folder ? { ...item, agentSessionId: agentId } : item))); }
+			}
+			if (!side && result.ok && result.agentSessionId && Number.isInteger(result.promptIndex)) {
+				const point = { agentSessionId: result.agentSessionId, index: result.promptIndex as number };
+				setExtraChats((list) => ({ ...list, [sessionId]: (list[sessionId] ?? []).map((message) => (message.id === userMessage.id ? { ...message, point } : message)) }));
 			}
 			if (result.lostSession && side) {
 				setSideAgents((list) => Object.fromEntries(Object.entries(list).filter(([id]) => id !== sessionId)));
@@ -1047,11 +1371,11 @@ export function App() {
 			}
 			if (result.ok) { return; }
 			setBusy((list) => ({ ...list, [uiId]: false }));
-			writeReply(uiId, (message) => ({ ...message, pending: false, streaming: false, text: `${message.text ? `${message.text}\n` : ""}${result.error || "Grok could not start."}` }));
+			writeReply(uiId, (message) => ({ ...message, at: Date.now(), pending: false, streaming: false, text: `${message.text ? `${message.text}\n` : ""}${result.error || "Grok could not start."}` }));
 			if (turnTargets.current[uiId]?.turnId === turnId) { delete turnTargets.current[uiId]; }
 		}).catch(() => {
 			setBusy((list) => ({ ...list, [uiId]: false }));
-			writeReply(uiId, (message) => ({ ...message, pending: false, streaming: false, text: message.text || "Grok could not start." }));
+			writeReply(uiId, (message) => ({ ...message, at: Date.now(), pending: false, streaming: false, text: message.text || "Grok could not start." }));
 			if (turnTargets.current[uiId]?.turnId === turnId) { delete turnTargets.current[uiId]; }
 		});
 		return true;
@@ -1059,11 +1383,11 @@ export function App() {
 
 	useEffect(() => {
 		for (const [sessionId, items] of Object.entries(queued)) {
-			if (!items.length || held[sessionId] || busy[sessionId] || turnTargets.current[sessionId]) { continue; }
+			if (!items.length || queuedRef.current[sessionId] !== items || held[sessionId] || busy[sessionId] || turnTargets.current[sessionId] || branching === sessionId) { continue; }
 			setQueued((current) => ({ ...current, [sessionId]: (current[sessionId] ?? []).filter((item) => item.id !== items[0].id) }));
 			send(items[0].text, false, sessionId, items[0].attachments);
 		}
-	}, [queued, held, busy]);
+	}, [queued, held, busy, branching]);
 
 	function sendNow(sessionId: string, itemId: string) {
 		setQueued((current) => {
@@ -1073,6 +1397,102 @@ export function App() {
 		});
 		setHeld((current) => ({ ...current, [sessionId]: false }));
 		if (turnTargets.current[sessionId]) { void window.grokCode?.cancel(sessionId); }
+	}
+
+	function editQueued(item: Queued) {
+		const latest = queuedRef.current[session.id]?.find((entry) => entry.id === item.id);
+		if (!latest) { return; }
+		setQueued((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((entry) => entry.id !== latest.id) }));
+		setPrompt((current) => (current.trim() ? `${current}\n\n${latest.text}` : latest.text));
+		if (latest.attachments.length) { setAttachments((current) => ({ ...current, [session.id]: [...new Set([...(current[session.id] ?? []), ...latest.attachments])] })); }
+		promptRef.current?.focus?.();
+	}
+
+	async function steerQueued(item: Queued) {
+		const api = window.grokCode;
+		const sessionId = session.id;
+		if (!api?.steer || !turnTargets.current[sessionId] || item.attachments.length) { return; }
+		const at = (queuedRef.current[sessionId] ?? []).findIndex((entry) => entry.id === item.id);
+		if (at < 0) { return; }
+		setQueued((current) => ({ ...current, [sessionId]: (current[sessionId] ?? []).filter((entry) => entry.id !== item.id) }));
+		const result = await api.steer(sessionId, item.text);
+		if (!result.ok) {
+			setQueued((current) => {
+				const items = [...(current[sessionId] ?? [])];
+				items.splice(Math.min(at, items.length), 0, item);
+				return { ...current, [sessionId]: items };
+			});
+			setNotice(`${result.error || "Grok did not take the message."} It stays queued.`);
+		}
+	}
+
+	function branchRequest(message: ChatMessage): GrokBranchRequest {
+		const current = settingsRef.current;
+		return { uiSessionId: session.id, cwd: session.folder, model: session.model ?? current.model, effort: session.effort ?? current.effort, mode: knownMode(modes[session.id] ?? current.defaultMode, current), agentSessionId: message.point!.agentSessionId, index: message.point!.index, text: message.text };
+	}
+
+	async function startRewind(message: ChatMessage) {
+		const api = window.grokCode;
+		const sessionId = session.id;
+		if (!api?.rewind || !message.point || busy[sessionId] || branching) { return; }
+		setBranching(sessionId);
+		const preview = await api.rewind({ ...branchRequest(message), rewindMode: "all", force: false }).finally(() => setBranching(null));
+		if (activeIdRef.current !== sessionId) { return; }
+		if (!preview.ok || (preview.error && !preview.conflicts?.length)) { setNotice(preview.error || "Grok could not rewind."); return; }
+		setRewindAsk({ sessionId, message, files: [...(preview.cleanFiles ?? []), ...(preview.conflicts ?? [])], conflicts: preview.conflicts ?? [] });
+	}
+
+	async function finishRewind(rewindMode: "all" | "conversation_only" | "files_only") {
+		const ask = rewindAsk;
+		const api = window.grokCode;
+		setRewindAsk(null);
+		if (!ask || !api?.rewind || branching) { return; }
+		if (ask.sessionId !== session.id || ask.message.point?.agentSessionId !== session.agentSessionId) { setNotice("This session changed since you opened the dialog, so nothing was rewound."); return; }
+		if (busy[ask.sessionId]) { setNotice("Grok started answering, so nothing was rewound. Rewind again when it finishes."); return; }
+		setBranching(ask.sessionId);
+		const result = await api.rewind({ ...branchRequest(ask.message), rewindMode, force: true, seen: ask.conflicts }).finally(() => setBranching(null));
+		setDiffTick((value) => value + 1);
+		setFileTick((value) => value + 1);
+		if (!result.ok || !result.done) {
+			const partial = result.revertedFiles?.length ?? 0;
+			setNotice(`${result.error || "Grok did not rewind."}${partial ? ` ${partial} file${partial === 1 ? " was" : "s were"} restored before it stopped.` : ""}`);
+			return;
+		}
+		if (rewindMode !== "files_only") {
+			setExtraChats((list) => {
+				const messages = list[ask.sessionId] ?? [];
+				const at = messages.findIndex((item) => item.id === ask.message.id);
+				return at < 0 ? list : { ...list, [ask.sessionId]: messages.slice(0, at) };
+			});
+			const text = ask.message.text;
+			setPrompt((current) => (current.trim() ? `${current}\n\n${text}` : text));
+			const files = ask.message.attachments ?? [];
+			if (files.length) { setAttachments((current) => ({ ...current, [ask.sessionId]: [...new Set([...(current[ask.sessionId] ?? []), ...files])] })); }
+		}
+		invalidateSuggestion(ask.sessionId);
+		const count = result.revertedFiles?.length ?? 0;
+		setNotice(rewindMode === "conversation_only" ? "Rewound the conversation. Files were left as they are." : `Rewound${rewindMode === "files_only" ? " the files" : ""}. ${count} file${count === 1 ? "" : "s"} restored.`);
+	}
+
+	async function forkAt(message: ChatMessage) {
+		const api = window.grokCode;
+		const source = session;
+		const point = message.point;
+		if (!api?.fork || !point || busy[source.id] || branching) { return; }
+		setBranching(source.id);
+		const result = await api.fork(branchRequest(message)).finally(() => setBranching(null));
+		if (!result.ok || !result.agentSessionId) { setNotice(result.error || "Grok could not fork this session."); return; }
+		const agentSessionId = result.agentSessionId;
+		const messages = extraChats[source.id] ?? [];
+		const at = messages.findIndex((item) => item.id === message.id);
+		const next = messages.findIndex((item, index) => index > at && item.role === "user");
+		const copied = (next < 0 ? messages : messages.slice(0, next)).map((item) => (!item.point ? item : item.point.agentSessionId === point.agentSessionId ? { ...item, point: { ...item.point, agentSessionId } } : { ...item, point: undefined }));
+		const forked: Session = { ...newSession({ folder: source.folder, project: source.project, branch: source.branch, worktree: source.worktree, environment: source.environment }), title: `${source.title} (fork)`, titleAuto: false, detail: "Fork", agentSessionId, model: source.model, effort: source.effort, allowedFolders: source.allowedFolders, worktreeFolder: source.worktreeFolder };
+		setSessions((current) => [forked, ...current]);
+		setExtraChats((list) => ({ ...list, [forked.id]: copied }));
+		if (modes[source.id]) { changeMode(forked.id, modes[source.id]); }
+		if (prePlan[source.id]) { setPrePlan((current) => ({ ...current, [forked.id]: prePlan[source.id] })); }
+		selectSession(forked.id);
 	}
 
 	async function commitPending(): Promise<Session | null> {
@@ -1134,7 +1554,8 @@ export function App() {
 				...(percent != null ? [`Context ${percent}% · $${(session.costUsd ?? 0).toFixed(2)}`] : []),
 			];
 			const stamp = crypto.randomUUID();
-			setExtraChats((current) => ({ ...current, [sessionId]: [...(current[sessionId] ?? []), { id: `user-${stamp}`, role: "user", text, live: true }, { id: `grok-${stamp}`, role: "grok", text: lines.join("\n"), live: true }] }));
+			const at = Date.now();
+			setExtraChats((current) => ({ ...current, [sessionId]: [...(current[sessionId] ?? []), { id: `user-${stamp}`, role: "user", text, at, live: true }, { id: `grok-${stamp}`, role: "grok", text: lines.join("\n"), at, live: true }] }));
 			setNotice(lines.join(" · "));
 			setPrompt("");
 			return;
@@ -1206,8 +1627,11 @@ export function App() {
 	function signOut() {
 		const api = window.grokCode;
 		if (!api?.signOut) { return; }
-		if (!window.confirm("Sign out of Grok on this computer? Grok in a terminal signs out too. Grok's background commands will stop.")) { return; }
-		void api.signOut().then((result) => setNotice(result.ok ? "Signed out. Grok asks you to sign in when you next send a message." : result.error || "Grok could not sign out."));
+		const request = api.signOut;
+		void askConfirm({ title: "Sign out of Grok?", body: "This signs Grok out on this computer, in a terminal too. Grok's background commands will stop.", ok: "Sign out", danger: true }).then((yes) => {
+			if (!yes) { return; }
+			void request().then((result) => setNotice(result.ok ? "Signed out. Grok asks you to sign in when you next send a message." : result.error || "Grok could not sign out."));
+		});
 	}
 
 	function openUrl(url: string, external: boolean) {
@@ -1242,9 +1666,13 @@ export function App() {
 		}
 		const external = event.ctrlKey || event.metaKey;
 		if (!settingsRef.current.linkAsked && !external) {
-			const inside = window.confirm("Open chat links in the Browser pane? Choose Cancel to open them in your default browser. You can change this in Settings.");
-			changeSettings({ linkAsked: true, linksInBuiltIn: inside });
-			settingsRef.current = { ...settingsRef.current, linkAsked: true, linksInBuiltIn: inside };
+			const href = url.toString();
+			void askConfirm({ title: "Where should chat links open?", body: "You can change this in Settings.", ok: "Browser pane", cancel: "Default browser" }).then((inside) => {
+				changeSettings({ linkAsked: true, linksInBuiltIn: inside });
+				settingsRef.current = { ...settingsRef.current, linkAsked: true, linksInBuiltIn: inside };
+				openUrl(href, external);
+			});
+			return;
 		}
 		openUrl(url.toString(), external);
 	}
@@ -1311,9 +1739,23 @@ export function App() {
 	const todos = latestTool(messages, (tool) => tool.todos) ?? [];
 	const planText = latestTool(messages, (tool) => (tool.plan ? tool.plan : undefined)) ?? "";
 	const sessionTerminals = terminals[session.id] ?? [];
+	const grokRows = (uiId: string, where: string): BackgroundTask[] => {
+		const prefix = where ? `${where} · ` : "";
+		const word = (status: string) => ({ running: "Running", completed: "Finished", failed: "Failed", cancelled: "Cancelled" } as Record<string, string>)[status] ?? status;
+		const agents: BackgroundTask[] = (subagents[uiId] ?? []).map((item) => ({ id: `agent-${uiId}-${item.id}`, label: item.label, detail: `${prefix}${["Subagent", item.agentType, item.model, word(item.status)].filter(Boolean).join(" · ")}`, running: item.status === "running", info: { kind: "agent", subagent: item } }));
+		const tasks = grokTasks[uiId] ?? [];
+		const finished = tasks.filter((task) => task.status !== "running").sort((a, b) => b.endedAt - a.endedAt).slice(0, 20);
+		const commands: BackgroundTask[] = [...tasks.filter((task) => task.status === "running"), ...finished].map((task) => ({ id: `task-${uiId}-${task.id}`, label: task.label, detail: `${prefix}${task.kind === "monitor" ? "Monitor" : "Command"} · ${word(task.status)}${task.exitCode !== null && task.status !== "running" ? ` · exit ${task.exitCode}` : ""}`, running: task.status === "running", tooltip: task.command,
+			info: { kind: "command", command: task.command, outputFile: task.outputFile || "", exitCode: task.exitCode, startedAt: task.startedAt, endedAt: task.endedAt, status: task.status },
+			onStop: task.status === "running" ? () => { void window.grokCode?.killTask?.(uiId, task.id).then((result) => { if (!result.ok) { setNotice(result.error || "Grok could not stop that command."); } }).catch(() => setNotice("Grok could not stop that command.")); } : undefined,
+		}));
+		return [...agents.filter((row) => row.running), ...commands.filter((row) => row.running), ...agents.filter((row) => !row.running), ...commands.filter((row) => !row.running)];
+	};
 	const backgroundTasks: BackgroundTask[] = [
-		...(busy[session.id] ? [{ id: "turn", label: "Grok is working", detail: session.title, running: true, onStop: () => stop(session.id) }] : []),
+		...(busy[session.id] ? [{ id: "turn", label: "Grok is working", detail: "Replying in this session", running: true, onStop: () => stop(session.id) }] : []),
 		...(busy[sideId] ? [{ id: "side", label: "Side chat", detail: "Answering a side question", running: true, onStop: () => stop(sideId) }] : []),
+		...grokRows(session.id, ""),
+		...grokRows(sideId, "Side chat"),
 		...(queued[session.id] ?? []).map((item) => ({ id: item.id, label: "Queued message", detail: item.text, running: false })),
 		...sessionTerminals.map((tab) => ({ id: tab.id, label: tab.title, detail: tab.cwd, running: tab.running, onStop: () => stopTerminal(tab.id), onOpen: () => { setActiveTerminal((current) => ({ ...current, [session.id]: tab.id })); showPane("terminal"); } })),
 	];
@@ -1323,9 +1765,12 @@ export function App() {
 			session,
 			messages: list,
 			view,
+			findTick,
 			todos,
 			plan: planText,
 			tasks: backgroundTasks,
+			taskOutput: (file) => window.grokCode?.taskOutput?.(file) ?? Promise.resolve({ ok: false, error: "Reopen this window to read task output." }),
+			subagentTranscript: (id) => window.grokCode?.subagentTranscript?.(id) ?? Promise.resolve({ ok: false, error: "Reopen this window to read task output." }),
 			busy: !!busy[uiId],
 			decide: (toolId, decision) => {
 				writeReply(uiId, (message) => ({ ...message, tools: message.tools?.map((tool) => (tool.id === toolId ? { ...tool, waiting: false, detail: decision === "deny" ? "Denied" : "Allowed" } : tool)) }));
@@ -1341,11 +1786,18 @@ export function App() {
 				const next = choice.outcome === "approved" || choice.outcome === "abandoned" ? (choice.mode ?? (resume === "Plan" ? "Normal" : resume)) : undefined;
 				if (next && uiId === session.id) { setModes((current) => ({ ...current, [session.id]: next })); }
 			}),
-			folderFiles: folderFiles ? { ...folderFiles, files: [...new Set([...folderFiles.files, ...dirtyDraftFiles])] } : undefined,
+			folderFiles: paneFiles,
 			openFile,
 			fileMenu: (file, event) => setFileMenu({ file, x: event.clientX, y: event.clientY }),
 			openLink,
 			copyText: (text) => copyText(text),
+			quote: (text) => {
+				const quoted = text.trim().split("\n").map((line) => `> ${line}`).join("\n");
+				setPrompt((current) => `${current}${current && !current.endsWith("\n") ? "\n\n" : ""}${quoted}\n\n`);
+				promptRef.current?.focus?.();
+			},
+			rewind: (message) => { void startRewind(message); },
+			fork: (message) => { void forkAt(message); },
 			openImage,
 			runInTerminal: (code) => { void runInTerminal(code); },
 			closePane: (id) => closePane(id),
@@ -1463,6 +1915,10 @@ export function App() {
 		setSessions((current) => current.map((item) => (item.id === id ? { ...item, ...patch } : item)));
 	}
 
+	function renameSession(id: string, title: string) {
+		if (sessionsRef.current.find((item) => item.id === id)?.title !== title) { updateSession(id, { title, titleAuto: false }); }
+	}
+
 	const usage = session.usage;
 	// The context split and the week's spend are read from Grok's files when a turn ends or the session changes.
 	const agentId = session.agentSessionId ?? "";
@@ -1479,6 +1935,7 @@ export function App() {
 	const queue = queued[session.id] ?? [];
 	const files = attachments[session.id] ?? [];
 	const isBusy = !!busy[session.id];
+	const suggestion = settings.promptSuggestions && !prompt && !isBusy && !pending ? suggestions[session.id] ?? "" : "";
 	const sendLabel = isBusy && !prompt.trim() ? "Stop" : "Send";
 	const recentFolders = [...new Map(sessions.map((item) => [folderKey(item.folder), item.folder])).values()].slice(0, 8);
 	const browserList = browserTabs[session.id] ?? [];
@@ -1500,7 +1957,7 @@ export function App() {
 					commits={commits[session.id] ?? []}
 					selectedFile={diffFile}
 					onSelectFile={setDiffFile}
-					onRefresh={() => setDiffTick((value) => value + 1)}
+					onRefresh={() => { setDiffTick((value) => value + 1); setRemoteTick((value) => value + 1); }}
 					onRevert={(file) => {
 						const api = window.grokCode;
 						if (!api?.revertFile) { return Promise.resolve({ ok: false, error: "Reopen this window to restore this file." }); }
@@ -1517,6 +1974,7 @@ export function App() {
 						const text = `Comments on the diff:\n\n${diffComments.map((item) => `- ${item.file}:${item.line}${item.side === "old" ? " (old side, before the change)" : ""} — ${item.text}`).join("\n")}`;
 						if (send(text, false)) { setComments((current) => ({ ...current, [session.id]: [] })); }
 					}}
+					onAskGrok={(text) => { if (send(text, false)) { setNotice("Asked Grok to commit."); } }}
 					branch={branch?.ok && branch.repo !== false && branch.branch ? { branch: branch.branch, base: branch.base ?? "main", ahead: branch.ahead ?? 0 } : undefined}
 					pr={prInfo?.ok ? (prInfo.pr as PrInfo | null) : prInfo ? null : undefined}
 					prError={prInfo && !prInfo.ok ? prInfo.error : undefined}
@@ -1530,9 +1988,12 @@ export function App() {
 		} else if (id === "editor") {
 			body = (
 				<FilesPane
+					docKey={editorKey}
+					fileTypes={settings.editorFileTypes}
 					files={modelForPanes.folderFiles}
 					file={editorFile}
 					onSelectFile={(file) => openFile(file)}
+					onLink={openLink}
 					line={editorLine.line}
 					lineTick={editorLine.tick}
 					open={editorOpen}
@@ -1617,10 +2078,15 @@ export function App() {
 		event.preventDefault();
 		const startX = event.clientX;
 		const startWidth = settings.sideWidth;
-		const move = (moveEvent: globalThis.MouseEvent) => changeSettings({ sideWidth: Math.min(Math.max(startWidth - (moveEvent.clientX - startX), 320), Math.max(360, window.innerWidth - 640)) });
+		let width = startWidth;
+		const move = (moveEvent: globalThis.MouseEvent) => {
+			width = Math.min(Math.max(startWidth - (moveEvent.clientX - startX), 320), Math.max(360, window.innerWidth - 640));
+			if (sideCol.current) { sideCol.current.style.width = `${width}px`; }
+		};
 		const up = () => {
 			window.removeEventListener("mousemove", move);
 			window.removeEventListener("mouseup", up);
+			if (width !== startWidth) { changeSettings({ sideWidth: width }); }
 		};
 		window.addEventListener("mousemove", move);
 		window.addEventListener("mouseup", up);
@@ -1644,11 +2110,11 @@ export function App() {
 					onPin={(id) => setSessions((current) => current.map((item) => (item.id === id ? { ...item, pinned: !item.pinned } : item)))}
 					onArchive={(id) => {
 						const target = sessions.find((item) => item.id === id);
-						if (target && !target.archived && target.worktreeFolder && window.grokCode?.removeWorktree) {
+						if (target && !target.archived && target.worktreeFolder && window.grokCode?.removeWorktree && !sharesFolder(target)) {
 							setHeld((current) => ({ ...current, [id]: true }));
-							void window.grokCode.removeWorktree(target.folder, target.worktreeFolder, { force: false }).then((result) => {
+							void window.grokCode.removeWorktree(target.folder, target.worktreeFolder, { force: false }).then(async (result) => {
 								if (result.ok) { updateSession(id, { archived: true, pinned: false }); return; }
-								if (result.dirty && window.confirm(result.ignored?.length ? `This worktree has files git ignores that removal would delete: ${result.ignored.join(", ")}. Archive anyway? The worktree stays on disk.` : "This session's worktree has uncommitted changes. Archive anyway? The worktree stays on disk.")) { updateSession(id, { archived: true, pinned: false }); return; }
+								if (result.dirty && await askConfirm({ title: "Archive this session?", body: result.ignored?.length ? `This worktree has files git ignores that removal would delete: ${result.ignored.join(", ")}. The worktree stays on disk.` : "This session's worktree has uncommitted changes. The worktree stays on disk.", ok: "Archive anyway", danger: true })) { updateSession(id, { archived: true, pinned: false }); return; }
 								if (result.dirty === false) { updateSession(id, { archived: true, pinned: false }); setNotice(`Archived, but the worktree folder could not be removed: ${result.error || "unknown error"}. Close any terminal open in it and delete the folder.`); return; }
 								if (!result.dirty) { updateSession(id, { archived: true, pinned: false }); setNotice(`Archived. The worktree could not be checked, so it stays on disk: ${result.error || "unknown error"}`); }
 							});
@@ -1665,7 +2131,7 @@ export function App() {
 						// Unarchive counts as activity, so automatic archiving does not archive it again at the next launch.
 						setSessions((current) => current.map((item) => (item.id === id ? { ...item, archived: !item.archived, pinned: false, ...(item.archived ? { lastActivityAt: Date.now() } : {}) } : item)));
 					}}
-					onRename={(id, title) => updateSession(id, { title })}
+					onRename={renameSession}
 					onDelete={(id) => {
 						void window.grokCode?.stopSession?.(id);
 						setDeleted((current) => [...current, id]);
@@ -1678,6 +2144,8 @@ export function App() {
 						setExtraChats((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id)));
 						// A queue that Stop held would stay unsent forever and make every close warn about it.
 						setQueued((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id)));
+						setGrokTasks((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id && key !== `side-${id}`)));
+						setSubagents((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id && key !== `side-${id}`)));
 					}}
 					onMarkUnread={(id, unread) => updateSession(id, { unread })}
 					onMarkCompleted={(id, completed) => updateSession(id, { completed })}
@@ -1703,7 +2171,7 @@ export function App() {
 								aria-label="Session title"
 								autoFocus
 								defaultValue={session.title}
-								onBlur={(event) => { const title = event.target.value.trim(); if (title && !pending) { updateSession(session.id, { title }); } setRenaming(null); }}
+								onBlur={(event) => { const title = event.target.value.trim(); if (title && !pending) { renameSession(session.id, title); } setRenaming(null); }}
 								onKeyDown={(event) => {
 									if (event.key === "Enter") { (event.target as HTMLInputElement).blur(); }
 									if (event.key === "Escape") { event.stopPropagation(); setRenaming(null); }
@@ -1818,10 +2286,13 @@ export function App() {
 							<div className="composer">
 								{queue.length > 0 && (
 									<div className="queue">
+										{held[session.id] && <p className="note">Held until you press Send now or send a new message.</p>}
 										{queue.map((item) => (
 											<div className="queued" key={item.id}>
 												<span>{item.text}</span>
+												{busy[session.id] && !held[session.id] && !item.attachments.length && !item.text.trim().startsWith("/") && <button className="texty" onClick={() => void steerQueued(item)}>Steer</button>}
 												<button className="texty" onClick={() => sendNow(session.id, item.id)}>Send now</button>
+												<button className="texty" onClick={() => editQueued(item)}>Edit</button>
 												<button className="texty" aria-label="Remove queued message" onClick={() => setQueued((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((entry) => entry.id !== item.id) }))}>×</button>
 											</div>
 										))}
@@ -1854,7 +2325,7 @@ export function App() {
 									ref={promptRef}
 									aria-label="Prompt"
 									rows={2}
-									placeholder={isBusy ? "Queue a message for when Grok finishes" : pending ? "Describe a task to start a new session" : "Reply to Grok, or type / for commands and @ to mention files"}
+									placeholder={suggestion ? `${suggestion}   (Tab to use)` : isBusy ? "Queue a message for when Grok finishes" : pending ? "Describe a task to start a new session" : "Reply to Grok, or type / for commands and @ to mention files"}
 									value={prompt}
 									onChange={(event) => setPrompt(event.target.value)}
 									onPaste={onPaste}
@@ -1866,6 +2337,11 @@ export function App() {
 											if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) { event.preventDefault(); pickPopup(popIndex); return; }
 										}
 										if (popup && event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setPopClosed(prompt); return; }
+										if (suggestion && event.key === "Tab" && !event.shiftKey) { event.preventDefault(); setPrompt(suggestion); return; }
+										if (event.key === "Escape") {
+											invalidateSuggestion(session.id);
+											if (suggestion) { event.preventDefault(); event.stopPropagation(); return; }
+										}
 										if (event.key === "Enter" && !event.shiftKey) {
 											event.preventDefault();
 											void submit();
@@ -1974,12 +2450,12 @@ export function App() {
 												onClick={() => {
 													if (turnTargets.current[session.id]) { return; }
 													changeMode(session.id, item.id);
-													if (item.id !== "Plan") { changeSettings({ modeByFolder: { ...settings.modeByFolder, [folderKey(session.folder)]: item.id } }); }
 													setMenu(null);
 												}}
 											>
 												{item.id}
 												<small>{item.detail}</small>
+												{restartStops(item.id) > 0 && <small className="mode-warn">Restarts Grok and stops {restartStops(item.id)} running background {restartStops(item.id) === 1 ? "task" : "tasks"}.</small>}
 											</button>
 										))}
 									</div>
@@ -2048,7 +2524,7 @@ export function App() {
 					{panes.length > 0 && (
 						<>
 							<div className="splitter" role="separator" aria-orientation="vertical" aria-label="Resize panes" onMouseDown={startResize} />
-							<div className="side-col" style={{ width: settings.sideWidth }}>
+							<div className="side-col" ref={sideCol} style={{ width: settings.sideWidth }}>
 								{panes.map((id) => sidePane(id))}
 							</div>
 						</>
@@ -2080,7 +2556,45 @@ export function App() {
 					</div>
 				</div>
 			)}
-			{settingsOpen && <SettingsPage settings={settings} onChange={changeSettings} onClose={() => setSettingsOpen(null)} servers={servers} folder={session.folder} onRun={(text) => void runFromSettings(text)} initialTab={settingsOpen} />}
+			{rewindAsk && (
+				<div className="overlay" onClick={() => setRewindAsk(null)}>
+					<div className="sheet" onClick={(event) => event.stopPropagation()} role="dialog" aria-modal="true" aria-label="Rewind to before this message?">
+						<h2>Rewind to before this message?</h2>
+						<p>Rewinding the conversation removes this message and everything after it, and puts this prompt back in the prompt box.</p>
+						<p>Restoring files undoes files Grok changed. Files only keeps the conversation as it is.</p>
+						<div style={{ maxHeight: "50vh", overflow: "auto", overflowWrap: "anywhere" }}>
+							{rewindAsk.files.length > 0 ? <><p>Files Grok would restore:</p><ul>{rewindAsk.files.map((file) => {
+								const base = folderKey(session.folder);
+								const label = folderKey(file).startsWith(`${base}/`) ? file.replace(/\\/g, "/").slice(base.length + 1) : file;
+								return <li key={file}><code>{label}</code></li>;
+							})}</ul></> : <p>No files would be restored.</p>}
+							{rewindAsk.conflicts.length > 0 && <div style={{ color: "var(--amber)" }}><p>These files changed outside Grok. Restoring files overwrites those edits:</p><ul>{rewindAsk.conflicts.map((file) => <li key={file}><code>{file}</code></li>)}</ul></div>}
+						</div>
+						<div className="actions" style={{ flexWrap: "wrap", marginTop: 16 }}>
+							{rewindAsk.files.length > 0 ? <>
+								<button type="button" className="yes" onClick={() => void finishRewind("all")}>Rewind conversation and files</button>
+								<button type="button" className="texty" onClick={() => void finishRewind("conversation_only")}>Conversation only</button>
+								<button type="button" className="texty" onClick={() => void finishRewind("files_only")}>Files only</button>
+							</> : <button type="button" className="yes" onClick={() => void finishRewind("conversation_only")}>Rewind conversation</button>}
+							<button type="button" className="texty" autoFocus onClick={() => setRewindAsk(null)}>Cancel</button>
+						</div>
+					</div>
+				</div>
+			)}
+			{settingsOpen && <SettingsPage settings={settings} onChange={changeSettings} onClose={() => setSettingsOpen(null)} onCheckSetup={() => { setSettingsOpen(null); checkSetup(); }} servers={servers} folder={session.folder} onRun={(text) => void runFromSettings(text)} initialTab={settingsOpen} />}
+			{setup.open && <Setup result={setup.result} checking={setup.checking} onCheck={() => checkSetup()} onCopy={(text) => void copyText(text)} onClose={() => setSetup((current) => ({ ...current, open: false }))} />}
+			{confirms[0] && (
+				<div key={confirms[0].id} className="overlay confirm-overlay">
+					<div className="sheet" role="alertdialog" aria-modal="true" aria-label={confirms[0].title}>
+						<h2>{confirms[0].title}</h2>
+						{confirms[0].body && <p className="confirm-body">{confirms[0].body}</p>}
+						<div className="actions" style={{ marginTop: 16 }}>
+							<button type="button" className="yes" autoFocus={!confirms[0].danger} onClick={() => answerConfirm(true, confirms[0].id)}>{confirms[0].ok}</button>
+							<button type="button" className="texty" autoFocus={!!confirms[0].danger} onClick={() => answerConfirm(false, confirms[0].id)}>{confirms[0].cancel ?? "Cancel"}</button>
+						</div>
+					</div>
+				</div>
+			)}
 		</div>
 	);
 }

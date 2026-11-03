@@ -34,4 +34,4 @@ Codewomplers Grok Desktop is Windows-only (`"os": ["win32"]` in `package.json`).
 
 ### API-key sign-in
 
-Grok accepts an API key in `XAI_API_KEY` when no saved sign-in exists, and the app passes its environment through to Grok. This has not been tested with a real key. Test it, document it in the README, and consider showing which sign-in is in use.
+Grok accepts an API key in `XAI_API_KEY` when no saved sign-in exists, and the app passes its environment through to Grok. This has not been tested with a real key. The setup check at launch counts only a saved sign-in, so it may report "Grok is not signed in" to someone who uses a key. Test it, make the setup check accept a key, document it in the README, and consider showing which sign-in is in use.

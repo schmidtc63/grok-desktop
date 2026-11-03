@@ -19,8 +19,9 @@ function killTree(child) {
 }
 
 class TerminalHost {
-	constructor(emit) {
+	constructor(emit, { flushMs = 30 } = {}) {
 		this.emit = emit;
+		this.flushMs = flushMs;
 		this.tabs = new Map();
 	}
 
@@ -55,11 +56,21 @@ class TerminalHost {
 		if (!data || tab.done) { return; }
 		tab.history += data;
 		if (tab.history.length > MAX_HISTORY * 2) { tab.history = tab.history.slice(-MAX_HISTORY); }
-		this.emit({ type: "terminal-data", id: tab.id, data });
+		if (!this.flushMs) { this.emit({ type: "terminal-data", id: tab.id, data }); return; }
+		tab.pending = (tab.pending || "") + data;
+		if (!tab.flushTimer) { tab.flushTimer = setTimeout(() => this.flushOutput(tab), this.flushMs); }
+	}
+
+	flushOutput(tab) {
+		clearTimeout(tab.flushTimer);
+		tab.flushTimer = null;
+		if (tab.pending) { this.emit({ type: "terminal-data", id: tab.id, data: tab.pending }); }
+		tab.pending = "";
 	}
 
 	finish(tab, code) {
 		if (tab.done) { return; }
+		this.flushOutput(tab);
 		tab.done = true;
 		this.tabs.delete(tab.id);
 		this.emit({ type: "terminal-exit", id: tab.id, code });

@@ -2,7 +2,9 @@
   "name": "grok-code",
   "version": "0.1.0",
   "private": true,
-  "os": ["win32"],
+  "os": [
+    "win32"
+  ],
   "license": "MIT",
   "description": "Codewomplers Grok Desktop: an unofficial desktop app for the Grok CLI on Windows.",
   "author": "Codewomplers",
@@ -16,6 +18,14 @@
     "test": "node scripts/test-agent.cjs && node scripts/test-files.cjs && node scripts/test-main.cjs && node scripts/test-renderer.cjs && node scripts/test-sidebar.cjs && node scripts/test-git.cjs && node scripts/test-terminal.cjs && node scripts/test-diff-files.cjs && node scripts/test-terminal-browser.cjs && node scripts/test-usage.cjs && node scripts/test-customize.cjs"
   },
   "dependencies": {
+    "@codemirror/autocomplete": "^6.20.4",
+    "@codemirror/commands": "^6.11.1",
+    "@codemirror/language": "^6.13.1",
+    "@codemirror/language-data": "^6.5.2",
+    "@codemirror/search": "^6.7.2",
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.15",
+    "@lezer/highlight": "^1.2.5",
     "marked": "^16.4.1",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"

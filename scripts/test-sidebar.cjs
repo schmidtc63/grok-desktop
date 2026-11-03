@@ -30,11 +30,11 @@ const react = {
 	},
 };
 const loaded = { exports: {} };
+const confirmModule = { exports: {} };
 const source = transformSync(fs.readFileSync(path.join(__dirname, "../src/Sidebar.tsx"), "utf8"), { loader: "tsx", format: "cjs", jsx: "automatic" }).code;
-vm.runInNewContext(source, {
-	module: loaded,
-	exports: loaded.exports,
-	require: (name) => name === "react" ? react : { jsx, jsxs: jsx, Fragment: "fragment" },
+const confirmSource = transformSync(fs.readFileSync(path.join(__dirname, "../src/confirm.ts"), "utf8"), { loader: "ts", format: "cjs" }).code;
+const context = vm.createContext({
+	require: (name) => name === "react" ? react : name === "./confirm" ? confirmModule.exports : { jsx, jsxs: jsx, Fragment: "fragment" },
 	localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
 	window: {
 		innerHeight: 1000, innerWidth: 1400, confirm: () => confirmed,
@@ -42,6 +42,8 @@ vm.runInNewContext(source, {
 		removeEventListener: (name, listener) => { if (listeners.get(name) === listener) { listeners.delete(name); } },
 	},
 });
+vm.runInContext(`(function(module, exports) {\n${confirmSource}\n})`, context)(confirmModule, confirmModule.exports);
+vm.runInContext(`(function(module, exports) {\n${source}\n})`, context)(loaded, loaded.exports);
 let confirmed = true;
 const sessions = [
 	{ id: "first", title: "First chat", folder: "C:/project", project: "Project", branch: "main", environment: "Local", status: "idle", pinned: true, archived: false },
@@ -105,53 +107,62 @@ const rowMenu = () => {
 	tree = render();
 };
 const menuButton = (label) => findAll(tree, (node) => node.type === "button" && text(node).startsWith(label))[0];
-rowMenu();
-menuButton("Mark as unread").props.onClick();
-rowMenu();
-menuButton("Mark as completed").props.onClick();
-rowMenu();
-confirmed = false;
-menuButton("Delete").props.onClick();
-rowMenu();
-confirmed = true;
-menuButton("Delete").props.onClick();
-assert.deepEqual(calls, ["unread:second:true", "completed:second:true", "delete:second"], "row actions reach App, and Delete asks first");
-calls.length = 0;
-props.activity = { second: "running" };
-rowMenu();
-menuButton("Delete").props.onClick();
-assert.deepEqual(calls, ["notice:Stop this session before deleting it."], "a working session cannot be deleted");
-props.activity = {};
-calls.length = 0;
-tree = render();
-findAll(tree, (node) => node.type === "button" && node.props.className === "session-hit" && text(node).includes("Second chat"))[0].props.onClick({ ctrlKey: true });
-assert.equal(opened, "second", "Ctrl+click opens the session in a new window");
-assert.deepEqual(calls, [], "Ctrl+click does not also select it here");
-rowMenu();
-menuButton("Move to section").props.onClick({ currentTarget: { getBoundingClientRect: () => ({ top: 10, left: 10, right: 200, bottom: 30 }) } });
-tree = render();
-menuButton("New section").props.onClick();
-assert.match(calls.at(-1), /^move:second:sec-\d+$/, "New section from a row moves that session into it");
-tree = render();
-assert.ok(findAll(tree, (node) => node.props?.["aria-label"] === "Section name").length === 1, "a new section opens for naming");
-const sessionsWithSection = sessions.map((item) => item.id === "second" ? { ...item, sectionId: calls.at(-1).split(":")[2] } : item);
-props.sessions = sessionsWithSection;
-tree = render();
-findAll(tree, (node) => node.props?.["aria-label"] === "Section name")[0].props.onBlur({ target: { value: "Reviews" } });
-tree = render();
-assert.ok(findAll(tree, (node) => node.props?.className === "group-label" && text(node) === "Reviews").length === 1, "a renamed section groups its sessions");
-storage.set("grok-code.sections.v1", JSON.stringify([{ id: "shared", name: "Shared reviews" }]));
-listeners.get("storage")({ key: "grok-code.sections.v1" });
-props.sessions = sessions.map((item) => item.id === "second" ? { ...item, sectionId: "shared" } : item);
-tree = render();
-assert.ok(findAll(tree, (node) => node.props?.className === "group-label" && text(node) === "Shared reviews").length === 1, "another window's sections reach this sidebar");
-rowMenu();
-menuButton("Move to section").props.onClick({ currentTarget: { getBoundingClientRect: () => ({ top: 10, left: 10, right: 200, bottom: 30 }) } });
-tree = render();
-menuButton("New section").props.onClick();
-render();
-assert.ok(JSON.parse(storage.get("grok-code.sections.v1")).some((section) => section.id === "shared"), "adding a section preserves the other window's section");
-effects.forEach((effect) => effect?.cleanup?.());
-assert.equal(listeners.has("storage"), false, "the shared-section listener is removed on cleanup");
-console.log("Sidebar row actions passed: unread, completed, delete with confirm, Ctrl+click window, sections.");
-console.log("Sidebar regressions passed: live approval badges, selected new-window identity, cross-window sections.");
+async function checkActions() {
+	rowMenu();
+	menuButton("Mark as unread").props.onClick();
+	rowMenu();
+	menuButton("Mark as completed").props.onClick();
+	rowMenu();
+	confirmed = false;
+	menuButton("Delete").props.onClick();
+	await Promise.resolve();
+	assert.deepEqual(calls, ["unread:second:true", "completed:second:true"], "cancelling Delete keeps the selected session");
+	rowMenu();
+	confirmed = true;
+	menuButton("Delete").props.onClick();
+	assert.deepEqual(calls, ["unread:second:true", "completed:second:true"], "Delete waits for its confirmation answer");
+	await Promise.resolve();
+	assert.deepEqual(calls, ["unread:second:true", "completed:second:true", "delete:second"], "row actions reach App, and Delete asks first");
+	calls.length = 0;
+	props.activity = { second: "running" };
+	rowMenu();
+	menuButton("Delete").props.onClick();
+	await Promise.resolve();
+	assert.deepEqual(calls, ["notice:Stop this session before deleting it."], "a working session cannot be deleted");
+	props.activity = {};
+	calls.length = 0;
+	tree = render();
+	findAll(tree, (node) => node.type === "button" && node.props.className === "session-hit" && text(node).includes("Second chat"))[0].props.onClick({ ctrlKey: true });
+	assert.equal(opened, "second", "Ctrl+click opens the session in a new window");
+	assert.deepEqual(calls, [], "Ctrl+click does not also select it here");
+	rowMenu();
+	menuButton("Move to section").props.onClick({ currentTarget: { getBoundingClientRect: () => ({ top: 10, left: 10, right: 200, bottom: 30 }) } });
+	tree = render();
+	menuButton("New section").props.onClick();
+	assert.match(calls.at(-1), /^move:second:sec-\d+$/, "New section from a row moves that session into it");
+	tree = render();
+	assert.ok(findAll(tree, (node) => node.props?.["aria-label"] === "Section name").length === 1, "a new section opens for naming");
+	const sessionsWithSection = sessions.map((item) => item.id === "second" ? { ...item, sectionId: calls.at(-1).split(":")[2] } : item);
+	props.sessions = sessionsWithSection;
+	tree = render();
+	findAll(tree, (node) => node.props?.["aria-label"] === "Section name")[0].props.onBlur({ target: { value: "Reviews" } });
+	tree = render();
+	assert.ok(findAll(tree, (node) => node.props?.className === "group-label" && text(node) === "Reviews").length === 1, "a renamed section groups its sessions");
+	storage.set("grok-code.sections.v1", JSON.stringify([{ id: "shared", name: "Shared reviews" }]));
+	listeners.get("storage")({ key: "grok-code.sections.v1" });
+	props.sessions = sessions.map((item) => item.id === "second" ? { ...item, sectionId: "shared" } : item);
+	tree = render();
+	assert.ok(findAll(tree, (node) => node.props?.className === "group-label" && text(node) === "Shared reviews").length === 1, "another window's sections reach this sidebar");
+	rowMenu();
+	menuButton("Move to section").props.onClick({ currentTarget: { getBoundingClientRect: () => ({ top: 10, left: 10, right: 200, bottom: 30 }) } });
+	tree = render();
+	menuButton("New section").props.onClick();
+	render();
+	assert.ok(JSON.parse(storage.get("grok-code.sections.v1")).some((section) => section.id === "shared"), "adding a section preserves the other window's section");
+	effects.forEach((effect) => effect?.cleanup?.());
+	assert.equal(listeners.has("storage"), false, "the shared-section listener is removed on cleanup");
+	console.log("Sidebar row actions passed: unread, completed, delete with confirm, Ctrl+click window, sections.");
+	console.log("Sidebar regressions passed: live approval badges, selected new-window identity, cross-window sections.");
+}
+
+void checkActions().catch((error) => { console.error(error); process.exitCode = 1; });

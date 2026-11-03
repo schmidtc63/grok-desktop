@@ -40,7 +40,7 @@ function makeHost(options, { tmpdir, platform = "win32" } = {}) {
 		clearTimeout: (timer) => timers.delete(timer),
 	};
 	vm.runInNewContext(source, sandbox, { filename: "agent.cjs" });
-	const host = new sandbox.module.exports.AgentHost((event) => events.push(event), options);
+	const host = new sandbox.module.exports.AgentHost((event) => events.push(event), { chunkMs: 0, ...options });
 	// A session whose Grok process has started, with a running turn built from `turn`.
 	function running(turn) {
 		const proc = host.start({ ...input, uiSessionId: turn.uiSessionId, cwd: turn.cwd || input.cwd }, "ask");
@@ -66,7 +66,94 @@ function makeHost(options, { tmpdir, platform = "win32" } = {}) {
 			}
 		}
 	}
-	return { host, timers, writes, spawns, kills, events, children, running, serve };
+	return { host, timers, writes, spawns, kills, events, children, running, serve, probeGrok: sandbox.module.exports.probeGrok };
+}
+
+async function checkProbeGrok() {
+	const failed = { ok: false, error: "Grok could not start." };
+	const cases = [
+		["cached token", { result: { authMethods: [{ id: "grok.com" }, { id: "cached_token" }], _meta: { agentVersion: "1.0.70" } } }, { ok: true, version: "1.0.70", signedIn: true }],
+		["signed out", { result: { authMethods: [{ id: "grok.com" }] } }, { ok: true, version: "", signedIn: false }],
+		["older Grok", { result: { _meta: { agentVersion: "x".repeat(60) } } }, { ok: true, version: "x".repeat(40), signedIn: true }],
+		["error reply", { error: { message: "secret" } }, failed],
+		["missing result", {}, failed],
+		["null result", { result: null }, failed],
+		["array result", { result: [] }, failed],
+		["ENOENT", null, { ok: false, error: "Grok is not installed, or not on PATH. Set GROK_PATH to its full path." }],
+		["EACCES", null, failed],
+		["exit", null, failed],
+		["timeout", null, failed],
+		["stdin error", null, failed],
+	];
+	for (const [name, reply, expected] of cases) {
+		const run = makeHost();
+		const pending = run.probeGrok();
+		const child = run.children[0];
+		assert.deepEqual(plain(run.spawns[0][1]), ["--permission-mode", "default", "agent", "--no-leader", "stdio"], name);
+		assert.equal(run.spawns[0][2].cwd, os.homedir());
+		assert.equal(run.spawns[0][2].windowsHide, true);
+		assert.equal(run.writes.length, 1);
+		assert.deepEqual(run.writes[0], { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false }, clientInfo: { name: "grok-code", version: "0.1.0" } } });
+		assert.equal([...run.timers.values()][0].ms, 15000);
+		if (reply) {
+			child.stdout.emit("data", Buffer.from(`not JSON\n${JSON.stringify({ id: 9, result: {} })}\n`));
+			const line = JSON.stringify({ jsonrpc: "2.0", id: 1, ...reply });
+			child.stdout.emit("data", Buffer.from(line.slice(0, 12)));
+			child.stdout.emit("data", Buffer.from(`${line.slice(12)}\n`));
+		} else if (name === "timeout") {
+			[...run.timers.values()][0].callback();
+		} else if (name === "exit") {
+			child.emit("exit", 1);
+		} else if (name === "stdin error") {
+			child.stdin.emit("error", new Error("secret"));
+		} else {
+			child.emit("error", Object.assign(new Error("secret"), { code: name }));
+		}
+		assert.deepEqual(plain(await pending), expected, name);
+		assert.deepEqual(taskkills(run.spawns), [String(child.pid)], `${name}: the probe always kills its child`);
+		assert.deepEqual(run.writes.map((message) => message.method), ["initialize"], `${name}: no authentication or session is started`);
+		assert.equal(run.timers.size, 0);
+		child.emit("exit", 0);
+		assert.equal(taskkills(run.spawns).length, 1, "a later exit does not finish twice");
+	}
+}
+
+function checkEditDiffs() {
+	const { host, running, events } = makeHost();
+	const first = { type: "diff", oldText: "old\n", newText: "new\nnext\n", _meta: { old_line: 3, new_line: 4 } };
+	const card = host.toolCard({ toolCallId: "diff", kind: "edit", content: [first, { type: "diff", oldText: "extra\n", newText: "" }] });
+	assert.deepEqual(plain(card.diff), { oldText: "old\n", newText: "new\nnext\n", oldLine: 3, newLine: 4 });
+	assert.deepEqual([card.additions, card.deletions], [2, 2], "counts still include every diff part");
+	const completed = host.toolCard({ toolCallId: "diff", kind: "edit", status: "completed", content: [{ ...first, _meta: { details: [{ old_line: 5, new_line: 6 }] } }] });
+	assert.deepEqual(plain(completed.diff), { oldText: "old\n", newText: "new\nnext\n", oldLine: 5, newLine: 6 });
+	for (const value of [0, -1, 1.5, "3", null]) {
+		const invalid = host.toolCard({ toolCallId: "diff", kind: "edit", content: [{ ...first, _meta: { old_line: value, new_line: value } }] });
+		assert.equal(invalid.diff.oldLine, undefined);
+		assert.equal(invalid.diff.newLine, undefined);
+	}
+	const bounded = host.toolCard({ toolCallId: "diff", kind: "edit", content: [{ type: "diff", oldText: "a".repeat(30000), newText: "b".repeat(30000) }] });
+	assert.deepEqual(plain(bounded.diff), { oldText: "a".repeat(20000), newText: "b".repeat(20000), clipped: true });
+	assert.deepEqual([bounded.additions, bounded.deletions], [1, 1]);
+	const proc = running({ uiSessionId: "chat", agentSessionId: "sid" });
+	const replace = { file_path: "a.txt", old_string: "a".repeat(30000), new_string: "b", replace_all: true };
+	host.onHook(proc, { id: 8001, params: { toolUseId: "replace-diff", toolName: "search_replace", toolInput: replace } });
+	assert.deepEqual(plain(events.at(-1).tool.diff), { oldText: "a".repeat(20000), newText: "b", clipped: true, replaceAll: true });
+	assert.equal(events.at(-1).tool.input, JSON.stringify(replace, null, 2), "clipped approvals keep all raw arguments");
+	const write = { file_path: "b.txt", content: "whole file" };
+	host.onHook(proc, { id: 8002, params: { toolUseId: "write-diff", toolName: "write", toolInput: write } });
+	assert.deepEqual(plain(events.at(-1).tool.diff), { oldText: "", newText: "whole file", whole: true });
+	assert.equal(events.at(-1).tool.input, JSON.stringify(write, null, 2));
+	for (const rawInput of [replace, write]) {
+		host.onPermission(proc, { id: rawInput === replace ? 8003 : 8004, params: { toolCall: { title: "Edit", kind: "edit", rawInput }, options: [] } });
+		assert.equal(events.at(-1).tool.input, JSON.stringify(rawInput, null, 2), "native approvals keep all raw arguments too");
+		assert.equal(events.at(-1).tool.diff.newText, rawInput.new_string || rawInput.content);
+		assert.equal(events.at(-1).tool.diff.replaceAll, rawInput === replace ? true : undefined);
+		assert.equal(events.at(-1).tool.diff.whole, rawInput === write ? true : undefined);
+	}
+	host.onHook(proc, { id: 8005, params: { toolUseId: "command-diff", toolName: "run_terminal_command", toolInput: { command: "echo hello", old_string: "old", new_string: "new" } } });
+	assert.equal(events.at(-1).tool.diff, undefined, "a command never gets an edit preview");
+	host.onPermission(proc, { id: 8006, params: { toolCall: { title: "Command", kind: "execute", rawInput: { command: "echo hello", content: "not a file" } }, options: [] } });
+	assert.equal(events.at(-1).tool.diff, undefined);
 }
 
 function config(model = "grok-4.7", effort = "high") {
@@ -119,6 +206,7 @@ async function checkCancellation() {
 	assert.equal(writes[0].params._meta["x.ai/hooks"].PreToolUse[0].timeout, 600);
 	assert.equal(JSON.stringify(spawns[0][1].slice(0, 3)), JSON.stringify(["--permission-mode", "default", "agent"]), "the agent starts in ask mode so Auto-review is not stuck on config always-approve");
 	assert.equal(spawns[0][2].cwd, input.cwd, "a session's Grok starts in that session's folder");
+	assert.equal(spawns[0][2].env.GROK_PROMPT_SUGGESTIONS, "1", "the app's own setting, not Grok's config.toml, decides prompt suggestions");
 	host.cancel(input.uiSessionId);
 	[...timers.values()].filter((timer) => timer.ms === 5000).at(-1).callback();
 	assert.deepEqual(plain(await sent), { ok: false, error: "Stopped." });
@@ -131,6 +219,7 @@ async function checkRestore() {
 	const proc = running({ uiSessionId: "chat", promptId: null });
 	host.sessions.set("chat", { sessionId: "persisted", cwd: input.cwd, proc, model: "grok-4.7", effort: "high" });
 	host.loseProc(proc, "Exited");
+	assert.deepEqual(plain(events.shift()), { type: "bg-tasks", uiSessionId: "chat", tasks: [], reset: true });
 	assert.equal(host.sessions.get("chat").proc, null);
 	assert.equal(host.sessions.get("chat").model, "");
 	const next = { uiSessionId: "chat", lost: false, parents: new Map() };
@@ -1029,7 +1118,7 @@ async function checkParityFeatures() {
 		sent.host.applyConfig = async () => {};
 		sent.host.applyMode = async () => {};
 		const prompts = [];
-		sent.host.request = (_proc, method, params) => { prompts.push({ method, params }); return { id: 1, promise: new Promise(() => {}) }; };
+		sent.host.request = (_proc, method, params) => { prompts.push({ method, params }); return { id: 1, promise: method === "_x.ai/rewind/points" ? Promise.resolve({ rewind_points: [] }) : new Promise(() => {}) }; };
 		void sent.host.prompt({ ...input, turnId: "t", attachments: [image, note] });
 		for (let i = 0; i < 5 && !prompts.some((item) => item.method === "session/prompt"); i++) { await new Promise((resolve) => setImmediate(resolve)); }
 		const blocks = prompts.find((item) => item.method === "session/prompt").params.prompt;
@@ -1089,7 +1178,347 @@ async function checkAccount() {
 	assert.equal(spawns.some((item) => item[0] === "taskkill"), true);
 }
 
+async function checkSessionEnhancements() {
+	const { host, running, events, writes } = makeHost();
+	const proc = running({ uiSessionId: "a", agentSessionId: "sid-a" });
+	const session = { sessionId: "sid-a", cwd: input.cwd, proc, model: input.model, effort: input.effort };
+	host.sessions.set("a", session);
+	const notify = (sessionId, update) => host.onMessage(proc, { method: "_x.ai/session_notification", params: { sessionId, update } });
+	const title = (sessionId, text) => host.onUpdate(proc, { sessionId, update: { sessionUpdate: "session_info_update", title: text } });
+	notify("sid-a", { sessionUpdate: "background_tasks", tasks: [{ task_id: "t1", description: "Build preview", command: "npm run dev", output_file: "C:/grok/sessions/project/terminal/output.log", kind: "bash", status: "running", started_at: "2026-10-30T13:41:54.657262600+00:00" }] });
+	assert.deepEqual(plain(events.at(-1)), { type: "bg-tasks", uiSessionId: "a", tasks: [{ id: "t1", label: "Build preview", command: "npm run dev", outputFile: "C:/grok/sessions/project/terminal/output.log", kind: "bash", status: "running", startedAt: Date.parse("2026-10-30T13:41:54.657Z"), endedAt: 0, exitCode: null }] });
+	title("sid-a", "  Fix   login bug ");
+	assert.deepEqual(plain(events.at(-1)), { type: "title", uiSessionId: "a", title: "Fix login bug" });
+	host.turns.delete("a");
+	title("sid-a", "Refined title");
+	assert.equal(events.at(-1).title, "Refined title", "a late title does not need a live turn");
+	let before = events.length;
+	title("unrelated", "Wrong title");
+	title("sid-a", "   ");
+	assert.equal(events.length, before, "foreign and empty titles do not rename the app session");
+	notify("sid-a", { sessionUpdate: "subagent_spawned", subagent_id: "kid", child_session_id: "kid", parent_session_id: "sid-a", description: "Review the parser", subagent_type: "reviewer", model: "grok-4.7" });
+	assert.deepEqual(plain(events.at(-1)), { type: "subagent", uiSessionId: "a", subagent: { id: "kid", childSessionId: "kid", label: "Review the parser", agentType: "reviewer", model: "grok-4.7", status: "running" } });
+	before = events.length;
+	notify("kid", { sessionUpdate: "background_tasks", tasks: [] });
+	title("kid", "Child title");
+	assert.equal(events.length, before, "a child neither replaces the task snapshot nor renames the parent");
+	notify("sid-a", { sessionUpdate: "subagent_finished", subagent_id: "kid", child_session_id: "kid", status: "completed", output: "Finished review", duration_ms: 2500, tokens_used: 300, tool_calls: 4 });
+	assert.deepEqual(plain(events.at(-1).subagent), { id: "kid", childSessionId: "kid", label: "", agentType: "", model: "", status: "completed", output: "Finished review", durationMs: 2500, tokensUsed: 300, toolCalls: 4 });
+	notify("sid-a", { sessionUpdate: "subagent_finished", subagent_id: "kid", output: "x".repeat(9000), duration_ms: "bad", tokens_used: null });
+	assert.equal(events.at(-1).subagent.output.length, 8001, "large final results are bounded");
+	assert.equal(Object.hasOwn(events.at(-1).subagent, "durationMs"), false);
+	assert.equal(Object.hasOwn(events.at(-1).subagent, "tokensUsed"), false);
+	notify("sid-a", { sessionUpdate: "background_tasks", tasks: [{ task_id: "fallback", command: "echo done", status: "completed", exit_code: 0 }] });
+	assert.equal(events.at(-1).tasks[0].label, "echo done", "commands remain visible after the parent turn ends");
+	const many = Array.from({ length: 60 }, (_, index) => ({ task_id: `done-${index}`, status: "completed" }));
+	notify("sid-a", { sessionUpdate: "background_tasks", tasks: [{ task_id: "still-running", status: "running" }, ...many] });
+	assert.equal(events.at(-1).tasks.length, 51);
+	assert.equal(events.at(-1).tasks[0].id, "still-running", "only completed task history is bounded");
+	assert.equal(events.at(-1).tasks[1].id, "done-0", "the newest completed entries retain the producer's order");
+	let killed = host.killTask("a", "still-running");
+	let killRequest = writes.at(-1);
+	assert.equal(killRequest.method, "_x.ai/task/kill");
+	assert.deepEqual(plain(killRequest.params), { sessionId: "sid-a", taskId: "still-running" });
+	host.onMessage(proc, { id: killRequest.id, result: { result: { taskId: "still-running", outcome: "killed" } } });
+	assert.deepEqual(plain(await killed), { ok: true, outcome: "killed" });
+	killed = host.killTask("a", "missing");
+	killRequest = writes.at(-1);
+	host.onMessage(proc, { id: killRequest.id, result: { result: { taskId: "missing", outcome: "not_found" } } });
+	assert.equal((await killed).ok, false, "a missing task never reports a successful stop");
+	killed = host.killTask("a", "t1");
+	killRequest = writes.at(-1);
+	host.onMessage(proc, { id: killRequest.id, result: { result: { outcome: "" } } });
+	assert.equal((await killed).ok, false, "an unrecognized outcome never reports a successful stop");
+	killed = host.killTask("a", "t1");
+	killRequest = writes.at(-1);
+	host.onMessage(proc, { id: killRequest.id, error: { code: -32601, message: "method not found" } });
+	assert.equal((await killed).ok, false);
+	before = writes.length;
+	assert.equal((await host.killTask("missing", "t1")).ok, false);
+	assert.equal((await host.killTask("a", "")).ok, false);
+	assert.equal(writes.length, before, "missing sessions and task ids make no stop request");
+	const requestSuggestion = () => {
+		const promise = host.suggestPrompt("a");
+		const request = writes.at(-1);
+		assert.equal(request.method, "_x.ai/suggestPrompt");
+		assert.equal(request.params.sessionId, "sid-a");
+		assert.equal(typeof request.params.generation, "number");
+		return { promise, request };
+	};
+	let pending = requestSuggestion();
+	host.onMessage(proc, { id: pending.request.id, result: { suggestion: "  Yes,  start ", generation: pending.request.params.generation } });
+	assert.equal(await pending.promise, "Yes, start");
+	pending = requestSuggestion();
+	host.onMessage(proc, { id: pending.request.id, result: { suggestion: null, generation: pending.request.params.generation } });
+	assert.equal(await pending.promise, "");
+	pending = requestSuggestion();
+	host.onMessage(proc, { id: pending.request.id, error: { code: -32601, message: "method not found" } });
+	assert.equal(await pending.promise, "");
+	pending = requestSuggestion();
+	proc.promptGeneration = (proc.promptGeneration || 0) + 1;
+	host.onMessage(proc, { id: pending.request.id, result: { suggestion: "stale", generation: pending.request.params.generation } });
+	assert.equal(await pending.promise, "", "a suggestion from before another turn stays discarded after that turn ends");
+	pending = requestSuggestion();
+	host.turns.set("a", { proc });
+	host.onMessage(proc, { id: pending.request.id, result: { suggestion: "too late", generation: pending.request.params.generation } });
+	assert.equal(await pending.promise, "");
+	before = writes.length;
+	assert.equal(await host.suggestPrompt("a"), "");
+	assert.equal(await host.suggestPrompt("missing"), "");
+	assert.equal(writes.length, before, "busy and missing sessions make no prediction request");
+	host.turns.delete("a");
+	pending = requestSuggestion();
+	host.procs.set("a", { lost: false });
+	host.onMessage(proc, { id: pending.request.id, result: { suggestion: "old process", generation: pending.request.params.generation } });
+	assert.equal(await pending.promise, "");
+	before = events.length;
+	host.loseProc(proc, "Replaced");
+	assert.equal(events.length, before, "a replaced process never clears the current process's task rows");
+	const current = running({ uiSessionId: "a", agentSessionId: "sid-a", promptId: null });
+	host.loseProc(current, "Idle");
+	assert.deepEqual(plain(events.at(-1)), { type: "bg-tasks", uiSessionId: "a", tasks: [], reset: true });
+}
+
+async function checkPromptIndexes() {
+	for (const choice of ["two", "empty", "failed", "timeout", "slash", "side"]) {
+		const { host, timers } = makeHost();
+		const proc = { ready: Promise.resolve(), pending: new Map() };
+		host.procFor = () => proc;
+		host.ensureSession = async () => ({ sessionId: "indexed" });
+		host.applyConfig = async () => {};
+		host.applyMode = async () => {};
+		const methods = [];
+		host.request = (_proc, method) => {
+			methods.push(method);
+			const promise = method !== "_x.ai/rewind/points" || choice === "timeout" ? new Promise(() => {})
+				: choice === "failed" ? Promise.reject(new Error("Method not found"))
+					: Promise.resolve({ rewind_points: choice === "two" ? [{ prompt_index: 0 }, { prompt_index: 1 }] : [] });
+			proc.pending.set(methods.length, {});
+			return { id: methods.length, promise };
+		};
+		const sent = host.prompt({ ...input, ...(choice === "slash" ? { text: "/status" } : {}), ...(choice === "side" ? { uiSessionId: "side-chat" } : {}) });
+		await ticks();
+		await ticks();
+		if (choice === "timeout") {
+			assert.equal(methods.includes("session/prompt"), false);
+			[...timers.values()].find((timer) => timer.ms === 5000).callback();
+		}
+		const result = await sent;
+		assert.equal(result.ok, true, choice);
+		assert.equal(result.promptIndex, choice === "two" ? 2 : choice === "empty" ? 0 : undefined, choice);
+		assert.equal(methods.at(-1), "session/prompt", choice);
+		assert.equal(methods.includes("_x.ai/rewind/points"), !["slash", "side"].includes(choice), choice);
+		if (choice === "timeout") { assert.equal(proc.pending.has(1), false, "a timed-out points request is dropped"); }
+	}
+}
+
+function branchHost() {
+	const test = makeHost();
+	const proc = { uiSessionId: "chat", cwd: input.cwd, permission: "ask", ready: Promise.resolve(), pending: new Map() };
+	const session = { sessionId: "branch-agent", cwd: input.cwd, proc };
+	const calls = [];
+	const request = { ...input, agentSessionId: session.sessionId, index: 1, text: "Change this file\nThen explain.", rewindMode: "all", force: false };
+	const reply = { points: { rewind_points: [{ prompt_index: 1, prompt_preview: "Change this file" }] }, preview: { success: false, clean_files: ["one.txt"], conflicts: [{ path: "two.txt" }], error: "External modifications detected." }, forced: { success: true, reverted_files: ["one.txt", "two.txt"], conflicts: [{ path: "two.txt" }] }, fork: { newSessionId: "fork-agent" } };
+	test.host.procs.set("chat", proc);
+	test.host.sessions.set("chat", session);
+	test.host.procFor = () => { throw new Error("An existing Grok must not restart."); };
+	test.host.ensureSession = async () => session;
+	test.host.request = (_proc, method, params) => {
+		calls.push({ method, params });
+		return { id: calls.length, promise: Promise.resolve(method === "_x.ai/rewind/points" ? reply.points : method === "_x.ai/session/fork" ? reply.fork : params.force ? reply.forced : reply.preview) };
+	};
+	return { ...test, proc, session, calls, request, reply };
+}
+
+async function checkBranches() {
+	const test = branchHost();
+	const { host, calls, request, reply } = test;
+	let result = await host.rewind(request);
+	assert.deepEqual(plain(result), { ok: true, done: false, revertedFiles: [], cleanFiles: ["one.txt"], conflicts: ["two.txt"], error: "External modifications detected." });
+	assert.deepEqual(plain(calls.at(-1)), { method: "_x.ai/rewind/execute", params: { sessionId: "branch-agent", targetPromptIndex: 1, mode: "all", force: false } });
+	for (const mode of ["all", "conversation_only", "files_only"]) {
+		calls.length = 0;
+		result = await host.rewind({ ...request, mode: "Always-approve", rewindMode: mode, force: true, seen: ["two.txt"] });
+		assert.equal(result.done, true);
+		assert.deepEqual(calls.map((call) => call.method), ["_x.ai/rewind/points", "_x.ai/rewind/execute", "_x.ai/rewind/execute"]);
+		assert.deepEqual(calls.slice(1).map((call) => [call.params.mode, call.params.force]), [[mode, false], [mode, true]], "a forced rewind previews again, reusing Grok despite a permission change");
+	}
+	calls.length = 0;
+	result = await host.rewind({ ...request, force: true, seen: [] });
+	assert.equal(result.ok, false);
+	assert.match(result.error, /after the preview/);
+	assert.equal(calls.some((call) => call.params.force), false, "a newly conflicting file cannot be overwritten");
+	reply.preview.conflicts = Array.from({ length: 201 }, (_, index) => ({ path: `conflict-${index}` }));
+	result = await host.rewind(request);
+	assert.equal(result.conflicts.length, 201, "every conflict must be visible in the dialog");
+	calls.length = 0;
+	result = await host.rewind({ ...request, force: true, seen: result.conflicts.slice(0, 200) });
+	assert.equal(result.ok, false, "a conflict after path 200 must also block the forced rewind");
+	assert.equal(calls.some((call) => call.params.force), false);
+	for (const points of [[{ prompt_index: 1, prompt_preview: "Another prompt" }], [{ prompt_index: 0, prompt_preview: "Change this file" }]]) {
+		reply.points = { rewind_points: points };
+		for (const action of ["rewind", "fork"]) {
+			calls.length = 0;
+			result = await host[action](request);
+			assert.equal(result.ok, false);
+			assert.match(result.error, /no longer matches/);
+			assert.equal(calls.length, 1, "a mismatch sends only the points query");
+		}
+	}
+	for (const update of [{ agentSessionId: undefined }, { index: -1 }, { rewindMode: "other" }, { cwd: path.join(input.cwd, "missing-branch-folder") }]) {
+		calls.length = 0;
+		assert.equal((await host.rewind({ ...request, ...update })).ok, false);
+		assert.equal(calls.length, 0, "invalid branch input sends nothing");
+	}
+	const other = branchHost();
+	other.session.sessionId = "earlier-agent";
+	assert.match((await other.host.rewind(other.request)).error, /earlier Grok conversation/);
+	assert.equal(other.calls.length, 0);
+	other.session.sessionId = other.request.agentSessionId;
+	other.proc.cwd = path.join(input.cwd, "moved");
+	assert.match((await other.host.rewind(other.request)).error, /another folder/);
+	assert.equal(other.calls.length, 0);
+	const fork = branchHost();
+	result = await fork.host.fork(fork.request);
+	assert.deepEqual(plain(result), { ok: true, agentSessionId: "fork-agent" });
+	assert.deepEqual(plain(fork.calls.at(-1)), { method: "_x.ai/session/fork", params: { sourceSessionId: "branch-agent", sourceCwd: input.cwd, newCwd: input.cwd, targetPromptIndex: 1 } });
+	fork.reply.fork = {};
+	assert.equal((await fork.host.fork(fork.request)).ok, false, "a missing fork id cannot report success");
+	for (const fails of [false, true]) {
+		const locked = branchHost();
+		const waiting = deferred();
+		const requestNormally = locked.host.request;
+		locked.host.request = (proc, method, params) => method === "_x.ai/rewind/points" ? { id: 99, promise: waiting.promise } : requestNormally(proc, method, params);
+		const first = locked.host.rewind(locked.request);
+		await ticks();
+		assert.match((await locked.host.rewind(locked.request)).error, /Wait for Grok to finish/);
+		assert.match((await locked.host.prompt(input)).error, /rewind or fork to finish/);
+		assert.equal(locked.calls.length, 0);
+		waiting.resolve(fails ? { rewind_points: [] } : locked.reply.points);
+		assert.equal((await first).ok, !fails);
+		assert.equal(locked.host.branching.size, 0, "the lock clears on success and failure");
+		locked.host.request = requestNormally;
+		assert.equal((await locked.host.rewind(locked.request)).ok, true);
+		locked.host.turns.set("chat", {});
+		const before = locked.calls.length;
+		assert.match((await locked.host.rewind(locked.request)).error, /Wait for Grok to finish/);
+		assert.equal(locked.calls.length, before, "a running turn blocks rewind before any request");
+		locked.host.turns.delete("chat");
+		assert.equal((await locked.host.fork(locked.request)).ok, true);
+	}
+}
+
+async function checkSteer() {
+	const { host, writes, events, running } = makeHost();
+	const proc = running({ uiSessionId: "chat", agentSessionId: "steer-agent" });
+	host.sessions.set("chat", { sessionId: "steer-agent", proc });
+	let result = host.steer("chat", "  Keep this text  ");
+	let sent = writes.at(-1);
+	assert.deepEqual(plain(sent.params), { sessionId: "steer-agent", text: "Keep this text" });
+	assert.equal(sent.method, "_x.ai/interject");
+	host.onMessage(proc, { id: sent.id, result: { result: { status: "queued" } } });
+	assert.equal((await result).ok, true);
+	host.onMessage(proc, { id: 800, method: "_x.ai/session/interjection", params: { sessionId: "steer-agent", text: "Keep this text" } });
+	assert.deepEqual(plain(events.at(-1)), { type: "steer", text: "Keep this text", uiSessionId: "chat", turnId: "turn" });
+	assert.equal(writes.at(-1).id, 800, "request-style interjection notifications are acknowledged");
+	const beforeEvents = events.length;
+	host.onMessage(proc, { method: "_x.ai/session/interjection", params: { sessionId: "different-agent", text: "Wrong session" } });
+	assert.equal(events.length, beforeEvents);
+	const turn = host.turns.get("chat");
+	for (const [key, value] of [["finished", true], ["cancelled", true], ["slash", true], ["promptId", null]]) {
+		const previous = turn[key];
+		turn[key] = value;
+		const before = writes.length;
+		assert.equal((await host.steer("chat", "text")).ok, false, key);
+		assert.equal(writes.length, before, key);
+		turn[key] = previous;
+	}
+	for (const text of ["", "  ", "/status", " /compact ", "x".repeat(100001)]) {
+		const before = writes.length;
+		assert.equal((await host.steer("chat", text)).ok, false);
+		assert.equal(writes.length, before);
+	}
+	assert.equal((await host.steer("missing", "text")).ok, false);
+	result = host.steer("chat", "No reply");
+	sent = writes.at(-1);
+	host.onMessage(proc, { id: sent.id, result: {} });
+	assert.equal((await result).ok, false);
+	result = host.steer("chat", "Failure");
+	sent = writes.at(-1);
+	host.onMessage(proc, { id: sent.id, error: { message: "Failed interject" } });
+	assert.match((await result).error, /Failed interject/);
+}
+
+function checkChunkBatching() {
+	const turn = () => ({ uiSessionId: "chat", turnId: "turn", promptId: 2, finished: false, cancelled: false, said: true });
+	const flush = (made) => {
+		const pending = [...made.timers.values()].filter((timer) => timer.ms === 30);
+		assert.ok(pending.length);
+		for (const timer of pending) { timer.callback(); }
+	};
+	const chunks = makeHost({ chunkMs: 30 });
+	for (const text of ["one", "two", "three"]) { chunks.host.emitTurn(turn(), { type: "chunk", text }); }
+	assert.deepEqual(chunks.events, [], "consecutive text waits for the batching timer");
+	assert.equal([...chunks.timers.values()].filter((timer) => timer.ms === 30).length, 1);
+	flush(chunks);
+	assert.deepEqual(plain(chunks.events), [{ type: "chunk", text: "onetwothree", uiSessionId: "chat", turnId: "turn" }]);
+	assert.equal(chunks.timers.size, 0);
+
+	const tool = makeHost({ chunkMs: 30 });
+	tool.host.emitTurn(turn(), { type: "chunk", text: "before tool" });
+	tool.host.emitTurn(turn(), { type: "tool", tool: { id: "read", kind: "read", detail: "Ran" } });
+	assert.deepEqual(tool.events.map((event) => event.type), ["chunk", "tool"], "tool updates flush text without waiting");
+	assert.equal(tool.timers.size, 0);
+
+	const alternate = makeHost({ chunkMs: 30 });
+	alternate.host.emitTurn(turn(), { type: "chunk", text: "first" });
+	alternate.host.emitTurn(turn(), { type: "thought", text: "thinking" });
+	alternate.host.emitTurn(turn(), { type: "chunk", text: "last" });
+	flush(alternate);
+	assert.deepEqual(alternate.events.map((event) => [event.type, event.text]), [["chunk", "first"], ["thought", "thinking"], ["chunk", "last"]]);
+
+	const done = makeHost({ chunkMs: 30 });
+	const finishing = turn();
+	done.host.turns.set("chat", finishing);
+	done.host.emitTurn(finishing, { type: "chunk", text: "final reply" });
+	done.host.finishPrompt(finishing, 2, { stopReason: "end_turn" }, "");
+	assert.deepEqual(done.events.map((event) => event.type), ["chunk", "done"], "completion flushes the final text before retiring the turn");
+	assert.equal(done.timers.size, 0);
+
+	const approval = makeHost({ chunkMs: 30 });
+	approval.host.emitTurn(turn(), { type: "chunk", text: "before approval" });
+	approval.host.openGate({ type: "question", toolId: "question", uiSessionId: "chat", turnId: "turn", kind: "question", toolName: "Question", detail: "Waiting for your answer" });
+	assert.deepEqual(approval.events.map((event) => event.type), ["chunk", "tool"], "direct approval emission also flushes text first");
+	assert.equal(approval.events[1].tool.waiting, true);
+
+	const steer = makeHost({ chunkMs: 30 });
+	steer.host.emitTurn(turn(), { type: "chunk", text: "before steer" });
+	steer.host.emitTurn(turn(), { type: "steer", text: "new direction" });
+	assert.deepEqual(steer.events.map((event) => event.type), ["chunk", "steer"]);
+
+	const parallel = makeHost({ chunkMs: 30 });
+	parallel.host.emitTurn(turn(), { type: "chunk", text: "a1" });
+	parallel.host.emitTurn({ ...turn(), uiSessionId: "other", turnId: "other-turn" }, { type: "chunk", text: "b1" });
+	parallel.host.emitTurn(turn(), { type: "chunk", text: "a2" });
+	assert.deepEqual(parallel.events, []);
+	flush(parallel);
+	assert.deepEqual(parallel.events.map((event) => [event.uiSessionId, event.turnId, event.text]), [["chat", "turn", "a1a2"], ["other", "other-turn", "b1"]]);
+
+	const quitting = makeHost({ chunkMs: 30 });
+	quitting.host.emitTurn(turn(), { type: "chunk", text: "saved before quit" });
+	quitting.host.kill();
+	assert.equal(quitting.events[0].text, "saved before quit");
+	assert.equal(quitting.timers.size, 0);
+}
+
 (async () => {
+	await checkProbeGrok();
+	checkEditDiffs();
+	checkChunkBatching();
+	await checkPromptIndexes();
+	await checkBranches();
+	await checkSteer();
+	await checkSessionEnhancements();
 	await checkAccount();
 	await checkSessions();
 	await checkProcesses();

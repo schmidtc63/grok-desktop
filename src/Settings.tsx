@@ -1,10 +1,17 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { Customize } from "./Customize";
-import { mapMode, MODES, type PermissionMode } from "./types";
+import { DEFAULT_FILE_TYPES, PLAIN_TEXT } from "./editor-defaults";
+import { mapMode, MODES, type PermissionMode, type TranscriptView } from "./types";
+
+const EditorSettings = lazy(() => import("./EditorSettings").then((module) => ({ default: module.EditorSettings })).catch(() => ({
+	default: () => <p className="note" role="alert">Editor file types could not load. Restart the app to try again.</p>,
+})));
 
 export interface AppSettings {
 	appearance: "system" | "light" | "dark";
 	autoSave: boolean;
+	editorFileTypes: Record<string, string>;
+	promptSuggestions: boolean;
 	keepCookies: boolean;
 	linksInBuiltIn: boolean;
 	linkAsked: boolean;
@@ -18,6 +25,7 @@ export interface AppSettings {
 	autoArchiveDays: number;
 	branchPrefix: string;
 	defaultMode: PermissionMode;
+	defaultView: TranscriptView;
 	allowBypass: boolean;
 	// Set once so an older saved Manual default is not applied again after this choice.
 	bypassDefaultApplied: boolean;
@@ -26,12 +34,13 @@ export interface AppSettings {
 	sideWidth: number;
 	sidebarCollapsed: boolean;
 	railOpen: boolean;
-	modeByFolder: Record<string, PermissionMode>;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
 	appearance: "system",
 	autoSave: true,
+	editorFileTypes: DEFAULT_FILE_TYPES,
+	promptSuggestions: true,
 	keepCookies: true,
 	linksInBuiltIn: true,
 	linkAsked: false,
@@ -45,6 +54,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
 	autoArchiveDays: 14,
 	branchPrefix: "grok",
 	defaultMode: "Normal",
+	defaultView: "normal",
 	allowBypass: true,
 	bypassDefaultApplied: true,
 	model: "grok-4.7",
@@ -52,7 +62,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
 	sideWidth: 560,
 	sidebarCollapsed: false,
 	railOpen: true,
-	modeByFolder: {},
 };
 
 export const settingsKey = "grok-code.settings.v1";
@@ -61,11 +70,13 @@ export function readSettings(): AppSettings {
 	try {
 		const saved = JSON.parse(localStorage.getItem(settingsKey) ?? "null");
 		const settings: AppSettings = saved && typeof saved === "object" ? { ...DEFAULT_SETTINGS, ...saved } : { ...DEFAULT_SETTINGS };
+		const fileTypes = saved && saved.editorFileTypes;
+		settings.editorFileTypes = fileTypes && typeof fileTypes === "object" && Object.getPrototypeOf(fileTypes) === Object.prototype && Object.values(fileTypes).every((value) => typeof value === "string") ? fileTypes : { ...DEFAULT_FILE_TYPES };
 		settings.defaultMode = mapMode(settings.defaultMode) ?? "Normal";
-		settings.modeByFolder = Object.fromEntries(Object.entries(settings.modeByFolder).map(([folder, mode]) => [folder, mapMode(mode) ?? "Normal"]));
+		if (!["normal", "thinking", "verbose"].includes(settings.defaultView)) { settings.defaultView = "normal"; }
 		return settings;
 	} catch {
-		return { ...DEFAULT_SETTINGS };
+		return { ...DEFAULT_SETTINGS, editorFileTypes: { ...DEFAULT_FILE_TYPES } };
 	}
 }
 
@@ -73,12 +84,13 @@ export function validPrefix(value: string) {
 	return /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(value) && !/^(main|master|staging|warm|prod-.*|release.*)$/i.test(value);
 }
 
-export type SettingsTab = "general" | "notifications" | "sessions" | "skills" | "connectors" | "plugins" | "about";
+export type SettingsTab = "general" | "editor" | "notifications" | "sessions" | "skills" | "connectors" | "plugins" | "about";
 
-export function SettingsPage({ settings, onChange, onClose, servers, folder, onRun, initialTab = "general" }: {
+export function SettingsPage({ settings, onChange, onClose, onCheckSetup, servers, folder, onRun, initialTab = "general" }: {
 	settings: AppSettings;
 	onChange: (patch: Partial<AppSettings>) => void;
 	onClose: () => void;
+	onCheckSetup: () => void;
 	servers: GrokMcpServer[];
 	folder: string;
 	onRun: (text: string) => void;
@@ -86,6 +98,8 @@ export function SettingsPage({ settings, onChange, onClose, servers, folder, onR
 }) {
 	const [tab, setTab] = useState<SettingsTab>(initialTab);
 	const [prefix, setPrefix] = useState(settings.branchPrefix);
+	const [extension, setExtension] = useState("");
+	const [newLanguage, setNewLanguage] = useState(PLAIN_TEXT);
 	const [info, setInfo] = useState("");
 	useEffect(() => {
 		void window.grokCode?.appInfo?.().then((result) => {
@@ -113,7 +127,7 @@ export function SettingsPage({ settings, onChange, onClose, servers, folder, onR
 		<div className="settings-page" role="dialog" aria-label="Settings">
 			<nav className="settings-nav">
 				<h2>Settings</h2>
-				{([["general", "General"], ["notifications", "Notifications"], ["sessions", "Sessions"], ["skills", "Skills"], ["connectors", "Connectors"], ["plugins", "Plugins"], ["about", "About"]] as [SettingsTab, string][]).map(([id, label]) => (
+				{([["general", "General"], ["editor", "Editor"], ["notifications", "Notifications"], ["sessions", "Sessions"], ["skills", "Skills"], ["connectors", "Connectors"], ["plugins", "Plugins"], ["about", "About"]] as [SettingsTab, string][]).map(([id, label]) => (
 					<button key={id} type="button" autoFocus={tab === id} className={tab === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>
 				))}
 				<span className="spacer" />
@@ -127,10 +141,16 @@ export function SettingsPage({ settings, onChange, onClose, servers, folder, onR
 						{row("Keep computer awake while Grok works", "Prevents idle sleep while any session is working. A closed lid still sleeps.", toggle("keepAwake", "Keep computer awake while Grok works"))}
 						{row("Keep awake on battery power", "When off, the hold drops while on battery. On battery, Windows may still sleep a few minutes after its own sleep timeout.", toggle("keepAwakeOnBattery", "Keep awake on battery power"))}
 						{row("Auto save in the Files pane", "Save edits shortly after you stop typing.", toggle("autoSave", "Auto save"))}
+						{row("Suggest your next prompt", "Show a suggested next message after Grok replies. Press Tab to use it. Predictions may use model quota.", toggle("promptSuggestions", "Suggest your next prompt"))}
 						<h3>Browser</h3>
 						{row("Keep cookies", "Sign-ins in the Browser pane survive restarts.", toggle("keepCookies", "Keep cookies"))}
 						{row("Open links in built-in browser", "Links in the chat open in the Browser pane. Ctrl+click opens your default browser.", toggle("linksInBuiltIn", "Open links in built-in browser"))}
 					</>
+				)}
+				{tab === "editor" && (
+					<Suspense fallback={<p className="meta" role="status">Loading editor file types...</p>}>
+						<EditorSettings fileTypes={settings.editorFileTypes} onChange={(fileTypes) => onChange({ editorFileTypes: fileTypes })} extension={extension} setExtension={setExtension} newLanguage={newLanguage} setNewLanguage={setNewLanguage} />
+					</Suspense>
 				)}
 				{tab === "notifications" && (
 					<>
@@ -146,6 +166,7 @@ export function SettingsPage({ settings, onChange, onClose, servers, folder, onR
 					<>
 						<h3>Sessions</h3>
 						{row("Default permission mode", `The mode each new session starts in. ${MODES.find((item) => item.id === settings.defaultMode)?.detail ?? ""}`, choose("defaultMode", "Default permission mode", MODES.map((item) => [item.id, item.id])))}
+						{row("Transcript view", "How much each session shows until you change it with Ctrl+O. Thinking adds Grok's reasoning; Verbose also opens tool details.", choose("defaultView", "Transcript view", [["normal", "Normal"], ["thinking", "Thinking"], ["verbose", "Verbose"]]))}
 						{row("Archive inactive sessions", "Archive sessions with no activity for this long. Clean worktree folders are removed; their branches stay. Pinned and running sessions stay.", choose("autoArchiveDays", "Archive inactive sessions", [[0, "Never"], [1, "1 day"], [2, "2 days"], [7, "7 days"], [14, "14 days"], [30, "30 days"]]))}
 						{row("Branch prefix", "Added to the branch names of new worktree sessions.", (
 							<span className="set-inline">
@@ -164,6 +185,7 @@ export function SettingsPage({ settings, onChange, onClose, servers, folder, onR
 						<p>{info || "Codewomplers Grok Desktop"}</p>
 						<p className="meta">Copyright (c) 2026 Codewomplers. Not affiliated with or endorsed by xAI. Grok is a trademark of its owner.</p>
 						<p className="meta">Help → Check for Updates explains how this build updates.</p>
+						<button type="button" className="texty" onClick={onCheckSetup}>Check setup</button>
 					</>
 				)}
 			</div>

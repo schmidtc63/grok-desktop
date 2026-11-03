@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { Markdown } from "./Markdown";
-import { imageSrc, type ChatMessage, type Session, type ToolCard, type TranscriptView } from "./types";
+import { type NumberedLine } from "./DiffPane";
+import { imageSrc, type ChatMessage, type Session, type ToolCard, type ToolDiff, type TranscriptView } from "./types";
 
 export interface FolderFiles {
   status: "loading" | "ready" | "error";
@@ -31,17 +32,22 @@ export interface BackgroundTask {
 	label: string;
 	detail: string;
 	running: boolean;
+	tooltip?: string;
 	onStop?: () => void;
 	onOpen?: () => void;
+	info?: { kind: "command"; command: string; outputFile: string; exitCode: number | null; startedAt: number; endedAt: number; status: string } | { kind: "agent"; subagent: GrokSubagent };
 }
 
 export interface PaneModel {
   session: Session;
   messages: ChatMessage[];
 	view: TranscriptView;
+	findTick: number;
 	todos: GrokTodo[];
 	plan: string;
 	tasks: BackgroundTask[];
+	taskOutput: NonNullable<GrokCodeApi["taskOutput"]>;
+	subagentTranscript: NonNullable<GrokCodeApi["subagentTranscript"]>;
 	busy: boolean;
 	decide: (toolId: string, decision: "allow" | "deny" | "always") => void;
 	answerQuestion: (toolId: string, answers: Record<string, string> | null) => Promise<GrokSendResult>;
@@ -52,6 +58,9 @@ export interface PaneModel {
 	fileMenu: (file: string, event: MouseEvent) => void;
 	openLink: (href: string, event: MouseEvent) => void;
 	copyText: (text: string) => void;
+	quote: (text: string) => void;
+	rewind: (message: ChatMessage) => void;
+	fork: (message: ChatMessage) => void;
 	openImage: (file: string) => void;
 	runInTerminal: (code: string) => void;
 	closePane: (id: "plan" | "tasks") => void;
@@ -76,6 +85,24 @@ function lineRange(detail: string) {
   return { start, end };
 }
 
+// Built once per file list; the list keeps its identity until its contents change.
+const knownIndexes = new WeakMap<string[], { byLower: Map<string, string>; names: { file: string; base: string }[] }>();
+
+function knownIndex(known: string[]) {
+	let index = knownIndexes.get(known);
+	if (!index) {
+		const byLower = new Map<string, string>();
+		const names = known.map((file) => {
+			const lower = file.toLowerCase();
+			if (!byLower.has(lower)) { byLower.set(lower, file); }
+			return { file, base: lower.slice(lower.lastIndexOf("/") + 1) };
+		});
+		index = { byLower, names };
+		knownIndexes.set(known, index);
+	}
+	return index;
+}
+
 function toRelative(raw: string, folder: string, known: string[]) {
   let text = raw.trim().replace(/^[@`]+|[`]+$/g, "").replace(/^"+|"+$/g, "");
 	if (!text || text.length > 300 || /[\0\r\n]/.test(text)) { return ""; }
@@ -86,7 +113,7 @@ function toRelative(raw: string, folder: string, known: string[]) {
     slash = slash.slice(folderKey.length + 1);
   }
   if (!slash || slash.split("/").some((part) => part === ".." || part === ".")) return "";
-  const knownHit = known.find((file) => file.toLowerCase() === slash.toLowerCase());
+  const knownHit = knownIndex(known).byLower.get(slash.toLowerCase());
   if (knownHit) return knownHit;
 	if (/\s/.test(slash)) { return ""; }
 	if (/^[\w.@][\w.@/-]*\.[A-Za-z0-9]{1,8}$/.test(slash) && (slash.includes("/") || /\.(?:[cm]?[jt]sx?|json|md|txt|css|s[ac]ss|html?|xml|ya?ml|toml|ini|sql|asp|inc|vbs|asa|py|rb|go|rs|[ch]|cpp|hpp|sh|ps1|png|jpe?g|gif|svg|webp)$/i.test(slash))) { return slash; }
@@ -95,6 +122,8 @@ function toRelative(raw: string, folder: string, known: string[]) {
 
 export function mentionedFiles(text: string, tools: ToolCard[] | undefined, folder: string, known: string[]): FileHit[] {
 	const found = new Map<string, FileHit>();
+	const index = knownIndex(known);
+	const lowerText = text.toLowerCase();
 	function add(raw: string, range: { start: number; end: number } | null, occurrence?: { start: number; end: number }) {
     const file = toRelative(raw, folder, known);
 		if (!file) { return; }
@@ -109,7 +138,8 @@ export function mentionedFiles(text: string, tools: ToolCard[] | undefined, fold
   }
 	const spans: { start: number; end: number }[] = [];
 	const partialPathAt = (index: number) => /[^\s]+\/[^.\s]*\s+$/.test(text.slice(0, index).replace(/\\/g, "/"));
-	for (const file of [...new Set([...known, ...found.keys()])].sort((left, right) => right.length - left.length)) {
+	const files = [...index.names.filter(({ base }) => lowerText.includes(base)).map(({ file }) => file), ...[...found.keys()].filter((file) => !index.byLower.has(file.toLowerCase()))];
+	for (const file of [...new Set(files)].sort((left, right) => right.length - left.length)) {
 		const root = folder.replace(/\\/g, "/").replace(/\/+$/, "");
 		const candidates = [`${root}/${file}`, `${root}/${file}`.replace(/\//g, "\\"), file];
 		const pattern = new RegExp(`(?:^|[^\\w./\\\\:-])(${candidates.map(escapeReg).join("|")})(?=$|[^\\w./\\\\-])`, "gi");
@@ -203,6 +233,61 @@ function plainTitle(title: string) {
 	return title.replace(/`[\s\S]*`/, "").replace(/`[\s\S]*$/, "").replace(/\s+/g, " ").trim();
 }
 
+export function editRows(diff: ToolDiff): NumberedLine[] {
+	const lines = (text: string) => {
+		const trimmed = text.replace(/\n$/, "");
+		return trimmed ? trimmed.split("\n") : [];
+	};
+	const before = lines(diff.oldText);
+	const after = lines(diff.newText);
+	const shared = Math.min(before.length, after.length);
+	let head = 0;
+	while (head < shared && before[head] === after[head]) { head++; }
+	let tail = 0;
+	while (tail < shared - head && before[before.length - tail - 1] === after[after.length - tail - 1]) { tail++; }
+	const rows: NumberedLine[] = [];
+	const oldNumber = (index: number) => diff.oldLine === undefined ? {} : { oldLine: diff.oldLine + index };
+	const newNumber = (index: number) => diff.newLine === undefined ? {} : { newLine: diff.newLine + index };
+	for (let index = head - Math.min(head, 3); index < head; index++) {
+		rows.push({ kind: "context", text: before[index], ...oldNumber(index), ...newNumber(index) });
+	}
+	for (let index = head; index < before.length - tail; index++) {
+		rows.push({ kind: "del", text: before[index], ...oldNumber(index) });
+	}
+	for (let index = head; index < after.length - tail; index++) {
+		rows.push({ kind: "add", text: after[index], ...newNumber(index) });
+	}
+	for (let index = 0; index < Math.min(tail, 3); index++) {
+		const oldIndex = before.length - tail + index;
+		const newIndex = after.length - tail + index;
+		rows.push({ kind: "context", text: before[oldIndex], ...oldNumber(oldIndex), ...newNumber(newIndex) });
+	}
+	return rows;
+}
+
+export function EditDiff({ diff, all = false }: { diff: ToolDiff; all?: boolean }) {
+	const rows = editRows(diff);
+	return (
+		<>
+			{diff.whole && <p className="note">Writes the whole file. If the file exists, all of its current text is replaced.</p>}
+			{diff.replaceAll && <p className="note">Replaces every match in the file, not only this one.</p>}
+			{rows.length > 0 && (
+				<div className="edit-diff">
+					{(all ? rows : rows.slice(0, 200)).map((row, index) => (
+						<div className={`dp-line dp-${row.kind}`} key={index}>
+							<span className="dp-num">{row.oldLine ?? ""}</span>
+							<span className="dp-num">{row.newLine ?? ""}</span>
+							<span className="dp-text">{row.kind === "add" ? "+" : row.kind === "del" ? "-" : " "}{row.text}</span>
+						</div>
+					))}
+				</div>
+			)}
+			{!all && rows.length > 200 && <p className="note">{rows.length - 200} more lines not shown.</p>}
+			{diff.clipped && <p className="note">Grok's edit was longer; this shows the start.</p>}
+		</>
+	);
+}
+
 export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 	const [open, setOpen] = useState(m.view === "verbose");
 	const [busy, setBusy] = useState(false);
@@ -219,8 +304,16 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 	const waiting = tool.waiting === true;
 	const toolId = waiting ? tool.id : undefined;
 	const command = tool.command || (tool.path ? undefined : tool.summary);
-	const expandable = !!(questions?.length || plan || command || tool.output || tool.path);
-	const tone = waiting ? " wait" : /^(Failed|Denied|Not run)/.test(tool.detail) ? " bad" : "";
+	const expandable = !!(questions?.length || plan || command || tool.output || tool.path || tool.diff);
+	const failed = /^(Failed|Denied|Not run)/.test(tool.detail);
+	const diffCounts = useMemo(() => {
+		if (!tool.diff || tool.diff.clipped || failed) { return undefined; }
+		const rows = editRows(tool.diff);
+		return { additions: rows.filter((row) => row.kind === "add").length, deletions: rows.filter((row) => row.kind === "del").length };
+	}, [tool.diff, failed]);
+	const additions = diffCounts?.additions ?? tool.additions;
+	const deletions = diffCounts?.deletions ?? tool.deletions;
+	const tone = waiting ? " wait" : failed ? " bad" : "";
 	const questionTexts = questions?.map((item, index) => <div className="tool-question" key={index}>{item.header && <span className="chip-tag">{item.header}</span>}{item.question}</div>);
 	function answerOf(item: GrokQuestion, index: number) {
 		const state = picks[index];
@@ -255,7 +348,7 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 								const on = !picks[index]?.typed && !!picks[index]?.picked.includes(option.label);
 								return (
 									<button type="button" key={optionIndex} className={on ? "on" : undefined} aria-pressed={on} disabled={busy} onClick={() => choose(index, item.multiSelect, option.label)}>
-										{option.label}
+										<span>{optionIndex < 9 && <kbd className="opt-key">{optionIndex + 1}</kbd>}{option.label}</span>
 										{option.description && <small>{option.description}</small>}
 									</button>
 								);
@@ -316,7 +409,18 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 		const approval = tool.command || tool.input || tool.path || tool.summary;
 		body = (
 			<>
-				{approval && <pre className="tool-code">{approval}</pre>}
+				{tool.diff ? (
+					<>
+						<div className="tool-path">{tool.path ?? tool.summary}</div>
+						{tool.diff.clipped ? (
+							<>
+								{tool.diff.whole && <p className="note">Writes the whole file. If the file exists, all of its current text is replaced.</p>}
+								{tool.diff.replaceAll && <p className="note">Replaces every match in the file, not only this one.</p>}
+								{approval && <pre className="tool-code">{approval}</pre>}
+							</>
+						) : <EditDiff diff={tool.diff} all />}
+					</>
+				) : approval && <pre className="tool-code">{approval}</pre>}
 				{toolId && (
 					<div className="actions">
 						<button type="button" onClick={() => m.decide(toolId, "deny")}>Deny</button>
@@ -334,6 +438,7 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 				{command && <pre className="tool-code">{command}</pre>}
 				{tool.output && <pre className="tool-code">{tool.output}</pre>}
 				{tool.path && <div className="tool-path">{tool.path}</div>}
+				{tool.diff && !failed && <EditDiff diff={tool.diff} />}
 			</>
 		);
 	}
@@ -342,8 +447,8 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 			<span className="tool-glyph" aria-hidden="true">{TOOL_GLYPHS[kind] ?? "•"}</span>
 			<span className="tool-label">{label}</span>
 			{text && <span className="tool-text" title={text}>{text}</span>}
-			{(tool.additions !== undefined || tool.deletions !== undefined) && (
-				<span className="tool-count"><span className="add">{`+${tool.additions ?? 0}`}</span> <span className="del">{`−${tool.deletions ?? 0}`}</span></span>
+			{(additions !== undefined || deletions !== undefined) && (
+				<span className="tool-count"><span className="add">{`+${additions ?? 0}`}</span> <span className="del">{`−${deletions ?? 0}`}</span></span>
 			)}
 			<span className={`tool-status${tone}`}>{tool.detail}</span>
 		</>
@@ -412,18 +517,28 @@ function Thought({ text, view }: { text: string; view: TranscriptView }) {
 	);
 }
 
-function MessageBody({ message, m }: { message: ChatMessage; m: PaneModel }) {
-  const known = m.folderFiles?.files ?? [];
-	const hits = mentionedFiles(message.text, message.tools, m.session.folder, known);
-	const hitFiles = hits.map((hit) => hit.file);
-	const renderText = (text: string, key: string) => (hitFiles.length ? linkedText(text, mentionedFiles(text, undefined, m.session.folder, hitFiles), m.openFile, m.fileMenu, key) : text);
+function MessageBody({ message, m, readOnly = false }: { message: ChatMessage; m: PaneModel; readOnly?: boolean }) {
+	const known = m.folderFiles?.files;
+	const hits = useMemo(() => readOnly ? [] : mentionedFiles(message.text, message.tools, m.session.folder, known ?? []), [readOnly, message.text, message.tools, m.session.folder, known]);
+	const hitFiles = useMemo(() => hits.map((hit) => hit.file), [hits]);
+	const renderText = (text: string, key: string) => (!readOnly && hitFiles.length ? linkedText(text, mentionedFiles(text, undefined, m.session.folder, hitFiles), m.openFile, m.fileMenu, key) : text);
 	const renderCode = (code: string, key: string) => {
+		if (readOnly) { return null; }
 		const match = /^(.+?)(?::(\d{1,7}))?$/.exec(code.trim());
-		const file = match ? toRelative(match[1], m.session.folder, hitFiles.length ? hitFiles : known) : "";
-		if (!file || !(hitFiles.includes(file) || known.includes(file))) { return null; }
+		const file = match ? toRelative(match[1], m.session.folder, hitFiles.length ? hitFiles : known ?? []) : "";
+		if (!file || !(hitFiles.includes(file) || (known ?? []).includes(file))) { return null; }
 		return <code key={key}><FileButton file={file} label={code} line={match?.[2] ? Number(match[2]) : undefined} onOpen={m.openFile} onMenu={m.fileMenu} /></code>;
 	};
-	const markdown = (text: string, key: string) => <Markdown key={key} text={text} renderText={renderText} renderCode={renderCode} onLink={m.openLink} onCopy={m.copyText} onRun={message.streaming ? undefined : m.runInTerminal} />;
+	const openLink = (href: string, event: MouseEvent) => {
+		if (readOnly) {
+			try {
+				const url = new URL(href);
+				if (url.protocol !== "http:" && url.protocol !== "https:") { return; }
+			} catch { return; }
+		}
+		m.openLink(href, event);
+	};
+	const markdown = (text: string, key: string) => <Markdown key={key} text={text} renderText={renderText} renderCode={renderCode} onLink={openLink} onCopy={m.copyText} onRun={readOnly || message.streaming ? undefined : m.runInTerminal} />;
 	if (message.role === "user") {
 		const files = message.attachments ?? [];
 		const others = files.filter((file) => !imageSrc(file));
@@ -467,6 +582,11 @@ function MessageBody({ message, m }: { message: ChatMessage; m: PaneModel }) {
 		message.parts.forEach((part, index) => {
 			if (part.kind === "text") {
 				if (part.text.trim()) { flush(); ordered.push(markdown(part.text, `t${index}`)); }
+				return;
+			}
+			if (part.kind === "steer") {
+				flush();
+				ordered.push(<div className="steer-note" key={`s${index}`}><small>You, while Grok worked</small><div className="message-text">{part.text}</div></div>);
 				return;
 			}
 			const tool = tools.find((item) => item.id === part.id);
@@ -514,30 +634,143 @@ export function TaskList({ todos }: { todos: GrokTodo[] }) {
 	);
 }
 
+const fullTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
+
+export function messageTime(message: ChatMessage) {
+	if (message.pending || message.streaming) { return null; }
+	const at = message.at ?? (message.role === "user" ? Number(/-(\d{13})$/.exec(message.id)?.[1] ?? NaN) : NaN);
+	if (!Number.isFinite(at)) { return null; }
+	const date = new Date(at);
+	if (Number.isNaN(date.getTime())) { return null; }
+	return { at, full: fullTime.format(date) };
+}
+
+// Where each session was being read in this window; following the newest message needs no entry.
+const readingAt = new Map<string, number>();
+
 function Chat({ m }: { m: PaneModel }) {
   const scroller = useRef<HTMLDivElement>(null);
 	const follow = useRef(true);
 	const [away, setAway] = useState(false);
-	const sessionId = useRef(m.session.id);
+	const sessionId = useRef("");
+	const [find, setFind] = useState<string | null>(null);
+	const [hit, setHit] = useState(0);
+	const [hits, setHits] = useState(0);
+	const [contentTick, setContentTick] = useState(0);
+	const findBox = useRef<HTMLInputElement>(null);
+	const jump = useRef(false);
   const signature = m.messages.map((message) => {
-		const tools = message.tools?.map((tool) => `${tool.id}:${tool.detail}:${tool.waiting}:${tool.output ?? ""}`).join(",") ?? "";
+		const tools = message.tools?.map((tool) => `${tool.id}:${tool.detail}:${tool.waiting}:${tool.output ?? ""}:${tool.diff ? 1 : 0}`).join(",") ?? "";
     return `${message.id}:${message.text}:${message.thought ?? ""}:${message.pending}:${tools}`;
   }).join("|");
   useEffect(() => {
     const node = scroller.current;
-		if (sessionId.current !== m.session.id) { follow.current = true; setAway(false); sessionId.current = m.session.id; }
+		if (sessionId.current !== m.session.id) {
+			sessionId.current = m.session.id;
+			const saved = readingAt.get(m.session.id);
+			follow.current = saved === undefined;
+			setAway(saved !== undefined);
+			if (node && saved !== undefined) { node.scrollTop = saved; }
+		}
 		if (node && follow.current) { node.scrollTop = node.scrollHeight; }
 	}, [signature, m.session.id, m.todos.length]);
+	useEffect(() => {
+		if (!m.findTick) { return; }
+		setFind((current) => current ?? "");
+		findBox.current?.focus();
+		findBox.current?.select();
+	}, [m.findTick]);
+	useEffect(() => () => {
+		if (typeof CSS !== "undefined") {
+			CSS.highlights?.delete("grok-find");
+			CSS.highlights?.delete("grok-find-current");
+		}
+	}, []);
+	useEffect(() => {
+		const column = scroller.current?.querySelector(".chat-col");
+		if (find === null || !column || typeof MutationObserver === "undefined") { return; }
+		const observer = new MutationObserver(() => setContentTick((value) => value + 1));
+		observer.observe(column, { childList: true, subtree: true, characterData: true });
+		return () => observer.disconnect();
+	}, [find !== null, m.session.id]);
+	useEffect(() => {
+		const registry = typeof CSS === "undefined" ? undefined : CSS.highlights;
+		if (!registry) { return; }
+		const needle = (find ?? "").toLowerCase();
+		const column = scroller.current?.querySelector(".chat-col");
+		const ranges: Range[] = [];
+		if (needle && column) {
+			const walker = document.createTreeWalker(column, NodeFilter.SHOW_TEXT, { acceptNode: (node) => (node.parentElement?.closest(".msg-foot") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT) });
+			// ponytail: cap highlights at 5000; type more to narrow a larger conversation.
+			for (let node = walker.nextNode(); node && ranges.length < 5000; node = walker.nextNode()) {
+				const length = node.nodeValue?.length ?? 0;
+				const text = (node.nodeValue ?? "").toLowerCase();
+				for (let at = text.indexOf(needle); at >= 0 && at < length && ranges.length < 5000; at = text.indexOf(needle, at + needle.length)) {
+					const range = document.createRange();
+					range.setStart(node, at);
+					range.setEnd(node, Math.min(at + needle.length, length));
+					ranges.push(range);
+				}
+			}
+		}
+		setHits(ranges.length);
+		const current = ranges.length ? ranges[((hit % ranges.length) + ranges.length) % ranges.length] : undefined;
+		if (ranges.length) { registry.set("grok-find", new Highlight(...ranges)); } else { registry.delete("grok-find"); }
+		if (current) { registry.set("grok-find-current", new Highlight(current)); } else { registry.delete("grok-find-current"); }
+		if (current && jump.current) { current.startContainer.parentElement?.scrollIntoView({ block: "center" }); }
+		jump.current = false;
+	}, [find, hit, signature, m.session.id, m.view, contentTick]);
   return (
 		<section className="chat" aria-label="Chat">
-			<div className="chat-scroll" ref={scroller} onScroll={(event) => { const node = event.currentTarget; follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 48; setAway(!follow.current); }}>
+			{find !== null && (
+				<div className="find-bar" role="search" onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); setFind(null); setHit(0); } }}>
+					<input
+						ref={findBox}
+						autoFocus
+						aria-label="Find in conversation"
+						placeholder="Find in conversation"
+						value={find}
+						onChange={(event) => { jump.current = true; setHit(0); setFind(event.target.value); }}
+						onKeyDown={(event) => {
+							if (event.key === "Enter") { event.preventDefault(); jump.current = true; setHit((value) => value + (event.shiftKey ? -1 : 1)); }
+						}}
+					/>
+					<span className="find-count">{hits ? `${(((hit % hits) + hits) % hits) + 1} of ${hits}` : find ? "No results" : ""}</span>
+					<button type="button" className="texty" aria-label="Previous match" disabled={!hits} onClick={() => { jump.current = true; setHit((value) => value - 1); }}>↑</button>
+					<button type="button" className="texty" aria-label="Next match" disabled={!hits} onClick={() => { jump.current = true; setHit((value) => value + 1); }}>↓</button>
+					<button type="button" className="texty" aria-label="Close find" onClick={() => { setFind(null); setHit(0); }}>×</button>
+				</div>
+			)}
+			<div className="chat-scroll" ref={scroller} onScroll={(event) => {
+				if (sessionId.current !== m.session.id) { return; }
+				const node = event.currentTarget;
+				follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 48;
+				if (follow.current) { readingAt.delete(m.session.id); } else { readingAt.set(m.session.id, node.scrollTop); }
+				setAway(!follow.current);
+			}}>
 				<div className="chat-col">
 					{m.messages.length === 0 && <p className="chat-empty">What should Grok work on in {m.session.project}?</p>}
-					{m.messages.map((message) => (
-						<article className={message.role === "user" ? "msg user" : "msg grok"} key={message.id}>
-							<MessageBody message={message} m={m} />
-						</article>
-					))}
+					{m.messages.map((message) => {
+						const time = messageTime(message);
+						return (
+							<article className={message.role === "user" ? "msg user" : "msg grok"} key={message.id} tabIndex={time ? 0 : undefined}>
+								<MessageBody message={message} m={m} />
+								<div className="msg-foot">
+									{time && <time className="msg-time" dateTime={new Date(time.at).toISOString()} title={time.full}>{time.full}</time>}
+									{!message.pending && !message.streaming && message.text.trim() && (
+										<span className="msg-actions">
+											<button type="button" className="texty" onClick={() => m.copyText(message.text)}>Copy</button>
+											<button type="button" className="texty" onClick={() => m.quote(message.text)}>Quote</button>
+											{message.role === "user" && message.point && message.point.agentSessionId === m.session.agentSessionId && !m.busy && <>
+												<button type="button" className="texty" onClick={() => m.rewind(message)}>Rewind</button>
+												<button type="button" className="texty" onClick={() => m.fork(message)}>Fork</button>
+											</>}
+										</span>
+									)}
+								</div>
+							</article>
+						);
+					})}
 					<TaskList todos={m.todos} />
 				</div>
       </div>
@@ -564,19 +797,70 @@ function Plan({ m }: { m: PaneModel }) {
 }
 
 function Tasks({ m }: { m: PaneModel }) {
+	const [openId, setOpenId] = useState("");
+	const [refresh, setRefresh] = useState(0);
+	const [output, setOutput] = useState<{ id: string; result?: Awaited<ReturnType<PaneModel["taskOutput"]>> }>({ id: "" });
+	const [transcriptRequest, setTranscriptRequest] = useState({ id: "", version: 0 });
+	const [transcript, setTranscript] = useState<{ id: string; result?: Awaited<ReturnType<PaneModel["subagentTranscript"]>> }>({ id: "" });
+	const info = m.tasks.find((task) => task.id === openId)?.info;
+	const command = info?.kind === "command" ? info : undefined;
+	const childId = info?.kind === "agent" ? info.subagent.childSessionId : undefined;
+	useEffect(() => {
+		if (!command) { return; }
+		let cancelled = false;
+		setOutput({ id: openId });
+		void m.taskOutput(command.outputFile).then((result) => { if (!cancelled) { setOutput({ id: openId, result }); } }).catch(() => {
+			if (!cancelled) { setOutput({ id: openId, result: { ok: false, error: "Task output could not be read." } }); }
+		});
+		return () => { cancelled = true; };
+	}, [openId, command?.outputFile, command?.status, refresh]);
+	useEffect(() => {
+		if (!childId || transcriptRequest.id !== openId) { return; }
+		let cancelled = false;
+		setTranscript({ id: openId });
+		void m.subagentTranscript(childId).then((result) => { if (!cancelled) { setTranscript({ id: openId, result }); } }).catch(() => {
+			if (!cancelled) { setTranscript({ id: openId, result: { ok: false, error: "This subagent's transcript could not be read." } }); }
+		});
+		return () => { cancelled = true; };
+	}, [openId, childId, transcriptRequest]);
+	const log = output.id === openId ? output.result : undefined;
+	const conversation = transcript.id === openId ? transcript.result : undefined;
   return (
     <section className="pane" aria-label="Background tasks">
 			<div className="pane-hd"><b>Background tasks</b><span className="spacer" /><PaneClose onClose={() => m.closePane("tasks")} /></div>
 			<div className="pane-bd">
 				{m.tasks.length === 0 && <p className="note">Nothing is running in the background.</p>}
 				{m.tasks.map((task) => (
-					<div className="bg-task" key={task.id}>
-						<span className={task.running ? "dot run" : "dot"} aria-hidden="true" />
-						<button type="button" className="bg-task-main" disabled={!task.onOpen} onClick={task.onOpen}>
-							<b>{task.label}</b>
-							<small>{task.detail}</small>
-						</button>
-						{task.onStop && task.running && <button type="button" className="texty" onClick={task.onStop}>Stop</button>}
+					<div key={task.id}>
+						<div className="bg-task">
+							<span className={task.running ? "dot run" : "dot"} aria-hidden="true" />
+							<button type="button" className="bg-task-main" disabled={!task.onOpen && !task.info} aria-expanded={task.info ? openId === task.id : undefined} onClick={() => { if (task.onOpen) { task.onOpen(); } else if (task.info) { setOpenId((current) => current === task.id ? "" : task.id); } }} title={task.tooltip}>
+								<b>{task.label}</b>
+								{task.detail && <small>{task.detail}</small>}
+							</button>
+							{task.onStop && task.running && <button type="button" className="texty" onClick={task.onStop}>Stop</button>}
+						</div>
+					{openId === task.id && task.info?.kind === "command" && (
+						<div className="task-details">
+							<code className="task-command">{task.info.command}</code>
+							<p className="meta">{task.info.status}{task.info.exitCode !== null ? ` · exit ${task.info.exitCode}` : ""}{task.info.startedAt ? ` · ${(Math.max(0, (task.info.endedAt || Date.now()) - task.info.startedAt) / 1000).toFixed(1)} s` : ""}</p>
+							{!log && <p className="note">Loading output...</p>}
+							{log && !log.ok && <p className="note">{log.error || "Task output is not available."}</p>}
+							{log?.ok && <pre className="task-output">{log.text || "No output yet."}</pre>}
+							{log?.truncated && <p className="note">Showing the last 200 KB.</p>}
+							{task.running && <button type="button" className="texty" onClick={() => setRefresh((value) => value + 1)}>Refresh</button>}
+						</div>
+					)}
+					{openId === task.id && task.info?.kind === "agent" && (
+						<div className="task-details">
+							<p className="meta">{[task.info.subagent.agentType, task.info.subagent.model, task.info.subagent.status, task.info.subagent.durationMs != null ? `${(task.info.subagent.durationMs / 1000).toFixed(1)} s` : "", task.info.subagent.toolCalls != null ? `${task.info.subagent.toolCalls} tool calls` : "", task.info.subagent.tokensUsed != null ? `${task.info.subagent.tokensUsed} tokens` : ""].filter(Boolean).join(" · ")}</p>
+							{task.info.subagent.output ? <MessageBody readOnly message={{ id: `subagent-result-${task.id}`, role: "grok", text: task.info.subagent.output }} m={m} /> : <p className="note">{task.running ? "Still working." : "No result was recorded."}</p>}
+							{task.info.subagent.childSessionId && <button type="button" className="texty" onClick={() => setTranscriptRequest((current) => ({ id: task.id, version: current.version + 1 }))}>Show transcript</button>}
+							{transcriptRequest.id === task.id && !conversation && <p className="note">Loading transcript...</p>}
+							{transcriptRequest.id === task.id && conversation && !conversation.ok && <p className="note">{conversation.error || "The transcript is not available."}</p>}
+							{conversation?.ok && <div className="task-transcript">{conversation.truncated && <p className="note">The start of this transcript was left out.</p>}{conversation.messages?.map((message) => <div className={`msg ${message.role}`} key={message.id}><MessageBody readOnly message={message} m={m} /></div>)}</div>}
+						</div>
+					)}
 					</div>
 				))}
       </div>
@@ -594,11 +878,15 @@ export function SideLog({ messages, model }: { messages: ChatMessage[]; model: P
   if (messages.length === 0) return null;
   return (
     <div className="side-log" ref={box} onScroll={(event) => { const node = event.currentTarget; follow.current = node.scrollHeight - node.scrollTop - node.clientHeight < 48; }}>
-      {messages.map((message) => (
-				<div key={message.id} className={message.role === "user" ? "msg user" : "msg grok"}>
-          <MessageBody message={message} m={model} />
-        </div>
-      ))}
+			{messages.map((message) => {
+				const time = messageTime(message);
+				return (
+					<div key={message.id} className={message.role === "user" ? "msg user" : "msg grok"} tabIndex={time ? 0 : undefined}>
+						<MessageBody message={message} m={model} />
+						{time && <time className="msg-time" dateTime={new Date(time.at).toISOString()} title={time.full}>{time.full}</time>}
+					</div>
+				);
+			})}
     </div>
   );
 }

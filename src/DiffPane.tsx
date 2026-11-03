@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useRef, useState } from "react";
+import { askConfirm } from "./confirm";
 
 export interface DiffComment { id: string; file: string; line: number; side: "old" | "new"; text: string }
 
@@ -25,6 +26,7 @@ export interface DiffPaneProps {
 	onAddComment: (comment: Omit<DiffComment, "id">) => void;
 	onRemoveComment: (id: string) => void;
 	onSendComments: () => void;
+	onAskGrok: (text: string) => void;
 	branch: { branch: string; base: string; ahead: number } | undefined;
 	pr: PrInfo | null | undefined;
 	prError?: string;
@@ -164,7 +166,7 @@ function PrStrip({ branch, pr, prError, onCreatePr, onMergeWhenReady }: Pick<Dif
 }
 
 export function DiffPane(props: DiffPaneProps) {
-	const { snapshot, scope, onScope, commits, selectedFile, onSelectFile, onRefresh, onRevert, comments, onAddComment, onRemoveComment, onSendComments, onOpenFile, onFileMenu, onClose } = props;
+	const { snapshot, scope, onScope, commits, selectedFile, onSelectFile, onRefresh, onRevert, comments, onAddComment, onRemoveComment, onSendComments, onAskGrok, onOpenFile, onFileMenu, onClose } = props;
 	const [menu, setMenu] = useState<Spot | null>(null);
 	const [note, setNote] = useState(``);
 	const [reverting, setReverting] = useState(false);
@@ -182,15 +184,18 @@ export function DiffPane(props: DiffPaneProps) {
 
 	function revert() {
 		setMenu(null);
-		if (!selected || !window.confirm(`Revert ${selected} to the last commit? This cannot be undone.`)) {
+		const file = selected;
+		if (!file) {
 			return;
 		}
-		const file = selected;
-		setReverting(true);
-		setNote(``);
-		void onRevert(file).then((result) => {
-			setNote(result.ok ? `Restored ${file} to the last commit.` : (result.error || `That file could not be restored.`));
-		}, () => setNote(`That file could not be restored.`)).finally(() => setReverting(false));
+		void askConfirm({ title: `Revert ${file}?`, body: `This puts the file back as it was at the last commit. This cannot be undone.`, ok: `Revert`, danger: true }).then((yes) => {
+			if (!yes) { return; }
+			setReverting(true);
+			setNote(``);
+			void onRevert(file).then((result) => {
+				setNote(result.ok ? `Restored ${file} to the last commit.` : (result.error || `That file could not be restored.`));
+			}, () => setNote(`That file could not be restored.`)).finally(() => setReverting(false));
+		});
 	}
 
 	function composeKeys(event: React.KeyboardEvent<HTMLTextAreaElement>, draft: Compose) {
@@ -319,6 +324,12 @@ export function DiffPane(props: DiffPaneProps) {
 				{snapshot?.ok && snapshot.repo !== false && files.length === 0 && <p className="note">No changes.</p>}
 				{snapshot?.truncated && <p className="note">The rest of the diff was left out.</p>}
 				{note && <p className="note">{note}</p>}
+				{snapshot?.ok && snapshot.repo !== false && scope === `uncommitted` && files.length > 0 && (
+					<div className="dp-commit">
+						<button className="texty" onClick={() => { void askConfirm({ title: `Commit all uncommitted changes?`, body: `Grok writes the commit message and commits. Nothing is pushed.`, ok: `Commit` }).then((yes) => { if (yes) { onAskGrok(`Commit the current uncommitted changes in this repository with a clear commit message. Don't push.`); } }); }}>Commit</button>
+						<button className="texty" onClick={() => { void askConfirm({ title: `Commit and push?`, body: `Grok commits all uncommitted changes and pushes the branch to its remote.`, ok: `Commit and push`, danger: true }).then((yes) => { if (yes) { onAskGrok(`Commit the current uncommitted changes in this repository with a clear commit message, then push the branch.`); } }); }}>Commit and push</button>
+					</div>
+				)}
 				{files.length > 0 && (
 					<div className="file-list">
 						{files.map((file) => (

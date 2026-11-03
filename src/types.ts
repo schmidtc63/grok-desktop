@@ -39,6 +39,7 @@ export interface ProjectSeed {
 export interface Session {
   id: string;
   title: string;
+	titleAuto?: boolean;
   project: string;
   folder: string;
   branch: string;
@@ -79,22 +80,28 @@ export interface ToolCard {
 	output?: string;
 	additions?: number;
 	deletions?: number;
+	diff?: ToolDiff;
 	questions?: GrokQuestion[];
 	plan?: string;
 	todos?: GrokTodo[];
 }
 
+// The text an edit replaced and its replacement; Grok sends snippets, not whole files.
+export interface ToolDiff { oldText: string; newText: string; oldLine?: number; newLine?: number; clipped?: boolean; whole?: boolean; replaceAll?: boolean }
+
 // A reply keeps its text and tool calls in the order they arrived.
-export type MessagePart = { kind: "text"; text: string } | { kind: "tool"; id: string };
+export type MessagePart = { kind: "text"; text: string } | { kind: "tool"; id: string } | { kind: "steer"; text: string };
 
 export interface ChatMessage {
   id: string;
   role: "user" | "grok";
   text: string;
+	at?: number;
   thought?: string;
   tools?: ToolCard[];
 	parts?: MessagePart[];
 	attachments?: string[];
+	point?: { agentSessionId: string; index: number };
   live?: boolean;
   pending?: boolean;
 	streaming?: boolean;

@@ -38,6 +38,9 @@ function load(name, globals = {}) {
 	const imports = (id) => {
 		if (id === "react") { return react; }
 		if (id === "react/jsx-runtime") { return { jsx, jsxs: jsx, Fragment: "fragment" }; }
+		if (id === "./confirm") { return load("confirm.ts", globals); }
+		if (id === "./Markdown") { return { Markdown: (props) => jsx("markdown", props) }; }
+		if (id === "./CodeEditorLoader") { return { CodeEditorLoader: (props) => jsx("code-editor", props) }; }
 		throw new Error(`Unexpected import ${id}`);
 	};
 	vm.runInNewContext(source, { require: imports, module, exports: module.exports, ...globals }, { filename: file });
@@ -81,12 +84,24 @@ function check(label, fn) {
 	}
 }
 
+async function checkAsync(label, fn) {
+	let timer;
+	try {
+		await Promise.race([Promise.resolve().then(fn), new Promise((resolve, reject) => { timer = setTimeout(() => reject(new Error("Check did not settle")), 5000); })]);
+		console.log(`PASS ${label}`);
+	} catch (error) {
+		failures++;
+		console.log(`FAIL ${label}: ${error.message}`);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 const { numberLines, checksSummary, DiffPane } = load("DiffPane.tsx");
 const { SessionRail } = load("SessionRail.tsx");
 const filesPane = load("FilesPane.tsx");
 const { shouldAutoSave, FilesPane } = filesPane;
-// The vm realm has its own Object prototype; copy results into this realm so deepEqual compares values only.
-const lineOffsets = (text, line) => ({ ...filesPane.lineOffsets(text, line) });
+const { fromFile } = filesPane;
 
 const hunk = {
 	id: "h1",
@@ -140,16 +155,20 @@ check("shouldAutoSave waits on a disk conflict", () => assert.equal(shouldAutoSa
 check("shouldAutoSave waits on a view-only file", () => assert.equal(shouldAutoSave({ ...ok, readOnly: true }), false));
 check("shouldAutoSave waits while a save runs", () => assert.equal(shouldAutoSave({ ...ok, saving: true }), false));
 
-const lf = "alpha\nbeta\ngamma";
-check("lineOffsets finds the first line", () => assert.deepEqual(lineOffsets(lf, 1), { start: 0, end: 5 }));
-check("lineOffsets finds a middle line", () => assert.deepEqual(lineOffsets(lf, 2), { start: 6, end: 10 }));
-check("lineOffsets finds the last line", () => assert.deepEqual(lineOffsets(lf, 3), { start: 11, end: 16 }));
-check("lineOffsets clamps past the end to the last line", () => assert.deepEqual(lineOffsets(lf, 99), { start: 11, end: 16 }));
-check("lineOffsets drops the CR of CRLF text", () => {
-	const crlf = "alpha\r\nbeta\r\ngamma";
-	assert.deepEqual(lineOffsets(crlf, 2), { start: 7, end: 11 });
-	assert.equal(crlf.slice(7, 11), "beta");
-	assert.deepEqual(lineOffsets(crlf, 3), { start: 13, end: 18 });
+check("Markdown links resolve from the document and preserve line targets and literal base names", () => {
+	for (const [file, href, expected] of [
+		["docs/a.md", "b.md", "docs/b.md"],
+		["docs/a.md", "b.md:42", "docs/b.md:42"],
+		["docs/sub/a.md", "../c.md#x", "docs/c.md"],
+		["docs/100%/a.md", "next.md", "docs/100%/next.md"],
+		["docs/x#y/a.md", "next.md", "docs/x#y/next.md"],
+		["docs/a.md", "https://example.test/a", "https://example.test/a"],
+		["docs/a.md", "#top", "#top"],
+		["docs/a.md", "C:/x.md", "C:/x.md"],
+		["docs/a.md", "C:\\x.md", "C:\\x.md"],
+	]) {
+		assert.equal(fromFile(file, href), expected);
+	}
 });
 
 const noop = () => {};
@@ -295,7 +314,7 @@ check("FilesPane saves edits typed during a save after that save succeeds, witho
 	assert.equal(timers.size, 0, "a failed save with the same base does not retry in a loop");
 });
 
-check("FilesPane renders the conflict banner, gutter and view-only note", () => {
+check("FilesPane renders the conflict banner and view-only note", () => {
 	const props = {
 		files: { status: "ready", files: ["a.txt", "b.txt"] }, file: "a.txt", onSelectFile: noop, lineTick: 0,
 		open: { status: "ready", text: "one\ntwo\nthree", version: "v1" },
@@ -308,15 +327,69 @@ check("FilesPane renders the conflict banner, gutter and view-only note", () => 
 	assert.ok(text.includes("This file changed on disk."));
 	assert.ok(text.includes("Override") && text.includes("Discard"));
 	assert.ok(text.includes("This file is view-only here."));
-	const gutter = tree.elements.find((el) => el.props.className === "fp-gutter");
-	assert.equal(gutter.props.children, "1\n2\n3");
 	const box = tree.elements.find((el) => el.props["aria-label"] === "File text");
 	assert.equal(box.props.readOnly, true);
 	assert.equal(box.props.value, "one\ntwo\nthree!");
 });
 
-if (failures > 0) {
-	console.log(`${failures} check(s) failed`);
-	process.exit(1);
+check("FilesPane previews Markdown drafts and switches to Source for edits and line targets", () => {
+	const links = [];
+	const props = {
+		files: { status: "ready", files: ["docs/a.md"] }, file: "docs/a.md", onSelectFile: noop, lineTick: 0,
+		open: { status: "ready", text: "# Original", version: "v1" },
+		draft: { text: "# Edited", baseText: "# Original", version: "v1" },
+		readOnly: false, autoSave: false, onAutoSave: noop, onEdit: noop, onSave: noop, onCancel: noop,
+		conflict: false, onOverride: noop, onDiscard: noop, onClearRecovery: noop, onFileMenu: noop, onLink: (href) => links.push(href), onClose: noop,
+	};
+	const render = renderer(FilesPane, props);
+	let tree = render();
+	const markdown = tree.elements.find((node) => node.type === "markdown");
+	assert.equal(markdown.props.text, "# Edited");
+	assert.ok(!tree.elements.some((node) => node.type === "code-editor"));
+	markdown.props.onLink("b.md:42", {});
+	markdown.props.onLink("#heading", {});
+	assert.deepEqual(links, ["docs/b.md:42"]);
+	tree.elements.find((node) => node.props.children === "Edit").props.onClick();
+	tree = render();
+	assert.equal(tree.elements.find((node) => node.type === "code-editor").props.value, "# Edited");
+	tree.elements.find((node) => node.props.children === "Preview").props.onClick();
+	assert.ok(render().elements.some((node) => node.type === "markdown"));
+	props.line = 2;
+	props.lineTick++;
+	render();
+	tree = render();
+	assert.ok(tree.elements.some((node) => node.type === "code-editor"));
+	assert.ok(!tree.elements.some((node) => node.type === "markdown"));
+});
+
+async function main() {
+	await checkAsync("Revert asks for the captured file and restores it only on yes", async () => {
+		for (const yes of [false, true]) {
+			const questions = [];
+			const reverted = [];
+			const { DiffPane: ConfirmPane } = load("DiffPane.tsx", { window: { innerWidth: 800, confirm: (question) => { questions.push(question); return yes; } } });
+			const props = {
+				...diffProps, scope: "uncommitted", comments: [],
+				snapshot: { ok: true, files: [...diffProps.snapshot.files, { path: "src/b.ts", hunks: [] }] },
+				onRevert: async (file) => { reverted.push(file); return { ok: true }; },
+			};
+			const render = renderer(ConfirmPane, props);
+			render().elements.find((node) => node.type === "button" && node.props["aria-label"] === "Changes menu").props.onClick({ currentTarget: { getBoundingClientRect: () => ({ bottom: 40, right: 400 }) } });
+			render().elements.find((node) => node.props.role === "menuitem" && node.props.children === "Revert file…").props.onClick();
+			assert.deepEqual(questions, ["Revert src/a.ts?\n\nThis puts the file back as it was at the last commit. This cannot be undone."]);
+			assert.deepEqual(reverted, [], "revert waits for the answer promise");
+			props.selectedFile = "src/b.ts";
+			assert.ok(!render().elements.some((node) => node.props.role === "menu"), "the menu closes before asking");
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.deepEqual(reverted, yes ? ["src/a.ts"] : []);
+			assert.equal(render().text.join("").includes("Restored src/a.ts to the last commit."), yes);
+		}
+	});
+	if (failures > 0) {
+		console.log(`${failures} check(s) failed`);
+		process.exitCode = 1;
+		return;
+	}
+	console.log("All diff and files pane checks passed");
 }
-console.log("All diff and files pane checks passed");
+void main().catch((error) => { console.error(error); process.exitCode = 1; });

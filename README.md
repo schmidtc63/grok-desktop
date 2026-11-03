@@ -34,6 +34,7 @@ npm run desktop
 ## Tests
 
 ```powershell
+npm run typecheck
 npm run build
 npm test
 ```

@@ -7,7 +7,7 @@ const { createRequire } = require("module");
 const { EventEmitter } = require("events");
 const { execFileSync, spawn } = require("child_process");
 const { readDiff, FILTER_NOT_OFF } = require("../electron/diff.cjs");
-const { branchInfo, readScopedDiff, listCommits, prStatus, prCreate, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree } = require("../electron/git.cjs");
+const { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree } = require("../electron/git.cjs");
 
 // Never let gh resolve a real GitHub repository from the environment; the temp origin is a local bare repo.
 delete process.env.GH_REPO;
@@ -63,6 +63,39 @@ function stubGitHub(reply) {
 		},
 	});
 	return { api: module.exports, calls };
+}
+
+async function checkTruncatedRepoFiles() {
+	const file = path.resolve(__dirname, "../electron/git.cjs");
+	const localRequire = createRequire(file);
+	const module = { exports: {} };
+	vm.runInNewContext(fs.readFileSync(file, "utf8"), {
+		module, Buffer, process, setTimeout, clearTimeout,
+		require(name) {
+			if (name !== "child_process") { return localRequire(name); }
+			return { spawn(_command, args) {
+				const child = new EventEmitter();
+				child.stdout = new EventEmitter();
+				child.stderr = new EventEmitter();
+				child.kill = () => {};
+				process.nextTick(() => {
+					if (args.includes("--deleted")) {
+						child.stdout.emit("data", Buffer.from("gone.txt\0"));
+						child.emit("close", 0);
+					} else {
+						child.stdout.emit("data", Buffer.from(`kept.txt\0gone.txt\0${"duplicate.txt\0".repeat(16000)}partial`));
+						child.stdout.emit("data", Buffer.alloc(2 * 1024 * 1024));
+						child.emit("close", -1);
+					}
+				});
+				return child;
+			} };
+		},
+	});
+	const listed = await module.exports.repoFiles(repo);
+	assert.equal(listed.truncated, true);
+	assert.deepEqual(Array.from(listed.files), ["kept.txt", "duplicate.txt"], "truncation keeps complete names, removes deletions and duplicates, and drops the partial tail despite a nonzero exit");
+	console.log("PASS repository files: the larger byte limit preserves complete names when git is stopped");
 }
 
 async function checkTruncatedDiffCounts() {
@@ -153,6 +186,7 @@ async function checkTruncatedDiffCounts() {
 }
 
 async function main() {
+	await checkTruncatedRepoFiles();
 	await checkTruncatedDiffCounts();
 	git(["init", "--quiet", "--bare", origin], root);
 	git(["init", "--quiet", "-b", "main", repo], root);
@@ -406,6 +440,9 @@ async function main() {
 	git(["diff"]);
 	assert.ok(fs.existsSync(marker), "plain git runs the repo's helper, so the check below means something");
 	fs.rmSync(marker);
+	const repoListing = await repoFiles(repo);
+	assert.ok(repoListing.files.includes("base.txt"), "the hardened repository listing returns tracked files");
+	assert.equal(fs.existsSync(marker), false, "the repository listing never runs core.fsmonitor");
 	assert.equal((await readScopedDiff(repo, "uncommitted")).ok, true);
 	await branchInfo(repo);
 	const extra = await addWorktree(repo, { name: "three", prefix: "grok" });

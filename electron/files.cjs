@@ -6,9 +6,11 @@ const { createHash, randomUUID } = require("crypto");
 const { isUtf8 } = require("buffer");
 const { promisify } = require("util");
 const { folderProblem } = require("./agent.cjs");
+const { repoFiles } = require("./git.cjs");
 
 const SKIP = new Set(["node_modules", ".git", "dist", "build", "coverage", ".vite"]);
-const MAX_FILES = 400;
+const SKIP_EXT = new Set("png jpg jpeg gif webp bmp ico tif tiff psd ai pdf doc docx xls xlsx xlsm ppt pptx zip 7z rar gz tgz tar mp3 mp4 mov avi wav m4a webm woff woff2 ttf otf eot exe dll so dylib bin pdb class jar o obj db sqlite mdb accdb bak mdf ldf".split(" "));
+const MAX_FILES = 5000;
 const MAX_DEPTH = 6;
 const MAX_FILE_BYTES = 200 * 1024;
 const MAX_OUTPUT = 80 * 1024;
@@ -19,61 +21,69 @@ function inside(root, candidate) {
   return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
-function listFiles(cwd) {
-  const problem = folderProblem(cwd);
-  if (problem) return { ok: false, error: problem };
-  let root;
-  try {
-    root = fs.realpathSync(cwd);
-  } catch {
-    return { ok: false, error: `That folder is not on this computer: ${cwd}` };
-  }
-  const files = [];
-  const seen = new Set();
-  let truncated = false;
-  let tooDeep = false;
+async function listFiles(cwd, budgetMs = 5000) {
+	const problem = folderProblem(cwd);
+	if (problem) { return { ok: false, error: problem }; }
+	let root;
+	try {
+		root = await fs.promises.realpath(cwd);
+	} catch {
+		return { ok: false, error: `That folder is not on this computer: ${cwd}` };
+	}
+	const listed = await repoFiles(root);
+	if (listed) {
+		const files = listed.files.filter((file) => !file.split("/").some((part) => SKIP.has(part)) && !SKIP_EXT.has(path.extname(file).slice(1).toLowerCase())).sort();
+		return { ok: true, files: files.slice(0, MAX_FILES), truncated: listed.truncated || files.length > MAX_FILES };
+	}
+	const files = [];
+	const seen = new Set();
+	const deadline = Date.now() + budgetMs;
+	let truncated = false;
+	let tooDeep = false;
 
-  function walk(dir, depth) {
+	async function walk(dir, depth) {
 		if (depth > MAX_DEPTH) { tooDeep = true; return; }
 		if (truncated) { return; }
-    let real;
-    try {
-      real = fs.realpathSync(dir);
-    } catch {
-      return;
-    }
-    if (seen.has(real) || !inside(root, real) && real !== root) return;
-    seen.add(real);
-    let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    entries.sort((a, b) => a.name.localeCompare(b.name));
-    for (const entry of entries) {
-      if (files.length >= MAX_FILES) {
-        truncated = true;
-        return;
-      }
-      if (SKIP.has(entry.name)) continue;
-      if (entry.isDirectory() && entry.name.startsWith(".")) continue;
-      const absolute = path.join(dir, entry.name);
-      let target;
-      try {
-        target = fs.realpathSync(absolute);
-      } catch {
-        continue;
-      }
-      if (!inside(root, target)) continue;
-      if (entry.isDirectory()) walk(absolute, depth + 1);
-      else if (entry.isFile()) files.push(path.relative(root, target).split(path.sep).join("/"));
-    }
-  }
+		if (Date.now() >= deadline) { truncated = true; return; }
+		let real;
+		try {
+			real = await fs.promises.realpath(dir);
+		} catch {
+			return;
+		}
+		if (seen.has(real) || !inside(root, real) && real !== root) { return; }
+		seen.add(real);
+		let entries;
+		try {
+			entries = await fs.promises.readdir(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		entries.sort((a, b) => a.name.localeCompare(b.name));
+		for (const entry of entries) {
+			if (files.length >= MAX_FILES || Date.now() >= deadline) {
+				truncated = true;
+				return;
+			}
+			if (SKIP.has(entry.name)) { continue; }
+			if (entry.isDirectory() && entry.name.startsWith(".")) { continue; }
+			if (entry.isFile() && SKIP_EXT.has(path.extname(entry.name).slice(1).toLowerCase())) { continue; }
+			const absolute = path.join(dir, entry.name);
+			let target;
+			try {
+				target = await fs.promises.realpath(absolute);
+			} catch {
+				continue;
+			}
+			if (!inside(root, target)) { continue; }
+			if (entry.isDirectory()) { await walk(absolute, depth + 1); }
+			else if (entry.isFile()) { files.push(path.relative(root, target).split(path.sep).join("/")); }
+		}
+	}
 
-  walk(root, 0);
-  files.sort();
-  return { ok: true, files, truncated: truncated || tooDeep };
+	await walk(root, 0);
+	files.sort();
+	return { ok: true, files, truncated: truncated || tooDeep };
 }
 
 function locateFile(cwd, relative) {

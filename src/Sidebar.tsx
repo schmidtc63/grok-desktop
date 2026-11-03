@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { ProjectSeed, Session } from "./types";
+import { askConfirm } from "./confirm";
 
 type GroupBy = "date" | "project" | "state" | "section" | "none";
 type SortBy = "recency" | "name" | "created";
@@ -449,7 +450,9 @@ export function Sidebar({
 							const id = rowSession.id;
 							closeAll();
 							if (activity[id]) { onNotice("Stop this session before deleting it."); return; }
-							if (window.confirm(`Delete "${rowSession.title}"? Its transcript is removed from this app and cannot be restored.`)) { onDelete(id); }
+							void askConfirm({ title: `Delete "${rowSession.title}"?`, body: "Its transcript is removed from this app and cannot be restored.", ok: "Delete", danger: true }).then((yes) => {
+								if (yes) { onDelete(id); }
+							});
 						}}
 					>
 						Delete…

@@ -1,11 +1,50 @@
 const assert = require("assert/strict");
+const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const vm = require("vm");
 const { randomUUID } = require("crypto");
 const { TerminalHost } = require("../electron/terminal.cjs");
 
 const events = [];
-const host = new TerminalHost((event) => { events.push(event); });
+const host = new TerminalHost((event) => { events.push(event); }, { flushMs: 0 });
+
+function checkOutputBatching() {
+	const timers = new Map();
+	const batched = [];
+	const sandbox = {
+		module: { exports: {} },
+		require: (name) => name === "./agent.cjs" ? { folderProblem: () => "" } : require(name),
+		setTimeout: (callback, ms) => { const timer = {}; timers.set(timer, { callback, ms }); return timer; },
+		clearTimeout: (timer) => timers.delete(timer),
+	};
+	vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../electron/terminal.cjs"), "utf8"), sandbox, { filename: "terminal.cjs" });
+	const batching = new sandbox.module.exports.TerminalHost((event) => batched.push(event), { flushMs: 30 });
+	const makeTab = (id) => { const tab = { id, history: "", done: false }; batching.tabs.set(id, tab); return tab; };
+	const last = makeTab("last");
+	batching.output(last, "one");
+	batching.output(last, "two");
+	assert.deepEqual(batched, []);
+	assert.equal(last.history, "onetwo", "history is immediately available while events wait");
+	batching.finish(last, 0);
+	assert.deepEqual(JSON.parse(JSON.stringify(batched)), [{ type: "terminal-data", id: "last", data: "onetwo" }, { type: "terminal-exit", id: "last", code: 0 }]);
+	assert.equal(timers.size, 0, "exit flushes and clears the pending timer");
+	const ongoing = makeTab("ongoing");
+	const flush = () => {
+		assert.equal(timers.size, 1);
+		const timer = [...timers.values()][0];
+		assert.equal(timer.ms, 30);
+		timer.callback();
+	};
+	batching.output(ongoing, "first");
+	flush();
+	assert.equal(ongoing.flushTimer, null);
+	batching.output(ongoing, "second");
+	flush();
+	assert.deepEqual(batched.slice(-2).map((event) => event.data), ["first", "second"], "later output schedules a fresh timer");
+	assert.equal(timers.size, 0);
+	console.log("PASS terminal output batches, flushes before exit, and schedules later output");
+}
 
 function output(id) {
 	return events.filter((event) => event.type === "terminal-data" && event.id === id).map((event) => event.data).join("");
@@ -46,6 +85,7 @@ function pidOf(id, name) {
 }
 
 async function main() {
+	checkOutputBatching();
 	const tmp = os.tmpdir();
 	const opened = host.open({ cwd: tmp });
 	assert.equal(opened.ok, true, opened.error);

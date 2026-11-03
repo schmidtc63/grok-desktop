@@ -12,6 +12,7 @@ let host;
 let terminals;
 let written;
 let grokLogouts = 0;
+let readinessChecks = 0;
 
 class TestWindow extends EventEmitter {
 	constructor(options) {
@@ -44,6 +45,7 @@ class TestHost {
 		this.cancelled = [];
 		this.decisions = [];
 		this.folderUpdates = [];
+		this.steered = [];
 	}
 	prompt(input) {
 		if (this.turns.has(input.uiSessionId)) { return Promise.resolve({ ok: false }); }
@@ -57,6 +59,9 @@ class TestHost {
 	answerQuestion(input) { this.decisions.push({ question: input }); return { ok: true }; }
 	answerPlan(input) { this.decisions.push({ plan: input }); return { ok: true }; }
 	setAllowedFolders(input) { this.folderUpdates.push(input); return { ok: true }; }
+	rewind(input) { this.rewound = input; return { ok: true, done: input.force }; }
+	fork(input) { this.forked = input; return { ok: true, agentSessionId: "forked-session" }; }
+	steer(id, text) { this.steered.push([id, text]); return { ok: true }; }
 	kill() {}
 	signedOut() { this.signOuts = (this.signOuts || 0) + 1; }
 }
@@ -181,8 +186,9 @@ const mainContext = {
 		}
 		if (name === "./agent.cjs") { return { AgentHost: TestHost }; }
 		if (name === "./git.cjs") { return { prCreate: (...args) => { written = args; return { ok: true }; }, prMergeWhenReady: (...args) => { written = args; return { ok: true }; }, restoreWorktree: (...args) => { written = args; return { ok: true }; } }; }
-		if (name === "./diff.cjs" || name === "./usage.cjs") { return {}; }
-		if (name === "./customize.cjs") { return { signOut: async () => { grokLogouts += 1; return { ok: true }; } }; }
+		if (name === "./usage.cjs") { return { taskOutput: (...args) => { written = args; return { ok: true, text: "task output" }; }, subagentTranscript: (...args) => { written = args; return { ok: true, messages: [] }; } }; }
+		if (name === "./diff.cjs") { return {}; }
+		if (name === "./customize.cjs") { return { signOut: async () => { grokLogouts += 1; return { ok: true }; }, readiness: async () => { readinessChecks += 1; return { grok: { ok: true, signedIn: true } }; } }; }
 		if (name === "./terminal.cjs") { return { TerminalHost: TestTerminals }; }
 		if (name === "./files.cjs") {
 			return { writeText: (...args) => { written = args; return { ok: true }; }, locateFile: (cwd, file) => file === "missing" ? { ok: false, error: "Missing file." } : { ok: true, target: path.join(cwd, file) } };
@@ -287,6 +293,14 @@ async function main() {
 	assert.equal(grokLogouts, 1);
 	assert.equal(host.signOuts, 1, "a signed-out Grok is stopped so the next message signs in again");
 	host.turns.set("first", running);
+	assert.equal(handlers.get("grok:steer")(second, "first", "New direction").ok, false, "another window cannot steer the running turn");
+	assert.deepEqual(host.steered, []);
+	assert.equal(handlers.get("grok:steer")(first, "first", "New direction").ok, true);
+	assert.deepEqual(host.steered, [["first", "New direction"]]);
+	host.turns.set("first", { ...running });
+	assert.equal(handlers.get("grok:steer")(first, "first", "Stale owner").ok, false, "ownership follows the exact running turn");
+	assert.equal(host.steered.length, 1);
+	host.turns.set("first", running);
 	assert.equal(handlers.get("grok:decide")(second, { uiSessionId: "first", toolId: "native" }).ok, false);
 	const folders = { uiSessionId: "first", allowedFolders: ["C:/extra"] };
 	assert.equal(handlers.get("grok:allowed-folders")(second, folders).ok, false);
@@ -330,8 +344,21 @@ async function main() {
 		}),
 	});
 	assert.equal(api.homeDir, require("node:os").homedir(), "the first session's folder comes from this computer, not a fixed path");
+	api.readiness();
+	assert.deepEqual(written, ["grok:readiness"]);
+	assert.equal((await handlers.get("grok:readiness")()).grok.signedIn, true);
+	assert.equal((await handlers.get("grok:readiness")()).grok.signedIn, true);
+	assert.equal(readinessChecks, 2, "every setup check asks the backend again");
 	api.writeFile("folder", "file", "text", "version");
 	assert.deepEqual(written, ["grok:write", "folder", "file", "text", "version"]);
+	api.taskOutput("task.log");
+	assert.deepEqual(written, ["grok:task-output", "task.log"]);
+	assert.equal(handlers.get("grok:task-output")({}, "task.log").text, "task output");
+	assert.deepEqual(written, ["task.log"]);
+	api.subagentTranscript("child-id");
+	assert.deepEqual(written, ["grok:subagent-transcript", "child-id"]);
+	assert.equal(handlers.get("grok:subagent-transcript")({}, "child-id").ok, true);
+	assert.deepEqual(written, ["child-id"]);
 	api.setAllowedFolders(folders);
 	assert.deepEqual(written, ["grok:allowed-folders", folders]);
 	api.newWindow("chosen-session");
@@ -354,6 +381,18 @@ async function main() {
 	assert.deepEqual(written, ["grok:forget-session", "moved"]);
 	handlers.get("grok:forget-session")({}, "moved");
 	assert.equal(host.forgotten, "moved");
+	const branchRequest = { uiSessionId: "first", agentSessionId: "native", index: 1, text: "Earlier prompt" };
+	const rewindRequest = { ...branchRequest, rewindMode: "all", force: true, seen: ["edited.txt"] };
+	api.rewind(rewindRequest);
+	assert.deepEqual(written, ["grok:rewind", rewindRequest]);
+	assert.equal(handlers.get("grok:rewind")(first, rewindRequest).done, true);
+	assert.equal(host.rewound, rewindRequest);
+	api.fork(branchRequest);
+	assert.deepEqual(written, ["grok:fork", branchRequest]);
+	assert.equal(handlers.get("grok:fork")(first, branchRequest).agentSessionId, "forked-session");
+	assert.equal(host.forked, branchRequest);
+	api.steer("first", "New direction");
+	assert.deepEqual(written, ["grok:steer", "first", "New direction"]);
 
 	host.turns.clear();
 	const owner = { sender: windows[2].webContents };
@@ -497,7 +536,8 @@ async function main() {
 		require(name) {
 			if (name === "electron") { return { ...electron, app: secondCopy, ipcMain: { handle: () => {}, on: () => {} } }; }
 			if (name === "./agent.cjs") { return { AgentHost: TestHost }; }
-			if (name === "./diff.cjs" || name === "./git.cjs" || name === "./usage.cjs" || name === "./files.cjs" || name === "./customize.cjs") { return {}; }
+			if (name === "./usage.cjs") { return { taskOutput: () => ({ ok: true }), subagentTranscript: () => ({ ok: true }) }; }
+			if (name === "./diff.cjs" || name === "./git.cjs" || name === "./files.cjs" || name === "./customize.cjs") { return {}; }
 			if (name === "./terminal.cjs") { return { TerminalHost: class { closeAll() {} } }; }
 			return require(name);
 		},

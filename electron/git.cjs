@@ -75,7 +75,21 @@ function run(command, args, cwd, timeout, maxBytes = MAX_BYTES) {
 // A repo's own core.fsmonitor program never runs from here.
 // core.hooksPath stops hook files only; a hook set in config ignores it, so the event an index refresh fires is off too.
 function git(args, cwd, timeout = GIT_TIMEOUT, options = {}) {
-	return run("git", ["-c", "core.fsmonitor=false", "-c", "log.showSignature=false", "-c", "diff.suppressBlankEmpty=false", ...(!options.hooks ? ["-c", `core.hooksPath=${os.devNull}`, "-c", "hook.post-index-change.enabled=false"] : []), ...args], cwd, timeout);
+	return run("git", ["-c", "core.fsmonitor=false", "-c", "log.showSignature=false", "-c", "diff.suppressBlankEmpty=false", ...(!options.hooks ? ["-c", `core.hooksPath=${os.devNull}`, "-c", "hook.post-index-change.enabled=false"] : []), ...args], cwd, timeout, options.maxBytes);
+}
+
+// Tracked and untracked files, relative to cwd; ignored and deleted files are left out.
+async function repoFiles(cwd) {
+	const [listed, deleted] = await Promise.all([
+		git(["ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd, 10000, { maxBytes: 2 * 1024 * 1024 }),
+		git(["ls-files", "--deleted", "-z"], cwd, 10000, { maxBytes: 2 * 1024 * 1024 }),
+	]);
+	if ((listed.code !== 0 && !listed.truncated) || deleted.code !== 0) { return null; }
+	const entries = listed.out.split("\0");
+	if (listed.truncated || !listed.out.endsWith("\0")) { entries.pop(); }
+	const gone = new Set(deleted.out.split("\0").filter(Boolean));
+	const files = [...new Set(entries)].filter((file) => file && !file.endsWith("/") && !gone.has(file));
+	return files.length ? { files, truncated: listed.truncated } : null;
 }
 
 function gh(args, cwd) {
@@ -407,4 +421,4 @@ async function removeWorktree(cwd, folder, options) {
 	return removed.code === 0 ? { ok: true, dirty } : { ...failure(removed, "Git"), dirty };
 }
 
-module.exports = { branchInfo, readScopedDiff, listCommits, prStatus, prCreate, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, run };
+module.exports = { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, run };

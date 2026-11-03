@@ -11,6 +11,7 @@ const { readDiff, parseUnified, revertFile } = require("../electron/diff.cjs");
 const tempBase = path.resolve(os.tmpdir(), process.env.CODEX_THREAD_ID || "codex-grokcode-files");
 fs.mkdirSync(tempBase, { recursive: true });
 const root = fs.mkdtempSync(path.join(tempBase, "codex-files-"));
+const depthRoot = fs.mkdtempSync(path.join(tempBase, "codex-depth-"));
 const nativeExec = childProcess.execFileSync;
 const nativeExecFile = childProcess.execFile;
 const nativeWrite = fs.writeFileSync;
@@ -42,6 +43,70 @@ function write(file, text) {
 
 function read(file) {
 	return fs.readFileSync(path.join(root, file), "utf8");
+}
+
+async function checkRepoFiles() {
+	const folder = path.join(root, "codex-listing");
+	fs.mkdirSync(folder);
+	git(["init", "--quiet"], folder);
+	git(["config", "core.autocrlf", "false"], folder);
+	const put = (file, text = "file\n") => {
+		const target = path.join(folder, file);
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		fs.writeFileSync(target, text);
+	};
+	put(".gitignore", "ignored.txt\nignored-folder/\n");
+	put("tracked.txt");
+	put("deleted.txt");
+	put("tracked-image.PNG");
+	put("tracked-sheet.xlsx");
+	put("vector.svg");
+	const deep = "nested/one/two/three/four/five/six/seven/deep.txt";
+	put(deep);
+	git(["add", "--all"], folder);
+	git(["-c", "user.name=GrokCode test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "--no-gpg-sign", "-m", "Listing"], folder);
+	fs.unlinkSync(path.join(folder, "deleted.txt"));
+	for (const name of ["untracked.txt", "space name.txt", "café.txt", "ignored.txt", "ignored-folder/visible.txt", "node_modules/pkg/index.js", "nested/dist/generated.txt", "untracked-image.png", "untracked-sheet.XLSX"]) { put(name); }
+	const listed = await listFiles(folder);
+	assert.equal(listed.ok, true);
+	assert.equal(listed.truncated, false);
+	assert.deepEqual(listed.files, [".gitignore", "tracked.txt", deep, "untracked.txt", "space name.txt", "café.txt", "vector.svg"].sort());
+	assert.deepEqual((await listFiles(path.join(folder, "nested"))).files, [deep.slice("nested/".length)], "subfolder paths are relative to the chosen folder");
+	assert.deepEqual((await listFiles(path.join(folder, "ignored-folder"))).files, ["visible.txt"], "an empty ignored git listing falls back to the walk");
+	const plain = path.join(depthRoot, "codex-plain");
+	fs.mkdirSync(plain);
+	fs.writeFileSync(path.join(plain, "plain.txt"), "plain\n");
+	for (const name of ["image.PNG", "sheet.xlsx", "vector.svg"]) { fs.writeFileSync(path.join(plain, name), "file\n"); }
+	assert.deepEqual((await listFiles(plain)).files, ["plain.txt", "vector.svg"], "the walk skips binary extensions case-insensitively and keeps SVG");
+	const outside = path.join(depthRoot, "codex-outside");
+	fs.mkdirSync(outside);
+	fs.writeFileSync(path.join(outside, "outside.txt"), "outside\n");
+	fs.symlinkSync(outside, path.join(plain, "linked-outside"), process.platform === "win32" ? "junction" : "dir");
+	const linked = path.join(depthRoot, "codex-linked-plain");
+	fs.symlinkSync(plain, linked, process.platform === "win32" ? "junction" : "dir");
+	assert.deepEqual((await listFiles(linked)).files, ["plain.txt", "vector.svg"], "a linked root is listed without following a junction outside that root");
+	const timed = await listFiles(plain, 0);
+	assert.equal(timed.ok, true);
+	assert.equal(timed.truncated, true, "a zero walk budget stops without throwing");
+	assert.deepEqual(timed.files, []);
+	const names = [];
+	for (let index = 0; index < 5001; index++) {
+		const name = `dir-${index % 10}/file-${String(index).padStart(4, "0")}-${"x".repeat(24)}.txt`;
+		names.push(name);
+		put(`many/${name}`);
+	}
+	const capped = await listFiles(path.join(folder, "many"));
+	assert.equal(capped.ok, true);
+	assert.equal(capped.truncated, true);
+	assert.deepEqual(capped.files, names.sort().slice(0, 5000), "repository listings keep 5000 alphabetically sorted files beyond the old byte limit");
+	const walkMany = path.join(plain, "many");
+	fs.mkdirSync(walkMany);
+	for (let index = 0; index < 6000; index++) { fs.writeFileSync(path.join(walkMany, `file-${String(index).padStart(4, "0")}.txt`), "file\n"); }
+	const walkCapped = await listFiles(walkMany);
+	assert.equal(walkCapped.ok, true);
+	assert.equal(walkCapped.truncated, true);
+	assert.equal(walkCapped.files.length, 5000, "the asynchronous walk keeps 5000 of 6000 text files");
+	console.log("PASS repository and plain-folder files: ignores, binary extensions, SVG, containment, budgets and 5000-file caps");
 }
 
 async function main() {
@@ -143,13 +208,12 @@ async function main() {
 	assert.equal(fs.existsSync(path.join(root, "editor.txt")), false);
 	console.log("PASS CR04/CR06: stale/missing saves and legacy encodings are rejected; UTF-8 save versions round-trip");
 
-	const depthRoot = path.join(root, "codex-depth");
 	const deepFolder = path.join(depthRoot, "one", "two", "three", "four", "five", "six", "seven");
 	fs.mkdirSync(deepFolder, { recursive: true });
 	fs.writeFileSync(path.join(deepFolder, "deep.txt"), "past the file tree limit\n");
 	fs.mkdirSync(path.join(depthRoot, "z"));
 	fs.writeFileSync(path.join(depthRoot, "z", "late.txt"), "after the deep folder\n");
-	const deepFiles = listFiles(depthRoot);
+	const deepFiles = await listFiles(depthRoot);
 	assert.equal(deepFiles.ok, true);
 	assert.equal(deepFiles.truncated, true, "a file below depth 6 triggers the left-out note");
 	assert.equal(deepFiles.files.includes("one/two/three/four/five/six/seven/deep.txt"), false);
@@ -212,6 +276,7 @@ async function main() {
 	commit("Theirs");
 	git(["checkout", "--quiet", baseBranch], conflictRoot);
 	assert.throws(() => git(["merge", "--no-edit", "other"], conflictRoot));
+	assert.equal((await listFiles(conflictRoot)).files.filter((file) => file === "conflict.txt").length, 1, "merge conflict stages list the file once");
 	fs.writeFileSync(path.join(conflictRoot, "z-ordinary.txt"), "ordinary changed\n");
 	const conflicted = await readDiff(conflictRoot);
 	assert.equal(conflicted.ok, true);
@@ -347,6 +412,8 @@ async function main() {
 		console.log("PASS R2-03 actual Windows ACL/version: protected staging precedes plaintext, replacement retains descriptor, late edits reject");
 	}
 
+	await checkRepoFiles();
+
 	if (process.argv.includes("--terminal")) {
 		const childFile = path.join(root, "codex-timeout-child.cjs");
 		const marker = path.join(root, "codex-survived.txt");
@@ -374,4 +441,7 @@ main().catch((error) => {
 	assert.equal(path.dirname(root), tempBase);
 	assert.ok(path.basename(root).startsWith("codex-files-"));
 	fs.rmSync(root, { recursive: true, force: true });
+	assert.equal(path.dirname(depthRoot), tempBase);
+	assert.ok(path.basename(depthRoot).startsWith("codex-depth-"));
+	fs.rmSync(depthRoot, { recursive: true, force: true });
 });

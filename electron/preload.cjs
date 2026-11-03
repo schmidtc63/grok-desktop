@@ -32,6 +32,12 @@ contextBridge.exposeInMainWorld("grokCode", {
 	contextBreakdown(agentSessionId) {
 		return ipcRenderer.invoke("grok:context-breakdown", agentSessionId);
 	},
+	taskOutput(file) {
+		return ipcRenderer.invoke("grok:task-output", file);
+	},
+	subagentTranscript(id) {
+		return ipcRenderer.invoke("grok:subagent-transcript", id);
+	},
 	recentSpend() {
 		return ipcRenderer.invoke("grok:recent-spend");
 	},
@@ -39,6 +45,9 @@ contextBridge.exposeInMainWorld("grokCode", {
 		return ipcRenderer.invoke("grok:app-info");
 	},
 	homeDir: ipcRenderer.sendSync("grok:home-dir"),
+	readiness() {
+		return ipcRenderer.invoke("grok:readiness");
+	},
 	customize(cwd) {
 		return ipcRenderer.invoke("grok:customize", cwd);
 	},
@@ -101,6 +110,21 @@ contextBridge.exposeInMainWorld("grokCode", {
   },
 	stopSession(uiSessionId) {
 		return ipcRenderer.invoke("grok:stop-session", uiSessionId);
+	},
+	suggestPrompt(uiSessionId) {
+		return ipcRenderer.invoke("grok:suggest-prompt", uiSessionId);
+	},
+	killTask(uiSessionId, taskId) {
+		return ipcRenderer.invoke("grok:kill-task", uiSessionId, taskId);
+	},
+	rewind(payload) {
+		return ipcRenderer.invoke("grok:rewind", payload);
+	},
+	fork(payload) {
+		return ipcRenderer.invoke("grok:fork", payload);
+	},
+	steer(uiSessionId, text) {
+		return ipcRenderer.invoke("grok:steer", uiSessionId, text);
 	},
 	forgetSession(uiSessionId) {
 		return ipcRenderer.invoke("grok:forget-session", uiSessionId);

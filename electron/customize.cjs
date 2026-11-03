@@ -3,7 +3,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { folderProblem, grokHome, grokPath } = require("./agent.cjs");
+const { folderProblem, grokHome, grokPath, probeGrok } = require("./agent.cjs");
 const { run } = require("./git.cjs");
 
 const LIST_TIMEOUT = 30000;
@@ -226,4 +226,24 @@ async function signOut() {
 	return { ok: true };
 }
 
-module.exports = { inventory, change, changeArgs, signOut, shape, tomlList, words };
+function readinessOf({ grok, git, gh, ghAuth, platform }) {
+	return {
+		grok: grok.ok ? { ok: true, version: grok.version, signedIn: grok.signedIn } : { ok: false, error: grok.error },
+		git: { ok: git.code === 0 },
+		gh: gh.code === 0 ? { ok: true, signedIn: !!ghAuth && ghAuth.code === 0 } : { ok: false },
+		install: platform === "win32" ? "irm https://x.ai/cli/install.ps1 | iex" : "curl -fsSL https://x.ai/cli/install.sh | bash",
+	};
+}
+
+async function readiness() {
+	const home = os.homedir();
+	const [grok, git, gh] = await Promise.all([
+		probeGrok(),
+		run("git", ["--version"], home, LIST_TIMEOUT),
+		run("gh", ["--version"], home, LIST_TIMEOUT),
+	]);
+	const ghAuth = gh.code === 0 ? await run("gh", ["auth", "status"], home, 5000) : null;
+	return readinessOf({ grok, git, gh, ghAuth, platform: process.platform });
+}
+
+module.exports = { inventory, change, changeArgs, signOut, shape, tomlList, words, readiness, readinessOf };

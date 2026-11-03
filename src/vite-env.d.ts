@@ -12,6 +12,32 @@ interface GrokTodo {
 	status: "pending" | "in_progress" | "completed";
 }
 
+interface GrokBgTask {
+	id: string;
+	label: string;
+	command: string;
+	outputFile?: string;
+	kind: string;
+	status: string;
+	startedAt: number;
+	endedAt: number;
+	exitCode: number | null;
+}
+
+interface GrokSubagent {
+	id: string;
+	label: string;
+	agentType: string;
+	model: string;
+	status: string;
+	childSessionId?: string;
+	output?: string;
+	durationMs?: number;
+	tokensUsed?: number;
+	toolCalls?: number;
+	endedAt?: number;
+}
+
 interface GrokUsage {
 	model: string;
 	inputTokens: number;
@@ -59,6 +85,13 @@ interface GrokMcpServer {
 	status: string;
 }
 
+interface GrokReadiness {
+	grok: { ok: boolean; version?: string; signedIn?: boolean; error?: string };
+	git: { ok: boolean };
+	gh: { ok: boolean; signedIn?: boolean };
+	install: string;
+}
+
 // What `grok inspect`, `grok mcp list` and `grok plugin list` report for one folder.
 interface GrokInventory {
 	ok: boolean;
@@ -92,6 +125,7 @@ interface GrokToolEvent {
 	output?: string;
 	additions?: number;
 	deletions?: number;
+	diff?: import("./types").ToolDiff;
 	questions?: GrokQuestion[];
 	plan?: string;
 	todos?: GrokTodo[];
@@ -105,7 +139,11 @@ interface GrokAccount {
 }
 
 interface GrokEvent {
-	type: "chunk" | "thought" | "tool" | "done" | "error" | "mode" | "usage" | "context" | "commands" | "models" | "mcp" | "mcp-status" | "terminal-data" | "terminal-exit" | "account";
+	type: "chunk" | "thought" | "tool" | "done" | "error" | "mode" | "usage" | "context" | "commands" | "models" | "mcp" | "mcp-status" | "terminal-data" | "terminal-exit" | "account" | "bg-tasks" | "subagent" | "title" | "steer";
+	tasks?: GrokBgTask[];
+	reset?: boolean;
+	subagent?: GrokSubagent;
+	title?: string;
 	account?: GrokAccount | null;
   uiSessionId: string;
 	turnId: string;
@@ -154,9 +192,13 @@ interface GrokSendResult {
   ok: boolean;
   error?: string;
 	agentSessionId?: string;
+	promptIndex?: number;
 	lostSession?: boolean;
 	closed?: boolean;
 }
+
+interface GrokBranchRequest { uiSessionId: string; cwd: string; model: string; effort: string; mode: string; agentSessionId: string; index: number; text: string }
+interface GrokRewindResult { ok: boolean; error?: string; done?: boolean; revertedFiles?: string[]; cleanFiles?: string[]; conflicts?: string[] }
 
 interface DiffLine {
   kind: "add" | "del" | "context";
@@ -258,8 +300,16 @@ interface GrokCodeApi {
 	openImage: (file: string) => Promise<WriteResult>;
 	appInfo: () => Promise<{ ok: boolean; version?: string; electron?: string }>;
 	contextBreakdown?: (agentSessionId: string) => Promise<{ ok: boolean; error?: string } & Partial<ContextBreakdown>>;
+	taskOutput?: (file: string) => Promise<{ ok: boolean; error?: string; text?: string; truncated?: boolean }>;
+	subagentTranscript?: (id: string) => Promise<{ ok: boolean; error?: string; messages?: import("./types").ChatMessage[]; truncated?: boolean }>;
+	suggestPrompt?: (uiSessionId: string) => Promise<string>;
+	killTask?: (uiSessionId: string, taskId: string) => Promise<{ ok: boolean; error?: string; outcome?: string }>;
+	rewind?: (payload: GrokBranchRequest & { rewindMode: "all" | "conversation_only" | "files_only"; force: boolean; seen?: string[] }) => Promise<GrokRewindResult>;
+	fork?: (payload: GrokBranchRequest) => Promise<{ ok: boolean; error?: string; agentSessionId?: string }>;
+	steer?: (uiSessionId: string, text: string) => Promise<{ ok: boolean; error?: string }>;
 	recentSpend?: () => Promise<{ ok: boolean; error?: string; usd?: number }>;
 	homeDir?: string;
+	readiness?: () => Promise<GrokReadiness>;
 	customize?: (cwd: string) => Promise<GrokInventory>;
 	customizeChange?: (cwd: string, input: GrokCustomizeChange) => Promise<{ ok: boolean; error?: string; message?: string }>;
 	account?: () => Promise<GrokAccount | null | undefined>;

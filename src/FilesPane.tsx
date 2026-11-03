@@ -1,8 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Markdown } from "./Markdown";
+import { CodeEditorLoader as CodeEditor } from "./CodeEditorLoader";
 
 export interface FilesPaneProps {
 	files: { status: "loading" | "ready" | "error"; error?: string; files: string[]; truncated?: boolean } | undefined;
 	file: string;
+	docKey: string;
+	fileTypes: Record<string, string>;
 	onSelectFile: (file: string) => void;
 	line?: number;
 	lineTick: number;
@@ -19,6 +23,7 @@ export interface FilesPaneProps {
 	onDiscard: () => void;
 	onClearRecovery: () => void;
 	onFileMenu: (file: string, event: React.MouseEvent) => void;
+	onLink: (href: string, event: React.MouseEvent) => void;
 	onClose: () => void;
 }
 
@@ -30,63 +35,38 @@ export function shouldAutoSave(state: { autoSave: boolean; dirty: boolean; confl
 	return state.autoSave && state.dirty && !state.conflict && !state.readOnly && !state.saving;
 }
 
-export function lineOffsets(text: string, line: number): { start: number; end: number } {
-	let start = 0;
-	for (let at = 1; at < line; at++) {
-		const next = text.indexOf(`\n`, start);
-		if (next === -1) {
-			break;
-		}
-		start = next + 1;
+export function fromFile(file: string, href: string): string {
+	if (/^([a-z][a-z0-9+-]*:|[#/\\])/i.test(href)) { return href; }
+	const parts = file.replace(/\\/g, `/`).split(`/`).slice(0, -1);
+	for (const part of href.replace(/\\/g, `/`).split(/[?#]/)[0].split(`/`)) {
+		if (part === `..`) { parts.pop(); } else if (part && part !== `.`) { parts.push(part); }
 	}
-	let end = text.indexOf(`\n`, start);
-	if (end === -1) {
-		end = text.length;
-	}
-	if (end > start && text[end - 1] === `\r`) {
-		end--;
-	}
-	return { start, end };
-}
-
-function countLines(text: string): number {
-	let count = 1;
-	for (let at = text.indexOf(`\n`); at !== -1; at = text.indexOf(`\n`, at + 1)) {
-		count++;
-	}
-	return count;
-}
-
-function lineHeightOf(node: HTMLElement): number {
-	const style = getComputedStyle(node);
-	const value = parseFloat(style.lineHeight);
-	if (style.lineHeight.endsWith(`px`) && value > 0) {
-		return value;
-	}
-	const font = parseFloat(style.fontSize) || 12;
-	return value > 0 ? value * font : font * 1.2;
+	return parts.join(`/`);
 }
 
 export function FilesPane(props: FilesPaneProps) {
-	const { files, file, onSelectFile, line, lineTick, open, draft, readOnly, autoSave, onAutoSave, onEdit, onSave, onCancel, conflict, onOverride, onDiscard, onClearRecovery, onFileMenu, onClose } = props;
+	const { files, file, docKey, fileTypes, onSelectFile, line, lineTick, open, draft, readOnly, autoSave, onAutoSave, onEdit, onSave, onCancel, conflict, onOverride, onDiscard, onClearRecovery, onFileMenu, onLink, onClose } = props;
 	const [menu, setMenu] = useState<Spot | null>(null);
 	const [filter, setFilter] = useState(``);
-	const box = useRef<HTMLTextAreaElement>(null);
-	const gutter = useRef<HTMLPreElement>(null);
+	const [preview, setPreview] = useState(true);
+	const [picked, setPicked] = useState<Record<string, string>>({});
+	const [expanded, setExpanded] = useState(false);
+	const paneRef = useRef<HTMLElement>(null);
 	const saveRef = useRef(onSave);
 	const target = useRef<{ tick: number; file: string } | null>(null);
-	const revealed = useRef<{ tick: number; node: HTMLTextAreaElement | null }>({ tick: NaN, node: null });
+	if (target.current?.tick !== lineTick) { target.current = { tick: lineTick, file }; }
+	const reveal = line && target.current.file === file && open?.status === `ready` ? { line, tick: lineTick } : undefined;
 
 	const listed = files?.files ?? [];
 	const dirty = !!draft && draft.text !== draft.baseText;
 	const saving = !!draft?.saving;
 	const ready = open?.status === `ready` && !open.binary;
+	const markdown = /\.(md|markdown)$/i.test(file);
+	const showPreview = markdown && preview && ready;
 	const editable = ready && !!draft;
 	const showEditor = ready || dirty;
 	const text = draft?.text ?? open?.text ?? ``;
 	const autoState = { autoSave, dirty, conflict, readOnly, saving };
-	const lineCount = useMemo(() => countLines(text), [text]);
-	const numbers = useMemo(() => Array.from({ length: lineCount }, (_, index) => index + 1).join(`\n`), [lineCount]);
 	const shown = useMemo(() => {
 		const needle = filter.trim().toLowerCase();
 		return needle ? listed.filter((name) => name.toLowerCase().includes(needle)) : listed;
@@ -107,28 +87,12 @@ export function FilesPane(props: FilesPaneProps) {
 	}, [draft?.text, draft?.baseText, autoSave, dirty, conflict, readOnly]);
 
 	useEffect(() => {
-		target.current = { tick: lineTick, file };
+		setPreview(!line);
 	}, [lineTick]);
 
-	// Reveal `line` once per lineTick, and again only if the textarea remounts for the same file (a reload).
 	useEffect(() => {
-		const node = box.current;
-		const want = target.current;
-		if (!node || !line || !want || want.file !== file || open?.status !== `ready`) {
-			return;
-		}
-		if (revealed.current.tick === want.tick && revealed.current.node === node) {
-			return;
-		}
-		revealed.current = { tick: want.tick, node };
-		const { start, end } = lineOffsets(node.value, line);
-		node.focus({ preventScroll: true });
-		node.setSelectionRange(start, end);
-		node.scrollTop = (line - 1) * lineHeightOf(node);
-		if (gutter.current) {
-			gutter.current.scrollTop = node.scrollTop;
-		}
-	});
+		if (expanded) { paneRef.current?.focus(); }
+	}, [expanded]);
 
 	// Flush a pending auto save before the pane loses this file, so the last edits are not dropped with the timer.
 	function flush() {
@@ -145,12 +109,20 @@ export function FilesPane(props: FilesPaneProps) {
 	}
 
 	return (
+		<>
+		{expanded && <div className="fp-backdrop" aria-hidden="true" onClick={() => setExpanded(false)} />}
 		<section
-			className="pane"
+			ref={paneRef}
+			className={expanded ? "pane fp-expanded" : "pane"}
 			aria-label="Files"
+			tabIndex={expanded ? -1 : undefined}
 			onKeyDown={(event) => {
 				if (event.key === `Escape` && menu) {
 					setMenu(null);
+					return;
+				}
+				if (event.key === `Escape` && expanded && !event.defaultPrevented) {
+					setExpanded(false);
 					return;
 				}
 				if (event.ctrlKey && !event.shiftKey && !event.altKey && event.key.toLowerCase() === `s`) {
@@ -166,12 +138,14 @@ export function FilesPane(props: FilesPaneProps) {
 				{file && <span className="fp-name" title={file}>{file}</span>}
 				<span className="spacer" />
 				{autoSave && saving && <span className="meta">Saving…</span>}
+				{markdown && ready && <button className={`texty`} aria-pressed={!preview} onClick={() => setPreview((value) => !value)}>{preview ? `Edit` : `Preview`}</button>}
 				{!autoSave && (
 					<>
 						<button className="texty" disabled={!dirty || saving || readOnly || conflict} onClick={onSave}>{saving ? `Saving` : `Save`}</button>
 						<button className="texty" disabled={!dirty || saving} onClick={onCancel}>Cancel</button>
 					</>
 				)}
+				<button className="icon-btn" aria-label={expanded ? `Return Files to the side` : `Pop out Files`} title={expanded ? `Return to the side (Esc)` : `Pop out`} aria-pressed={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? `⤡` : `⤢`}</button>
 				<button className="icon-btn" aria-label="Files menu" aria-haspopup="menu" onClick={(event) => {
 					const rect = event.currentTarget.getBoundingClientRect();
 					setMenu({ top: rect.bottom + 4, left: Math.min(Math.max(8, rect.right - 200), window.innerWidth - 208) });
@@ -205,7 +179,7 @@ export function FilesPane(props: FilesPaneProps) {
 					<>
 						<input className="fp-filter" aria-label="Filter files" placeholder="Filter files" value={filter} onChange={(event) => setFilter(event.target.value)} />
 						<div className="fp-list">
-							{shown.map((name) => (
+							{shown.slice(0, 500).map((name) => (
 								<button
 									key={name}
 									className={name === file ? `fp-row on` : `fp-row`}
@@ -218,6 +192,7 @@ export function FilesPane(props: FilesPaneProps) {
 							))}
 							{shown.length === 0 && <p className="meta fp-none">No files match.</p>}
 						</div>
+						{shown.length > 500 && <p className="meta">Showing 500 of {shown.length}. Type to filter.</p>}
 					</>
 				)}
 				{readOnly && file && <p className="note">This file is view-only here.</p>}
@@ -225,24 +200,14 @@ export function FilesPane(props: FilesPaneProps) {
 				{files?.status !== `error` && open?.status === `error` && <p className="note">{open.error}</p>}
 				{open?.binary && <p className="note">This file is binary.</p>}
 				{draft?.note && <p className="note">{draft.note}</p>}
-				{showEditor && (
+				{showPreview && (
+					<div className={`fp-preview`}>
+						<Markdown text={text} onLink={(href, event) => { if (!href.startsWith(`#`)) { onLink(fromFile(file, href), event); } }} />
+					</div>
+				)}
+				{showEditor && !showPreview && (
 					<div className="fp-editor">
-						<pre className="fp-gutter" ref={gutter} aria-hidden="true">{numbers}</pre>
-						<textarea
-							ref={box}
-							className="fp-text"
-							aria-label="File text"
-							wrap="off"
-							spellCheck={false}
-							value={text}
-							readOnly={readOnly || !editable}
-							onChange={(event) => onEdit(event.target.value)}
-							onScroll={(event) => {
-								if (gutter.current) {
-									gutter.current.scrollTop = event.currentTarget.scrollTop;
-								}
-							}}
-						/>
+						<CodeEditor key={docKey} aria-label="File text" file={file} value={text} readOnly={readOnly || !editable} fileTypes={fileTypes} language={picked[docKey]} onLanguage={(name) => setPicked((current) => ({ ...current, [docKey]: name }))} reveal={reveal} onEdit={onEdit} />
 					</div>
 				)}
 				{dirty && !editable && <p className="note">Unsaved draft retained. You can select and copy its text.</p>}
@@ -255,5 +220,6 @@ export function FilesPane(props: FilesPaneProps) {
 				{!!draft?.recoveryTexts?.length && <button className="texty" onClick={onClearRecovery}>Discard retained text</button>}
 			</div>
 		</section>
+		</>
 	);
 }
