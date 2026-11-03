@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type MouseEvent, type SetStateAction } from "react";
-import { SHORTCUTS } from "./data";
+import { caseKey, FILE_MANAGER, keyLabel, modKey, PLATFORM, SHORTCUTS } from "./data";
 import { BrowserPane, type BrowserTab, type DevServer } from "./BrowserPane";
 import { askConfirm, setConfirmHost, type PendingConfirm } from "./confirm";
 import { DiffPane, type DiffComment, type PrInfo } from "./DiffPane";
@@ -211,7 +211,7 @@ export function sideCap(windowWidth: number, sidebarCollapsed: boolean): number 
 }
 
 function folderKey(folder: string) {
-	return folder.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+	return caseKey(folder.trim().replace(/\\/g, "/").replace(/\/+$/, ""));
 }
 
 function shortPath(folder: string) {
@@ -266,7 +266,8 @@ export function App() {
 		return history?.sessions.find((item) => item.id === requested)?.id ?? history?.sessions.find((item) => !item.archived)?.id ?? "";
 	});
 	// A fresh id each time, so two windows that both restore the form cannot send into one session.
-	const [restoredForm] = useState<Session | null>(() => (history?.newSessionDraft ? { ...history.newSessionDraft.session, id: `new-${crypto.randomUUID()}` } : null));
+	// A window opened for one session shows that session and leaves the form to the others.
+	const [restoredForm] = useState<Session | null>(() => (history?.newSessionDraft && !new URLSearchParams(window.location?.search ?? "").get("session") ? { ...history.newSessionDraft.session, id: `new-${crypto.randomUUID()}` } : null));
 	const [pending, setPending] = useState<Session | null>(() => restoredForm ?? (history ? null : sessions[0]));
 	const [useWorktree, setUseWorktree] = useState(history?.newSessionDraft?.useWorktree ?? false);
 	const [panes, setPanes] = useState<SidePaneId[]>([]);
@@ -358,6 +359,7 @@ export function App() {
 	const [deleted, setDeleted] = useState<string[]>(history?.deleted ?? []);
 	const [views, setViews] = useState<Record<string, TranscriptView>>({});
 	const [findTick, setFindTick] = useState(0);
+	const [findAt, setFindAt] = useState({ tick: 0, text: "" });
 	const [commands, setCommands] = useState<GrokCommand[]>(readCommands);
 	const [models, setModels] = useState<GrokModel[]>([]);
 	const [servers, setServers] = useState<GrokMcpServer[]>([]);
@@ -401,6 +403,8 @@ export function App() {
 	const sessionsRef = useRef(sessions);
 	const activeIdRef = useRef(activeId);
 	const pendingRef = useRef(pending);
+	// The new-session form, kept with its text while another session is on screen; New session brings it back.
+	const keptForm = useRef<{ session: Session; useWorktree: boolean } | null>(null);
 	const draftsRef = useRef(drafts);
 	const useWorktreeRef = useRef(useWorktree);
 	const creatingWorktree = useRef(false);
@@ -427,7 +431,7 @@ export function App() {
 	queuedRef.current = queued;
 	attachmentsRef.current = attachments;
 	const persistedDrafts = useRef(editorDrafts);
-	const lastSaved = useRef<History | null>(history ? { sessions, extraChats, modes, prePlan, editorDrafts, composerDrafts: drafts, queued, attachments, backgroundWork, newSessionDraft: history.newSessionDraft, deleted } : null);
+	const lastSaved = useRef<History | null>(history ? { sessions, extraChats, modes, prePlan, editorDrafts, composerDrafts: drafts, queued, attachments, backgroundWork, newSessionDraft: restoredForm ? history.newSessionDraft : undefined, deleted } : null);
 	const saveHistory = useRef<() => boolean>(() => true);
 
 	function answerConfirm(yes: boolean, id = confirmQueue.current[0]?.id) {
@@ -573,7 +577,7 @@ export function App() {
 			// ponytail: saved here without the lock, so a write from another window in the same instant can lose its last change.
 			const saved = saveHistory.current();
 			const current = editorDraftsRef.current;
-			const unsavedMessage = !saved && Object.entries(draftsRef.current).some(([id, text]) => text && (pendingRef.current?.id === id || sessionsRef.current.some((item) => item.id === id)));
+			const unsavedMessage = !saved && Object.entries(draftsRef.current).some(([id, text]) => text && (pendingRef.current?.id === id || keptForm.current?.session.id === id || sessionsRef.current.some((item) => item.id === id)));
 			// Saved queued messages and attachments need a warning only when the save fails.
 			if (unsavedMessage || (current !== persistedDrafts.current && Object.values(current).some((draft) => draft && (draft.text !== draft.baseText || draft.recoveryTexts?.length))) || (!saved && (Object.values(queuedRef.current).some((items) => items.length) || Object.values(attachmentsRef.current).some((files) => files.length)))) {
 				event.preventDefault();
@@ -591,8 +595,8 @@ export function App() {
 		const currentQueue = queuedRef.current;
 		const currentAttachments = attachmentsRef.current;
 		const currentWork = backgroundWorkRef.current;
-		const form = pendingRef.current;
-		const newSessionDraft = form && currentDrafts[form.id] ? { session: form, useWorktree: useWorktreeRef.current, text: currentDrafts[form.id] } : undefined;
+		const form = pendingRef.current ? { session: pendingRef.current, useWorktree: useWorktreeRef.current } : keptForm.current;
+		const newSessionDraft = form && currentDrafts[form.session.id] ? { ...form, text: currentDrafts[form.session.id] } : undefined;
 		const sameForm = last?.newSessionDraft?.session === newSessionDraft?.session && last?.newSessionDraft?.useWorktree === newSessionDraft?.useWorktree && last?.newSessionDraft?.text === newSessionDraft?.text;
 		if (last && last.sessions === sessions && last.extraChats === extraChats && last.modes === modes && last.prePlan === prePlan && last.editorDrafts === editorDrafts && last.composerDrafts === currentDrafts && sameRecords(last.queued, currentQueue) && sameRecords(last.attachments, currentAttachments) && sameRecords(last.backgroundWork, currentWork) && sameForm && last.deleted === deleted) { return true; }
 		try {
@@ -647,7 +651,8 @@ export function App() {
 				queued: queue,
 				attachments: staged,
 				backgroundWork: work,
-				newSessionDraft,
+				// ponytail: one stored form for all windows; a second window's unsent form replaces the first's here, though each window keeps its own until it closes.
+				newSessionDraft: sameForm ? saved?.newSessionDraft : newSessionDraft,
 				deleted: [...gone].slice(-500),
 			}));
 			persistedDrafts.current = editorDrafts;
@@ -708,7 +713,7 @@ export function App() {
 		const title = sessionsRef.current.find((item) => item.id === sessionId)?.title ?? "Codewomplers Grok Desktop";
 		try {
 			const shown = new Notification(title, { body, silent: current.sound === "none" });
-			shown.onclick = () => { window.focus(); setActiveId(sessionId); setPending(null); };
+			shown.onclick = () => { window.focus(); setActiveId(sessionId); leaveForm(); };
 		} catch {
 			// Notifications can be blocked by the system.
 		}
@@ -1199,20 +1204,38 @@ export function App() {
 		setFocusedPane((current) => (current === id ? null : current));
 	}
 
-	function selectSession(id: string) {
-		flushEditor();
+	// The form on screen when it has text that would be lost with it; the first-launch form is already in the list.
+	function formWithText() {
+		const form = pendingRef.current;
+		return form && draftsRef.current[form.id] && !sessionsRef.current.some((item) => item.id === form.id) ? { session: form, useWorktree: useWorktreeRef.current } : null;
+	}
+
+	// A form with text is kept rather than dropped, so looking at another session never loses it.
+	function leaveForm() {
+		const form = formWithText();
+		if (form) { keptForm.current = form; }
 		setPending(null);
+	}
+
+	function selectSession(id: string, find?: string) {
+		flushEditor();
+		leaveForm();
 		setActiveId(id);
 		setMenu(null);
+		if (find) { setFindAt((current) => ({ tick: current.tick + 1, text: find })); }
 		setSessions((current) => (current.some((item) => item.id === id && item.unread) ? current.map((item) => (item.id === id ? { ...item, unread: false } : item)) : current));
 	}
 
 	function createSession(seed?: Partial<ProjectSeed>) {
 		flushEditor();
 		const base = seed?.folder ? seed : { folder: session.folder, project: session.project, branch: session.branch, worktree: session.project, environment: "Local" as Environment };
-		const created = newSession(base);
+		// A form with text, on screen or kept, comes back with it; a folder picked in the sidebar still applies.
+		const kept = formWithText() ?? keptForm.current;
+		keptForm.current = null;
+		const reopen = kept && !seed?.folder;
+		const created = reopen ? kept.session : { ...newSession(base), ...(kept ? { id: kept.session.id } : {}) };
 		setPending(created);
-		setUseWorktree(false);
+		setUseWorktree(reopen ? kept.useWorktree : false);
 		setMenu(null);
 		setSideOpen(false);
 		setTimeout(() => promptRef.current?.focus?.(), 0);
@@ -1278,7 +1301,7 @@ export function App() {
 				}
 				return;
 			}
-			if (/^[1-9]$/.test(event.key) && !event.ctrlKey && !event.altKey && document.querySelector(".pop")) {
+			if (/^[1-9]$/.test(event.key) && !event.ctrlKey && !event.altKey && !event.metaKey && document.querySelector(".pop")) {
 				const items = Array.from(document.querySelectorAll<HTMLButtonElement>(".pop button:not(:disabled)"));
 				const item = items[Number(event.key) - 1];
 				if (item) { event.preventDefault(); item.click(); }
@@ -1293,7 +1316,7 @@ export function App() {
 				const choice = block?.querySelectorAll<HTMLButtonElement>(".tool-choices button:not(:disabled)")[Number(event.key) - 1];
 				if (choice) { event.preventDefault(); choice.click(); return; }
 			}
-			if (!event.ctrlKey) { return; }
+			if (!modKey(event)) { return; }
 			// Settings covers the sessions, so its shortcuts must not change them unseen.
 			if (settingsShown.current) { return; }
 			if (event.key === "Tab") { run(event.shiftKey ? "previous" : "next"); return; }
@@ -1853,6 +1876,7 @@ export function App() {
 			messages: list,
 			view,
 			findTick,
+			findAt: uiId === session.id ? findAt : undefined,
 			todos,
 			plan: planText,
 			tasks: backgroundTasks,
@@ -2155,7 +2179,7 @@ export function App() {
 					onInterrupt={(tabId) => {
 						void window.grokCode?.terminalInterrupt?.(tabId).then((result) => {
 							if (!result.ok) { setTerminalError(result.error || "The running command could not be stopped."); return; }
-							if (!result.stopped) { setNotice("Nothing to stop. A PowerShell command that starts no program stops only when you close the tab."); }
+							if (!result.stopped) { setNotice(`Nothing to stop. A ${PLATFORM === "win32" ? "PowerShell" : "bash"} command that starts no program stops only when you close the tab.`); }
 						});
 					}}
 					onClose={() => closePane("terminal")}
@@ -2231,6 +2255,7 @@ export function App() {
 			{!settings.sidebarCollapsed && (
 				<Sidebar
 					sessions={sessions}
+					chats={extraChats}
 					activeId={pending ? "" : session.id}
 					query={query}
 					activity={activity}
@@ -2319,7 +2344,7 @@ export function App() {
 							))}
 							<div className="menu-label">Open in</div>
 							<button type="button" className="item" disabled={!!pending} onClick={() => { openSessionWindow(session.id); setMenu(null); }}>New window</button>
-							<button type="button" className="item" onClick={() => openIn("explorer")}>File Explorer</button>
+							<button type="button" className="item" onClick={() => openIn("explorer")}>{FILE_MANAGER}</button>
 							<button type="button" className="item" onClick={() => openIn("vscode")}>VS Code</button>
 							<hr />
 							<button type="button" className="item" disabled={railOpen && !railShown} onClick={() => { changeSettings({ railOpen: !railOpen }); setMenu(null); }}>{railOpen && !railShown ? "Session rail (window too narrow)" : railShown ? "Hide session rail" : "Show session rail"}</button>
@@ -2336,7 +2361,7 @@ export function App() {
 							))}
 							<hr />
 							<button type="button" className="item" disabled={railOpen && !railShown} onClick={() => { changeSettings({ railOpen: !railOpen }); setMenu(null); }}>{railOpen && !railShown ? "Session rail (window too narrow)" : railShown ? "Hide session rail" : "Show session rail"}</button>
-							<button type="button" className="item" onClick={() => { setShortcuts(true); setMenu(null); }}>Keyboard shortcuts<small>Ctrl+/</small></button>
+							<button type="button" className="item" onClick={() => { setShortcuts(true); setMenu(null); }}>Keyboard shortcuts<small>{keyLabel("Ctrl+/")}</small></button>
 							<button type="button" className="item" onClick={() => { setSettingsOpen("general"); setMenu(null); }}>Settings</button>
 						</div>
 					)}
@@ -2471,10 +2496,10 @@ export function App() {
 									<MenuButton label="+" title="Add files, folders and commands" open={menu === "plus"} onClick={() => setMenu(menu === "plus" ? null : "plus")} />
 									<MenuButton label={session.environment} title="Environment" open={menu === "env"} onClick={() => setMenu(menu === "env" ? null : "env")} />
 									<MenuButton label={shortPath(session.folder)} title={session.folder} open={menu === "folder"} onClick={() => setMenu(menu === "folder" ? null : "folder")} />
-									<MenuButton label={mode} title="Permission mode (Ctrl+Shift+M)" open={menu === "mode"} onClick={() => setMenu(menu === "mode" ? null : "mode")} />
+									<MenuButton label={mode} title={keyLabel("Permission mode (Ctrl+Shift+M)")} open={menu === "mode"} onClick={() => setMenu(menu === "mode" ? null : "mode")} />
 									<span className="spacer" />
 									{contextPercent !== null && <span className="usage-ring" title={`Context about ${contextPercent}% used · session cost $${(session.costUsd ?? 0).toFixed(2)}${recentUsd !== null ? `\nGrok, last 7 days on this computer: $${recentUsd.toFixed(2)}` : ""}`} style={{ ["--pct" as string]: `${contextPercent}` }} aria-label={`Context ${contextPercent}% used`} />}
-									<MenuButton label={`${baseModel}${fastOn ? " · fast" : ""} · ${effort}`} title="Model (Ctrl+Shift+I) and effort (Ctrl+Shift+E)" open={menu === "model" || menu === "effort"} onClick={() => setMenu(menu === "model" ? null : "model")} />
+									<MenuButton label={`${baseModel}${fastOn ? " · fast" : ""} · ${effort}`} title={keyLabel("Model (Ctrl+Shift+I) and effort (Ctrl+Shift+E)")} open={menu === "model" || menu === "effort"} onClick={() => setMenu(menu === "model" ? null : "model")} />
 									<button
 										type="button"
 										className={sendLabel === "Stop" ? "send-btn stop" : "send-btn"}
@@ -2525,7 +2550,7 @@ export function App() {
 								{menu === "folder" && (
 									<div className="pop up">
 										<div className="item">{session.folder}</div>
-										<button type="button" className="item" onClick={() => openIn("explorer")}>Open in File Explorer</button>
+										<button type="button" className="item" onClick={() => openIn("explorer")}>Open in {FILE_MANAGER}</button>
 										<button
 											type="button"
 											className="item"
@@ -2655,9 +2680,9 @@ export function App() {
 					<button type="button" role="menuitem" onClick={() => openFile(fileMenu.file)}>Open</button>
 					<button type="button" role="menuitem" onClick={() => { setPrompt((current) => `${current}${current && !current.endsWith(" ") ? " " : ""}@${fileMenu.file} `); setFileMenu(null); promptRef.current?.focus?.(); }}>Attach as context</button>
 					<button type="button" role="menuitem" onClick={() => openIn("vscode", fileMenu.file)}>Open in VS Code</button>
-					<button type="button" role="menuitem" onClick={() => { void window.grokCode?.reveal(session.folder, fileMenu.file).then((result) => { if (!result.ok) { setNotice(result.error || "That file is not in this folder."); } }); setFileMenu(null); }}>Show in File Explorer</button>
+					<button type="button" role="menuitem" onClick={() => { void window.grokCode?.reveal(session.folder, fileMenu.file).then((result) => { if (!result.ok) { setNotice(result.error || "That file is not in this folder."); } }); setFileMenu(null); }}>Show in {FILE_MANAGER}</button>
 					<div className="menu-label">Copy</div>
-					<button type="button" role="menuitem" onClick={() => { copyText(`${session.folder.replace(/[\\/]+$/, "")}\\${fileMenu.file.replace(/\//g, "\\")}`, "Copied the absolute path."); setFileMenu(null); }}>Absolute path</button>
+					<button type="button" role="menuitem" onClick={() => { copyText(PLATFORM === "win32" ? `${session.folder.replace(/[\\/]+$/, "")}\\${fileMenu.file.replace(/\//g, "\\")}` : `${session.folder.replace(/\/+$/, "")}/${fileMenu.file}`, "Copied the absolute path."); setFileMenu(null); }}>Absolute path</button>
 					<button type="button" role="menuitem" onClick={() => { copyText(fileMenu.file, "Copied the relative path."); setFileMenu(null); }}>Relative path</button>
 					<button type="button" role="menuitem" onClick={() => { copyText(fileMenu.file.split(/[\\/]/).pop() ?? fileMenu.file, "Copied the filename."); setFileMenu(null); }}>Filename</button>
 				</div>
@@ -2668,7 +2693,7 @@ export function App() {
 						<h2>Keyboard shortcuts</h2>
 						<ul>
 							{SHORTCUTS.map(([key, label]) => (
-								<li key={`${key}-${label}`}><span>{label}</span><kbd>{key}</kbd></li>
+								<li key={`${key}-${label}`}><span>{label}</span><kbd>{keyLabel(key)}</kbd></li>
 							))}
 						</ul>
 						<button className="texty" onClick={() => setShortcuts(false)}>Close</button>

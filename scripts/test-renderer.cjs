@@ -336,6 +336,14 @@ async function check() {
 	await app.settle();
 	assert.equal(app.model().messages.at(-1).text, "original reply");
 	assert.equal(app.sidebar().sessions.find((item) => item.id === firstId).unread, false, "selecting a session marks it read");
+	const findAt = app.model().findAt;
+	assert.equal(app.sidebar().chats[firstId].at(-1).text, "original reply", "sidebar search reads the saved conversations");
+	app.sidebar().onSelect(firstId, "Original");
+	await app.settle();
+	assert.deepEqual({ ...app.model().findAt }, { tick: findAt.tick + 1, text: "Original" }, "a message-text match opens Find in the main chat with the search text");
+	app.sidebar().onSelect(firstId);
+	await app.settle();
+	assert.equal(app.model().findAt.tick, findAt.tick + 1, "a plain selection leaves Find alone");
 
 	app.files["a.txt"] = { text: "agent change\r\n", version: "a2" };
 	app.editor().onSelectFile("b.txt");
@@ -1938,7 +1946,16 @@ async function checkNewSessionDraftRelaunch() {
 	assert.equal(new Set(restoredIds).size, 3, "each restore gets a fresh id, so two windows cannot send into one session");
 	relaunch.sidebar().onSelect(original);
 	await relaunch.settle();
-	assert.equal(savedHistory(relaunch).newSessionDraft, undefined, "closing the form clears its saved slot");
+	assert.equal(savedHistory(relaunch).newSessionDraft?.text, "Do this later", "looking at another session keeps the form");
+	relaunch.sidebar().onNew();
+	await relaunch.settle();
+	assert.equal(relaunch.node((node) => node.props["aria-label"] === "Prompt").props.value, "Do this later");
+	assert.equal(relaunch.node((node) => node.props.className === "toggle field-toggle").props.children[0].props.checked, true, "the kept form keeps its worktree choice");
+	typePrompt(relaunch, "");
+	await relaunch.settle();
+	relaunch.sidebar().onSelect(original);
+	await relaunch.settle();
+	assert.equal(savedHistory(relaunch).newSessionDraft, undefined, "a form left empty clears its saved slot");
 	const first = harness();
 	await first.settle();
 	typePrompt(first, "First-launch draft");
@@ -1951,6 +1968,51 @@ async function checkNewSessionDraftRelaunch() {
 	await firstRelaunch.settle();
 	assert.equal(firstRelaunch.sidebar().sessions.length, 1);
 	assert.equal(savedHistory(firstRelaunch).newSessionDraft, undefined, "sending the form clears its saved slot");
+}
+
+async function checkKeptNewSessionForm() {
+	const app = await composerWindow();
+	const original = app.model().session.id;
+	const prompt = () => app.node((node) => node.props["aria-label"] === "Prompt").props.value;
+	const folder = () => app.node((node) => node.props["aria-label"] === "Folder").props.value;
+	app.sidebar().onNewIn({ folder: "C:/kept-project", project: "kept-project", branch: "main", worktree: "kept-project", environment: "Local" });
+	await app.settle();
+	const formId = app.model().session.id;
+	typePrompt(app, "Half-written task");
+	app.sidebar().onSelect(original);
+	await app.settle();
+	assert.equal(app.model().session.id, original);
+	assert.equal(app.sidebar().sessions.some((item) => item.id === formId), false, "the kept form is not a sidebar row");
+	assert.equal(savedHistory(app).newSessionDraft?.text, "Half-written task");
+	const sessionWindow = harness(app.storage, `?session=${original}`);
+	await sessionWindow.settle();
+	assert.equal(sessionWindow.model().session.id, original, "a window opened for a session shows it, not the form");
+	assert.equal(sessionWindow.node((node) => node.props.className === "new-page"), undefined);
+	typePrompt(sessionWindow, "A reply drafted in the other window");
+	await sessionWindow.settle();
+	assert.equal(savedHistory(sessionWindow).newSessionDraft?.text, "Half-written task", "another window's saves keep the form");
+	app.sidebar().onNew();
+	await app.settle();
+	assert.equal(app.model().session.id, formId, "New session reopens the kept form");
+	assert.equal(prompt(), "Half-written task");
+	assert.equal(folder(), "c:/kept-project");
+	app.sidebar().onNew();
+	await app.settle();
+	assert.equal(prompt(), "Half-written task", "New session on the form keeps its text");
+	app.sidebar().onNewIn({ folder: "C:/other-project", project: "other-project", branch: "main", worktree: "other-project", environment: "Local" });
+	await app.settle();
+	assert.equal(prompt(), "Half-written task", "a folder picked in the sidebar keeps the text");
+	assert.equal(folder(), "c:/other-project");
+	const before = app.sends.length;
+	sendPrompt(app, "Half-written task");
+	await app.settle();
+	assert.equal(app.sends.length, before + 1);
+	assert.equal(app.sidebar().sessions.find((item) => item.id === formId)?.folder, "C:/other-project", "the reopened form sends like a fresh one");
+	assert.equal(savedHistory(app).newSessionDraft, undefined);
+	app.sidebar().onNew();
+	await app.settle();
+	assert.notEqual(app.model().session.id, formId);
+	assert.equal(prompt(), "", "after sending, New session starts empty");
 }
 
 async function checkSentComposerDraft() {
@@ -4016,6 +4078,7 @@ async function main() {
 	await checkSettingsBlocksShortcuts();
 	await checkComposerDraftRelaunch();
 	await checkNewSessionDraftRelaunch();
+	await checkKeptNewSessionForm();
 	await checkSentComposerDraft();
 	await checkComposerDraftMerge();
 	await checkDeletedComposerDraft();

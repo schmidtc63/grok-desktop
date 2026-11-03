@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import type { ProjectSeed, Session } from "./types";
+import type { ChatMessage, ProjectSeed, Session } from "./types";
 import { askConfirm } from "./confirm";
+import { caseKey, keyLabel } from "./data";
 
 type GroupBy = "date" | "project" | "state" | "section" | "none";
 type SortBy = "recency" | "name" | "created";
@@ -50,7 +51,7 @@ function store(key: string, value: unknown) {
 }
 
 function pathKey(folder: string) {
-	return folder.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+	return caseKey(folder.replace(/\//g, "\\").replace(/\\+$/, ""));
 }
 
 function stamp(session: Session) {
@@ -139,8 +140,28 @@ function groupSessions(list: Session[], everyone: Session[], view: SidebarView, 
 	}));
 }
 
+// Lowercased message text. Messages are replaced, never changed in place, so each object is its own cache key.
+const lowered = new WeakMap<ChatMessage, string>();
+
+// The first saved message containing needle, as a one-line excerpt around the match.
+export function textHit(messages: ChatMessage[] | undefined, needle: string) {
+	for (const message of messages ?? []) {
+		let lower = lowered.get(message);
+		if (lower === undefined) {
+			lower = message.text.toLowerCase();
+			lowered.set(message, lower);
+		}
+		const at = lower.indexOf(needle);
+		if (at < 0) { continue; }
+		const start = Math.max(0, at - 24);
+		return `${start ? "…" : ""}${message.text.slice(start, at + needle.length + 80).replace(/\s+/g, " ").trim()}`;
+	}
+	return undefined;
+}
+
 export function Sidebar({
 	sessions,
+	chats,
 	activeId,
 	query,
 	activity,
@@ -168,11 +189,12 @@ export function Sidebar({
 	onUpdate,
 }: {
 	sessions: Session[];
+	chats: Record<string, ChatMessage[]>;
 	activeId: string;
 	query: string;
 	activity: Activity;
 	onQuery: (value: string) => void;
-	onSelect: (id: string) => void;
+	onSelect: (id: string, find?: string) => void;
 	onNew: () => void;
 	onNewIn: (seed: ProjectSeed) => void;
 	onPin: (id: string) => void;
@@ -232,13 +254,17 @@ export function Sidebar({
 
 	const needle = query.trim().toLowerCase();
 	const cutoff = view.days ? Date.now() - view.days * DAY : 0;
+	const excerpts = new Map<string, string>();
 
 	function shown(session: Session) {
 		if (view.status === "active" && session.archived) { return false; }
 		if (view.status === "archived" && !session.archived) { return false; }
 		if (cutoff && stamp(session) < cutoff) { return false; }
 		if (!needle) { return true; }
-		return `${session.title} ${session.project} ${session.folder}`.toLowerCase().includes(needle);
+		if (`${session.title} ${session.project} ${session.folder}`.toLowerCase().includes(needle)) { return true; }
+		const excerpt = textHit(chats[session.id], needle);
+		if (excerpt !== undefined) { excerpts.set(session.id, excerpt); }
+		return excerpt !== undefined;
 	}
 
 	function sorted(list: Session[]) {
@@ -303,13 +329,14 @@ export function Sidebar({
 		return {
 			session,
 			now,
+			excerpt: excerpts.get(session.id),
 			state: stateOf(session, activity),
 			active: session.id === activeId,
 			menuOpen: rowMenu?.id === session.id,
 			renaming: renaming === session.id,
 			onSelect: (id: string, event: React.MouseEvent) => {
 				if (event.ctrlKey || event.metaKey) { onOpenWindow(id); return; }
-				onSelect(id);
+				onSelect(id, excerpts.has(id) ? query.trim() : undefined);
 			},
 			onOpenMenu: openRow,
 			onRename: (title: string | null) => {
@@ -326,7 +353,7 @@ export function Sidebar({
 	return (
 		<aside className="sidebar">
 			<div className="side-tools">
-				<button className="new-btn" aria-label="New session" title="New session (Ctrl+N)" onClick={onNew}>
+				<button className="new-btn" aria-label="New session" title={keyLabel("New session (Ctrl+N)")} onClick={onNew}>
 					<PlusIcon /> New session
 				</button>
 				<span className="spacer" />
@@ -424,8 +451,8 @@ export function Sidebar({
 					</div>
 					<hr />
 					{update && <button onClick={() => { closeAll(); onUpdate(); }}>Update to {update.latest}…</button>}
-					<button onClick={() => { closeAll(); onSettings(); }}>Settings<small>Ctrl+,</small></button>
-					<button onClick={() => { closeAll(); onShortcuts(); }}>Keyboard shortcuts<small>Ctrl+/</small></button>
+					<button onClick={() => { closeAll(); onSettings(); }}>Settings<small>{keyLabel("Ctrl+,")}</small></button>
+					<button onClick={() => { closeAll(); onShortcuts(); }}>Keyboard shortcuts<small>{keyLabel("Ctrl+/")}</small></button>
 					<button onClick={() => { closeAll(); onOpenUrl("https://console.x.ai"); }}>Get xAI API keys<small>↗</small></button>
 					<hr />
 					<button disabled={account === null} onClick={() => { closeAll(); onSignOut(); }}>Sign out</button>
@@ -561,6 +588,7 @@ function ProjectHead({ label, seed, onNewIn }: { label: string; seed: ProjectSee
 function Row({
 	session,
 	now,
+	excerpt,
 	state,
 	active,
 	menuOpen,
@@ -572,6 +600,7 @@ function Row({
 }: {
 	session: Session;
 	now: number;
+	excerpt?: string;
 	state: RowState;
 	active: boolean;
 	menuOpen: boolean;
@@ -591,7 +620,7 @@ function Row({
 			) : (
 				<button className="session-hit" title={`${session.title}\n${session.folder}${time ? `\n${new Date(time).toLocaleString()}` : ""}`} onClick={(event) => onSelect(session.id, event)} onDoubleClick={onStartRename}>
 					<b>{session.title}</b>
-					{state === "needs-you" ? <small className="needs-you">Needs you</small> : meta && <small className="session-meta">{meta}</small>}
+					{state === "needs-you" ? <small className="needs-you">Needs you</small> : excerpt !== undefined ? <small className="session-meta">{excerpt}</small> : meta && <small className="session-meta">{meta}</small>}
 				</button>
 			)}
 			<button className="icon-btn" aria-label={`Actions for ${session.title}`} aria-expanded={menuOpen} onClick={(event) => onOpenMenu(session.id, event)}>⋯</button>

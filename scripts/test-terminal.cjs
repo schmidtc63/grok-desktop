@@ -90,6 +90,11 @@ function hasLine(id, line) {
 	return output(id).split(/\r?\n/).includes(line);
 }
 
+// A line sent while a command still runs is echoed at once, so on bash its output follows the next prompt, as in a terminal.
+function printed(id, text) {
+	return output(id).split(/\r?\n/).some((line) => line === text || line.endsWith(` $ ${text}`));
+}
+
 function exits(id) {
 	return events.filter((event) => event.type === "terminal-exit" && event.id === id);
 }
@@ -120,14 +125,37 @@ function pidOf(id, name) {
 	return match ? Number(match[1]) : 0;
 }
 
-async function main() {
-	checkTerminalShell();
-	checkOutputBatching();
-	const tmp = os.tmpdir();
-	const opened = host.open({ cwd: tmp });
-	assert.equal(opened.ok, true, opened.error);
-	const id = opened.id;
-	assert.deepEqual(host.list(), [{ id, cwd: tmp, running: true }]);
+// macOS and Linux: bash -i over pipes prints a prompt naming the folder, and the host echoes each line.
+async function posixShell(id, tmp) {
+	const real = fs.realpathSync(tmp);
+	await waitFor(() => output(id).includes(" $ "), "bash prompt");
+	assert.equal(/no job control|cannot set terminal process group/.test(output(id)), false, "the job-control warnings are dropped");
+	console.log("PASS bash shows its prompt and no job-control warning");
+	host.write(id, "for i in 1 2; do\n  echo \"n$i\"\ndone");
+	await waitFor(() => output(id).includes("n1\n") && output(id).includes("n2\n"), "multiline for output");
+	console.log("PASS multiline command completes without another write");
+	assert.equal(host.write(id, "x=41").ok, true);
+	assert.equal(host.write(id, "echo $((x + 1))\n").ok, true);
+	await waitFor(() => output(id).includes("42\n"), "42");
+	// Both lines were sent before bash printed its next prompt, so they echo together, as typed-ahead lines do in a terminal.
+	assert.ok(output(id).includes(" $ x=41\necho $((x + 1))\n"), "input lines are echoed after the prompt");
+	assert.equal(output(id).split("echo $((x + 1))").length, 2, "an input line is echoed once");
+	assert.ok(output(id).indexOf("echo $((x + 1))") < output(id).indexOf("42\n"), "the echo comes before the output");
+	assert.ok(output(id).includes(" $ for i in 1 2; do\n  echo \"n$i\"\ndone\nn1\nn2\n"), "a multiline command is echoed whole, with no continuation prompts");
+	assert.equal(output(id).split("\n").some((line) => line.split(" $ ").length > 2), false, "no empty prompt from a blank line");
+	console.log("PASS variables persist between writes (x=41, echo $((x + 1)) printed 42) and input is echoed");
+	host.write(id, "cd ..");
+	host.write(id, "pwd");
+	await waitFor(() => output(id).includes(`${path.dirname(real)}\n`), "parent of tmpdir");
+	await waitFor(() => output(id).includes(`${path.dirname(real)} $ `), "prompt naming the new folder");
+	console.log("PASS location persists between writes (cd .. then pwd) and the prompt shows it");
+	host.write(id, "echo \"héllo\"");
+	await waitFor(() => output(id).includes("héllo\n"), "UTF-8 output");
+	console.log("PASS UTF-8 round trip (héllo intact)");
+	host.write(id, "echo \"shell=$$\"");
+}
+
+async function windowsShell(id, tmp) {
 	host.write(id, "Import-Module \"$PSHOME/Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1\"; Get-ExecutionPolicy");
 	await waitFor(() => hasLine(id, "RemoteSigned"), "RemoteSigned execution policy");
 	console.log("PASS terminal execution policy is RemoteSigned");
@@ -148,8 +176,19 @@ async function main() {
 	host.write(id, "\"héllo\".Length");
 	await waitFor(() => hasLine(id, "héllo") && hasLine(id, "5"), "UTF-8 output");
 	console.log("PASS UTF-8 round trip (héllo intact, length 5 so stdin was decoded as UTF-8)");
-
 	host.write(id, "\"shell=$PID\"");
+}
+
+async function main() {
+	const windows = process.platform === "win32";
+	if (windows) { checkTerminalShell(); }
+	checkOutputBatching();
+	const tmp = os.tmpdir();
+	const opened = host.open({ cwd: tmp });
+	assert.equal(opened.ok, true, opened.error);
+	const id = opened.id;
+	assert.deepEqual(host.list(), [{ id, cwd: tmp, running: true }]);
+	await (windows ? windowsShell(id, tmp) : posixShell(id, tmp));
 	await waitFor(() => pidOf(id, "shell") > 0, "shell pid");
 	const firstShell = pidOf(id, "shell");
 	assert.equal(host.history(id), output(id));
@@ -172,7 +211,9 @@ async function main() {
 
 	const sleeper = host.open({ cwd: tmp });
 	assert.equal(sleeper.ok, true, sleeper.error);
-	host.write(sleeper.id, "\"shell=$PID\"; $child = Start-Process ping.exe -ArgumentList '-n','60','127.0.0.1' -WindowStyle Hidden -PassThru; \"grandchild=$($child.Id)\"; Start-Sleep 60");
+	host.write(sleeper.id, windows
+		? "\"shell=$PID\"; $child = Start-Process ping.exe -ArgumentList '-n','60','127.0.0.1' -WindowStyle Hidden -PassThru; \"grandchild=$($child.Id)\"; Start-Sleep 60"
+		: "echo \"shell=$$\"; sleep 60 & echo \"grandchild=$!\"; sleep 60");
 	await waitFor(() => pidOf(sleeper.id, "grandchild") > 0, "grandchild pid");
 	const shellPid = pidOf(sleeper.id, "shell");
 	const grandPid = pidOf(sleeper.id, "grandchild");
@@ -184,11 +225,13 @@ async function main() {
 	await waitFor(() => !alive(shellPid) && !alive(grandPid), "process tree to stop", 10000);
 	await pause(1500);
 	assert.equal(exits(sleeper.id).length, 1);
-	console.log("PASS close() stops Start-Sleep 60 and its child process tree, emits terminal-exit once, removes the tab");
+	console.log("PASS close() stops a 60-second sleep and its child process tree, emits terminal-exit once, removes the tab");
 
 	const stopper = host.open({ cwd: tmp });
 	assert.equal(stopper.ok, true, stopper.error);
-	host.write(stopper.id, "\"shell=$PID\"; $ping = Start-Process ping.exe -ArgumentList '-n','60','127.0.0.1' -NoNewWindow -PassThru; \"ping=$($ping.Id)\"; $ping.WaitForExit()");
+	host.write(stopper.id, windows
+		? "\"shell=$PID\"; $ping = Start-Process ping.exe -ArgumentList '-n','60','127.0.0.1' -NoNewWindow -PassThru; \"ping=$($ping.Id)\"; $ping.WaitForExit()"
+		: "echo \"shell=$$\"; sleep 60 & echo \"ping=$!\"; wait");
 	await waitFor(() => pidOf(stopper.id, "ping") > 0, "ping pid");
 	const stopperShell = pidOf(stopper.id, "shell");
 	const pingPid = pidOf(stopper.id, "ping");
@@ -200,12 +243,23 @@ async function main() {
 	assert.equal(alive(stopperShell), true, "the shell survives the interrupt");
 	assert.deepEqual(host.list().find((tab) => tab.id === stopper.id), { id: stopper.id, cwd: tmp, running: true });
 	host.write(stopper.id, "echo after");
-	await waitFor(() => hasLine(stopper.id, "after"), "echo after the interrupt");
+	await waitFor(() => printed(stopper.id, "after"), "echo after the interrupt");
+	if (!windows) {
+		host.write(stopper.id, "sleep 60");
+		await pause(500);
+		assert.equal((await host.interrupt(stopper.id)).stopped, 1, "Stop ends a foreground command");
+		await waitFor(() => output(stopper.id).endsWith(" $ "), "the prompt after Stop");
+		// Stopping a foreground command makes bash print a tcsetattr notice. This prints the macOS wording on every system.
+		const notice = "bash: [12329: 3] tcsetattr: Operation not supported on socket";
+		host.write(stopper.id, `echo "${notice}"; echo back`);
+		await waitFor(() => hasLine(stopper.id, "back"), "echo after stopping a foreground command");
+		assert.equal(output(stopper.id).split(/\r?\n/).includes(notice), false, "the macOS tcsetattr notice is hidden");
+	}
 	assert.deepEqual(await host.interrupt(stopper.id), { ok: true, stopped: 0 });
 	assert.deepEqual(await host.interrupt("no-such-tab"), { ok: false, error: "That terminal is closed." });
 	assert.equal(exits(stopper.id).length, 0);
 	host.close(stopper.id);
-	console.log(`PASS interrupt() stops ping.exe (${stopped.stopped} stopped) and keeps the shell, which then runs echo after; an idle shell stops 0; an unknown tab is closed`);
+	console.log(`PASS interrupt() stops the running child (${stopped.stopped} stopped) and keeps the shell, which then runs echo after; an idle shell stops 0; an unknown tab is closed`);
 
 	const quitter = host.open({ cwd: tmp });
 	assert.equal(quitter.ok, true, quitter.error);

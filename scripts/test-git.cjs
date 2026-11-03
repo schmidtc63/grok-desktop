@@ -13,7 +13,8 @@ const { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, 
 delete process.env.GH_REPO;
 delete process.env.GH_HOST;
 
-const tempBase = path.resolve(os.tmpdir(), process.env.CODEX_THREAD_ID || "grokcode-git");
+// macOS puts the temp folder behind the /var symlink, and git reports real paths.
+const tempBase = path.resolve(fs.realpathSync(os.tmpdir()), process.env.CODEX_THREAD_ID || "grokcode-git");
 fs.mkdirSync(tempBase, { recursive: true });
 const root = fs.mkdtempSync(path.join(tempBase, "git-"));
 const origin = path.join(root, "origin.git");
@@ -507,7 +508,6 @@ async function main() {
 	git(["config", "filter.evil.clean", `node "${filterHelper}" "decoy.clean value"`]);
 	git(["config", "filter.a=b.clean", `node "${equalsHelper}"`]);
 	git(["config", "filter.a=b.smudge", `node "${equalsHelper}"`]);
-	git(["config", "filter.a=b.process", `node "${equalsProcess}"`]);
 	fs.appendFileSync(configFile, `[filter ""]\n\tclean = ${JSON.stringify(`node "${emptyHelper}"`)}\n\tsmudge = ${JSON.stringify(`node "${emptyHelper}"`)}\n`);
 	fs.appendFileSync(configFile, `[filter "x\u2028y"]\n\tclean = ${JSON.stringify(`node "${lineHelper}"`)}\n`);
 	write("x.evil", "three\n");
@@ -519,15 +519,20 @@ async function main() {
 	assert.equal(fs.existsSync(equalsMarker), true, "plain git runs the local filter named a=b");
 	assert.equal(fs.existsSync(emptyMarker), true, "plain git runs the local filter with an empty name");
 	assert.equal(fs.existsSync(hookMarker), true, "plain git runs post-index-change");
-	assert.equal(fs.existsSync(configHookMarker), true, "plain git runs a post-index-change hook set in config");
+	// Hooks set in config are new in git (2.53 has none, 2.55 does); with an older git there is nothing for the app to turn off.
+	let configHooks = false;
+	try { configHooks = git(["hook", "list", "post-index-change"]).split(/\r?\n/).includes("planted"); } catch {}
+	if (configHooks) { assert.equal(fs.existsSync(configHookMarker), true, "plain git runs a post-index-change hook set in config"); }
 	assert.equal(fs.existsSync(lineMarker), true, "plain git runs a local filter whose name holds U+2028");
-	fs.rmSync(configHookMarker);
+	fs.rmSync(configHookMarker, { force: true });
 	fs.rmSync(lineMarker);
 	fs.rmSync(filterMarker);
 	fs.rmSync(equalsMarker);
 	fs.rmSync(emptyMarker);
 	fs.rmSync(hookMarker);
 	// Set only now: plain git stops when a required driver's process fails, so the app must turn required off.
+	// The process comes after the plain run too: it exits before git's handshake, which Windows git survives and git on Linux does not.
+	git(["config", "filter.a=b.process", `node "${equalsProcess}"`]);
 	git(["config", "filter.a=b.required", "true"]);
 	write("x.evil", "four\n");
 	write("keep.txt", "keep a=b\n");

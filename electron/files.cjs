@@ -5,7 +5,7 @@ const path = require("path");
 const { createHash, randomUUID } = require("crypto");
 const { isUtf8 } = require("buffer");
 const { promisify } = require("util");
-const { folderProblem } = require("./agent.cjs");
+const { folderProblem, killTree, OWN_GROUP } = require("./agent.cjs");
 const { repoFiles } = require("./git.cjs");
 
 const SKIP = new Set(["node_modules", ".git", "dist", "build", "coverage", ".vite"]);
@@ -251,8 +251,9 @@ function decodeOutput(buf) {
   return buf.toString("utf8");
 }
 
-function killTree(child) {
+function stopTree(child) {
 	if (!child || child.pid == null) { return Promise.resolve(false); }
+	if (process.platform !== "win32") { return Promise.resolve(killTree(child)); }
 	return new Promise((resolve) => {
 		const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
 		killer.on("error", () => resolve(false));
@@ -266,7 +267,10 @@ function runCommand(cwd, command) {
   const text = typeof command === "string" ? command.trim() : "";
   if (!text) return Promise.resolve({ ok: false, error: "Type a command to run." });
   if (text.length > 4000) return Promise.resolve({ ok: false, error: "That command is too long." });
-  const shell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+	const windows = process.platform === "win32";
+	// macOS and Linux run the command in bash without the user's profile, as Windows does with PowerShell's -NoProfile.
+  const shell = windows ? path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe") : "bash";
+	const args = windows ? ["-NoProfile", "-NonInteractive", "-Command", text] : ["--noprofile", "--norc", "-c", text];
   return new Promise((resolve) => {
     let settled = false;
     let truncated = false;
@@ -289,14 +293,15 @@ function runCommand(cwd, command) {
       clearTimeout(timer);
       resolve(value);
     };
-    const child = spawn(shell, ["-NoProfile", "-NonInteractive", "-Command", text], {
+    const child = spawn(shell, args, {
+      ...OWN_GROUP,
       cwd,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
     child.on("error", (error) => {
       const missing = error && error.code === "ENOENT";
-      finish({ ok: false, error: missing ? "PowerShell is not available in this window." : "The command could not run." });
+      finish({ ok: false, error: missing ? `${windows ? "PowerShell" : "bash"} is not available in this window.` : "The command could not run." });
     });
     child.stdout.on("data", push);
     child.stderr.on("data", push);
@@ -314,7 +319,7 @@ function runCommand(cwd, command) {
 			stopping = true;
 			timedOut = timeout;
 			truncated = true;
-			void killTree(child).then((killed) => {
+			void stopTree(child).then((killed) => {
 				const reason = timedOut ? "Command exceeded the 20-second limit." : "Command exceeded the output limit.";
 				if (!killed) {
 					finish({ ok: false, error: `${reason} Its process tree could not be confirmed stopped.` });

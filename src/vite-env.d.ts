@@ -327,6 +327,7 @@ interface GrokCodeApi {
 	steer?: (uiSessionId: string, text: string) => Promise<{ ok: boolean; error?: string }>;
 	recentSpend?: () => Promise<{ ok: boolean; error?: string; usd?: number }>;
 	homeDir?: string;
+	platform?: string;
 	readiness?: () => Promise<GrokReadiness>;
 	customize?: (cwd: string) => Promise<GrokInventory>;
 	customizeChange?: (cwd: string, input: GrokCustomizeChange) => Promise<{ ok: boolean; error?: string; message?: string }>;

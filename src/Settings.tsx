@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { Customize } from "./Customize";
+import { keyLabel } from "./data";
 import { DEFAULT_FILE_TYPES, PLAIN_TEXT } from "./editor-defaults";
 import { mapMode, MODES, type PermissionMode, type TranscriptView } from "./types";
 
@@ -149,12 +150,12 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 						<h3>General</h3>
 						{row("Appearance", "Follow the system, or always light or dark.", choose("appearance", "Appearance", [["system", "System"], ["light", "Light"], ["dark", "Dark"]]))}
 						{row("Keep computer awake while Grok works", "Prevents idle sleep while any session is working. A closed lid still sleeps.", toggle("keepAwake", "Keep computer awake while Grok works"))}
-						{row("Keep awake on battery power", "When off, the hold drops while on battery. On battery, Windows may still sleep a few minutes after its own sleep timeout.", toggle("keepAwakeOnBattery", "Keep awake on battery power"))}
+						{row("Keep awake on battery power", "When off, the hold drops while on battery. On battery, the computer may still sleep a few minutes after its own sleep timeout.", toggle("keepAwakeOnBattery", "Keep awake on battery power"))}
 						{row("Auto save in the Files pane", "Save edits shortly after you stop typing.", toggle("autoSave", "Auto save"))}
 						{row("Suggest your next prompt", "Show a suggested next message after Grok replies. Press Tab to use it. Predictions may use model quota.", toggle("promptSuggestions", "Suggest your next prompt"))}
 						<h3>Browser</h3>
 						{row("Keep cookies", "Sign-ins in the Browser pane survive restarts.", toggle("keepCookies", "Keep cookies"))}
-						{row("Open links in built-in browser", "Links in the chat open in the Browser pane. Ctrl+click opens your default browser.", toggle("linksInBuiltIn", "Open links in built-in browser"))}
+						{row("Open links in built-in browser", keyLabel("Links in the chat open in the Browser pane. Ctrl+click opens your default browser."), toggle("linksInBuiltIn", "Open links in built-in browser"))}
 					</>
 				)}
 				{tab === "editor" && (
@@ -176,7 +177,7 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 					<>
 						<h3>Sessions</h3>
 						{row("Default permission mode", `The mode each new session starts in. ${MODES.find((item) => item.id === settings.defaultMode)?.detail ?? ""}`, choose("defaultMode", "Default permission mode", MODES.map((item) => [item.id, item.id])))}
-						{row("Transcript view", "How much each session shows until you change it with Ctrl+O. Thinking adds Grok's reasoning; Verbose also opens tool details.", choose("defaultView", "Transcript view", [["normal", "Normal"], ["thinking", "Thinking"], ["verbose", "Verbose"]]))}
+						{row("Transcript view", keyLabel("How much each session shows until you change it with Ctrl+O. Thinking adds Grok's reasoning; Verbose also opens tool details."), choose("defaultView", "Transcript view", [["normal", "Normal"], ["thinking", "Thinking"], ["verbose", "Verbose"]]))}
 						{row("Archive inactive sessions", "Archive sessions with no activity for this long. Clean worktree folders are removed; their branches stay. Pinned and running sessions stay.", choose("autoArchiveDays", "Archive inactive sessions", [[0, "Never"], [1, "1 day"], [2, "2 days"], [7, "7 days"], [14, "14 days"], [30, "30 days"]]))}
 						{row("Branch prefix", "Added to the branch names of new worktree sessions.", (
 							<span className="set-inline">

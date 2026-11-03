@@ -5,6 +5,12 @@ const { execFileSync } = require("child_process");
 const { EventEmitter } = require("events");
 const { main, markerLive, readMarker, findNode, writeAtomic, run } = require("./update-helper.cjs");
 
+// The helper stops and relaunches the app with Windows tools, and updatePrepare offers it only on Windows (test-updates checks that).
+if (process.platform !== "win32") {
+	console.log("SKIP update helper checks: the in-app updater runs on Windows only");
+	process.exit(0);
+}
+
 const tempBase = path.resolve("C:/Claude/temp", process.env.CODEX_THREAD_ID || "grokcode-updates");
 fs.mkdirSync(tempBase, { recursive: true });
 const root = fs.mkdtempSync(path.join(tempBase, "codex-update-helper-tests-"));

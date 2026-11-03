@@ -25,6 +25,9 @@ function load(name) {
 		if (id === "react/jsx-runtime") {
 			return { jsx, jsxs: jsx, Fragment: "fragment" };
 		}
+		if (id === "./data") {
+			return load("data.ts");
+		}
 		throw new Error(`Unexpected import ${id}`);
 	};
 	vm.runInNewContext(source, { require: imports, module, exports: module.exports, URL }, { filename: file });

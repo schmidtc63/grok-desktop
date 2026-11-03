@@ -10,7 +10,7 @@ const localRequire = createRequire(file);
 const moduleState = { exports: {} };
 let now = 0;
 vm.runInNewContext(fs.readFileSync(file, "utf8"), {
-	module: moduleState, Date: { now: () => now },
+	module: moduleState, Date: { now: () => now }, process: { platform: "win32" },
 	require(name) {
 		if (name === "../scripts/update-helper.cjs") { return { findNode: async () => process.execPath }; }
 		return localRequire(name);
@@ -123,6 +123,11 @@ async function main() {
 	}
 	const missingNode = await checkPrepare({}, async () => null);
 	assert.equal(missingNode.result.reason, "Node.js isn't on PATH.");
+	for (const platform of ["darwin", "linux"]) {
+		const manual = await updatePrepare(appDir, "0.9.0", "v0.10.0", { runGit: () => { throw new Error("git ran"); }, platform });
+		assert.equal(manual.ready, false, `${platform} never runs the Windows-only update helper`);
+		assert.ok(manual.reason.includes("git pull, npm install and npm run desktop"), manual.reason);
+	}
 	assert.equal(missingNode.calls.some((call) => call.startsWith("fetch")), false);
 	const prepared = await checkPrepare({ "tag -l --format=%(contents) v0.10.0": "n".repeat(4500) });
 	assert.equal(prepared.result.ready, true);

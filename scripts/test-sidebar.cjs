@@ -36,8 +36,10 @@ const loaded = { exports: {} };
 const confirmModule = { exports: {} };
 const source = transformSync(fs.readFileSync(path.join(__dirname, "../src/Sidebar.tsx"), "utf8"), { loader: "tsx", format: "cjs", jsx: "automatic" }).code;
 const confirmSource = transformSync(fs.readFileSync(path.join(__dirname, "../src/confirm.ts"), "utf8"), { loader: "ts", format: "cjs" }).code;
+const dataModule = { exports: {} };
+const dataSource = transformSync(fs.readFileSync(path.join(__dirname, "../src/data.ts"), "utf8"), { loader: "ts", format: "cjs" }).code;
 const context = vm.createContext({
-	require: (name) => name === "react" ? react : name === "./confirm" ? confirmModule.exports : { jsx, jsxs: jsx, Fragment: "fragment" },
+	require: (name) => name === "react" ? react : name === "./confirm" ? confirmModule.exports : name === "./data" ? dataModule.exports : { jsx, jsxs: jsx, Fragment: "fragment" },
 	localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
 	Date: class extends Date { static now() { return now; } },
 	setInterval: (run, delay) => { const id = ++intervalId; intervals.set(id, { run, delay }); return id; },
@@ -49,6 +51,7 @@ const context = vm.createContext({
 	},
 });
 vm.runInContext(`(function(module, exports) {\n${confirmSource}\n})`, context)(confirmModule, confirmModule.exports);
+vm.runInContext(`(function(module, exports) {\n${dataSource}\n})`, context)(dataModule, dataModule.exports);
 vm.runInContext(`(function(module, exports) {\n${source}\n})`, context)(loaded, loaded.exports);
 let confirmed = true;
 const sessions = [
@@ -59,10 +62,11 @@ let opened;
 const calls = [];
 const props = {
 	sessions,
+	chats: {},
 	activeId: "first",
 	query: "",
 	activity: { first: "needs-you", second: "needs-you" },
-	onQuery() {}, onSelect: (id) => calls.push(`select:${id}`), onNew() {}, onNewIn() {}, onPin() {}, onArchive() {}, onNotice: (text) => calls.push(`notice:${text}`),
+	onQuery() {}, onSelect: (id, find) => calls.push(find ? `select:${id}:${find}` : `select:${id}`), onNew() {}, onNewIn() {}, onPin() {}, onArchive() {}, onNotice: (text) => calls.push(`notice:${text}`),
 	onRename: (id, title) => calls.push(`rename:${id}:${title}`), onDelete: (id) => calls.push(`delete:${id}`),
 	onMarkUnread: (id, unread) => calls.push(`unread:${id}:${unread}`), onMarkCompleted: (id, done) => calls.push(`completed:${id}:${done}`),
 	onMove: (id, section) => calls.push(`move:${id}:${section}`), onSettings() {}, onCollapse() {},
@@ -215,6 +219,26 @@ async function checkActions() {
 	tree = render();
 	assert.equal(findAll(tree, (node) => node.props?.className === "account-btn")[0].props["aria-label"], "Account and settings");
 	assert.equal(findAll(tree, (node) => node.props?.className === "update-flag").length, 0);
+	const hit = (title) => findAll(tree, (node) => node.type === "button" && node.props.className === "session-hit" && text(node).includes(title))[0];
+	props.chats = { second: [{ id: "m1", role: "grok", text: "Done." }, { id: "m2", role: "user", text: "Please fix the  flaky\nlogin test in auth.ts" }] };
+	props.query = " LOGIN ";
+	tree = render();
+	assert.equal(hit("First chat"), undefined, "a session without the text is hidden");
+	assert.equal(text(findAll(hit("Second chat"), (node) => node.props?.className === "session-meta")[0]), "Please fix the flaky login test in auth.ts", "a message-text match shows where it matched");
+	calls.length = 0;
+	hit("Second chat").props.onClick({});
+	assert.deepEqual(calls, ["select:second:LOGIN"], "opening a message-text match asks for Find with the search text");
+	props.query = "second";
+	tree = render();
+	hit("Second chat").props.onClick({});
+	assert.deepEqual(calls, ["select:second:LOGIN", "select:second"], "a title match opens the session without Find");
+	props.query = "nothing like this";
+	tree = render();
+	assert.ok(findAll(tree, (node) => node.props?.className === "note" && text(node) === "No sessions match.").length === 1);
+	assert.equal(loaded.exports.textHit([{ text: `${"x".repeat(40)} needle here` }], "needle"), `…${"x".repeat(23)} needle here`, "a match deep in a message is clipped from shortly before it");
+	assert.equal(loaded.exports.textHit([{ text: "İstanbul" }], "zzz"), undefined);
+	props.query = "";
+	props.chats = {};
 	effects.forEach((effect) => effect?.cleanup?.());
 	assert.equal(listeners.has("storage"), false, "the shared-section listener is removed on cleanup");
 	assert.equal(intervals.size, 0, "activity refresh stops on cleanup");
@@ -223,4 +247,35 @@ async function checkActions() {
 	console.log("Sidebar activity passed: relative labels, worktree branch, minute refresh, arrow focus and cleanup.");
 }
 
+// The platform rules in data.ts, loaded as the preload reports each platform.
+function checkPlatformRules() {
+	const loadFor = (platform) => {
+		const module = { exports: {} };
+		vm.runInNewContext(`(function(module, exports) {\n${dataSource}\n})`, { window: { grokCode: { platform } } })(module, module.exports);
+		return module.exports;
+	};
+	const key = (overrides) => ({ ctrlKey: false, metaKey: false, key: "n", code: "KeyN", ...overrides });
+	const mac = loadFor("darwin");
+	assert.equal(mac.modKey(key({ metaKey: true })), true, "Cmd+N on macOS");
+	assert.equal(mac.modKey(key({ ctrlKey: true })), false, "Ctrl+N is not the shortcut on macOS");
+	assert.equal(mac.modKey(key({ ctrlKey: true, key: "Tab", code: "Tab" })), true, "Ctrl+Tab stays Ctrl on macOS");
+	assert.equal(mac.modKey(key({ ctrlKey: true, key: "`", code: "Backquote" })), true, "Ctrl+` stays Ctrl on macOS");
+	assert.equal(mac.keyLabel("Ctrl+Shift+N"), "Cmd+Shift+N");
+	assert.equal(mac.keyLabel("Ctrl+Shift+Tab"), "Ctrl+Shift+Tab");
+	assert.equal(mac.keyLabel("Ctrl+`"), "Ctrl+`");
+	assert.equal(mac.keyLabel("Ctrl+click opens it"), "Cmd+click opens it");
+	assert.equal(mac.FILE_MANAGER, "Finder");
+	assert.equal(mac.caseKey("/Users/A/Proj"), "/users/a/proj");
+	const linux = loadFor("linux");
+	assert.equal(linux.modKey(key({ ctrlKey: true })), true);
+	assert.equal(linux.keyLabel("Ctrl+Shift+N"), "Ctrl+Shift+N");
+	assert.equal(linux.caseKey("/home/u/Proj") === linux.caseKey("/home/u/proj"), false, "Linux keeps two folders that differ only by case apart");
+	const windows = loadFor(undefined);
+	assert.equal(windows.PLATFORM, "win32", "no preload platform behaves as Windows");
+	assert.equal(windows.FILE_MANAGER, "File Explorer");
+	assert.equal(windows.caseKey("C:\\Proj"), "c:\\proj");
+	console.log("PASS platform rules: Cmd on macOS except Tab and backquote, labels, file manager names, and Linux path case");
+}
+
+checkPlatformRules();
 void checkActions().catch((error) => { console.error(error); process.exitCode = 1; });

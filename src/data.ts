@@ -1,3 +1,24 @@
+// The main process's platform. Code loaded without the preload (tests) behaves as on Windows.
+export const PLATFORM = (typeof window !== "undefined" && window.grokCode?.platform) || "win32";
+
+// On macOS, Cmd takes Ctrl's place, except Ctrl+Tab, Ctrl+Shift+Tab and Ctrl+`: macOS itself owns Cmd+Tab and Cmd+`.
+export function modKey(event: { ctrlKey: boolean; metaKey: boolean; key: string; code: string }) {
+	if (PLATFORM !== "darwin" || event.key === "Tab" || event.code === "Backquote") { return event.ctrlKey; }
+	return event.metaKey;
+}
+
+// The same rule for shortcut text: "Ctrl+N" reads "Cmd+N" on macOS, and "Ctrl+click" reads "Cmd+click".
+export function keyLabel(text: string) {
+	return PLATFORM === "darwin" ? text.replace(/Ctrl\+(?!(?:Shift\+)?Tab|`)/g, "Cmd+") : text;
+}
+
+export const FILE_MANAGER = PLATFORM === "darwin" ? "Finder" : PLATFORM === "linux" ? "File Manager" : "File Explorer";
+
+// Folder paths compare without case on Windows and macOS, whose usual file systems ignore it; Linux keeps case.
+export function caseKey(text: string) {
+	return PLATFORM === "linux" ? text : text.toLowerCase();
+}
+
 // Claude Code Desktop's shortcut list, with Windows keys.
 export const SHORTCUTS: [string, string][] = [
 	["Ctrl+/", "Show keyboard shortcuts"],

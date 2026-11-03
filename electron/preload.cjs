@@ -60,6 +60,7 @@ contextBridge.exposeInMainWorld("grokCode", {
 		return ipcRenderer.invoke("grok:update-result");
 	},
 	homeDir: ipcRenderer.sendSync("grok:home-dir"),
+	platform: process.platform,
 	readiness() {
 		return ipcRenderer.invoke("grok:readiness");
 	},

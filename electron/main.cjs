@@ -45,17 +45,20 @@ const host = new AgentHost((event) => {
 		}
 		return;
 	}
-  for (const win of BrowserWindow.getAllWindows()) {
-    if (!win.isDestroyed()) win.webContents.send("grok:event", event);
-  }
+	broadcast(event);
 }, { rulesFile: () => path.join(app.getPath("userData"), "always-allow.json") });
 
 const terminals = new TerminalHost((event) => {
 	if (event.type === "terminal-exit") { terminalOwners.delete(event.id); }
-	for (const win of BrowserWindow.getAllWindows()) {
-		if (!win.isDestroyed()) { win.webContents.send("grok:event", event); }
-	}
+	broadcast(event);
 });
+
+function broadcast(event) {
+	for (const win of BrowserWindow.getAllWindows()) {
+		// A closing window's page is destroyed before the window, and its terminals close in between (macOS Cmd+Q).
+		if (!win.isDestroyed() && !win.webContents.isDestroyed()) { win.webContents.send("grok:event", event); }
+	}
+}
 
 const appDir = path.resolve(__dirname, "..");
 const pageFile = path.join(appDir, "dist", "index.html");
@@ -138,7 +141,8 @@ function createWindow(uiSessionId) {
 	const contents = win.webContents;
 	// Ctrl+R in the app's own page would reload the window and stop its turns. View > Reload stays, and a focused Browser-pane page still refreshes.
 	contents.on("before-input-event", (event, input) => {
-		if (input.type === "keyDown" && input.control && !input.alt && !input.meta && input.key.toLowerCase() === "r") { event.preventDefault(); }
+		const reloadKey = process.platform === "darwin" ? input.meta && !input.control : input.control && !input.meta;
+		if (input.type === "keyDown" && reloadKey && !input.alt && input.key.toLowerCase() === "r") { event.preventDefault(); }
 	});
 	const closeOwnedTerminals = () => {
 		for (const [id, owner] of terminalOwners) {
@@ -395,7 +399,12 @@ ipcMain.handle("grok:open-external", (_event, url) => {
 });
 
 // VS Code's CLI is a .cmd; start Code.exe beside it instead, so no shell parses the path.
+// On macOS and Linux `code` is a script with a shebang, which spawn runs directly.
 function vsCodeExe() {
+	if (process.platform !== "win32") {
+		const which = spawnSync("which", ["code"], { encoding: "utf8" });
+		return which.status === 0 ? String(which.stdout || "").split(/\r?\n/)[0].trim() : "";
+	}
 	const found = spawnSync("where.exe", ["code"], { encoding: "utf8", windowsHide: true });
 	const cmd = String(found.stdout || "").split(/\r?\n/).map((line) => line.trim()).find((line) => /code\.cmd$/i.test(line));
 	if (!cmd) { return ""; }
@@ -610,7 +619,9 @@ async function checkForUpdates(win) {
 }
 
 Menu.setApplicationMenu(Menu.buildFromTemplate([
-	{ label: "File", submenu: [{ label: "New Window", accelerator: "Ctrl+Shift+N", click: () => createWindow() }, { type: "separator" }, { role: "quit" }] },
+	// macOS shows the first menu as the application menu whatever its label.
+	...(process.platform === "darwin" ? [{ role: "appMenu" }] : []),
+	{ label: "File", submenu: [{ label: "New Window", accelerator: "CmdOrCtrl+Shift+N", click: () => createWindow() }, { type: "separator" }, { role: "quit" }] },
 	{ role: "editMenu" },
 	{ label: "View", submenu: [{ role: "reload" }, { role: "toggleDevTools" }, { type: "separator" }, { role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" }, { type: "separator" }, { role: "togglefullscreen" }] },
 	{ label: "Help", submenu: [
@@ -718,6 +729,8 @@ function startApplication() {
 	if (process.argv.includes("--build-if-stale")) { buildIfStale(); }
 	app.whenReady().then(createWindow);
 	app.whenReady().then(repairShortcuts);
+	// macOS ignores a window's icon and shows the dock icon instead.
+	if (process.platform === "darwin" && !appIcon.isEmpty()) { app.whenReady().then(() => app.dock.setIcon(appIcon)); }
 }
 
 const startupMarker = updateHelper.readMarker(app.getPath("userData"));

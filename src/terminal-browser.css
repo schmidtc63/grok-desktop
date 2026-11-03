@@ -92,7 +92,7 @@
 	overflow: auto;
 	background: var(--code);
 	color: var(--code-text);
-	font-family: Consolas, "Cascadia Mono", monospace;
+	font-family: Consolas, "Cascadia Mono", ui-monospace, Menlo, monospace;
 	font-size: 12.5px;
 	line-height: 1.45;
 	white-space: pre-wrap;
@@ -111,7 +111,7 @@
 	border-radius: 8px;
 	padding: 7px 10px;
 	color: var(--text);
-	font-family: Consolas, "Cascadia Mono", monospace;
+	font-family: Consolas, "Cascadia Mono", ui-monospace, Menlo, monospace;
 	font-size: 12.5px;
 }
 .tp-row input:disabled { color: var(--faint); }
@@ -175,7 +175,7 @@
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
-	font-family: Consolas, "Cascadia Mono", monospace;
+	font-family: Consolas, "Cascadia Mono", ui-monospace, Menlo, monospace;
 	font-size: 12px;
 }
 .bp-server .texty { padding: 3px 9px; }

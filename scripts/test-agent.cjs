@@ -10,7 +10,7 @@ process.exitCode = 1;
 const source = fs.readFileSync(path.join(__dirname, "../electron/agent.cjs"), "utf8");
 const input = { uiSessionId: "chat", cwd: path.resolve(__dirname, ".."), text: "Hello", model: "grok-4.7", effort: "high", mode: "Normal" };
 
-function makeHost(options, { tmpdir, platform = "win32" } = {}) {
+function makeHost(options, { tmpdir, platform = "win32", killErrors = {} } = {}) {
 	const timers = new Map();
 	const writes = [];
 	const spawns = [];
@@ -35,7 +35,8 @@ function makeHost(options, { tmpdir, platform = "win32" } = {}) {
 			spawn: (...args) => { spawns.push(args); return args[0] === "taskkill" ? new EventEmitter() : fakeChild(); },
 			spawnSync: (...args) => { kills.push(args); return { status: 0 }; },
 		} : (name === "os" && tmpdir ? { ...os, tmpdir: () => tmpdir } : require(name)),
-		process: { platform, env: {} },
+		// `kill` records process-group kills; killErrors maps a pid to the error code its kill throws.
+		process: { platform, env: {}, kill: (pid, signal) => { kills.push(["kill", pid, signal]); if (killErrors[Math.abs(pid)]) { throw Object.assign(new Error("kill failed"), { code: killErrors[Math.abs(pid)] }); } } },
 		setTimeout: (callback, ms) => { const timer = {}; timers.set(timer, { callback, ms }); return timer; },
 		clearTimeout: (timer) => timers.delete(timer),
 	};
@@ -66,7 +67,24 @@ function makeHost(options, { tmpdir, platform = "win32" } = {}) {
 			}
 		}
 	}
-	return { host, timers, writes, spawns, kills, events, children, running, serve, probeGrok: sandbox.module.exports.probeGrok };
+	return { host, timers, writes, spawns, kills, events, children, running, serve, probeGrok: sandbox.module.exports.probeGrok, killTree: sandbox.module.exports.killTree };
+}
+
+// macOS and Linux: each Grok leads its own process group, and killTree ends the group instead of running taskkill.
+function checkPosixProcessGroups() {
+	const posix = makeHost({}, { platform: "linux", killErrors: { 9: "EPERM", 10: "ESRCH" } });
+	posix.host.start({ ...input, uiSessionId: "posix" }, "ask").ready.catch(() => {});
+	assert.equal(posix.spawns[0][2].detached, true, "on Linux each Grok leads its own process group");
+	assert.equal(posix.killTree([{ pid: 7 }, { pid: 10 }]), true, "ESRCH means that group had already exited");
+	const fallback = [];
+	assert.equal(posix.killTree([{ pid: 9, kill: (signal) => fallback.push(signal) }]), false, "a group kill that fails reports it");
+	assert.deepEqual(fallback, ["SIGKILL"], "and falls back to the direct child");
+	assert.deepEqual(posix.kills, [["kill", -7, "SIGKILL"], ["kill", -10, "SIGKILL"], ["kill", -9, "SIGKILL"]]);
+	assert.equal(posix.spawns.some((item) => item[0] === "taskkill"), false);
+	const windows = makeHost({});
+	windows.host.start({ ...input, uiSessionId: "windows" }, "ask").ready.catch(() => {});
+	assert.equal("detached" in windows.spawns[0][2], false, "Windows spawns stay attached, so no console window opens");
+	console.log("PASS macOS/Linux Grok processes lead their own process group, and killTree ends each group");
 }
 
 async function checkProbeGrok() {
@@ -1606,6 +1624,7 @@ function checkChunkBatching() {
 }
 
 (async () => {
+	checkPosixProcessGroups();
 	await checkProbeGrok();
 	checkEditDiffs();
 	checkChunkBatching();

@@ -3,7 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { createHash } = require("crypto");
-const { folderProblem, resolvedEditPath, killTree } = require("./agent.cjs");
+const { folderProblem, resolvedEditPath, killTree, OWN_GROUP } = require("./agent.cjs");
 
 const MAX_BYTES = 180000;
 const MAX_LINES = 700;
@@ -27,7 +27,7 @@ function runGit(args, cwd, timeout = 8000) {
     };
     // A repo's own config must not start a program just because the Changes pane opened.
 		// core.hooksPath stops hook files only; a hook set in config ignores it, so the event an index refresh fires is off too.
-		const child = spawn("git", ["-c", "core.fsmonitor=false", "-c", "diff.suppressBlankEmpty=false", "-c", `core.hooksPath=${os.devNull}`, "-c", "hook.post-index-change.enabled=false", ...args], { cwd, env: { ...process.env, GROK_CODE_EMPTY: "", GROK_CODE_FALSE: "false" }, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn("git", ["-c", "core.fsmonitor=false", "-c", "diff.suppressBlankEmpty=false", "-c", `core.hooksPath=${os.devNull}`, "-c", "hook.post-index-change.enabled=false", ...args], { cwd, env: { ...process.env, GROK_CODE_EMPTY: "", GROK_CODE_FALSE: "false" }, ...OWN_GROUP, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     child.on("error", (error) => {
       finish({
         code: -1,
@@ -67,7 +67,9 @@ function runGit(args, cwd, timeout = 8000) {
 }
 
 async function localFilterOff(cwd) {
-	const config = await runGit(["config", "--show-scope", "--name-only", "--get-regexp", "^filter\\..*\\.(clean|smudge|process)$"], cwd);
+	// Every key, matched here: in a UTF-8 locale (macOS, Linux) git's own --get-regexp "." skips a name that is not valid UTF-8,
+	// so that driver would stay on unseen.
+	const config = await runGit(["config", "--show-scope", "--name-only", "--list"], cwd);
 	// A cut-off listing could miss a driver, so it is refused like a name that cannot be turned off.
 	if (config.truncated) { return null; }
 	const names = new Set();

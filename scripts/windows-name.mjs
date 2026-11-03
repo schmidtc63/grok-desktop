@@ -2,6 +2,8 @@ import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { rcedit } from "rcedit";
 
+// The Windows file properties are the only thing this script names; macOS and Linux have nothing to edit.
+if (process.platform !== "win32") { process.exit(0); }
 // Electron 45 downloads its binary the first time its package is required, so a fresh install has no dist/ until then.
 const exe = createRequire(import.meta.url)("electron");
 const current = execFileSync(

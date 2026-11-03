@@ -8,7 +8,8 @@ const { createHash } = require("crypto");
 const { listFiles, readText, writeText, runCommand } = require("../electron/files.cjs");
 const { readDiff, parseUnified, revertFile } = require("../electron/diff.cjs");
 
-const tempBase = path.resolve(os.tmpdir(), process.env.CODEX_THREAD_ID || "codex-grokcode-files");
+// macOS puts the temp folder behind the /var symlink, and the modules report real paths.
+const tempBase = path.resolve(fs.realpathSync(os.tmpdir()), process.env.CODEX_THREAD_ID || "codex-grokcode-files");
 fs.mkdirSync(tempBase, { recursive: true });
 const root = fs.mkdtempSync(path.join(tempBase, "codex-files-"));
 const depthRoot = fs.mkdtempSync(path.join(tempBase, "codex-depth-"));
@@ -262,6 +263,9 @@ async function main() {
 	fs.mkdirSync(conflictRoot);
 	git(["init", "--quiet"], conflictRoot);
 	git(["config", "core.autocrlf", "false"], conflictRoot);
+	// git merge needs an identity before it starts, and a CI runner or container has no global one.
+	git(["config", "user.name", "GrokCode test"], conflictRoot);
+	git(["config", "user.email", "test@example.invalid"], conflictRoot);
 	const commit = (message) => git(["-c", "user.name=GrokCode test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "--no-gpg-sign", "-am", message], conflictRoot);
 	fs.writeFileSync(path.join(conflictRoot, "conflict.txt"), "base\n");
 	fs.writeFileSync(path.join(conflictRoot, "z-ordinary.txt"), "ordinary base\n");
@@ -414,13 +418,21 @@ async function main() {
 
 	await checkRepoFiles();
 
+	// `echo` is Write-Output in PowerShell and a builtin in bash, so one command checks the shell of each platform.
+	const echoed = await runCommand(root, "echo run-box-ok");
+	assert.equal(echoed.ok, true, JSON.stringify(echoed));
+	assert.equal(echoed.code, 0);
+	assert.equal(echoed.output.trim(), "run-box-ok");
+	console.log(`PASS the Run box runs a command in ${process.platform === "win32" ? "PowerShell" : "bash"}`);
+
 	if (process.argv.includes("--terminal")) {
 		const childFile = path.join(root, "codex-timeout-child.cjs");
 		const marker = path.join(root, "codex-survived.txt");
 		fs.writeFileSync(childFile, `setTimeout(() => require("fs").writeFileSync(${JSON.stringify(marker)}, "survived"), 23000);`);
 		const escapePs = (text) => `'${text.replace(/'/g, "''")}'`;
+		const escapeSh = (text) => `'${text.replace(/'/g, "'\\''")}'`;
 		const started = Date.now();
-		const result = await runCommand(root, `& ${escapePs(process.execPath)} ${escapePs(childFile)}`);
+		const result = await runCommand(root, process.platform === "win32" ? `& ${escapePs(process.execPath)} ${escapePs(childFile)}` : `${escapeSh(process.execPath)} ${escapeSh(childFile)}`);
 		assert.equal(result.ok, true, JSON.stringify(result));
 		assert.equal(result.code, -1);
 		assert.equal(result.timedOut, true);
@@ -428,7 +440,7 @@ async function main() {
 		assert.ok(Date.now() - started < 23000, "Timeout must settle before the child marker deadline");
 		await new Promise((resolve) => setTimeout(resolve, Math.max(0, 24500 - (Date.now() - started))));
 		assert.equal(fs.existsSync(marker), false, "Descendant must be stopped before it writes its marker");
-		console.log("PASS CR10: real PowerShell/Node descendant stopped at timeout without writing its delayed marker");
+		console.log("PASS CR10: real shell/Node descendant stopped at timeout without writing its delayed marker");
 	}
 }
 

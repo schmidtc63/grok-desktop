@@ -341,6 +341,10 @@ module.exports = { main, markerLive, readMarker, findNode, writeAtomic, run };
 
 if (require.main === module) {
 	let options;
+	// Only Windows has the in-app updater (updatePrepare refuses elsewhere), so on macOS and Linux no update is running or needs recovery.
+	if (process.platform !== "win32" && (process.argv[2] === "--recover" || process.argv[2] === "--busy")) {
+		process.exit(0);
+	}
 	if (process.argv[2] === "--recover" || process.argv[2] === "--busy") {
 		const args = process.argv.slice(3);
 		const wait = args.indexOf("--wait");

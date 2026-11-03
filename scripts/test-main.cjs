@@ -43,8 +43,10 @@ class TestWindow extends EventEmitter {
 		super();
 		this.options = options;
 		this.webContents = new EventEmitter();
-		this.webContents.send = () => {};
-		this.webContents.isDestroyed = () => !!this.destroyed;
+		this.webContents.isDestroyed = () => !!(this.destroyed || this.webContents.gone);
+		this.webContents.send = () => {
+			if (this.webContents.isDestroyed()) { throw new TypeError("Object has been destroyed"); }
+		};
 		this.webContents.getURL = () => "file:///index.html";
 		this.webContents.reload = () => { this.reloads = (this.reloads || 0) + 1; };
 		windows.push(this);
@@ -193,9 +195,10 @@ const shortcuts = {
 	[path.join(pinnedFolder, "Grok.lnk")]: { target: process.execPath, args: "", appUserModelId: "Grok.Code" },
 };
 const shortcutWrites = [];
+// These checks cover the Windows behavior (shortcut repair, Ctrl+R) on every host; checkMacMenu loads a macOS copy.
 const mainContext = {
 	__dirname: path.join(root, "electron"),
-	process,
+	process: Object.create(process, { platform: { value: "win32" } }),
 	URL,
 	Buffer,
 	require(name) {
@@ -351,8 +354,11 @@ async function main() {
 	const crashedTerminal = handlers.get("grok:terminal-open")(first, { cwd: root }).id;
 	first.sender.emit("render-process-gone");
 	assert.deepEqual(terminals.closed, [firstTerminal, crashedTerminal], "a renderer crash closes its terminals");
+	// As on macOS Cmd+Q: the page is destroyed while its window still exists, so the terminal-exit broadcast must skip it.
+	second.sender.gone = true;
 	second.sender.emit("destroyed");
 	assert.deepEqual(terminals.closed, [firstTerminal, crashedTerminal, secondTerminal], "destroy closes only the remaining owner's terminals");
+	second.sender.gone = false;
 	assert.equal(terminals.closeAllCalls, 0);
 	assert.equal((await handlers.get("grok:send")(first, { uiSessionId: "first" })).ok, true);
 	assert.equal((await handlers.get("grok:send")(second, { uiSessionId: "first" })).ok, false);
@@ -429,8 +435,10 @@ async function main() {
 				sendSync: (name) => { const event = {}; handlers.get(name)(event); return event.returnValue; },
 			},
 		}),
+		process: { platform: "darwin" },
 	});
 	assert.equal(api.homeDir, require("node:os").homedir(), "the first session's folder comes from this computer, not a fixed path");
+	assert.equal(api.platform, "darwin", "the renderer learns the platform from the preload");
 	api.readiness();
 	assert.deepEqual(written, ["grok:readiness"]);
 	api.updateCheck(true);
@@ -689,9 +697,10 @@ async function main() {
 		quitCalls: 0,
 	});
 	secondCopy.quit = () => { secondCopy.quitCalls += 1; };
+	// The second copy runs as on macOS: it quits at once, but it still builds the application menu.
 	vm.runInNewContext(fs.readFileSync(path.join(root, "electron/main.cjs"), "utf8"), {
 		__dirname: path.join(root, "electron"),
-		process,
+		process: { ...process, platform: "darwin" },
 		URL,
 		require(name) {
 			if (name === "electron") { return { ...electron, app: secondCopy, ipcMain: { handle: () => {}, on: () => {} } }; }
@@ -705,6 +714,8 @@ async function main() {
 		},
 	});
 	assert.equal(secondCopy.quitCalls, 1, "a second copy quits");
+	assert.equal(appMenu[0].role, "appMenu", "macOS gets the application menu first");
+	assert.equal(appMenu[1].submenu[0].accelerator, "CmdOrCtrl+Shift+N", "New Window is Cmd+Shift+N on macOS");
 	assert.equal(windows.length, windowCount, "and opens no window of its own");
 	const openFirstWindow = (saved) => {
 		for (const win of windows) { win.destroyed = true; }
@@ -742,7 +753,7 @@ async function main() {
 	assert.equal(later.maximizedWhenShown, false, "later windows do not inherit maximized state");
 	const originalProcess = mainContext.process;
 	const appExe = path.join(root, "node_modules", "electron", "dist", "electron.exe");
-	mainContext.process = { ...process, execPath: appExe };
+	mainContext.process = Object.create(originalProcess, { execPath: { value: appExe } });
 	const movedPin = path.join(pinnedFolder, "Moved by Windows.lnk");
 	const unrelatedPin = path.join(pinnedFolder, "Other moved checkout.lnk");
 	shortcuts[movedPin] = { target: appExe.replace("node_modules", "NODE_MODULES.UPDATE-OLD"), args: `"${root}" --build-if-stale`, icon: iconFile, appUserModelId: "Grok.Code" };
@@ -759,7 +770,7 @@ async function main() {
 		guarded.quit = () => { guarded.quitCalls += 1; };
 		const before = { windows: windows.length, dialogs: dialogs.length, builds: viteBuilds.length, children: children.length };
 		vm.runInNewContext(fs.readFileSync(path.join(root, "electron/main.cjs"), "utf8"), {
-			__dirname: path.join(root, "electron"), process: { ...process, argv: [...process.argv, "--build-if-stale"] }, URL, Buffer,
+			__dirname: path.join(root, "electron"), process: { ...process, platform: "win32", argv: [...process.argv, "--build-if-stale"] }, URL, Buffer,
 			setTimeout(callback, delay) { timers.push({ callback, delay }); },
 			require(name) {
 				if (name === "electron") { return { ...electron, app: guarded, ipcMain: { handle() {}, on() {} }, Notification: class { constructor(options) { this.options = options; } show() { notifications.push(this.options); } } }; }

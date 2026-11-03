@@ -40,6 +40,7 @@ function load(name, globals = {}, confirm) {
 		if (id === "react") { return react; }
 		if (id === "react/jsx-runtime") { return { jsx, jsxs: jsx, Fragment: "fragment" }; }
 		if (id === "./confirm") { return confirm ?? load("confirm.ts", globals); }
+		if (id === "./data") { return load("data.ts", globals); }
 		if (id === "./Markdown") { return { Markdown: (props) => jsx("markdown", props) }; }
 		if (id === "./CodeEditorLoader") { return { CodeEditorLoader: (props) => jsx("code-editor", props) }; }
 		throw new Error(`Unexpected import ${id}`);

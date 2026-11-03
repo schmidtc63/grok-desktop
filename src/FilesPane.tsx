@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Markdown } from "./Markdown";
+import { modKey } from "./data";
 import { CodeEditorLoader as CodeEditor } from "./CodeEditorLoader";
 
 export interface FilesPaneProps {
@@ -125,7 +126,7 @@ export function FilesPane(props: FilesPaneProps) {
 					setExpanded(false);
 					return;
 				}
-				if (event.ctrlKey && !event.shiftKey && !event.altKey && event.key.toLowerCase() === `s`) {
+				if (modKey(event) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === `s`) {
 					event.preventDefault();
 					if (dirty && !saving && !readOnly && !conflict) {
 						onSave();

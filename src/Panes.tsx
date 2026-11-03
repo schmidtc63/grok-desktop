@@ -43,6 +43,8 @@ export interface PaneModel {
   messages: ChatMessage[];
 	view: TranscriptView;
 	findTick: number;
+	// Opens Find with this text at its first match; the main chat gets it when a sidebar search matched message text.
+	findAt?: { tick: number; text: string };
 	todos: GrokTodo[];
 	plan: string;
 	tasks: BackgroundTask[];
@@ -658,7 +660,8 @@ function Chat({ m }: { m: PaneModel }) {
 	const [hits, setHits] = useState(0);
 	const [contentTick, setContentTick] = useState(0);
 	const findBox = useRef<HTMLInputElement>(null);
-	const jump = useRef(false);
+	// true jumps on the next highlight pass; a string waits for the pass that searches that text.
+	const jump = useRef<boolean | string>(false);
   const signature = m.messages.map((message) => {
 		const tools = message.tools?.map((tool) => `${tool.id}:${tool.detail}:${tool.waiting}:${tool.output ?? ""}:${tool.diff ? 1 : 0}`).join(",") ?? "";
     return `${message.id}:${message.text}:${message.thought ?? ""}:${message.pending}:${tools}`;
@@ -680,6 +683,12 @@ function Chat({ m }: { m: PaneModel }) {
 		findBox.current?.focus();
 		findBox.current?.select();
 	}, [m.findTick]);
+	useEffect(() => {
+		if (!m.findAt?.tick) { return; }
+		jump.current = m.findAt.text.toLowerCase();
+		setHit(0);
+		setFind(m.findAt.text);
+	}, [m.findAt?.tick]);
 	useEffect(() => () => {
 		if (typeof CSS !== "undefined") {
 			CSS.highlights?.delete("grok-find");
@@ -717,8 +726,9 @@ function Chat({ m }: { m: PaneModel }) {
 		const current = ranges.length ? ranges[((hit % ranges.length) + ranges.length) % ranges.length] : undefined;
 		if (ranges.length) { registry.set("grok-find", new Highlight(...ranges)); } else { registry.delete("grok-find"); }
 		if (current) { registry.set("grok-find-current", new Highlight(current)); } else { registry.delete("grok-find-current"); }
-		if (current && jump.current) { current.startContainer.parentElement?.scrollIntoView({ block: "center" }); }
-		jump.current = false;
+		const wanted = jump.current === true || jump.current === needle;
+		if (current && wanted) { current.startContainer.parentElement?.scrollIntoView({ block: "center" }); }
+		if (wanted) { jump.current = false; }
 	}, [find, hit, signature, m.session.id, m.view, contentTick]);
   return (
 		<section className="chat" aria-label="Chat">

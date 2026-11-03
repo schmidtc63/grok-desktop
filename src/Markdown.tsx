@@ -1,5 +1,6 @@
 import { createElement, type MouseEvent, type ReactNode } from "react";
 import { lexer, type Token, type Tokens } from "marked";
+import { PLATFORM } from "./data";
 
 export interface MarkdownProps {
 	text: string;
@@ -12,7 +13,8 @@ export interface MarkdownProps {
 	onRun?: (code: string) => void;
 }
 
-const SHELLS = new Set(["powershell", "pwsh", "ps1", "ps"]);
+// Run sends a block to the Terminal pane, so only the language that pane runs gets the button.
+const SHELLS = new Set(PLATFORM === "win32" ? ["powershell", "pwsh", "ps1", "ps"] : ["bash", "sh", "shell", "zsh", "console"]);
 
 export function isShell(lang: string | undefined) {
 	return SHELLS.has(String(lang || "").trim().split(/\s+/)[0].toLowerCase());

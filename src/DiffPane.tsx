@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { askConfirm } from "./confirm";
+import { keyLabel, modKey } from "./data";
 
 export interface DiffComment { id: string; file: string; line: number; side: "old" | "new"; text: string }
 
@@ -278,13 +279,13 @@ export function DiffPane(props: DiffPaneProps) {
 			return;
 		}
 		const text = draft.text.trim();
-		if (event.ctrlKey && !text) {
+		if (modKey(event) && !text) {
 			return;
 		}
 		event.preventDefault();
 		event.stopPropagation();
 		if (text) {
-			if (event.ctrlKey) { sendAfterAdd.current = true; }
+			if (modKey(event)) { sendAfterAdd.current = true; }
 			onAddComment({ file: draft.file, line: draft.line, side: draft.side, text });
 			setCompose(null);
 		}
@@ -367,7 +368,7 @@ export function DiffPane(props: DiffPaneProps) {
 					go(event.key === `ArrowDown` ? 1 : -1);
 					return;
 				}
-				if (event.ctrlKey && event.key === `Enter` && comments.length > 0) {
+				if (modKey(event) && event.key === `Enter` && comments.length > 0) {
 					event.preventDefault();
 					onSendComments();
 				}
@@ -451,7 +452,7 @@ export function DiffPane(props: DiffPaneProps) {
 			{comments.length > 0 && (
 				<div className="dp-foot">
 					<span className="meta">{comments.length === 1 ? `1 comment` : `${comments.length} comments`}</span>
-					<button className="texty dp-send" onClick={onSendComments}>Send to Grok (Ctrl+Enter)</button>
+					<button className="texty dp-send" onClick={onSendComments}>{keyLabel("Send to Grok (Ctrl+Enter)")}</button>
 				</div>
 			)}
 		</section>

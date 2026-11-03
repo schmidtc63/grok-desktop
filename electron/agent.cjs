@@ -56,8 +56,10 @@ function folderProblem(cwd) {
   return "";
 }
 
+// Windows and macOS file systems usually ignore case; Linux keeps it, so ~/Proj and ~/proj stay two folders there.
 function pathKey(folder) {
-  return folder.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+  const key = folder.replace(/\//g, "\\").replace(/\\+$/, "");
+  return process.platform === "linux" ? key : key.toLowerCase();
 }
 
 function allowedFoldersProblem(folders) {
@@ -117,15 +119,31 @@ function editIsAllowed(turn, input) {
 	}
 }
 
+// On macOS and Linux a child spawned with these options leads its own process group, so killTree can end its whole tree.
+// Windows needs none: taskkill /T follows parent ids, and `detached` there would open a console window.
+const OWN_GROUP = process.platform === "win32" ? {} : { detached: true };
+
 // Takes one process or a list; one taskkill ends every tree. `sync` waits for it, so Grok's own child processes
-// are gone before the app exits or a folder is removed.
+// are gone before the app exits or a folder is removed. On macOS and Linux the kill is synchronous either way, and
+// the result says whether every group is gone (ESRCH: it had already exited).
 function killTree(children, sync = false) {
 	const list = (Array.isArray(children) ? children : [children]).filter((child) => child && child.pid != null);
 	if (!list.length) { return; }
   if (process.platform === "win32") {
 		(sync ? spawnSync : spawn)("taskkill", [...list.flatMap((child) => ["/PID", String(child.pid)]), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
   } else {
-		for (const child of list) { child.kill(); }
+		let stopped = true;
+		for (const child of list) {
+			try {
+				process.kill(-child.pid, "SIGKILL");
+			} catch (error) {
+				if (!error || error.code !== "ESRCH") {
+					stopped = false;
+					try { child.kill("SIGKILL"); } catch {}
+				}
+			}
+		}
+		return stopped;
   }
 }
 
@@ -256,7 +274,7 @@ function probeGrok() {
 			resolve(result);
 		};
 		try {
-			child = spawn(grokPath(), ["--permission-mode", "default", "agent", "--no-leader", "stdio"], { cwd: os.homedir(), windowsHide: true, stdio: ["pipe", "pipe", "ignore"] });
+			child = spawn(grokPath(), ["--permission-mode", "default", "agent", "--no-leader", "stdio"], { ...OWN_GROUP, cwd: os.homedir(), windowsHide: true, stdio: ["pipe", "pipe", "ignore"] });
 			const decoder = new StringDecoder("utf8");
 			let buffer = "";
 			child.stdout.on("data", (chunk) => {
@@ -948,6 +966,7 @@ class AgentHost {
       input.effort,
       "stdio",
     ], {
+      ...OWN_GROUP,
       cwd: input.cwd,
       // The app's own setting decides whether it asks for prompt suggestions, so Grok's config.toml switch must not veto them here.
       env: { ...process.env, GROK_PROMPT_SUGGESTIONS: "1" },
@@ -1670,4 +1689,4 @@ class AgentHost {
   }
 }
 
-module.exports = { AgentHost, folderProblem, resolvedEditPath, killTree, grokHome, grokPath, accountOf, probeGrok };
+module.exports = { AgentHost, folderProblem, resolvedEditPath, killTree, OWN_GROUP, grokHome, grokPath, accountOf, probeGrok };

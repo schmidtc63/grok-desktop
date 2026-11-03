@@ -26,7 +26,11 @@ Cursor's API can also run an agent on a registered machine, and `grok worker` re
 
 ### macOS and Linux
 
-Codewomplers Grok Desktop is Windows-only (`"os": ["win32"]` in `package.json`). The terminal, shell commands, path handling and window naming assume Windows.
+Codewomplers Grok Desktop runs on macOS and Linux from source. Still open:
+
+- The in-app updater is Windows-only: `scripts/update-helper.cjs` stops and relaunches the app with Windows tools, so `updatePrepare` refuses on macOS and Linux and shows the manual steps.
+- On macOS, starting the app from the Dock opens plain Electron, and the menu bar names it "Electron". Both need packaging, which is not planned.
+- Open in VS Code has not been tried on macOS or Linux.
 
 ### API-key sign-in
 

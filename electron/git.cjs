@@ -3,7 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { createHash } = require("crypto");
-const { folderProblem } = require("./agent.cjs");
+const { folderProblem, killTree, OWN_GROUP } = require("./agent.cjs");
 const { readDiff, parseUnified, localFilterOff, FILTER_NOT_OFF } = require("./diff.cjs");
 
 const GIT_TIMEOUT = 20000;
@@ -23,7 +23,7 @@ function stop(child) {
 	if (process.platform === "win32" && child.pid) {
 		spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" }).on("error", () => {});
 	} else {
-		child.kill();
+		killTree(child);
 	}
 }
 
@@ -37,7 +37,7 @@ function run(command, args, cwd, timeout, maxBytes = MAX_BYTES, options = {}) {
 		const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1", NO_COLOR: "1", GROK_CODE_EMPTY: "", GROK_CODE_FALSE: "false", ...options.env };
 		let child;
 		try {
-			child = spawn(command, args, { cwd, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+			child = spawn(command, args, { ...OWN_GROUP, cwd, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
 		} catch (error) {
 			resolve(result({ err: error.message }));
 			return;

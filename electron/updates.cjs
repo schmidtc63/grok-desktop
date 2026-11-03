@@ -63,10 +63,12 @@ async function checkForUpdate(appDir, current, { force = false, runGit = git } =
 	return result;
 }
 
-async function updatePrepare(appDir, current, tag, { runGit = git, findNode: locateNode = findNode } = {}) {
+async function updatePrepare(appDir, current, tag, { runGit = git, findNode: locateNode = findNode, platform = process.platform } = {}) {
 	const info = { ok: true, ready: false, notes: "", current, latest: typeof tag === "string" ? tag.slice(1) : "", tag };
 	const refuse = (reason) => ({ ...info, reason });
 	if (typeof tag !== "string" || !TAG.test(tag) || !parseVersion(tag)) { return refuse("That release tag isn't valid."); }
+	// ponytail: scripts/update-helper.cjs stops and relaunches the app with Windows tools only; port it before offering this elsewhere.
+	if (platform !== "win32") { return refuse("On macOS and Linux, update by hand: quit the app, then in its folder run git pull, npm install and npm run desktop."); }
 	const run = (args, timeout = 20000) => runGit(args, appDir, timeout, QUIET);
 	try {
 		const branch = await run(["rev-parse", "--abbrev-ref", "HEAD"]);

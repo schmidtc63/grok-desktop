@@ -1,4 +1,5 @@
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { PLATFORM } from "./data";
 
 export interface TerminalTab { id: string; title: string; cwd: string; running: boolean; output: string }
 
@@ -137,7 +138,7 @@ export function TerminalPane({ tabs, activeId, error, onActivate, onNew, onClose
 						<input
 							ref={inputRef}
 							aria-label="Terminal input"
-							placeholder={`PS ${active.cwd}>`}
+							placeholder={PLATFORM === "win32" ? `PS ${active.cwd}>` : `${active.cwd} $`}
 							value={line.draft}
 							disabled={!active.running}
 							spellCheck={false}

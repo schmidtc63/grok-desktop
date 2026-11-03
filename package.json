@@ -1,12 +1,9 @@
 {
   "name": "grok-code",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
-  "os": [
-    "win32"
-  ],
   "license": "MIT",
-  "description": "Codewomplers Grok Desktop: an unofficial desktop app for the Grok CLI on Windows.",
+  "description": "Codewomplers Grok Desktop: an unofficial desktop app for the Grok CLI on Windows, macOS and Linux.",
   "author": "Codewomplers",
   "main": "electron/main.cjs",
   "type": "module",
