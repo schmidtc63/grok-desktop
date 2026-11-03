@@ -183,7 +183,8 @@ async function main() {
 	const windows = process.platform === "win32";
 	if (windows) { checkTerminalShell(); }
 	checkOutputBatching();
-	const tmp = os.tmpdir();
+	// The GitHub Windows runner's temp folder sits under a short 8.3 name (RUNNER~1), which PowerShell prints in full.
+	const tmp = fs.realpathSync.native(os.tmpdir());
 	const opened = host.open({ cwd: tmp });
 	assert.equal(opened.ok, true, opened.error);
 	const id = opened.id;
