@@ -94,6 +94,32 @@ class TerminalHost {
 		return { ok: true };
 	}
 
+	interrupt(id) {
+		const tab = this.tabs.get(id);
+		if (!tab || tab.child.pid === undefined || tab.child.exitCode !== null) { return Promise.resolve({ ok: false, error: "That terminal is closed." }); }
+		const pid = tab.child.pid;
+		const failed = { ok: false, error: "The running command could not be stopped." };
+		// Stop the shell's direct children with their trees. Skip conhost.exe (the shell's console host: killing it ends the shell)
+		// and any process older than the shell (its real parent ended and Windows reused that PID). One CIM query, because a second
+		// costs about half a second. A PowerShell loop such as Start-Sleep runs in the shell itself and has no child to stop.
+		const script = `$found = Get-CimInstance Win32_Process -Filter "ProcessId=${pid} OR ParentProcessId=${pid}"; $shell = $found | Where-Object ProcessId -eq ${pid}; $found | Where-Object { $shell -and $_.ParentProcessId -eq ${pid} -and $_.CreationDate -ge $shell.CreationDate -and $_.Name -ne 'conhost.exe' } | ForEach-Object ProcessId`;
+		return new Promise((resolve) => {
+			const query = spawn(terminalShell(), ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, stdio: ["ignore", "pipe", "ignore"], timeout: 10000 });
+			let found = "";
+			query.stdout.on("data", (buf) => { found += buf; });
+			query.on("error", () => resolve(failed));
+			query.on("close", (code) => {
+				if (code !== 0) { resolve(failed); return; }
+				const pids = found.match(/\d+/g) || [];
+				if (!pids.length) { resolve({ ok: true, stopped: 0 }); return; }
+				const kill = spawn("taskkill", [...pids.flatMap((child) => ["/PID", child]), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+				kill.on("error", () => resolve(failed));
+				// ponytail: taskkill exits 128 both for "access denied" and for a process that already ended, so an elevated child still counts as stopped; probe each PID afterwards if that matters.
+				kill.on("close", () => resolve({ ok: true, stopped: pids.length }));
+			});
+		});
+	}
+
 	close(id) {
 		const tab = this.tabs.get(id);
 		if (tab) {

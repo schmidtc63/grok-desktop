@@ -25,6 +25,7 @@
 	color: var(--text);
 }
 .bp-icon:disabled { color: var(--faint); cursor: default; }
+.tp-pane .pane-hd .texty { padding: 2px 9px; }
 
 /* Tab strips */
 .tp-tabs,

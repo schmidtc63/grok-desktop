@@ -984,10 +984,17 @@ async function checkParityFeatures() {
 	host.turns.get("chat").agentSessionId = "sid-c";
 	const procOther = running({ uiSessionId: "other", turnId: "turn-o", cwd, agentSessionId: "sid-o", promptId: 3 });
 	const beforeOther = writes.length;
+	host.onHook(procOther, { id: "mcp-6", params: { sessionId: "sid-o", toolUseId: "mcp-6", toolName: "use_tool", toolInput: { tool_name: "chrome__read_page", tool_input: { tabId: 3 } } } });
+	assert.equal(writes.length, beforeOther, "Always allow on a tool belongs to one conversation");
+	host.decide({ uiSessionId: "other", toolId: "mcp-6", decision: "deny" });
 	host.onHook(procOther, { id: "cmd-6", params: { sessionId: "sid-o", toolUseId: "cmd-6", toolName: "run_terminal_command", toolInput: { command: "npm test -- --watch=false" } } });
-	assert.equal(writes.length, beforeOther, "Always allow belongs to one session");
+	assert.equal(writes.find((item) => item.id === "cmd-6").result.decision, "allow", "Always allow on an exact command covers every session in its folder");
+	assert.deepEqual(plain(host.listRules()), [{ folder: cwd, commands: ["npm test -- --watch=false", "powershell -Command Get-Date"] }], "only exact commands are saved for the folder");
+	const cards = events.filter((event) => event.type === "tool" && event.tool.waiting);
+	const cardFor = (id) => cards.find((event) => event.tool.id === id).tool;
+	assert.deepEqual([cardFor("cmd-1").always, cardFor("mcp-1").always, cardFor("edit-1").always, cardFor("cmd-4").always], ["folder", "conversation", "conversation", undefined], "each card says what Always allow would remember");
 
-	// Choose a folder starts a new conversation, so a rule never follows it, even back to the first folder.
+	// A saved command belongs to its folder: Choose a folder leaves it behind, and it applies again back in the first folder.
 	const moved = makeHost();
 	const turnIn = async (turnId, folder, agentSessionId) => {
 		const sent = moved.host.prompt({ ...input, turnId, cwd: folder, ...(agentSessionId ? { agentSessionId } : {}) });
@@ -1013,27 +1020,30 @@ async function checkParityFeatures() {
 	await moved.serve();
 	const backChat = await turnIn("move-d", cwd);
 	assert.notEqual(backChat, firstChat, "the fake Grok gives each new conversation its own id");
-	assert.equal(ask("move-4", backChat), undefined, "back in the first folder, the new conversation starts with no Always allow rules");
-	assert.equal(moved.host.gates.has("move-4"), true);
-	moved.host.decide({ uiSessionId: "chat", toolId: "move-4", decision: "deny" });
+	assert.equal(ask("move-4", backChat).result.decision, "allow", "back in the first folder, its saved command applies to the new conversation");
 	// A turn that keeps its conversation id in another folder still gets no rule from the first folder.
 	await moved.serve();
 	assert.equal(await turnIn("move-e", path.join(cwd, "scripts"), firstChat), firstChat);
 	assert.equal(ask("move-5", firstChat), undefined, "the same conversation in another folder starts with no Always allow rules");
 	assert.equal(moved.host.gates.has("move-5"), true);
 	moved.host.decide({ uiSessionId: "chat", toolId: "move-5", decision: "deny" });
-	// Choose a folder and back with no message in between: the app tells the host to forget the cached conversation.
+	// Choose a folder and back with no message in between: the app tells the host to forget the cached conversation and its tool rules.
 	await moved.serve();
+	const askTool = (id, sessionId) => {
+		moved.host.onHook(moved.host.procs.get("chat"), { id, params: { sessionId, toolUseId: id, toolName: "use_tool", toolInput: { tool_name: "chrome__read_page", tool_input: {} } } });
+		return moved.writes.find((item) => item.id === id);
+	};
 	assert.equal(await turnIn("move-g", cwd, backChat), backChat);
-	ask("move-6", backChat);
+	askTool("move-6", backChat);
 	assert.equal(moved.host.decide({ uiSessionId: "chat", toolId: "move-6", decision: "always" }).ok, true);
 	await moved.serve();
 	moved.host.forgetSession("chat");
 	const freshChat = await turnIn("move-f", cwd);
 	assert.notEqual(freshChat, backChat, "after forgetSession the same folder starts a new conversation");
-	assert.equal(ask("move-7", freshChat), undefined, "after forgetSession the old conversation's rules do not apply");
+	assert.equal(askTool("move-7", freshChat), undefined, "after forgetSession the old conversation's tool rules do not apply");
 	assert.equal(moved.host.gates.has("move-7"), true);
 	moved.host.decide({ uiSessionId: "chat", toolId: "move-7", decision: "deny" });
+	assert.equal(ask("move-8", freshChat).result.decision, "allow", "the folder's saved command still applies");
 
 	host.onUpdate(proc, { sessionId: "sid-c", update: { sessionUpdate: "available_commands_update", availableCommands: [{ name: "review", description: "Review changes", input: { hint: "branch" } }, { name: "bad name" }] } });
 	assert.deepEqual(plain(events.at(-1)), { type: "commands", commands: [{ name: "review", description: "Review changes", hint: "branch" }] });
@@ -1408,6 +1418,40 @@ async function checkBranches() {
 	}
 }
 
+// Always allow on an exact command is saved for its folder, survives a restart, and can be removed; the file is checked when read.
+function checkSavedRules() {
+	const folder = path.resolve(__dirname, "..");
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-rules-"));
+	const file = path.join(dir, "always-allow.json");
+	try {
+		const ask = (made, id, uiSessionId, command) => {
+			const proc = made.running({ uiSessionId, cwd: folder });
+			made.host.onHook(proc, { id, params: { toolUseId: id, toolName: "run_terminal_command", toolInput: { command } } });
+			return made.writes.find((item) => item.id === id);
+		};
+		const first = makeHost({ rulesFile: () => file });
+		assert.equal(ask(first, "c1", "chat", "npm test"), undefined);
+		assert.deepEqual(plain(first.host.decide({ uiSessionId: "chat", toolId: "c1", decision: "always" })), { ok: true });
+		assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { version: 1, folders: [{ folder, commands: ["npm test"] }] }, "the rule is written to the rules file");
+		const restarted = makeHost({ rulesFile: () => file });
+		assert.equal(ask(restarted, "c2", "later", "npm test").result.decision, "allow", "a saved command applies after a restart, in any session in its folder");
+		assert.deepEqual(plain(restarted.host.removeRule(folder.toUpperCase(), "npm test")), { ok: true }, "folders match as Windows does");
+		assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { version: 1, folders: [] });
+		assert.equal(ask(restarted, "c3", "again", "npm test"), undefined, "a removed rule asks again");
+		assert.equal(restarted.host.removeRule(folder, "npm test").ok, false);
+		fs.writeFileSync(file, JSON.stringify({ version: 1, folders: [{ folder, commands: ["npm test && curl example.com", "git status", 5, "git status", "echo $HOME"] }, { folder: "relative/folder", commands: ["git status"] }, null] }));
+		assert.deepEqual(plain(makeHost({ rulesFile: () => file }).host.listRules()), [{ folder, commands: ["git status"] }], "a rules file is checked like a click");
+		fs.writeFileSync(file, "not json");
+		assert.deepEqual(plain(makeHost({ rulesFile: () => file }).host.listRules()), [], "an unreadable rules file is no rules");
+		const blocked = makeHost({ rulesFile: () => path.join(file, "nested.json") });
+		assert.equal(ask(blocked, "c4", "chat", "git status"), undefined);
+		assert.match(blocked.host.decide({ uiSessionId: "chat", toolId: "c4", decision: "always" }).warning, /until the app closes/, "a rule that cannot be saved says so");
+		assert.equal(ask(blocked, "c5", "chat", "git status").result.decision, "allow", "and still applies for now");
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+}
+
 async function checkSteer() {
 	const { host, writes, events, running } = makeHost();
 	const proc = running({ uiSessionId: "chat", agentSessionId: "steer-agent" });
@@ -1447,6 +1491,56 @@ async function checkSteer() {
 	sent = writes.at(-1);
 	host.onMessage(proc, { id: sent.id, error: { message: "Failed interject" } });
 	assert.match((await result).error, /Failed interject/);
+	assert.deepEqual(plain(proc.steers), ["Keep this text"], "steers Grok refused are not remembered");
+
+	// A steer that reaches Grok after the turn ended runs as Grok's own turn, which joins the app as a new turn.
+	const late = makeHost();
+	const lateProc = late.running({ uiSessionId: "chat", agentSessionId: "late-agent", mode: "Auto-review", allowedFolders: ["C:/extra"] });
+	late.host.sessions.set("chat", { sessionId: "late-agent", proc: lateProc });
+	lateProc.lastTurn = late.host.turns.get("chat");
+	const notify = (update, meta) => late.host.onMessage(lateProc, { method: "_x.ai/session_notification", params: { sessionId: "late-agent", update, ...(meta ? { _meta: meta } : {}) } });
+	const update = (update, meta) => late.host.onMessage(lateProc, { method: "session/update", params: { sessionId: "late-agent", update, ...(meta ? { _meta: meta } : {}) } });
+	const steered = late.host.steer("chat", "Also add tests");
+	const interject = late.writes.at(-1);
+	late.host.finishPrompt(late.host.turns.get("chat"), 2, { stopReason: "end_turn" }, "");
+	late.host.onMessage(lateProc, { id: interject.id, result: { status: "queued" } });
+	assert.equal((await steered).ok, true);
+	notify({ sessionUpdate: "hook_execution", event_name: "user_prompt_submit", prompt_id: "interject-fallback-1" });
+	const adopted = late.host.turns.get("chat");
+	assert.ok(adopted && adopted.fallback, "Grok's own turn for a late steer joins the app");
+	assert.deepEqual(plain({ mode: adopted.mode, allowedFolders: adopted.allowedFolders, agentSessionId: adopted.agentSessionId, promptId: adopted.promptId }), { mode: "Auto-review", allowedFolders: ["C:/extra"], agentSessionId: "late-agent", promptId: "interject-fallback-1" }, "it keeps the last turn's mode and folders");
+	assert.deepEqual(plain(late.events.at(-1)), { type: "turn-start", uiSessionId: "chat", turnId: adopted.turnId, text: "Also add tests" });
+	update({ sessionUpdate: "user_message_chunk", content: { type: "text", text: "Also add tests" } });
+	update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Added." } }, { promptId: "interject-fallback-1" });
+	assert.deepEqual(plain(late.events.at(-1)), { type: "chunk", text: "Added.", uiSessionId: "chat", turnId: adopted.turnId });
+	assert.equal(late.events.filter((event) => event.type === "turn-start").length, 1, "the echoed steer does not start a second turn");
+	notify({ sessionUpdate: "turn_completed", prompt_id: "interject-fallback-1", stop_reason: "end_turn", usage: { inputTokens: 10, outputTokens: 2, modelCalls: 1, costUsdTicks: 0, modelUsage: { "grok-4.7": {} } } });
+	assert.equal(late.host.turns.has("chat"), false, "turn_completed ends Grok's own turn");
+	assert.deepEqual(late.events.slice(-2).map((event) => event.type), ["usage", "done"]);
+	assert.equal(late.events.at(-1).turnId, adopted.turnId);
+	update({ sessionUpdate: "user_message_chunk", content: { type: "text", text: "Also add tests" } });
+	notify({ sessionUpdate: "hook_execution", prompt_id: "interject-fallback-2" });
+	assert.equal(late.host.turns.has("chat"), false, "with no steer waiting, Grok's messages never start a turn");
+
+	// The echo of the steer starts the turn too; a replayed prompt does not.
+	const echo = makeHost();
+	const echoProc = echo.running({ uiSessionId: "chat", agentSessionId: "echo-agent" });
+	echo.host.sessions.set("chat", { sessionId: "echo-agent", proc: echoProc });
+	echoProc.lastTurn = echo.host.turns.get("chat");
+	const echoSteer = echo.host.steer("chat", "Use the other file");
+	echo.host.onMessage(echoProc, { id: echo.writes.at(-1).id, result: { status: "queued" } });
+	await echoSteer;
+	echo.host.finishPrompt(echo.host.turns.get("chat"), 2, { stopReason: "end_turn" }, "");
+	const echoed = (text, meta) => echo.host.onMessage(echoProc, { method: "session/update", params: { sessionId: "echo-agent", update: { sessionUpdate: "user_message_chunk", content: { type: "text", text }, ...(meta ? { _meta: meta } : {}) } } });
+	echoed("Use the other file", { isReplay: true });
+	echoed("Something else");
+	assert.equal(echo.host.turns.has("chat"), false, "a replay or another text starts nothing");
+	echoed("Use the other file");
+	assert.equal(echo.host.turns.get("chat").fallback, true);
+	assert.equal(echo.events.at(-1).text, "Use the other file");
+	echo.host.onMessage(echoProc, { method: "session/update", params: { sessionId: "echo-agent", update: { sessionUpdate: "turn_completed", prompt_id: "interject-fallback-9", stop_reason: "cancelled" } } });
+	assert.equal(echo.host.turns.has("chat"), false, "turn_completed ends it on either channel");
+	assert.equal(echo.events.at(-1).stopReason, "cancelled");
 }
 
 function checkChunkBatching() {
@@ -1534,6 +1628,7 @@ function checkChunkBatching() {
 	await checkInteractions();
 	await checkModesAndCards();
 	await checkParityFeatures();
+	checkSavedRules();
 	console.log("Agent regression checks passed: one Grok per session (own folder, permission at launch, mode-change restart and its notice, folder change, Stop and crash isolation, worktree release, quit cleanup, idle stop that keeps busy and background Groks), parallel sessions, cancellation, restoration, configuration, Auto-review fail-safe, edit-folder/home boundaries, process failure cleanup/diagnostics, stdin errors, tool policy, questions, plan approval, plan mode sync, tool rows, Always allow scope, Grok commands/models/MCP, todos, usage and attachments.");
 	process.exitCode = 0;
 })().catch((error) => { console.error(error); process.exitCode = 1; });

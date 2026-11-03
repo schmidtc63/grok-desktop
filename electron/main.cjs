@@ -34,10 +34,21 @@ let startingUpdate = false;
 const owners = new Map();
 const terminalOwners = new Map();
 const host = new AgentHost((event) => {
+	// A turn Grok starts for a late steer belongs to the window that steered; with that window gone, it stops.
+	if (event.type === "turn-start") {
+		const owner = owners.get(event.uiSessionId);
+		if (owner && !owner.contents.isDestroyed()) {
+			owners.set(event.uiSessionId, { contents: owner.contents, turn: host.turns.get(event.uiSessionId) });
+			owner.contents.send("grok:event", event);
+		} else {
+			host.cancel(event.uiSessionId);
+		}
+		return;
+	}
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) win.webContents.send("grok:event", event);
   }
-});
+}, { rulesFile: () => path.join(app.getPath("userData"), "always-allow.json") });
 
 const terminals = new TerminalHost((event) => {
 	if (event.type === "terminal-exit") { terminalOwners.delete(event.id); }
@@ -273,6 +284,10 @@ ipcMain.handle("grok:decide", (event, payload) => {
 	return host.decide(payload);
 });
 
+// Commands saved with Always allow, by folder, for Settings to list and remove.
+ipcMain.handle("grok:always-rules", () => host.listRules());
+ipcMain.handle("grok:always-rule-remove", (_event, folder, command) => (typeof folder === "string" && typeof command === "string" ? host.removeRule(folder, command) : { ok: false, error: "That rule is already gone." }));
+
 ipcMain.handle("grok:answer-question", (event, payload) => {
 	if (!ownsTurn(event, payload && payload.uiSessionId)) { return { ok: false, error: "That question belongs to another window." }; }
 	return host.answerQuestion(payload);
@@ -359,6 +374,7 @@ ipcMain.handle("grok:terminal-open", (event, payload) => {
 ipcMain.handle("grok:terminal-write", (_event, id, text) => terminals.write(id, text));
 ipcMain.handle("grok:terminal-close", (_event, id) => terminals.close(id));
 ipcMain.handle("grok:terminal-history", (_event, id) => terminals.history(id));
+ipcMain.handle("grok:terminal-interrupt", (event, id) => (terminalOwners.get(id) === event.sender ? terminals.interrupt(id) : { ok: false, error: "That terminal is closed." }));
 
 ipcMain.handle("grok:branch-info", (_event, cwd) => git.branchInfo(cwd));
 ipcMain.handle("grok:scoped-diff", (_event, cwd, scope) => git.readScopedDiff(cwd, scope));

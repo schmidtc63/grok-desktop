@@ -785,6 +785,19 @@ export function App() {
 				setSessions((current) => current.map((item) => (item.id === id && item.titleAuto === true ? manual ? { ...item, title: manual.title, titleAuto: false } : item.title !== title ? { ...item, title } : item : item)));
 				return;
 			}
+			// Grok ran a steer that arrived after the turn ended as a turn of its own; it shows as a new message and reply.
+			if (event.type === "turn-start" && event.uiSessionId && event.turnId) {
+				const id = event.uiSessionId;
+				if (turnTargets.current[id] || !sessionsRef.current.some((item) => item.id === id)) { return; }
+				const stamp = Date.now();
+				const replyId = `grok-${event.turnId}`;
+				turnTargets.current[id] = { sessionId: id, replyId, turnId: event.turnId, where: "main" };
+				const asked: ChatMessage[] = event.text ? [{ id: `user-${event.turnId}`, role: "user", text: event.text, at: stamp, live: true }] : [];
+				setExtraChats((list) => ({ ...list, [id]: [...(list[id] ?? []), ...asked, { id: replyId, role: "grok", text: "", pending: true, streaming: true, live: true }] }));
+				setSessions((list) => list.map((item) => (item.id === id ? { ...item, lastActivityAt: stamp, completed: false } : item)));
+				setBusy((list) => ({ ...list, [id]: true }));
+				return;
+			}
 			const uiId = event.uiSessionId;
 			const target = uiId ? turnTargets.current[uiId] : undefined;
 			if (!uiId || !target || event.turnId !== target.turnId) { return; }
@@ -1351,7 +1364,8 @@ export function App() {
 		}
 	}
 
-	function send(text: string, side: boolean, targetId = session.id, files: string[] = []) {
+	// `steer` is set for what the user types: during a turn it goes into that turn. Everything else waits in the queue.
+	function send(text: string, side: boolean, targetId = session.id, files: string[] = [], steer = false) {
 		const body = text.trim();
 		const target = sessionsRef.current.find((item) => item.id === targetId);
 		if (!body || !target) { return false; }
@@ -1372,8 +1386,14 @@ export function App() {
 				setNotice(SIDE_BUSY);
 				return false;
 			}
-			setQueued((list) => ({ ...list, [sessionId]: [...(list[sessionId] ?? []), { id: crypto.randomUUID(), text: body, attachments: files }] }));
+			const item = { id: crypto.randomUUID(), text: body, attachments: files };
 			setHeld((list) => ({ ...list, [sessionId]: false }));
+			// Attachments and commands cannot go into a running turn, so they wait; a steer Grok refuses joins the queue.
+			if (steer && turnTargets.current[uiId] && window.grokCode?.steer && !files.length && !body.startsWith("/")) {
+				void steerQueued(item, sessionId, true);
+				return true;
+			}
+			setQueued((list) => ({ ...list, [sessionId]: [...(list[sessionId] ?? []), item] }));
 			return true;
 		}
 		if (!target.model) { updateSession(sessionId, { model: chosenModel, effort: chosenEffort }); }
@@ -1475,13 +1495,13 @@ export function App() {
 		promptRef.current?.focus?.();
 	}
 
-	async function steerQueued(item: Queued) {
+	// A queued row, or with `typed` a message not queued yet, goes into the running turn; if Grok refuses it, it waits in the queue.
+	async function steerQueued(item: Queued, sessionId = session.id, typed = false) {
 		const api = window.grokCode;
-		const sessionId = session.id;
 		if (!api?.steer || !turnTargets.current[sessionId] || item.attachments.length) { return; }
-		const at = (queuedRef.current[sessionId] ?? []).findIndex((entry) => entry.id === item.id);
+		const at = typed ? Infinity : (queuedRef.current[sessionId] ?? []).findIndex((entry) => entry.id === item.id);
 		if (at < 0) { return; }
-		setQueued((current) => ({ ...current, [sessionId]: (current[sessionId] ?? []).filter((entry) => entry.id !== item.id) }));
+		if (!typed) { setQueued((current) => ({ ...current, [sessionId]: (current[sessionId] ?? []).filter((entry) => entry.id !== item.id) })); }
 		const result = await api.steer(sessionId, item.text);
 		if (!result.ok) {
 			setQueued((current) => {
@@ -1635,7 +1655,7 @@ export function App() {
 		const target = await commitPending();
 		if (!target) { return; }
 		const files = attachments[session.id] ?? [];
-		if (send(text, false, target.id, files)) {
+		if (send(text, false, target.id, files, true)) {
 			setDrafts((current) => ((current[target.id] ?? "") === prompt ? { ...current, [session.id]: "", [target.id]: "" } : current));
 			setAttachments((current) => ({ ...current, [session.id]: [], [target.id]: [] }));
 		}
@@ -1842,7 +1862,10 @@ export function App() {
 			decide: (toolId, decision) => {
 				writeReply(uiId, (message) => ({ ...message, tools: message.tools?.map((tool) => (tool.id === toolId ? { ...tool, waiting: false, detail: decision === "deny" ? "Denied" : "Allowed" } : tool)) }));
 				void window.grokCode?.decide({ uiSessionId: uiId, toolId, decision }).then((result) => {
-					if (result.ok) { return; }
+					if (result.ok) {
+						if (result.warning) { setNotice(result.warning); }
+						return;
+					}
 					writeReply(uiId, (message) => ({ ...message, tools: message.tools?.map((tool) => (tool.id === toolId ? { ...tool, waiting: false, detail: result.error || "That approval already closed." } : tool)) }));
 				});
 			},
@@ -1991,6 +2014,30 @@ export function App() {
 		if (sessionsRef.current.find((item) => item.id === id)?.title !== title) { updateSession(id, { title, titleAuto: false }); }
 	}
 
+	// Archives, or unarchives, a session. Archiving stops its Grok; the sidebar asks first when that would stop work.
+	function archiveSession(id: string, target: Session | undefined) {
+		if (target && !target.archived && target.worktreeFolder && window.grokCode?.removeWorktree && !sharesFolder(target)) {
+			setHeld((current) => ({ ...current, [id]: true }));
+			void window.grokCode.removeWorktree(target.folder, target.worktreeFolder, { force: false }).then(async (result) => {
+				if (result.ok) { updateSession(id, { archived: true, pinned: false }); return; }
+				if (result.dirty && await askConfirm({ title: "Archive this session?", body: result.ignored?.length ? `This worktree has files git ignores that removal would delete: ${result.ignored.join(", ")}. The worktree stays on disk.` : "This session's worktree has uncommitted changes. The worktree stays on disk.", ok: "Archive anyway", danger: true })) { updateSession(id, { archived: true, pinned: false }); return; }
+				if (result.dirty === false) { updateSession(id, { archived: true, pinned: false }); setNotice(`Archived, but the worktree folder could not be removed: ${result.error || "unknown error"}. Close any terminal open in it and delete the folder.`); return; }
+				if (!result.dirty) { updateSession(id, { archived: true, pinned: false }); setNotice(`Archived. The worktree could not be checked, so it stays on disk: ${result.error || "unknown error"}`); }
+			});
+			return;
+		}
+		if (target?.archived && target.worktreeFolder) {
+			if (!window.grokCode?.restoreWorktree) { setNotice("Reopen this window to restore the worktree."); return; }
+			void window.grokCode.restoreWorktree(target.worktreeFolder, target.branch).then((result) => {
+				if (result.ok) { updateSession(id, { archived: false, pinned: false, lastActivityAt: Date.now() }); } else { setNotice(result.error || "The worktree could not be restored."); }
+			}).catch(() => setNotice("The worktree could not be restored."));
+			return;
+		}
+		if (target && !target.archived) { setHeld((current) => ({ ...current, [id]: true })); void window.grokCode?.stopSession?.(id); }
+		// Unarchive counts as activity, so automatic archiving does not archive it again at the next launch.
+		setSessions((current) => current.map((item) => (item.id === id ? { ...item, archived: !item.archived, pinned: false, ...(item.archived ? { lastActivityAt: Date.now() } : {}) } : item)));
+	}
+
 	const usage = session.usage;
 	// The context split and the week's spend are read from Grok's files when a turn ends or the session changes.
 	const agentId = session.agentSessionId ?? "";
@@ -2105,6 +2152,12 @@ export function App() {
 					onInput={(tabId, text) => {
 						void window.grokCode?.terminalWrite?.(tabId, text).then((result) => { if (!result.ok) { setTerminalError(result.error || "That line could not be sent."); } });
 					}}
+					onInterrupt={(tabId) => {
+						void window.grokCode?.terminalInterrupt?.(tabId).then((result) => {
+							if (!result.ok) { setTerminalError(result.error || "The running command could not be stopped."); return; }
+							if (!result.stopped) { setNotice("Nothing to stop. A PowerShell command that starts no program stops only when you close the tab."); }
+						});
+					}}
 					onClose={() => closePane("terminal")}
 				/>
 			);
@@ -2188,26 +2241,12 @@ export function App() {
 					onPin={(id) => setSessions((current) => current.map((item) => (item.id === id ? { ...item, pinned: !item.pinned } : item)))}
 					onArchive={(id) => {
 						const target = sessions.find((item) => item.id === id);
-						if (target && !target.archived && target.worktreeFolder && window.grokCode?.removeWorktree && !sharesFolder(target)) {
-							setHeld((current) => ({ ...current, [id]: true }));
-							void window.grokCode.removeWorktree(target.folder, target.worktreeFolder, { force: false }).then(async (result) => {
-								if (result.ok) { updateSession(id, { archived: true, pinned: false }); return; }
-								if (result.dirty && await askConfirm({ title: "Archive this session?", body: result.ignored?.length ? `This worktree has files git ignores that removal would delete: ${result.ignored.join(", ")}. The worktree stays on disk.` : "This session's worktree has uncommitted changes. The worktree stays on disk.", ok: "Archive anyway", danger: true })) { updateSession(id, { archived: true, pinned: false }); return; }
-								if (result.dirty === false) { updateSession(id, { archived: true, pinned: false }); setNotice(`Archived, but the worktree folder could not be removed: ${result.error || "unknown error"}. Close any terminal open in it and delete the folder.`); return; }
-								if (!result.dirty) { updateSession(id, { archived: true, pinned: false }); setNotice(`Archived. The worktree could not be checked, so it stays on disk: ${result.error || "unknown error"}`); }
-							});
+						const working = busy[id] || busy[`side-${id}`] || [...(grokTasks[id] ?? []), ...(grokTasks[`side-${id}`] ?? [])].some((task) => task.status === "running") || [...(subagents[id] ?? []), ...(subagents[`side-${id}`] ?? [])].some((agent) => agent.status === "running");
+						if (target && !target.archived && working) {
+							void askConfirm({ title: "Archive this session?", body: "Grok is still working in this session. Archiving stops the turn and any background commands.", ok: "Archive and stop", danger: true }).then((yes) => { if (yes) { archiveSession(id, target); } });
 							return;
 						}
-						if (target?.archived && target.worktreeFolder) {
-							if (!window.grokCode?.restoreWorktree) { setNotice("Reopen this window to restore the worktree."); return; }
-							void window.grokCode.restoreWorktree(target.worktreeFolder, target.branch).then((result) => {
-								if (result.ok) { updateSession(id, { archived: false, pinned: false, lastActivityAt: Date.now() }); } else { setNotice(result.error || "The worktree could not be restored."); }
-							}).catch(() => setNotice("The worktree could not be restored."));
-							return;
-						}
-						if (target && !target.archived) { setHeld((current) => ({ ...current, [id]: true })); void window.grokCode?.stopSession?.(id); }
-						// Unarchive counts as activity, so automatic archiving does not archive it again at the next launch.
-						setSessions((current) => current.map((item) => (item.id === id ? { ...item, archived: !item.archived, pinned: false, ...(item.archived ? { lastActivityAt: Date.now() } : {}) } : item)));
+						archiveSession(id, target);
 					}}
 					onRename={renameSession}
 					onDelete={(id) => {
@@ -2405,7 +2444,7 @@ export function App() {
 									ref={promptRef}
 									aria-label="Prompt"
 									rows={2}
-									placeholder={suggestion ? `${suggestion}   (Tab to use)` : isBusy ? "Queue a message for when Grok finishes" : pending ? "Describe a task to start a new session" : "Reply to Grok, or type / for commands and @ to mention files"}
+									placeholder={suggestion ? `${suggestion}   (Tab to use)` : isBusy ? "Steer Grok while it works" : pending ? "Describe a task to start a new session" : "Reply to Grok, or type / for commands and @ to mention files"}
 									value={prompt}
 									onChange={(event) => setPrompt(event.target.value)}
 									onPaste={onPaste}
@@ -2440,7 +2479,7 @@ export function App() {
 										type="button"
 										className={sendLabel === "Stop" ? "send-btn stop" : "send-btn"}
 										aria-label={sendLabel}
-										title={sendLabel === "Stop" ? "Stop (Esc)" : isBusy ? "Queue (Enter)" : "Send (Enter)"}
+										title={sendLabel === "Stop" ? "Stop (Esc)" : isBusy ? (prompt.trim().startsWith("/") || (attachments[session.id] ?? []).length ? "Queue (Enter)" : "Steer (Enter)") : "Send (Enter)"}
 										disabled={sendLabel === "Send" && !prompt.trim()}
 										onClick={() => { if (sendLabel === "Stop") { stop(session.id); } else { void submit(); } }}
 									>

@@ -7,14 +7,14 @@ function tokens(value: number) {
 	return value >= 1000 ? `${(value / 1000).toFixed(value >= 100000 ? 0 : 1)}k` : String(value);
 }
 
-// Claude Code's context rows, in its order and colors; Grok's own parts take the gray rows.
+// Claude Code's context rows, in its order and colors; Grok's own parts take stepped grays, so each shows in the bar.
 const CONTEXT_ROWS: { key: keyof ContextParts | "messages"; label: string; color: string }[] = [
 	{ key: "messages", label: "Messages", color: "var(--blue)" },
 	{ key: "tools", label: "System tools", color: "var(--accent)" },
 	{ key: "skills", label: "Skills", color: "var(--green)" },
-	{ key: "systemPrompt", label: "System prompt", color: "var(--faint)" },
-	{ key: "rules", label: "Rules and memory", color: "var(--faint)" },
-	{ key: "mcp", label: "MCP servers", color: "var(--faint)" },
+	{ key: "systemPrompt", label: "System prompt", color: "var(--muted)" },
+	{ key: "rules", label: "Rules and memory", color: "color-mix(in srgb, var(--muted) 67%, var(--faint))" },
+	{ key: "mcp", label: "MCP servers", color: "color-mix(in srgb, var(--muted) 33%, var(--faint))" },
 	{ key: "workflows", label: "Workflows", color: "var(--faint)" },
 ];
 

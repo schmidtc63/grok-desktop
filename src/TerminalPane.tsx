@@ -10,6 +10,7 @@ export interface TerminalPaneProps {
 	onNew: () => void;
 	onCloseTab: (id: string) => void;
 	onInput: (id: string, text: string) => void;
+	onInterrupt: (tabId: string) => void;
 	onClose: () => void;
 }
 
@@ -38,7 +39,7 @@ export function historyStep(history: string[], index: number, direction: -1 | 1)
 	return { index: next, value: next === history.length ? "" : history[next] };
 }
 
-export function TerminalPane({ tabs, activeId, error, onActivate, onNew, onCloseTab, onInput, onClose }: TerminalPaneProps) {
+export function TerminalPane({ tabs, activeId, error, onActivate, onNew, onCloseTab, onInput, onInterrupt, onClose }: TerminalPaneProps) {
 	const [lines, setLines] = useState<Record<string, LineState>>({});
 	const outRef = useRef<HTMLPreElement>(null);
 	const inputRef = useRef<HTMLInputElement>(null);
@@ -91,6 +92,7 @@ export function TerminalPane({ tabs, activeId, error, onActivate, onNew, onClose
 				</div>
 				<button className="tp-new" aria-label="New terminal tab" onClick={onNew}>+</button>
 				<span className="spacer" />
+				{active?.running && <button className="texty" title="Stop the running command (Ctrl+C). The terminal stays open." onClick={() => onInterrupt(active.id)}>Stop</button>}
 				<button className="pane-x" aria-label="Close pane" onClick={onClose}>×</button>
 			</div>
 			{!active && (
@@ -142,6 +144,12 @@ export function TerminalPane({ tabs, activeId, error, onActivate, onNew, onClose
 							autoComplete="off"
 							onChange={(event) => setLine({ ...line, draft: event.target.value })}
 							onKeyDown={(event) => {
+								// Ctrl+C with no selection stops the running command; with a selection it copies as usual.
+								if (event.ctrlKey && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "c" && event.currentTarget.selectionStart === event.currentTarget.selectionEnd) {
+									event.preventDefault();
+									onInterrupt(active.id);
+									return;
+								}
 								if (event.key !== "ArrowUp" && event.key !== "ArrowDown") {
 									return;
 								}

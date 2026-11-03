@@ -44,6 +44,7 @@ class TestWindow extends EventEmitter {
 		this.options = options;
 		this.webContents = new EventEmitter();
 		this.webContents.send = () => {};
+		this.webContents.isDestroyed = () => !!this.destroyed;
 		this.webContents.getURL = () => "file:///index.html";
 		this.webContents.reload = () => { this.reloads = (this.reloads || 0) + 1; };
 		windows.push(this);
@@ -68,8 +69,9 @@ class TestWindow extends EventEmitter {
 }
 
 class TestHost {
-	constructor() {
+	constructor(emit) {
 		host = this;
+		this.emit = emit;
 		this.turns = new Map();
 		this.cancelled = [];
 		this.decisions = [];
@@ -369,7 +371,23 @@ async function main() {
 	host.turns.set("first", { ...running });
 	assert.equal(handlers.get("grok:steer")(first, "first", "Stale owner").ok, false, "ownership follows the exact running turn");
 	assert.equal(host.steered.length, 1);
+	const sends = [windows[0].webContents.send, windows[1].webContents.send];
+	const delivered = [[], []];
+	windows[0].webContents.send = (...args) => delivered[0].push(args);
+	windows[1].webContents.send = (...args) => delivered[1].push(args);
+	host.turns.set("first", { uiSessionId: "first", fallback: true });
+	host.emit({ type: "turn-start", uiSessionId: "first", turnId: "steer-turn", text: "New direction" });
+	assert.deepEqual(delivered.map((list) => list.length), [1, 0], "a turn Grok starts for a late steer goes only to the window that steered");
+	assert.equal(handlers.get("grok:steer")(first, "first", "Into the adopted turn").ok, true, "that window owns the adopted turn");
+	assert.equal(handlers.get("grok:steer")(second, "first", "Not this window").ok, false);
+	const cancelledBefore = host.cancelled.length;
+	host.emit({ type: "turn-start", uiSessionId: "nobody", turnId: "orphan", text: "No window" });
+	assert.deepEqual(host.cancelled.slice(cancelledBefore), ["nobody"], "a turn Grok starts with no window to show it stops");
+	host.cancelled.length = cancelledBefore;
 	host.turns.set("first", running);
+	host.emit({ type: "turn-start", uiSessionId: "first", turnId: "turn", text: "" });
+	host.steered.length = 1;
+	[windows[0].webContents.send, windows[1].webContents.send] = sends;
 	assert.equal(handlers.get("grok:decide")(second, { uiSessionId: "first", toolId: "native" }).ok, false);
 	const folders = { uiSessionId: "first", allowedFolders: ["C:/extra"] };
 	assert.equal(handlers.get("grok:allowed-folders")(second, folders).ok, false);

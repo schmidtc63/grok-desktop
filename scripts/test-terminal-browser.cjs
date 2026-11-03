@@ -106,6 +106,42 @@ function fakeEvent(target, key) {
 	return event;
 }
 
+// Renders TerminalPane with two tabs, the second active, and records onInterrupt calls.
+function renderTerminal(running = true) {
+	const interrupted = [];
+	const tree = terminal.TerminalPane({
+		tabs: [{ id: "one", title: "one", cwd: "C:\\one", running: true, output: "" }, { id: "two", title: "two", cwd: "C:\\two", running, output: "" }],
+		activeId: "two",
+		onActivate() {},
+		onNew() {},
+		onCloseTab() {},
+		onInput() {},
+		onInterrupt: (id) => interrupted.push(id),
+		onClose() {},
+	});
+	return { tree, interrupted };
+}
+
+function findNode(node, match) {
+	if (Array.isArray(node)) {
+		for (const item of node) {
+			const found = findNode(item, match);
+			if (found) {
+				return found;
+			}
+		}
+		return null;
+	}
+	if (!node || typeof node !== "object") {
+		return null;
+	}
+	return match(node) ? node : findNode(node.props.children, match);
+}
+
+function ctrlC(selectionStart, selectionEnd) {
+	return Object.assign(fakeEvent(null, "c"), { ctrlKey: true, shiftKey: false, altKey: false, currentTarget: { selectionStart, selectionEnd } });
+}
+
 (async () => {
 	await check("stripAnsi removes SGR colors", () => {
 		assert.equal(stripAnsi("\x1b[31mred\x1b[0m and \x1b[1;32mbold green\x1b[m"), "red and bold green");
@@ -138,6 +174,26 @@ function fakeEvent(target, key) {
 	await check("historyStep down from the newest entry returns to a fresh empty line", () => {
 		assert.deepEqual(historyStep(["a", "b", "c"], 2, 1), { index: 3, value: "" });
 		assert.deepEqual(historyStep(["a", "b", "c"], 3, 1), { index: 3, value: "" });
+	});
+	await check("TerminalPane Stop button interrupts the active tab and is hidden once it exits", () => {
+		const { tree, interrupted } = renderTerminal();
+		const stop = findNode(tree, (node) => node.type === "button" && node.props.children === "Stop");
+		assert.equal(stop.props.title, "Stop the running command (Ctrl+C). The terminal stays open.");
+		stop.props.onClick();
+		assert.deepEqual(interrupted, ["two"]);
+		assert.equal(findNode(renderTerminal(false).tree, (node) => node.type === "button" && node.props.children === "Stop"), null);
+	});
+	await check("TerminalPane Ctrl+C in the input interrupts the active tab only without a selection", () => {
+		const { tree, interrupted } = renderTerminal();
+		const input = findNode(tree, (node) => node.type === "input");
+		const bare = ctrlC(4, 4);
+		input.props.onKeyDown(bare);
+		assert.deepEqual(interrupted, ["two"]);
+		assert.equal(bare.blocked, 1);
+		const selected = ctrlC(0, 4);
+		input.props.onKeyDown(selected);
+		assert.deepEqual(interrupted, ["two"]);
+		assert.equal(selected.blocked, 0);
 	});
 	await check("PICKER_SCRIPT parses as JavaScript", () => {
 		assert.equal(typeof PICKER_SCRIPT, "string");

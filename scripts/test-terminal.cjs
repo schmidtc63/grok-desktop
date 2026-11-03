@@ -186,6 +186,27 @@ async function main() {
 	assert.equal(exits(sleeper.id).length, 1);
 	console.log("PASS close() stops Start-Sleep 60 and its child process tree, emits terminal-exit once, removes the tab");
 
+	const stopper = host.open({ cwd: tmp });
+	assert.equal(stopper.ok, true, stopper.error);
+	host.write(stopper.id, "\"shell=$PID\"; $ping = Start-Process ping.exe -ArgumentList '-n','60','127.0.0.1' -NoNewWindow -PassThru; \"ping=$($ping.Id)\"; $ping.WaitForExit()");
+	await waitFor(() => pidOf(stopper.id, "ping") > 0, "ping pid");
+	const stopperShell = pidOf(stopper.id, "shell");
+	const pingPid = pidOf(stopper.id, "ping");
+	assert.equal(alive(stopperShell) && alive(pingPid), true);
+	const stopped = await host.interrupt(stopper.id);
+	assert.equal(stopped.ok, true, stopped.error);
+	assert.ok(stopped.stopped >= 1, `stopped ${stopped.stopped} processes`);
+	await waitFor(() => !alive(pingPid), "ping to stop", 5000);
+	assert.equal(alive(stopperShell), true, "the shell survives the interrupt");
+	assert.deepEqual(host.list().find((tab) => tab.id === stopper.id), { id: stopper.id, cwd: tmp, running: true });
+	host.write(stopper.id, "echo after");
+	await waitFor(() => hasLine(stopper.id, "after"), "echo after the interrupt");
+	assert.deepEqual(await host.interrupt(stopper.id), { ok: true, stopped: 0 });
+	assert.deepEqual(await host.interrupt("no-such-tab"), { ok: false, error: "That terminal is closed." });
+	assert.equal(exits(stopper.id).length, 0);
+	host.close(stopper.id);
+	console.log(`PASS interrupt() stops ping.exe (${stopped.stopped} stopped) and keeps the shell, which then runs echo after; an idle shell stops 0; an unknown tab is closed`);
+
 	const quitter = host.open({ cwd: tmp });
 	assert.equal(quitter.ok, true, quitter.error);
 	host.write(quitter.id, "exit 3");

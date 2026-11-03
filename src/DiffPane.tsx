@@ -192,11 +192,16 @@ export function DiffPane(props: DiffPaneProps) {
 	const selected = files.some((file) => file.path === selectedFile) ? selectedFile : files[0]?.path ?? ``;
 	const current = files.find((file) => file.path === selected);
 	const [review, setReview] = useState(false);
+	// Unchecked paths are kept, so a file that appears later is included; a path no longer in the list counts for nothing.
+	const [excluded, setExcluded] = useState<string[]>([]);
 	const paneRef = useRef<HTMLElement>(null);
 	const bodyRef = useRef<HTMLDivElement>(null);
 	const index = files.findIndex((file) => file.path === selected);
 	const isViewed = (file: DiffFile) => props.viewed[file.path] === fileFingerprint(file);
 	const viewedCount = files.filter(isViewed).length;
+	const canCommit = snapshot?.ok && snapshot.repo !== false && scope === `uncommitted` && files.length > 0;
+	const picked = files.filter((file) => !excluded.includes(file.path));
+	const none = picked.length === 0;
 	useEffect(() => { if (review) { paneRef.current?.focus(); } }, [review]);
 	useEffect(() => {
 		bodyRef.current?.scrollTo?.({ top: 0 });
@@ -216,6 +221,31 @@ export function DiffPane(props: DiffPaneProps) {
 
 	function toggleViewed(file: DiffFile) {
 		props.onViewed(file.path, isViewed(file) ? null : fileFingerprint(file));
+	}
+
+	function togglePick(file: string) {
+		setExcluded((list) => list.includes(file) ? list.filter((item) => item !== file) : [...list, file]);
+	}
+
+	function commit(push: boolean) {
+		const some = picked.length < files.length;
+		const count = `${picked.length} of ${files.length} files`;
+		// A renamed file also names its old path, or the commit would leave the old one behind.
+		const names = picked.flatMap((file) => file.from ? [file.from, file.path] : [file.path]).map((name) => `\`${name}\``).join(`, `);
+		const only = `Commit only these files in this repository with a clear commit message, and leave the other changes uncommitted: ${names}.`;
+		const ask = push
+			? { title: some ? `Commit ${count} and push?` : `Commit and push?`, body: some ? `Grok commits only the checked files and pushes the branch to its remote.` : `Grok commits all uncommitted changes and pushes the branch to its remote.`, ok: `Commit and push`, danger: true }
+			: { title: some ? `Commit ${count}?` : `Commit all uncommitted changes?`, body: some ? `Grok writes the commit message and commits only the checked files. Nothing is pushed.` : `Grok writes the commit message and commits. Nothing is pushed.`, ok: `Commit` };
+		const request = push
+			? (some ? `${only} Then push the branch.` : `Commit the current uncommitted changes in this repository with a clear commit message, then push the branch.`)
+			: (some ? `${only} Don't push.` : `Commit the current uncommitted changes in this repository with a clear commit message. Don't push.`);
+		// The files left out stay uncommitted, so they start checked for the next commit.
+		void askConfirm(ask).then((yes) => {
+			if (yes) {
+				onAskGrok(request);
+				setExcluded([]);
+			}
+		});
 	}
 
 	function revert() {
@@ -367,17 +397,17 @@ export function DiffPane(props: DiffPaneProps) {
 				</>
 			)}
 			<PrStrip branch={props.branch} pr={props.pr} prError={props.prError} onCreatePr={props.onCreatePr} onMergeWhenReady={props.onMergeWhenReady} />
-			<div className="pane-bd">
+			<div className={review ? `pane-bd` : `pane-bd dp-side`}>
 				{!snapshot && <p className="meta">Reading the working tree…</p>}
 				{snapshot && !snapshot.ok && <p className="note">{snapshot.error || `The changes could not be read.`}</p>}
 				{snapshot?.ok && snapshot.repo === false && <p className="note">This folder is not a git checkout.</p>}
 				{snapshot?.ok && snapshot.repo !== false && files.length === 0 && <p className="note">No changes.</p>}
 				{snapshot?.truncated && <p className="note">The rest of the diff was left out.</p>}
 				{note && <p className="note">{note}</p>}
-				{snapshot?.ok && snapshot.repo !== false && scope === `uncommitted` && files.length > 0 && (
+				{canCommit && (
 					<div className="dp-commit">
-						<button className="texty" onClick={() => { void askConfirm({ title: `Commit all uncommitted changes?`, body: `Grok writes the commit message and commits. Nothing is pushed.`, ok: `Commit` }).then((yes) => { if (yes) { onAskGrok(`Commit the current uncommitted changes in this repository with a clear commit message. Don't push.`); } }); }}>Commit</button>
-						<button className="texty" onClick={() => { void askConfirm({ title: `Commit and push?`, body: `Grok commits all uncommitted changes and pushes the branch to its remote.`, ok: `Commit and push`, danger: true }).then((yes) => { if (yes) { onAskGrok(`Commit the current uncommitted changes in this repository with a clear commit message, then push the branch.`); } }); }}>Commit and push</button>
+						<button className="texty" disabled={none} title={none ? `Check at least one file.` : undefined} onClick={() => commit(false)}>Commit</button>
+						<button className="texty" disabled={none} title={none ? `Check at least one file.` : undefined} onClick={() => commit(true)}>Commit and push</button>
 					</div>
 				)}
 				{files.length > 0 && (
@@ -386,17 +416,19 @@ export function DiffPane(props: DiffPaneProps) {
 							<p className="meta dp-progress">{viewedCount} of {files.length} viewed{snapshot?.truncated ? ` · more files were left out` : ``}</p>
 							<div className="file-list">
 								{files.map((file) => (
-									<button
-										key={file.path}
-										className={file.path === selected ? `file-row on` : `file-row`}
-										title={file.path}
-										onClick={() => onSelectFile(file.path)}
-										onDoubleClick={() => onOpenFile(file.path)}
-										onContextMenu={(event) => { event.preventDefault(); onFileMenu(file.path, event); }}
-									>
-										<span>{isViewed(file) && <span className="dp-viewed" aria-label="Viewed">✓ </span>}{file.path}</span>
-										{file.additions !== undefined && file.deletions !== undefined && <span className="dp-stat"><span className="dp-adds">+{file.additions}</span> <span className="dp-dels">−{file.deletions}</span></span>}
-									</button>
+									<div className="dp-file" key={file.path}>
+										{canCommit && <input type="checkbox" className="dp-pick" aria-label={`Include ${file.path} in the commit`} checked={!excluded.includes(file.path)} onChange={() => togglePick(file.path)} />}
+										<button
+											className={file.path === selected ? `file-row on` : `file-row`}
+											title={file.path}
+											onClick={() => onSelectFile(file.path)}
+											onDoubleClick={() => onOpenFile(file.path)}
+											onContextMenu={(event) => { event.preventDefault(); onFileMenu(file.path, event); }}
+										>
+											<span>{isViewed(file) && <span className="dp-viewed" aria-label="Viewed">✓ </span>}{file.path}</span>
+											{file.additions !== undefined && file.deletions !== undefined && <span className="dp-stat"><span className="dp-adds">+{file.additions}</span> <span className="dp-dels">−{file.deletions}</span></span>}
+										</button>
+									</div>
 								))}
 							</div>
 						</div>

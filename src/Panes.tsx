@@ -424,7 +424,7 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 				{toolId && (
 					<div className="actions">
 						<button type="button" onClick={() => m.decide(toolId, "deny")}>Deny</button>
-						{!toolId.startsWith("native-permission:") && <button type="button" title="Allow this tool, or this exact command, for the rest of this conversation" onClick={() => m.decide(toolId, "always")}>Always allow</button>}
+						{!toolId.startsWith("native-permission:") && tool.always && <button type="button" title={tool.always === "folder" ? "Allow this exact command in this folder from now on, in every session. Settings lists the commands you allowed." : "Allow this tool for the rest of this conversation"} onClick={() => m.decide(toolId, "always")}>{tool.always === "folder" ? "Always allow in this folder" : "Allow for this conversation"}</button>}
 						<button type="button" className="yes" onClick={() => m.decide(toolId, "allow")}>Allow</button>
 					</div>
 				)}

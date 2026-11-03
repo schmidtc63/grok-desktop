@@ -101,11 +101,21 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 	const [extension, setExtension] = useState("");
 	const [newLanguage, setNewLanguage] = useState(PLAIN_TEXT);
 	const [info, setInfo] = useState("");
+	const [rules, setRules] = useState<GrokAlwaysRules[] | null>(null);
+	const [rulesError, setRulesError] = useState("");
 	useEffect(() => {
 		void window.grokCode?.appInfo?.().then((result) => {
 			if (result.ok) { setInfo(`Codewomplers Grok Desktop ${result.version} · Electron ${result.electron}`); }
 		});
 	}, []);
+	const loadRules = () => { void window.grokCode?.alwaysRules?.().then(setRules).catch(() => setRules([])); };
+	useEffect(() => { if (tab === "sessions") { loadRules(); } }, [tab]);
+	const removeRule = (folder: string, command: string) => {
+		void window.grokCode?.removeAlwaysRule?.(folder, command).then((result) => {
+			setRulesError(result.ok ? "" : result.error || "That command could not be removed.");
+			loadRules();
+		});
+	};
 	const row = (label: string, detail: string, control: React.ReactNode) => (
 		<div className="set-row">
 			<div><b>{label}</b><small>{detail}</small></div>
@@ -176,6 +186,19 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 						))}
 						{!validPrefix(prefix) && <p className="note">Use 1–40 letters, digits, ".", "_" or "-", not a protected name such as main.</p>}
 						{row("Worktree location", "New session worktrees are created inside the project.", <code>{"<repo>/.grok/worktrees"}</code>)}
+						<h3>Allowed commands</h3>
+						<p className="meta">Commands you allowed with Always allow in this folder. Grok runs each one in its folder without asking, in every session. Tools you allowed last only for their conversation, so they are not listed.</p>
+						{rules && !rules.length && <p className="meta">None yet.</p>}
+						{rules && rules.length > 0 && (
+							<div className="set-rules">
+								{rules.flatMap((entry) => entry.commands.map((command) => (
+									<div key={`${entry.folder}|${command}`}>
+										{row(command, entry.folder, <button type="button" className="texty" aria-label={`Remove ${command} in ${entry.folder}`} onClick={() => removeRule(entry.folder, command)}>Remove</button>)}
+									</div>
+								)))}
+							</div>
+						)}
+						{rulesError && <p className="note" role="alert">{rulesError}</p>}
 					</>
 				)}
 				{(tab === "skills" || tab === "connectors" || tab === "plugins") && <Customize key={folder} view={tab} folder={folder} live={servers} onRun={onRun} />}

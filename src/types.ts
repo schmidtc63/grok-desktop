@@ -84,6 +84,7 @@ export interface ToolCard {
 	questions?: GrokQuestion[];
 	plan?: string;
 	todos?: GrokTodo[];
+	always?: "folder" | "conversation";
 }
 
 // The text an edit replaced and its replacement; Grok sends snippets, not whole files.

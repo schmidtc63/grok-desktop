@@ -1,5 +1,6 @@
 const { spawn, spawnSync } = require("child_process");
 const { StringDecoder } = require("string_decoder");
+const { randomUUID } = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -37,6 +38,8 @@ function samePrompt(preview, text) {
 const HOOK_TIMEOUT_SEC = 600;
 const AUTO_DENY_MS = 8 * 60 * 1000;
 const IDLE_MS = 10 * 60 * 1000;
+// A steer that reaches Grok after its turn ended runs as a turn of Grok's own, with a prompt id that starts with this.
+const FALLBACK_PROMPT = "interject-fallback-";
 const HOOKS = {
   PreToolUse: [{ matcher: ".*", hookCallbackIds: ["gate"], timeout: HOOK_TIMEOUT_SEC }],
 };
@@ -326,7 +329,8 @@ function alwaysKey(kind, toolName, command, input) {
 	return `tool:${name}`;
 }
 
-// A rule lasts for one Grok conversation in one folder, so Choose a folder, which starts a new conversation, clears it.
+// A tool rule lasts for one Grok conversation in one folder, so Choose a folder, which starts a new conversation, clears it.
+// An exact command is saved for its folder instead (see savedRules), since it is narrow enough to keep.
 function ruleScope(turn) {
 	return `${turn.uiSessionId}|${pathKey(turn.cwd)}|${turn.agentSessionId}`;
 }
@@ -409,8 +413,11 @@ function grokTask(task) {
 }
 
 class AgentHost {
-	constructor(emit, { idleMs = IDLE_MS, chunkMs = 30 } = {}) {
+	constructor(emit, { idleMs = IDLE_MS, chunkMs = 30, rulesFile = null } = {}) {
 		this.send = emit;
+		// Where saved command rules live; a function, so the window's data folder is read only when first needed. None keeps them in memory.
+		this.rulesFile = rulesFile;
+		this.folderRules = null;
 		// Send held text before any other event for the session, preserving transcript order.
 		this.emit = (event) => {
 			if (event && event.uiSessionId) { this.flushText(event.uiSessionId); }
@@ -497,6 +504,8 @@ class AgentHost {
 	async dispatch(input, turn) {
     try {
 			turn.proc = this.procFor(input, turn);
+			turn.proc.lastTurn = turn;
+			turn.proc.steers = [];
 			turn.proc.promptGeneration = (turn.proc.promptGeneration || 0) + 1;
 			this.touch(turn.proc);
 			await turn.proc.ready;
@@ -533,17 +542,78 @@ class AgentHost {
     }
     const gate = this.gates.get(String(input.toolId || ""));
 		if (!gate || gate.uiSessionId !== input.uiSessionId || gate.type) { return { ok: false, error: "That approval already closed." }; }
+		let warning = "";
 		if (input.decision === "always") {
 			const key = alwaysKey(gate.kind, gate.rawName || gate.toolName, gate.command, gate.toolInput);
-			if (key && gate.scope) {
+			if (key.startsWith("command:") && gate.folder) {
+				warning = this.saveRule(gate.folder, key.slice("command:".length));
+			} else if (key && gate.scope) {
 				const keys = this.always.get(gate.scope) || new Set();
 				keys.add(key);
 				this.always.set(gate.scope, keys);
 			}
 		}
     this.answerGate(gate, input.decision === "deny" ? "deny" : "allow", input.decision === "deny" ? "Denied by the user." : "");
-    return { ok: true };
+    return warning ? { ok: true, warning } : { ok: true };
   }
+
+	// Saved command rules, by folder: { folder, commands }. Read once from the rules file; a bad or missing file is no rules.
+	savedRules() {
+		if (this.folderRules) { return this.folderRules; }
+		this.folderRules = new Map();
+		const file = typeof this.rulesFile === "function" ? this.rulesFile() : this.rulesFile;
+		if (!file) { return this.folderRules; }
+		try {
+			const data = JSON.parse(fs.readFileSync(file, "utf8"));
+			for (const entry of Array.isArray(data && data.folders) ? data.folders.slice(0, 500) : []) {
+				const folder = entry && typeof entry.folder === "string" ? entry.folder : "";
+				// The file is checked like a click: only exact commands that never chain, pipe or redirect.
+				const commands = [...new Set((entry && Array.isArray(entry.commands) ? entry.commands : []).filter((command) => typeof command === "string" && alwaysKey("command", "", command) === `command:${command}`))].slice(0, 500);
+				if (folder && path.isAbsolute(folder) && commands.length) { this.folderRules.set(pathKey(folder), { folder, commands }); }
+			}
+		} catch {
+			// No file yet, or one that is not ours to trust: start empty.
+		}
+		return this.folderRules;
+	}
+
+	listRules() {
+		return [...this.savedRules().values()].map((entry) => ({ folder: entry.folder, commands: [...entry.commands] })).sort((a, b) => a.folder.localeCompare(b.folder));
+	}
+
+	// Returns a warning when the rule could not be written; it still applies until the app closes.
+	saveRule(folder, command) {
+		const rules = this.savedRules();
+		const entry = rules.get(pathKey(folder)) || { folder, commands: [] };
+		if (!entry.commands.includes(command)) { entry.commands = [...entry.commands, command]; }
+		rules.set(pathKey(folder), entry);
+		return this.writeRules() ? "" : "This command is allowed until the app closes; it could not be saved.";
+	}
+
+	removeRule(folder, command) {
+		const rules = this.savedRules();
+		const key = pathKey(String(folder || ""));
+		const entry = rules.get(key);
+		if (!entry || !entry.commands.includes(command)) { return { ok: false, error: "That rule is already gone." }; }
+		entry.commands = entry.commands.filter((item) => item !== command);
+		if (!entry.commands.length) { rules.delete(key); }
+		return this.writeRules() ? { ok: true } : { ok: false, error: "The rules file could not be saved." };
+	}
+
+	writeRules() {
+		const file = typeof this.rulesFile === "function" ? this.rulesFile() : this.rulesFile;
+		if (!file) { return true; }
+		const temp = `${file}.${process.pid}.tmp`;
+		try {
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(temp, `${JSON.stringify({ version: 1, folders: this.listRules() }, null, "\t")}\n`);
+			fs.renameSync(temp, file);
+			return true;
+		} catch {
+			try { fs.unlinkSync(temp); } catch { /* nothing was written */ }
+			return false;
+		}
+	}
 
 	answerQuestion(input) {
 		const gate = input && this.gates.get(String(input.toolId || ""));
@@ -714,13 +784,68 @@ class AgentHost {
 		if (turn.slash) { return { ok: false, error: "Grok is running a command, which can't be steered." }; }
 		if (typeof text !== "string" || !text.trim() || text.length > 100000) { return { ok: false, error: "Write a message first." }; }
 		if (text.trim().startsWith("/")) { return { ok: false, error: "Send commands on their own, not into a running turn." }; }
+		const proc = turn.proc;
+		const said = text.trim();
+		// Kept until the next turn starts, so a turn Grok starts for a late steer can show what was sent.
+		proc.steers = [...(proc.steers || []), said].slice(-5);
+		const drop = () => {
+			const at = proc.steers.lastIndexOf(said);
+			if (at >= 0) { proc.steers.splice(at, 1); }
+		};
 		try {
-			const result = await this.request(turn.proc, "_x.ai/interject", { sessionId: session.sessionId, text: text.trim() }).promise;
+			const result = await this.request(proc, "_x.ai/interject", { sessionId: session.sessionId, text: said }).promise;
 			const status = String(((result && result.result) || result || {}).status || "");
+			if (status !== "queued") { drop(); }
 			return status === "queued" ? { ok: true } : { ok: false, error: "Grok did not take the message." };
 		} catch (error) {
+			drop();
 			return { ok: false, error: this.clip(error.message || "Grok could not take the message.") };
 		}
+	}
+
+	// A steer that reaches Grok just after its turn ended starts a turn of Grok's own, with no session/prompt waiting on it.
+	// That turn joins the app as a new one, with the last turn's folder, folders and mode, so its reply and approvals show.
+	adoptFallback(proc, params, update) {
+		const sessionId = String(params.sessionId || "");
+		const promptId = String((params._meta && params._meta.promptId) || update.prompt_id || "");
+		const echoed = update.sessionUpdate === "user_message_chunk" && !(update._meta && update._meta.isReplay) ? chunkText(update).trim() : "";
+		const steers = proc.steers || [];
+		if (!steers.length || update.sessionUpdate === "turn_completed" || (!promptId.startsWith(FALLBACK_PROMPT) && !(echoed && steers.includes(echoed)))) { return; }
+		const last = proc.lastTurn;
+		const session = this.sessions.get(proc.uiSessionId);
+		if (!last || proc.lost || this.turns.has(proc.uiSessionId) || proc.parents.has(sessionId) || proc.uiSessionId.startsWith("side-") || !session || session.proc !== proc || session.sessionId !== sessionId) { return; }
+		const text = echoed && steers.includes(echoed) ? echoed : steers[steers.length - 1];
+		steers.splice(steers.indexOf(text), 1);
+		const turn = {
+			uiSessionId: proc.uiSessionId,
+			turnId: `steer-${randomUUID()}`,
+			cwd: last.cwd,
+			allowedFolders: [...(last.allowedFolders || [])],
+			mode: last.mode,
+			agentSessionId: sessionId,
+			cancelled: false,
+			finished: false,
+			promptId: promptId.startsWith(FALLBACK_PROMPT) ? promptId : FALLBACK_PROMPT,
+			slash: false,
+			said: false,
+			proc,
+			fallback: true,
+		};
+		this.turns.set(turn.uiSessionId, turn);
+		proc.lastTurn = turn;
+		this.touch(proc);
+		this.emit({ type: "turn-start", uiSessionId: turn.uiSessionId, turnId: turn.turnId, text });
+	}
+
+	// Grok ends its own turn with `turn_completed`, since no session/prompt reply comes for it.
+	finishFallback(proc, sessionId, update) {
+		const turn = this.turns.get(proc.uiSessionId);
+		const promptId = String(update.prompt_id || "");
+		if (!turn || !turn.fallback || turn.proc !== proc || turn.agentSessionId !== sessionId || !promptId.startsWith(FALLBACK_PROMPT)) { return; }
+		turn.promptId = promptId;
+		const usage = update.usage && typeof update.usage === "object" ? update.usage : null;
+		const modelId = usage && usage.modelUsage && typeof usage.modelUsage === "object" ? Object.keys(usage.modelUsage)[0] || "" : "";
+		this.finishPrompt(turn, promptId, { stopReason: String(update.stop_reason || "end_turn"), ...(usage ? { _meta: { usage, modelId } } : {}) }, "");
 	}
 
 	// A points request must not hold up sending when an older or unresponsive Grok cannot answer it.
@@ -1133,6 +1258,7 @@ class AgentHost {
 					} : {}),
 				} });
 			}
+			if (update.sessionUpdate === "turn_completed") { this.finishFallback(proc, sessionId, update); } else { this.adoptFallback(proc, msg.params || {}, update); }
 			const turn = this.turnFor(proc, sessionId);
 			const live = turn && turn.promptId != null ? turn : null;
 			const note = commandNote(update);
@@ -1185,6 +1311,11 @@ class AgentHost {
 			if (main && title && !proc.lost && this.procs.get(proc.uiSessionId) === proc && !proc.parents.has(sessionId)) { this.emit({ type: "title", uiSessionId: proc.uiSessionId, title }); }
 			return;
 		}
+		if (update.sessionUpdate === "turn_completed") {
+			this.finishFallback(proc, String(params.sessionId || ""), update);
+			return;
+		}
+		this.adoptFallback(proc, params, update);
 		const turn = this.turnFor(proc, params.sessionId);
 		if (!turn || turn.promptId == null) { return; }
 		if (update.sessionUpdate === "agent_message_chunk" || update.sessionUpdate === "agent_thought_chunk") {
@@ -1229,7 +1360,8 @@ class AgentHost {
 		}
 		const command = params.toolInput && typeof params.toolInput.command === "string" ? params.toolInput.command : "";
 		const key = alwaysKey(kind, toolName, command, params.toolInput);
-		if (key && (this.always.get(ruleScope(turn)) || new Set()).has(key) && (kind !== "edit" || editIsAllowed(turn, params.toolInput))) {
+		const saved = key.startsWith("command:") && (this.savedRules().get(pathKey(turn.cwd)) || { commands: [] }).commands.includes(key.slice("command:".length));
+		if (key && (saved || (this.always.get(ruleScope(turn)) || new Set()).has(key)) && (kind !== "edit" || editIsAllowed(turn, params.toolInput))) {
 			this.reply(proc, msg.id, { decision: "allow", reason: "" });
 			this.outcomes.set(toolId, "allow");
 			this.outcomes.set(`${toolId}:detail`, "Allowed");
@@ -1245,6 +1377,9 @@ class AgentHost {
 			toolId,
 			uiSessionId: turn.uiSessionId,
 			scope: ruleScope(turn),
+			folder: turn.cwd,
+			// What Always allow would remember: this exact command in this folder, or this tool for this conversation.
+			always: key.startsWith("command:") ? "folder" : key ? "conversation" : "",
 			turnId: turn.turnId,
 			toolName,
 			kind,
@@ -1310,6 +1445,7 @@ class AgentHost {
 				...(gate.command ? { command: gate.command } : {}),
 				...(gate.input ? { input: gate.input } : {}),
 				...(gate.diff ? { diff: gate.diff } : {}),
+				...(gate.always ? { always: gate.always } : {}),
 				waiting: true,
 				...(gate.questions ? { questions: gate.questions } : {}),
 				...(gate.plan !== undefined ? { plan: gate.plan } : {}),

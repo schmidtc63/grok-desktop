@@ -129,6 +129,13 @@ interface GrokToolEvent {
 	questions?: GrokQuestion[];
 	plan?: string;
 	todos?: GrokTodo[];
+	// What Always allow would remember for this approval: the exact command in this folder, or the tool for this conversation.
+	always?: "folder" | "conversation";
+}
+
+interface GrokAlwaysRules {
+	folder: string;
+	commands: string[];
 }
 
 interface GrokAccount {
@@ -139,7 +146,7 @@ interface GrokAccount {
 }
 
 interface GrokEvent {
-	type: "chunk" | "thought" | "tool" | "done" | "error" | "mode" | "usage" | "context" | "commands" | "models" | "mcp" | "mcp-status" | "terminal-data" | "terminal-exit" | "account" | "bg-tasks" | "subagent" | "title" | "steer" | "update-open";
+	type: "chunk" | "thought" | "tool" | "done" | "error" | "mode" | "usage" | "context" | "commands" | "models" | "mcp" | "mcp-status" | "terminal-data" | "terminal-exit" | "account" | "bg-tasks" | "subagent" | "title" | "steer" | "turn-start" | "update-open";
 	current?: string;
 	latest?: string;
 	tag?: string;
@@ -198,6 +205,7 @@ interface GrokSendResult {
 	promptIndex?: number;
 	lostSession?: boolean;
 	closed?: boolean;
+	warning?: string;
 }
 
 interface GrokBranchRequest { uiSessionId: string; cwd: string; model: string; effort: string; mode: string; agentSessionId: string; index: number; text: string }
@@ -217,6 +225,8 @@ interface DiffHunk {
 
 interface DiffFile {
   path: string;
+	// The old path of a rename, in the same folder.
+	from?: string;
   additions?: number;
   deletions?: number;
   hunks: DiffHunk[];
@@ -327,6 +337,9 @@ interface GrokCodeApi {
 	terminalWrite?: (id: string, text: string) => Promise<WriteResult>;
 	terminalClose?: (id: string) => Promise<WriteResult>;
 	terminalHistory?: (id: string) => Promise<string>;
+	terminalInterrupt?: (id: string) => Promise<{ ok: boolean; error?: string; stopped?: number }>;
+	alwaysRules?: () => Promise<GrokAlwaysRules[]>;
+	removeAlwaysRule?: (folder: string, command: string) => Promise<WriteResult>;
 	branchInfo?: (cwd: string) => Promise<BranchInfo>;
 	scopedDiff?: (cwd: string, scope: string) => Promise<DiffSnapshot>;
 	listCommits?: (cwd: string) => Promise<{ ok: boolean; error?: string; commits?: { sha: string; short: string; subject: string; when: string }[] }>;

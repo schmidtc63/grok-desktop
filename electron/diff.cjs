@@ -226,6 +226,7 @@ function parseUnified(text, label, inventory = [], inputTruncated = false) {
 			item = { path: change.path, additions: 0, deletions: 0, hunks: [] };
 			files.push(item);
 		}
+		if (change.from) { item.from = change.from; }
 		if (!item.hunks.length) {
 			const detail = change.from ? `Renamed from ${change.from}` : (truncated || inputTruncated ? "Diff content was left out." : "File metadata changed.");
 			item.hunks.push({ id: fingerprints.get(item) || "", loc: label || "Change", lines: [{ kind: "context", text: detail }] });
@@ -259,6 +260,8 @@ function mergeFiles(into, files) {
       into.push(file);
       continue;
     }
+		// A staged rename with unstaged edits arrives twice; only the staged half knows the old path.
+		if (file.from && !found.from) { found.from = file.from; }
 		if (found.conflicted || file.conflicted) {
 			if (file.conflicted) { Object.assign(found, file); }
 			continue;
@@ -389,7 +392,11 @@ async function readDiff(cwd) {
   for (const file of files) {
     const shown = displayPath(toplevel, folder, file.path);
     if (!shown) continue;
-    visible.push({ ...file, path: shown });
+    // A rename keeps its old path, so a commit of the file can name both; an old path outside this folder is dropped.
+    const from = file.from ? displayPath(toplevel, folder, file.from) : "";
+    const entry = { ...file, path: shown };
+    if (from) { entry.from = from; } else { delete entry.from; }
+    visible.push(entry);
   }
   assignIds(visible);
   return { ok: true, repo: true, truncated, files: visible };

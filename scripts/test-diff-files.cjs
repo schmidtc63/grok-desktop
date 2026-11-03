@@ -31,14 +31,15 @@ const react = {
 };
 const jsx = (type, props) => ({ type, props: props ?? {} });
 
-function load(name, globals = {}) {
+// A test that needs to see the confirm questions passes the confirm module the component should share.
+function load(name, globals = {}, confirm) {
 	const file = path.join(__dirname, "..", "src", name);
 	const source = transformSync(fs.readFileSync(file, "utf8"), { loader: "tsx", format: "cjs", jsx: "automatic" }).code;
 	const module = { exports: {} };
 	const imports = (id) => {
 		if (id === "react") { return react; }
 		if (id === "react/jsx-runtime") { return { jsx, jsxs: jsx, Fragment: "fragment" }; }
-		if (id === "./confirm") { return load("confirm.ts", globals); }
+		if (id === "./confirm") { return confirm ?? load("confirm.ts", globals); }
 		if (id === "./Markdown") { return { Markdown: (props) => jsx("markdown", props) }; }
 		if (id === "./CodeEditorLoader") { return { CodeEditorLoader: (props) => jsx("code-editor", props) }; }
 		throw new Error(`Unexpected import ${id}`);
@@ -239,6 +240,82 @@ check("Ctrl+Enter adds the draft before sending the updated comments", () => {
 	assert.equal(calls.length, 2, "the comment sends once");
 });
 
+const pickFiles = ["src/a.ts", "src/b.ts", "src/c.ts"].map((file) => ({ path: file, additions: 1, deletions: 0, hunks: [hunk] }));
+const pickProps = { ...diffProps, scope: "uncommitted", comments: [], snapshot: { ok: true, files: pickFiles } };
+const pickBoxes = (tree) => tree.elements.filter((el) => /^Include .+ in the commit$/.test(el.props["aria-label"] ?? ""));
+const pickBox = (tree, file) => pickBoxes(tree).find((el) => el.props["aria-label"] === `Include ${file} in the commit`);
+const commitButton = (tree, label) => tree.elements.find((el) => el.type === "button" && el.props.children === label);
+
+// Renders the Changes pane over props, answers every confirm question yes, and records the questions and the requests sent to Grok.
+function commitRig(props) {
+	const confirms = load("confirm.ts");
+	const asks = [];
+	const requests = [];
+	confirms.setConfirmHost((pending) => { asks.push(JSON.parse(JSON.stringify(pending))); pending.resolve(true); });
+	const shown = { ...props, onAskGrok: (text) => requests.push(text) };
+	const render = renderer(load("DiffPane.tsx", {}, confirms).DiffPane, shown);
+	return {
+		props: shown, render, asks, requests,
+		toggle: (file) => pickBox(render(), file).props.onChange(),
+		async press(label) {
+			commitButton(render(), label).props.onClick();
+			await new Promise((resolve) => setImmediate(resolve));
+			return { ask: asks.at(-1), request: requests.at(-1) };
+		},
+	};
+}
+
+check("File checkboxes appear only where the commit buttons appear, all checked", () => {
+	const tree = flatten(DiffPane(pickProps));
+	assert.ok(commitButton(tree, "Commit") && commitButton(tree, "Commit and push"));
+	assert.deepEqual(pickBoxes(tree).map((el) => el.props["aria-label"]), pickFiles.map((file) => `Include ${file.path} in the commit`));
+	assert.ok(pickBoxes(tree).every((el) => el.type === "input" && el.props.type === "checkbox" && el.props.checked === true));
+	for (const changed of [{ scope: "branch" }, { scope: "abc123" }, { snapshot: { ok: true, files: [] } }, { snapshot: { ok: true, repo: false, files: pickFiles } }, { snapshot: { ok: false, files: pickFiles } }]) {
+		const other = flatten(DiffPane({ ...pickProps, ...changed }));
+		assert.equal(commitButton(other, "Commit"), undefined, JSON.stringify(Object.keys(changed)));
+		assert.equal(pickBoxes(other).length, 0, JSON.stringify(Object.keys(changed)));
+	}
+});
+
+check("Clicking a file checkbox does not select or open the file row", () => {
+	const calls = [];
+	const render = renderer(DiffPane, { ...pickProps, onSelectFile: (file) => calls.push(`select:${file}`), onOpenFile: (file) => calls.push(`open:${file}`) });
+	const rows = render().elements.filter((el) => el.type === "button" && /^file-row/.test(el.props.className ?? ""));
+	assert.equal(rows.length, 3);
+	rows.forEach((row) => assert.ok(!flatten(row.props.children).elements.some((el) => el.type === "input"), "the checkbox sits beside the row button, not inside it"));
+	pickBox(render(), "src/b.ts").props.onChange();
+	assert.deepEqual(calls, []);
+	assert.equal(pickBox(render(), "src/b.ts").props.checked, false);
+	rows[1].props.onClick();
+	assert.deepEqual(calls, ["select:src/b.ts"], "the row itself still selects");
+});
+
+check("Both commit buttons are disabled while no file is checked", () => {
+	const render = renderer(DiffPane, pickProps);
+	pickFiles.forEach((file) => pickBox(render(), file.path).props.onChange());
+	for (const label of ["Commit", "Commit and push"]) {
+		assert.equal(commitButton(render(), label).props.disabled, true);
+		assert.equal(commitButton(render(), label).props.title, "Check at least one file.");
+	}
+	pickBox(render(), "src/c.ts").props.onChange();
+	for (const label of ["Commit", "Commit and push"]) {
+		assert.equal(commitButton(render(), label).props.disabled, false);
+		assert.equal(commitButton(render(), label).props.title, undefined);
+	}
+});
+
+check("Review shows the same checkboxes and state, and leaves the side-pane scroll layout", () => {
+	const render = renderer(DiffPane, pickProps);
+	const body = (tree) => tree.elements.find((el) => /^pane-bd/.test(el.props.className ?? ""));
+	pickBox(render(), "src/b.ts").props.onChange();
+	assert.equal(body(render()).props.className, "pane-bd dp-side");
+	render().elements.find((el) => el.props["aria-label"] === "Review in a large view").props.onClick();
+	const tree = render();
+	assert.equal(body(tree).props.className, "pane-bd");
+	assert.deepEqual(pickBoxes(tree).map((el) => el.props.checked), [true, false, true]);
+	assert.ok(commitButton(tree, "Commit"));
+});
+
 const railProps = {
 	session: { folder: "C:/project", branch: "feature", environment: "Local" },
 	diff: { ok: true, files: [] }, branch: { ok: true, branch: "feature", base: "main", ahead: 1 },
@@ -385,6 +462,69 @@ async function main() {
 			assert.deepEqual(reverted, yes ? ["src/a.ts"] : []);
 			assert.equal(render().text.join("").includes("Restored src/a.ts to the last commit."), yes);
 		}
+	});
+	await checkAsync("Commit and Commit and push name only the checked files, and all checked keeps the fixed requests", async () => {
+		const fixed = [
+			{ title: "Commit all uncommitted changes?", body: "Grok writes the commit message and commits. Nothing is pushed.", ok: "Commit" },
+			{ title: "Commit and push?", body: "Grok commits all uncommitted changes and pushes the branch to its remote.", ok: "Commit and push", danger: true },
+		];
+		const fixedRequests = [
+			"Commit the current uncommitted changes in this repository with a clear commit message. Don't push.",
+			"Commit the current uncommitted changes in this repository with a clear commit message, then push the branch.",
+		];
+		const rig = commitRig(pickProps);
+		await rig.press("Commit");
+		await rig.press("Commit and push");
+		assert.deepEqual(rig.asks, fixed);
+		assert.deepEqual(rig.requests, fixedRequests);
+
+		rig.toggle("src/b.ts");
+		assert.equal(pickBox(rig.render(), "src/b.ts").props.checked, false);
+		await rig.press("Commit");
+		assert.equal(pickBox(rig.render(), "src/b.ts").props.checked, true, "after a commit request the files left out start checked again");
+		rig.toggle("src/b.ts");
+		await rig.press("Commit and push");
+		assert.deepEqual(rig.asks.slice(2), [
+			{ title: "Commit 2 of 3 files?", body: "Grok writes the commit message and commits only the checked files. Nothing is pushed.", ok: "Commit" },
+			{ title: "Commit 2 of 3 files and push?", body: "Grok commits only the checked files and pushes the branch to its remote.", ok: "Commit and push", danger: true },
+		]);
+		assert.deepEqual(rig.requests.slice(2), [
+			"Commit only these files in this repository with a clear commit message, and leave the other changes uncommitted: `src/a.ts`, `src/c.ts`. Don't push.",
+			"Commit only these files in this repository with a clear commit message, and leave the other changes uncommitted: `src/a.ts`, `src/c.ts`. Then push the branch.",
+		]);
+
+		rig.toggle("src/a.ts");
+		rig.toggle("src/b.ts");
+		assert.equal((await rig.press("Commit")).ask.title, "Commit 1 of 3 files?");
+		assert.ok(rig.requests.at(-1).includes(": `src/c.ts`. Don't push."));
+
+		const before = rig.asks.length;
+		await rig.press("Commit");
+		await rig.press("Commit and push");
+		assert.deepEqual(rig.asks.slice(before), fixed, "with every file checked again, the fixed questions return");
+		assert.deepEqual(rig.requests.slice(before), fixedRequests, "with every file checked again, the fixed requests return");
+	});
+	await checkAsync("A file that appears later is included, and an unchecked file that left the list counts for nothing", async () => {
+		const rig = commitRig(pickProps);
+		rig.toggle("src/b.ts");
+		rig.props.snapshot = { ok: true, files: [...pickFiles, { path: "src/d.ts", additions: 1, deletions: 0, hunks: [hunk] }] };
+		assert.equal(pickBox(rig.render(), "src/d.ts").props.checked, true);
+		const added = await rig.press("Commit");
+		assert.equal(added.ask.title, "Commit 3 of 4 files?");
+		assert.ok(added.request.includes(": `src/a.ts`, `src/c.ts`, `src/d.ts`. Don't push."));
+		rig.props.snapshot = { ok: true, files: [pickFiles[0], pickFiles[2]] };
+		const gone = await rig.press("Commit and push");
+		assert.equal(gone.ask.title, "Commit and push?");
+		assert.equal(gone.request, "Commit the current uncommitted changes in this repository with a clear commit message, then push the branch.");
+	});
+	await checkAsync("A renamed file is named by its old and new path", async () => {
+		const renamed = { path: "src/new.ts", from: "src/old.ts", additions: 0, deletions: 0, hunks: [hunk] };
+		const rig = commitRig({ ...pickProps, snapshot: { ok: true, files: [renamed, ...pickFiles] } });
+		rig.toggle("src/b.ts");
+		assert.ok(pickBox(rig.render(), "src/new.ts"), "the row is labelled with the new path");
+		const asked = await rig.press("Commit");
+		assert.equal(asked.ask.title, "Commit 3 of 4 files?");
+		assert.equal(asked.request, "Commit only these files in this repository with a clear commit message, and leave the other changes uncommitted: `src/old.ts`, `src/new.ts`, `src/a.ts`, `src/c.ts`. Don't push.");
 	});
 	if (failures > 0) {
 		console.log(`${failures} check(s) failed`);

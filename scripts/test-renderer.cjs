@@ -731,6 +731,8 @@ async function checkSessionOrder() {
 	kept.sidebar().onArchive(blank);
 	kept.sidebar().onArchive(shelved);
 	await kept.settle();
+	button(kept, "Archive and stop").props.onClick();
+	await kept.settle();
 	assert.equal(kept.sidebar().sessions.filter((item) => !item.archived).map((item) => item.id).join("|"), open, "one unarchived session is left");
 	kept.sidebar().onDelete(open);
 	await kept.settle();
@@ -1159,13 +1161,18 @@ async function checkToolRows() {
 
 	const long = `Write-Output start; ${"x".repeat(5962)}; Write-Output end`;
 	assert.equal(long.length, 6000);
-	const approval = show({ id: "approve", kind: "command", title: "run_terminal_command", detail: "Waiting for you", waiting: true, command: long, summary: `${long.slice(0, 500)}…` });
+	const approval = show({ id: "approve", kind: "command", title: "run_terminal_command", detail: "Waiting for you", waiting: true, command: long, summary: `${long.slice(0, 500)}…`, always: "folder" });
 	assert.ok(approval.nodes().some((node) => node.props.children === long), "a waiting approval shows the complete command");
 	button(approval, "Deny").props.onClick();
-	button(approval, "Always allow").props.onClick();
+	button(approval, "Always allow in this folder").props.onClick();
+	const toolApproval = show({ id: "tool-approve", kind: "mcp", title: "use_tool", detail: "Waiting for you", waiting: true, always: "conversation" });
+	assert.ok(button(toolApproval, "Allow for this conversation"), "a tool rule says it lasts one conversation");
+	assert.equal(button(toolApproval, "Always allow in this folder"), undefined);
+	const chained = show({ id: "chained", kind: "command", title: "run_terminal_command", detail: "Waiting for you", waiting: true, command: "npm test && curl example.com" });
+	assert.equal(button(chained, "Always allow in this folder") || button(chained, "Allow for this conversation"), undefined, "a call Always allow could not remember offers no remembered grant");
 	const nativeApproval = show({ id: "native-permission:command", kind: "execute", title: "Run command", waiting: true });
 	assert.ok(button(nativeApproval, "Deny") && button(nativeApproval, "Allow"), "native permission cards keep Deny and Allow");
-	assert.equal(button(nativeApproval, "Always allow"), undefined, "native permission cards do not offer an unused remembered grant");
+	assert.equal(button(nativeApproval, "Always allow in this folder") || button(nativeApproval, "Allow for this conversation"), undefined, "native permission cards do not offer an unused remembered grant");
 	button(approval, "Allow").props.onClick();
 	assert.equal(decisions.join("|"), "approve:deny|approve:always|approve:allow");
 	const mcpInput = JSON.stringify({ tool_name: "chrome__tabs_open", tool_input: { url: `https://example.com/${"p".repeat(600)}` } }, null, 2);
@@ -1527,13 +1534,39 @@ async function checkRoutineBatchB() {
 			appWindow.emit({ type: "done", uiSessionId: appWindow.model().session.id, turnId: appWindow.sends.at(-1).turnId, stopReason: "cancelled" });
 			return { ok: true };
 		};
-		appWindow.api.stopSession = cancel;
-		appWindow.api.removeWorktree = cancel;
+		const stops = [];
+		appWindow.api.stopSession = async (id) => { stops.push(id); return cancel(); };
+		appWindow.api.removeWorktree = async (...args) => { stops.push(args[1]); return cancel(); };
 		appWindow.sidebar().onArchive(appWindow.model().session.id);
 		await appWindow.settle();
+		assert.ok(textOf(appWindow.render()).includes("Grok is still working in this session. Archiving stops the turn and any background commands."), "archiving a working session asks first");
+		assert.deepEqual(stops, [], "nothing stops before the confirmation");
+		assert.equal(appWindow.sidebar().sessions.find((item) => item.id === appWindow.sends[0].uiSessionId).archived, false);
+		button(appWindow, "Archive and stop").props.onClick();
+		await appWindow.settle();
+		assert.equal(stops.length, 1, "confirming archive stops the session's Grok");
 		assert.equal(appWindow.sends.length, 1, `archive holds the queued follow-up (${inWorktree ? "worktree" : "local"})`);
 		assert.equal(appWindow.sidebar().sessions.find((item) => item.id === appWindow.sends[0].uiSessionId).archived, true);
 	}
+	const background = await composerWindow();
+	const backgroundId = background.model().session.id;
+	const stopped = [];
+	background.api.stopSession = async (id) => { stopped.push(id); return { ok: true }; };
+	background.emit({ type: "bg-tasks", uiSessionId: backgroundId, tasks: [{ id: "server", label: "Dev server", command: "npm run dev", kind: "bash", status: "running", startedAt: Date.now(), endedAt: 0, exitCode: null }] });
+	await background.settle();
+	background.sidebar().onArchive(backgroundId);
+	await background.settle();
+	assert.ok(textOf(background.render()).includes("Archiving stops the turn and any background commands."), "a running background command alone asks before archiving");
+	button(background, "Cancel").props.onClick();
+	await background.settle();
+	assert.deepEqual(stopped, [], "cancelling the confirmation keeps the background command");
+	assert.equal(background.sidebar().sessions.find((item) => item.id === backgroundId).archived, false);
+	background.emit({ type: "bg-tasks", uiSessionId: backgroundId, tasks: [{ id: "server", label: "Dev server", command: "npm run dev", kind: "bash", status: "completed", startedAt: Date.now(), endedAt: Date.now(), exitCode: 0 }] });
+	await background.settle();
+	background.sidebar().onArchive(backgroundId);
+	await background.settle();
+	same(stopped, [backgroundId], "an idle session archives in one click");
+	assert.equal(background.sidebar().sessions.find((item) => item.id === backgroundId).archived, true);
 
 	const streaming = harness();
 	await streaming.settle();
@@ -2658,7 +2691,11 @@ async function checkSteer() {
 	assert.equal(app.sends.length, 2, "ending the turn while steer is pending never sends that row again");
 	sendPrompt(app, "Another running turn");
 	await app.settle();
+	// Without steering in this window, typed messages queue, which gives the rows to steer.
+	const steerApi = app.api.steer;
+	app.api.steer = undefined;
 	for (const text of ["before", "failed steer", "after"]) { sendPrompt(app, text); await app.settle(); }
+	app.api.steer = steerApi;
 	queuedAction(app, 1, "Steer").props.onClick();
 	app.render();
 	finish({ ok: false, error: "Grok is stopping this turn." });
@@ -2675,6 +2712,57 @@ async function checkSteer() {
 	button(app, "Stop").props.onClick();
 	await app.settle();
 	assert.equal(button(app, "Steer"), undefined, "Stop holds the queue and hides Steer");
+
+	const typed = await composerWindow();
+	const typedId = typed.model().session.id;
+	sendPrompt(typed, "A running turn");
+	await typed.settle();
+	const queuedTexts = () => typed.nodes().filter((node) => node.props.className === "queued").map((node) => textOf(node.props.children[0]));
+	const sentBefore = typed.sends.length;
+	const steers = [];
+	let answer = { ok: true };
+	typed.api.steer = async (...args) => { steers.push(args); return answer; };
+	sendPrompt(typed, "Use the other file");
+	await typed.settle();
+	same(steers, [[typedId, "Use the other file"]], "Enter during a turn steers it");
+	same(queuedTexts(), [], "a steered message is not queued");
+	assert.equal(typed.sends.length, sentBefore, "nor sent as a new turn");
+	sendPrompt(typed, "/compact");
+	await typed.settle();
+	stageAttachments(typed, [path.join(__dirname, "steer-attachment.md")]);
+	sendPrompt(typed, "With an attachment");
+	await typed.settle();
+	assert.equal(steers.length, 1, "commands and attachments are not steered");
+	same(queuedTexts(), ["/compact", "With an attachment"], "they wait in the queue");
+	answer = { ok: false, error: "Grok has finished this turn." };
+	sendPrompt(typed, "Too late");
+	await typed.settle();
+	same(queuedTexts(), ["/compact", "With an attachment", "Too late"], "a steer Grok refuses joins the end of the queue");
+	assert.match(typed.notice(), /finished this turn.*stays queued/);
+
+	const adopt = await composerWindow();
+	const adoptId = adopt.model().session.id;
+	sendPrompt(adopt, "First turn");
+	await adopt.settle();
+	adopt.emit({ type: "done", uiSessionId: adoptId, turnId: adopt.sends.at(-1).turnId });
+	await adopt.settle();
+	adopt.emit({ type: "turn-start", uiSessionId: adoptId, turnId: "steer-turn", text: "Also add tests" });
+	await adopt.settle();
+	assert.equal(adopt.model().messages.at(-2).role, "user");
+	assert.equal(adopt.model().messages.at(-2).text, "Also add tests", "a turn Grok starts for a late steer shows the steer as a message");
+	assert.equal(adopt.model().messages.at(-1).pending, true);
+	assert.ok(button(adopt, "Stop"), "that turn can be stopped like any other");
+	adopt.emit({ type: "chunk", uiSessionId: adoptId, turnId: "steer-turn", text: "Added." });
+	adopt.emit({ type: "done", uiSessionId: adoptId, turnId: "steer-turn" });
+	await adopt.settle();
+	assert.equal(adopt.model().messages.at(-1).text, "Added.");
+	assert.equal(button(adopt, "Stop"), undefined);
+	sendPrompt(adopt, "Live turn");
+	await adopt.settle();
+	const count = adopt.model().messages.length;
+	adopt.emit({ type: "turn-start", uiSessionId: adoptId, turnId: "second", text: "Ignored" });
+	await adopt.settle();
+	assert.equal(adopt.model().messages.length, count, "a turn the app already shows is not replaced");
 }
 
 async function checkStreamHistorySaves() {
@@ -2901,7 +2989,7 @@ async function checkReviewWorkspace() {
 	assert.equal(view.canMarkViewed(snapshot.files[0]), true);
 	assert.equal(view.canMarkViewed(snapshot.files[2]), false);
 	const progress = () => textOf(view.node((node) => node.props.className === "meta dp-progress"));
-	const viewed = () => view.node((node) => node.type === "input" && node.props.type === "checkbox");
+	const viewed = () => view.node((node) => node.type === "input" && node.props.type === "checkbox" && !node.props["aria-label"]);
 	const section = () => view.node((node) => node.type === "section" && node.props["aria-label"] === "Changes");
 	const sectionKey = (key, target = "SECTION") => section().props.onKeyDown({ key, altKey: true, defaultPrevented: false, target: { tagName: target }, preventDefault() {} });
 	assert.equal(progress(), "0 of 3 viewed · more files were left out");

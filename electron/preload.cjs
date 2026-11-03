@@ -90,6 +90,9 @@ contextBridge.exposeInMainWorld("grokCode", {
 	terminalHistory(id) {
 		return ipcRenderer.invoke("grok:terminal-history", id);
 	},
+	terminalInterrupt(id) {
+		return ipcRenderer.invoke("grok:terminal-interrupt", id);
+	},
 	branchInfo(cwd) {
 		return ipcRenderer.invoke("grok:branch-info", cwd);
 	},
@@ -147,6 +150,12 @@ contextBridge.exposeInMainWorld("grokCode", {
   decide(payload) {
     return ipcRenderer.invoke("grok:decide", payload);
   },
+	alwaysRules() {
+		return ipcRenderer.invoke("grok:always-rules");
+	},
+	removeAlwaysRule(folder, command) {
+		return ipcRenderer.invoke("grok:always-rule-remove", folder, command);
+	},
 	setAllowedFolders(payload) {
 		return ipcRenderer.invoke("grok:allowed-folders", payload);
 	},

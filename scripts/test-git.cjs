@@ -159,6 +159,8 @@ async function checkTruncatedDiffCounts() {
 	assert.equal(small.ok, true);
 	assert.equal(small.truncated, false);
 	assert.deepEqual(counts(small, "m-renamed name.txt"), [1, 0]);
+	assert.equal(small.files.find((file) => file.path === "m-renamed name.txt").from, "m-rename.txt", "a rename with edits keeps its old path");
+	assert.equal(small.files.find((file) => file.path === "n-binary.bin").from, undefined);
 	assert.deepEqual(counts(small, "n-binary.bin"), [undefined, undefined]);
 	assert.ok(small.files.find((file) => file.path === "n-binary.bin").hunks.some((hunk) => hunk.lines.some((line) => line.text === "Binary file")));
 	write("a-large.txt", "rename cutoff\n".repeat(900), folder);
@@ -171,6 +173,9 @@ async function checkTruncatedDiffCounts() {
 	assert.ok(renamed.files.find((file) => file.path === "m-renamed name.txt").hunks.some((hunk) => hunk.lines.some((line) => line.text === "Renamed from m-rename.txt")));
 	assert.deepEqual(counts(renamed, "n-binary.bin"), [undefined, undefined]);
 	assert.equal(renamed.files.some((file) => file.path === "m-rename.txt"), false);
+	write("m-renamed name.txt", "edited after the rename was staged\n", folder);
+	const editedRename = await readDiff(folder);
+	assert.equal(editedRename.files.find((file) => file.path === "m-renamed name.txt").from, "m-rename.txt", "a staged rename with unstaged edits keeps its old path");
 	console.log("PASS diff counts: NUL-delimited rename paths retain counts and binary counts stay absent");
 
 	reset();
