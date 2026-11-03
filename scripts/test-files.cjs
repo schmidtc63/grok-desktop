@@ -8,8 +8,9 @@ const { createHash } = require("crypto");
 const { listFiles, readText, writeText, runCommand } = require("../electron/files.cjs");
 const { readDiff, parseUnified, revertFile } = require("../electron/diff.cjs");
 
-// macOS puts the temp folder behind the /var symlink, and the modules report real paths.
-const tempBase = path.resolve(fs.realpathSync(os.tmpdir()), process.env.CODEX_THREAD_ID || "codex-grokcode-files");
+// macOS puts the temp folder behind the /var symlink and the GitHub Windows runner names it with a short 8.3 name (RUNNER~1),
+// while the modules report git's real, full paths. The native realpath resolves both.
+const tempBase = path.resolve(fs.realpathSync.native(os.tmpdir()),process.env.CODEX_THREAD_ID || "codex-grokcode-files");
 fs.mkdirSync(tempBase, { recursive: true });
 const root = fs.mkdtempSync(path.join(tempBase, "codex-files-"));
 const depthRoot = fs.mkdtempSync(path.join(tempBase, "codex-depth-"));

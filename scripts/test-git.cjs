@@ -13,8 +13,9 @@ const { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, 
 delete process.env.GH_REPO;
 delete process.env.GH_HOST;
 
-// macOS puts the temp folder behind the /var symlink, and git reports real paths.
-const tempBase = path.resolve(fs.realpathSync(os.tmpdir()), process.env.CODEX_THREAD_ID || "grokcode-git");
+// macOS puts the temp folder behind the /var symlink and the GitHub Windows runner names it with a short 8.3 name (RUNNER~1),
+// while git reports real, full paths. The native realpath resolves both.
+const tempBase = path.resolve(fs.realpathSync.native(os.tmpdir()),process.env.CODEX_THREAD_ID || "grokcode-git");
 fs.mkdirSync(tempBase, { recursive: true });
 const root = fs.mkdtempSync(path.join(tempBase, "git-"));
 const origin = path.join(root, "origin.git");
@@ -422,7 +423,17 @@ async function main() {
 	const ghDirs = (process.env.PATH || "").split(path.delimiter).filter((dir) => dir && fs.existsSync(path.join(dir, process.platform === "win32" ? "gh.exe" : "gh")));
 	const savedPath = process.env.PATH;
 	try {
-		process.env.PATH = savedPath.split(path.delimiter).filter((dir) => !ghDirs.includes(dir)).join(path.delimiter);
+		const kept = savedPath.split(path.delimiter).filter((dir) => !ghDirs.includes(dir));
+		// Ubuntu keeps gh and git together in /usr/bin, so hiding gh hides git too; git gets a folder of its own there.
+		const gitName = process.platform === "win32" ? "git.exe" : "git";
+		const shared = ghDirs.find((dir) => fs.existsSync(path.join(dir, gitName)));
+		if (shared) {
+			const gitOnly = path.join(root, "git-only");
+			fs.mkdirSync(gitOnly);
+			fs.symlinkSync(path.join(shared, gitName), path.join(gitOnly, gitName));
+			kept.unshift(gitOnly);
+		}
+		process.env.PATH = kept.join(path.delimiter);
 		assert.deepEqual(await prStatus(repo), { ok: false, error: "GitHub CLI (gh) is not installed." });
 		assert.deepEqual(await prCreate(repo, { title: "Test" }), { ok: false, error: "GitHub CLI (gh) is not installed." });
 	} finally {
