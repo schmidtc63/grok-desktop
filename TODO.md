@@ -24,10 +24,6 @@ The New session form shows a greyed-out Cloud environment. Grok itself has no pu
 
 Cursor's API can also run an agent on a registered machine, and `grok worker` registers a computer with Cursor. This could turn the greyed-out SSH environment into "My machines". Remote agents run commands on that machine, so it needs a clear opt-in.
 
-### Installers and updates
-
-Codewomplers Grok Desktop runs from source with `npm run desktop`. Packaging with electron-builder or Electron Forge, publishing GitHub Releases, code signing (unsigned installers trigger Windows SmartScreen) and an update path would let people run it without Node.js.
-
 ### macOS and Linux
 
 Codewomplers Grok Desktop is Windows-only (`"os": ["win32"]` in `package.json`). The terminal, shell commands, path handling and window naming assume Windows.
