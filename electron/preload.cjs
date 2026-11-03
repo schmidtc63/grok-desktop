@@ -20,6 +20,9 @@ contextBridge.exposeInMainWorld("grokCode", {
 	attention() {
 		return ipcRenderer.invoke("grok:attention");
 	},
+	taskbar(state) {
+		return ipcRenderer.invoke("grok:taskbar", state);
+	},
 	keepAwake(payload) {
 		return ipcRenderer.invoke("grok:keep-awake", payload);
 	},
@@ -43,6 +46,18 @@ contextBridge.exposeInMainWorld("grokCode", {
 	},
 	appInfo() {
 		return ipcRenderer.invoke("grok:app-info");
+	},
+	updateCheck(force) {
+		return ipcRenderer.invoke("grok:update-check", force);
+	},
+	updatePrepare(tag) {
+		return ipcRenderer.invoke("grok:update-prepare", tag);
+	},
+	updateStart(tag) {
+		return ipcRenderer.invoke("grok:update-start", tag);
+	},
+	updateResult() {
+		return ipcRenderer.invoke("grok:update-result");
 	},
 	homeDir: ipcRenderer.sendSync("grok:home-dir"),
 	readiness() {

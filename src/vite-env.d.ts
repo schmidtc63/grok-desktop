@@ -139,7 +139,10 @@ interface GrokAccount {
 }
 
 interface GrokEvent {
-	type: "chunk" | "thought" | "tool" | "done" | "error" | "mode" | "usage" | "context" | "commands" | "models" | "mcp" | "mcp-status" | "terminal-data" | "terminal-exit" | "account" | "bg-tasks" | "subagent" | "title" | "steer";
+	type: "chunk" | "thought" | "tool" | "done" | "error" | "mode" | "usage" | "context" | "commands" | "models" | "mcp" | "mcp-status" | "terminal-data" | "terminal-exit" | "account" | "bg-tasks" | "subagent" | "title" | "steer" | "update-open";
+	current?: string;
+	latest?: string;
+	tag?: string;
 	tasks?: GrokBgTask[];
 	reset?: boolean;
 	subagent?: GrokSubagent;
@@ -295,10 +298,15 @@ interface GrokCodeApi {
 	openIn: (payload: { target: "explorer" | "vscode"; cwd: string; file?: string; line?: number }) => Promise<WriteResult>;
 	clearBrowsingData: (partition: string) => Promise<WriteResult>;
 	attention: () => Promise<WriteResult>;
+	taskbar?: (state: "idle" | "running" | "needs-you") => Promise<WriteResult>;
 	keepAwake: (payload: { working: boolean; onBattery: boolean }) => Promise<WriteResult>;
 	saveImage: (base64: string) => Promise<WriteResult & { path?: string }>;
 	openImage: (file: string) => Promise<WriteResult>;
 	appInfo: () => Promise<{ ok: boolean; version?: string; electron?: string }>;
+	updateCheck?: (force?: boolean) => Promise<{ ok: boolean; available?: boolean; reason?: string; current?: string; latest?: string; tag?: string }>;
+	updatePrepare?: (tag: string) => Promise<{ ok: boolean; ready?: boolean; reason?: string; notes?: string; current?: string; latest?: string; tag?: string }>;
+	updateStart?: (tag: string) => Promise<WriteResult>;
+	updateResult?: () => Promise<{ ok: boolean; message: string } | null>;
 	contextBreakdown?: (agentSessionId: string) => Promise<{ ok: boolean; error?: string } & Partial<ContextBreakdown>>;
 	taskOutput?: (file: string) => Promise<{ ok: boolean; error?: string; text?: string; truncated?: boolean }>;
 	subagentTranscript?: (id: string) => Promise<{ ok: boolean; error?: string; messages?: import("./types").ChatMessage[]; truncated?: boolean }>;

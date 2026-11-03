@@ -57,6 +57,18 @@ function stamp(session: Session) {
 	return session.lastActivityAt ?? session.createdAt ?? 0;
 }
 
+const weekday = new Intl.DateTimeFormat(undefined, { weekday: "short" });
+const monthDay = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+
+export function ago(time: number, now = Date.now()): string {
+	const minutes = Math.floor((now - time) / 60000);
+	if (minutes < 1) { return "now"; }
+	if (minutes < 60) { return `${minutes}m`; }
+	if (minutes < 24 * 60) { return `${Math.floor(minutes / 60)}h`; }
+	if (minutes < 7 * 24 * 60) { return weekday.format(time); }
+	return monthDay.format(time);
+}
+
 function stateOf(session: Session, activity: Activity): RowState {
 	const live = activity[session.id];
 	if (live) { return live; }
@@ -152,6 +164,8 @@ export function Sidebar({
 	onShortcuts,
 	onOpenUrl,
 	onSignOut,
+	update,
+	onUpdate,
 }: {
 	sessions: Session[];
 	activeId: string;
@@ -177,6 +191,8 @@ export function Sidebar({
 	onShortcuts: () => void;
 	onOpenUrl: (url: string) => void;
 	onSignOut: () => void;
+	update: { latest: string } | null;
+	onUpdate: () => void;
 }) {
 	const [view, setView] = useState<SidebarView>(readView);
 	const [sections, setSections] = useState<Section[]>(readSections);
@@ -187,9 +203,14 @@ export function Sidebar({
 	const [renaming, setRenaming] = useState<string | null>(null);
 	const [sectionMenu, setSectionMenu] = useState<{ id: string; top: number; left: number } | null>(null);
 	const [accountMenu, setAccountMenu] = useState<{ bottom: number; left: number } | null>(null);
+	const [now, setNow] = useState(Date.now());
 
 	useEffect(() => { store(viewKey, view); }, [view]);
 	useEffect(() => { store(sectionsKey, sections); }, [sections]);
+	useEffect(() => {
+		const timer = setInterval(() => setNow(Date.now()), 60000);
+		return () => clearInterval(timer);
+	}, []);
 	useEffect(() => {
 		function onStorage(event: StorageEvent) {
 			if (event.key === sectionsKey) { setSections(readSections()); }
@@ -281,6 +302,7 @@ export function Sidebar({
 	function rowProps(session: Session) {
 		return {
 			session,
+			now,
 			state: stateOf(session, activity),
 			active: session.id === activeId,
 			menuOpen: rowMenu?.id === session.id,
@@ -333,7 +355,16 @@ export function Sidebar({
 					<button className="texty" onClick={() => setView((current) => ({ ...current, status: "active", days: 0 }))}>Clear</button>
 				</div>
 			)}
-			<div className="session-scroll">
+			<div className="session-scroll" onKeyDown={(event) => {
+				if (event.key !== "ArrowDown" && event.key !== "ArrowUp") { return; }
+				const target = event.target as HTMLElement;
+				if (!target.matches("button.session-hit")) { return; }
+				const rows = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>(".session-hit"));
+				const index = rows.indexOf(target as HTMLButtonElement);
+				if (index < 0) { return; }
+				event.preventDefault();
+				rows[Math.min(Math.max(index + (event.key === "ArrowDown" ? 1 : -1), 0), rows.length - 1)].focus();
+			}}>
 				{pinned.length > 0 && <div className="group-label">Pinned</div>}
 				{pinned.map((session) => <Row key={session.id} {...rowProps(session)} />)}
 				{grouped.map((group) => (
@@ -366,7 +397,7 @@ export function Sidebar({
 			<div className="side-foot">
 				<button
 					className="account-btn"
-					aria-label="Account and settings"
+					aria-label={update ? `Account and settings, version ${update.latest} available` : "Account and settings"}
 					aria-expanded={accountMenu !== null}
 					onClick={(event) => {
 						const rect = event.currentTarget.getBoundingClientRect();
@@ -375,7 +406,7 @@ export function Sidebar({
 					}}
 				>
 					<span className="avatar">{(account?.email || "G").charAt(0).toUpperCase()}</span>
-					<span className="who">{account?.email || (account === null ? "Signed out" : "Grok")}{account?.plan && <small>{account.plan}</small>}</span>
+					<span className="who">{account?.email || (account === null ? "Signed out" : "Grok")}{account?.plan && <small>{account.plan}</small>}{update && <small className="update-flag">Update available · {update.latest}</small>}</span>
 				</button>
 				<button className="side-icon" aria-label="Collapse sidebar" title="Collapse sidebar" onClick={onCollapse}>«</button>
 			</div>
@@ -392,6 +423,7 @@ export function Sidebar({
 						{recentUsd !== null && <span>Grok on this computer, last 7 days: ${recentUsd.toFixed(2)}</span>}
 					</div>
 					<hr />
+					{update && <button onClick={() => { closeAll(); onUpdate(); }}>Update to {update.latest}…</button>}
 					<button onClick={() => { closeAll(); onSettings(); }}>Settings<small>Ctrl+,</small></button>
 					<button onClick={() => { closeAll(); onShortcuts(); }}>Keyboard shortcuts<small>Ctrl+/</small></button>
 					<button onClick={() => { closeAll(); onOpenUrl("https://console.x.ai"); }}>Get xAI API keys<small>↗</small></button>
@@ -528,6 +560,7 @@ function ProjectHead({ label, seed, onNewIn }: { label: string; seed: ProjectSee
 
 function Row({
 	session,
+	now,
 	state,
 	active,
 	menuOpen,
@@ -538,6 +571,7 @@ function Row({
 	onStartRename,
 }: {
 	session: Session;
+	now: number;
 	state: RowState;
 	active: boolean;
 	menuOpen: boolean;
@@ -547,15 +581,17 @@ function Row({
 	onRename: (title: string | null) => void;
 	onStartRename: () => void;
 }) {
+	const time = stamp(session);
+	const meta = [session.worktreeFolder ? session.branch : "", time ? ago(time, now) : ""].filter(Boolean).join(" · ");
 	return (
 		<div className={`session${active ? " active" : ""}${menuOpen ? " menu-open" : ""}${state === "unread" ? " unread" : ""}`} onContextMenu={(event) => onOpenMenu(session.id, event)}>
 			<span className={`dot ${state}`} title={STATE_LABEL[state]} aria-hidden="true" />
 			{renaming ? (
 				<InlineName label="Session title" value={session.title} onDone={onRename} />
 			) : (
-				<button className="session-hit" title={`${session.title}\n${session.folder}`} onClick={(event) => onSelect(session.id, event)} onDoubleClick={onStartRename}>
+				<button className="session-hit" title={`${session.title}\n${session.folder}${time ? `\n${new Date(time).toLocaleString()}` : ""}`} onClick={(event) => onSelect(session.id, event)} onDoubleClick={onStartRename}>
 					<b>{session.title}</b>
-					{state === "needs-you" && <small>Needs you</small>}
+					{state === "needs-you" ? <small className="needs-you">Needs you</small> : meta && <small className="session-meta">{meta}</small>}
 				</button>
 			)}
 			<button className="icon-btn" aria-label={`Actions for ${session.title}`} aria-expanded={menuOpen} onClick={(event) => onOpenMenu(session.id, event)}>⋯</button>

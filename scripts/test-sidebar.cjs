@@ -8,6 +8,9 @@ const states = [];
 const effects = [];
 const storage = new Map();
 const listeners = new Map();
+const intervals = new Map();
+let intervalId = 0;
+let now = Date.now();
 let cursor = 0;
 let effectCursor = 0;
 let pendingEffects = [];
@@ -36,6 +39,9 @@ const confirmSource = transformSync(fs.readFileSync(path.join(__dirname, "../src
 const context = vm.createContext({
 	require: (name) => name === "react" ? react : name === "./confirm" ? confirmModule.exports : { jsx, jsxs: jsx, Fragment: "fragment" },
 	localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
+	Date: class extends Date { static now() { return now; } },
+	setInterval: (run, delay) => { const id = ++intervalId; intervals.set(id, { run, delay }); return id; },
+	clearInterval: (id) => intervals.delete(id),
 	window: {
 		innerHeight: 1000, innerWidth: 1400, confirm: () => confirmed,
 		addEventListener: (name, listener) => listeners.set(name, listener),
@@ -46,8 +52,8 @@ vm.runInContext(`(function(module, exports) {\n${confirmSource}\n})`, context)(c
 vm.runInContext(`(function(module, exports) {\n${source}\n})`, context)(loaded, loaded.exports);
 let confirmed = true;
 const sessions = [
-	{ id: "first", title: "First chat", folder: "C:/project", project: "Project", branch: "main", environment: "Local", status: "idle", pinned: true, archived: false },
-	{ id: "second", title: "Second chat", folder: "C:/project", project: "Project", branch: "main", environment: "Local", status: "idle", pinned: false, archived: false },
+	{ id: "first", title: "First chat", folder: "C:/project", project: "Project", branch: "main", environment: "Local", status: "idle", pinned: true, archived: false, createdAt: now - 5 * 60000 },
+	{ id: "second", title: "Second chat", folder: "C:/project", project: "Project", branch: "feature/sidebar", worktreeFolder: "C:/project-worktree", environment: "Local", status: "idle", pinned: false, archived: false, lastActivityAt: now - 3 * 60 * 60000 },
 ];
 let opened;
 const calls = [];
@@ -61,6 +67,7 @@ const props = {
 	onMarkUnread: (id, unread) => calls.push(`unread:${id}:${unread}`), onMarkCompleted: (id, done) => calls.push(`completed:${id}:${done}`),
 	onMove: (id, section) => calls.push(`move:${id}:${section}`), onSettings() {}, onCollapse() {},
 	onOpenWindow: (id) => { opened = id; },
+	update: null, onUpdate: () => calls.push("update"), recentUsd: null,
 };
 function materialize(node) {
 	if (!node || typeof node !== "object") { return node; }
@@ -89,10 +96,41 @@ function text(node) {
 	return node?.props ? text(node.props.children) : "";
 }
 let tree = render();
+const ago = loaded.exports.ago;
+assert.equal(ago(now - 30000, now), "now");
+assert.equal(ago(now - 5 * 60000, now), "5m");
+assert.equal(ago(now - 3 * 60 * 60000, now), "3h");
+assert.equal(ago(now - 2 * 24 * 60 * 60000, now), new Intl.DateTimeFormat(undefined, { weekday: "short" }).format(now - 2 * 24 * 60 * 60000));
+assert.equal(ago(now - 10 * 24 * 60 * 60000, now), new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(now - 10 * 24 * 60 * 60000));
 assert.equal(findAll(tree, (node) => node.type === "small" && text(node) === "Needs you").length, 2, "pinned and project rows display live approvals despite idle stored status");
 props.activity = {};
 tree = render();
 assert.equal(findAll(tree, (node) => node.type === "small" && text(node) === "Needs you").length, 0, "resolved approvals clear their row badge");
+assert.deepEqual(findAll(tree, (node) => node.props?.className === "session-meta").map(text), ["5m", "feature/sidebar · 3h"], "plain rows show time, and worktree rows also show the branch");
+assert.ok(findAll(tree, (node) => node.props?.className === "session-hit")[0].props.title.endsWith(new Date(sessions[0].createdAt).toLocaleString()), "row hover includes the exact activity date");
+assert.equal(intervals.size, 1, "sidebar has one label refresh interval");
+assert.equal([...intervals.values()][0].delay, 60000);
+now += 60000;
+[...intervals.values()][0].run();
+tree = render();
+assert.equal(text(findAll(tree, (node) => node.props?.className === "session-meta")[0]), "6m", "activity labels refresh while the sidebar stays open");
+const scroller = findAll(tree, (node) => node.props?.className === "session-scroll")[0];
+let focused = 0;
+let prevented = 0;
+const buttons = [0, 1].map((index) => ({ matches: (selector) => selector === "button.session-hit", focus: () => { focused = index; } }));
+const key = (value, target = buttons[focused]) => scroller.props.onKeyDown({ key: value, target, currentTarget: { querySelectorAll: () => buttons }, preventDefault: () => { prevented++; } });
+key("ArrowUp");
+assert.equal(focused, 0, "ArrowUp stops at the first row");
+key("ArrowDown");
+assert.equal(focused, 1, "ArrowDown focuses the next row");
+key("ArrowDown");
+assert.equal(focused, 1, "ArrowDown stops at the last row");
+key("ArrowUp");
+assert.equal(focused, 0, "ArrowUp focuses the previous row");
+assert.equal(prevented, 4);
+key("x");
+key("ArrowDown", { matches: () => false });
+assert.equal(prevented, 4, "other keys and rename inputs keep their own keyboard behavior");
 const secondRow = findAll(tree, (node) => node.props?.onContextMenu && text(node).includes("Second chat"))[0];
 assert.ok(secondRow);
 secondRow.props.onContextMenu({ preventDefault() {}, stopPropagation() {}, currentTarget: { getBoundingClientRect: () => ({ top: 10, left: 10, bottom: 30 }) } });
@@ -159,10 +197,30 @@ async function checkActions() {
 	menuButton("New section").props.onClick();
 	render();
 	assert.ok(JSON.parse(storage.get("grok-code.sections.v1")).some((section) => section.id === "shared"), "adding a section preserves the other window's section");
+	props.update = { latest: "0.2.1" };
+	tree = render();
+	const account = findAll(tree, (node) => node.props?.className === "account-btn")[0];
+	assert.equal(account.props["aria-label"], "Account and settings, version 0.2.1 available");
+	assert.equal(findAll(tree, (node) => node.props?.className === "update-flag")[0].props.children.join(""), "Update available · 0.2.1");
+	account.props.onClick({ currentTarget: { getBoundingClientRect: () => ({ top: 900, left: 10 }) } });
+	tree = render();
+	const accountMenu = findAll(tree, (node) => node.props?.className === "row-pop account-menu")[0];
+	const updateAction = findAll(accountMenu, (node) => node.type === "button")[0];
+	assert.equal(updateAction.props.children.join(""), "Update to 0.2.1…", "update is the first account action");
+	updateAction.props.onClick();
+	tree = render();
+	assert.equal(calls.at(-1), "update");
+	assert.equal(findAll(tree, (node) => node.props?.className === "row-pop account-menu").length, 0, "the account menu closes before opening the update");
+	props.update = null;
+	tree = render();
+	assert.equal(findAll(tree, (node) => node.props?.className === "account-btn")[0].props["aria-label"], "Account and settings");
+	assert.equal(findAll(tree, (node) => node.props?.className === "update-flag").length, 0);
 	effects.forEach((effect) => effect?.cleanup?.());
 	assert.equal(listeners.has("storage"), false, "the shared-section listener is removed on cleanup");
+	assert.equal(intervals.size, 0, "activity refresh stops on cleanup");
 	console.log("Sidebar row actions passed: unread, completed, delete with confirm, Ctrl+click window, sections.");
 	console.log("Sidebar regressions passed: live approval badges, selected new-window identity, cross-window sections.");
+	console.log("Sidebar activity passed: relative labels, worktree branch, minute refresh, arrow focus and cleanup.");
 }
 
 void checkActions().catch((error) => { console.error(error); process.exitCode = 1; });

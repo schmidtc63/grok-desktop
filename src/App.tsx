@@ -31,6 +31,7 @@ import {
 
 type Menu = string | null;
 type ConfirmItem = PendingConfirm & { id: number };
+type Notice = { id: number; text: string };
 type BackgroundWork = Record<string, { tasks: GrokBgTask[]; agents: GrokSubagent[] }>;
 
 const historyKey = "grok-code.history.v1";
@@ -205,6 +206,10 @@ function permissionGroup(mode: PermissionMode) {
 	return mode === "Always-approve" ? "yolo" : mode === "Auto-review" ? "auto" : "ask";
 }
 
+export function sideCap(windowWidth: number, sidebarCollapsed: boolean): number {
+	return Math.max(320, windowWidth - (sidebarCollapsed ? 0 : 268) - 6 - 400);
+}
+
 function folderKey(folder: string) {
 	return folder.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 }
@@ -298,7 +303,39 @@ export function App() {
 	const [sideChats, setSideChats] = useState<Record<string, ChatMessage[]>>({});
 	const [sideAgents, setSideAgents] = useState<Record<string, string>>({});
 	const sideSeen = useRef<Record<string, string>>({});
-	const [notice, setNotice] = useState("");
+	const [notices, setNotices] = useState<Notice[]>([]);
+	const noticeId = useRef(0);
+	const setNotice = useCallback((text: string, fade = false) => {
+		if (!text) { return; }
+		const id = ++noticeId.current;
+		if (fade) {
+			setTimeout(() => setNotices((list) => list.some((item) => item.id === id) ? list.filter((item) => item.id !== id) : list), 4000);
+		}
+		setNotices((list) => [...list.filter((item) => item.text !== text), { id, text }].slice(-3));
+	}, []);
+	const [update, setUpdate] = useState<{ current: string; latest: string; tag: string } | null>(null);
+	const openUpdate = useCallback(async (info: { current: string; latest: string; tag: string } | null) => {
+		const api = window.grokCode;
+		if (!info || !api?.updatePrepare) { return; }
+		try {
+			const prepared = await api.updatePrepare(info.tag);
+			if (prepared.ok && prepared.ready) {
+				const yes = await askConfirm({ title: `Update to version ${info.latest}?`, body: [prepared.notes?.slice(0, 1500), "The app closes, updates and opens again by itself. This takes a minute or two, longer if Electron itself changed. Running Grok replies and terminals stop."].filter(Boolean).join("\n\n"), ok: "Update and restart" });
+				if (yes && api.updateStart) {
+					const result = await api.updateStart(info.tag);
+					if (!result.ok) { setNotice(result.error || "The update could not start."); }
+				}
+			} else {
+				const yes = await askConfirm({ title: `Version ${info.latest} is available`, body: `${prepared.reason || "This copy couldn't be prepared for an update."}\n\nQuit the app, then in its folder run: git pull, npm install, npm run desktop`, ok: "Copy steps" });
+				if (yes) {
+					const result = await api.copyText("git pull\nnpm install\nnpm run desktop");
+					setNotice(result.ok ? "Update steps copied." : result.error || "The steps could not be copied.", result.ok);
+				}
+			}
+		} catch {
+			setNotice("The update could not be prepared. Try again.");
+		}
+	}, [setNotice]);
 	const [shortcuts, setShortcuts] = useState(false);
 	const [rewindAsk, setRewindAsk] = useState<{ sessionId: string; message: ChatMessage; files: string[]; conflicts: string[] } | null>(null);
 	const [branching, setBranching] = useState<string | null>(null);
@@ -329,6 +366,7 @@ export function App() {
 	const [branches, setBranches] = useState<Record<string, BranchInfo | undefined>>({});
 	const [prs, setPrs] = useState<Record<string, PrStatus | undefined>>({});
 	const [comments, setComments] = useState<Record<string, DiffComment[]>>({});
+	const [viewed, setViewed] = useState<Record<string, Record<string, string>>>({});
 	const [diffFile, setDiffFile] = useState("");
 	const [diffTick, setDiffTick] = useState(0);
 	const [remoteTick, setRemoteTick] = useState(0);
@@ -614,7 +652,7 @@ export function App() {
 			}));
 			persistedDrafts.current = editorDrafts;
 			lastSaved.current = { sessions, extraChats, modes, prePlan, editorDrafts, composerDrafts: currentDrafts, queued: currentQueue, attachments: currentAttachments, backgroundWork: currentWork, newSessionDraft, deleted };
-			setNotice((current) => (current === HISTORY_FULL || current === HISTORY_FAILED ? "" : current));
+			setNotices((list) => list.some((item) => item.text === HISTORY_FULL || item.text === HISTORY_FAILED) ? list.filter((item) => item.text !== HISTORY_FULL && item.text !== HISTORY_FAILED) : list);
 			return true;
 		} catch (error) {
 			setNotice(error instanceof DOMException && error.name === "QuotaExceededError" ? HISTORY_FULL : HISTORY_FAILED);
@@ -680,6 +718,12 @@ export function App() {
 		const api = window.grokCode;
 		if (!api) { return; }
 		return api.onEvent((event) => {
+			if (event.type === "update-open" && event.current && event.latest && event.tag) {
+				const info = { current: event.current, latest: event.latest, tag: event.tag };
+				setUpdate(info);
+				void openUpdate(info);
+				return;
+			}
 			if (event.type === "commands" && event.commands) {
 				const list = event.commands;
 				setCommands(list);
@@ -769,7 +813,7 @@ export function App() {
 			}
 			if (event.type === "done" || event.type === "error") {
 				setBusy((current) => ({ ...current, [uiId]: false }));
-				setNotice((current) => (current === SIDE_BUSY ? "" : current));
+				setNotices((list) => list.some((item) => item.text === SIDE_BUSY) ? list.filter((item) => item.text !== SIDE_BUSY) : list);
 				setDiffTick((value) => value + 1);
 				setRemoteTick((value) => value + 1);
 				setFileTick((value) => value + 1);
@@ -846,7 +890,7 @@ export function App() {
 				}
 			}
 		});
-	}, [writeReply]);
+	}, [writeReply, openUpdate]);
 
 	const visible = pending ?? sessions.find((item) => item.id === activeId) ?? sessions.find((item) => !item.archived) ?? sessions[0];
 	const session = visible;
@@ -868,8 +912,9 @@ export function App() {
 	const scope = diffScope[session.id] ?? "uncommitted";
 	const diffOpen = panes.includes("diff");
 	const railOpen = settings.railOpen;
+	const paneWidth = Math.min(settings.sideWidth, sideCap(windowWidth, settings.sidebarCollapsed));
 	// Like Claude's rail, it steps aside when the chat column would get too narrow.
-	const railShown = railOpen && windowWidth - (settings.sidebarCollapsed ? 0 : 260) - (panes.length ? settings.sideWidth : 0) - 280 >= 560;
+	const railShown = railOpen && windowWidth - (settings.sidebarCollapsed ? 0 : 260) - (panes.length ? paneWidth : 0) - 280 >= 560;
 	const model = session.model ?? settings.model;
 	const effort = session.effort ?? settings.effort;
 	const modelInfo = models.find((item) => item.id === model);
@@ -932,6 +977,28 @@ export function App() {
 		if (!load) { return; }
 		void load().then((info) => { if (info?.version) { appVersion.current = info.version; } }).catch(() => {});
 	}, []);
+
+	useEffect(() => {
+		const check = window.grokCode?.updateCheck;
+		if (!check) { return; }
+		let cancelled = false;
+		let timer: ReturnType<typeof setTimeout>;
+		const read = async () => {
+			try {
+				const result = await check();
+				if (!cancelled && result.ok) {
+					setUpdate(result.available && result.current && result.latest && result.tag ? { current: result.current, latest: result.latest, tag: result.tag } : null);
+				}
+			} catch { /* Background checks stay quiet when the origin is unavailable. */ }
+			if (!cancelled) { timer = setTimeout(() => { void read(); }, 6 * 60 * 60 * 1000); }
+		};
+		timer = setTimeout(() => { void read(); }, 15000);
+		return () => { cancelled = true; clearTimeout(timer); };
+	}, []);
+
+	useEffect(() => {
+		void window.grokCode?.updateResult?.().then((result) => { if (result?.message) { setNotice(result.message, result.ok); } }).catch(() => {});
+	}, [setNotice]);
 
 	function createPr() {
 		const api = window.grokCode;
@@ -1471,7 +1538,7 @@ export function App() {
 		}
 		invalidateSuggestion(ask.sessionId);
 		const count = result.revertedFiles?.length ?? 0;
-		setNotice(rewindMode === "conversation_only" ? "Rewound the conversation. Files were left as they are." : `Rewound${rewindMode === "files_only" ? " the files" : ""}. ${count} file${count === 1 ? "" : "s"} restored.`);
+		setNotice(rewindMode === "conversation_only" ? "Rewound the conversation. Files were left as they are." : `Rewound${rewindMode === "files_only" ? " the files" : ""}. ${count} file${count === 1 ? "" : "s"} restored.`, true);
 	}
 
 	async function forkAt(message: ChatMessage) {
@@ -1511,11 +1578,11 @@ export function App() {
 			creatingWorktree.current = true;
 			setNotice("Creating the worktree…");
 			const result = await api.addWorktree(draft.folder, { name, prefix: settingsRef.current.branchPrefix }).finally(() => { creatingWorktree.current = false; });
+			setNotices((list) => list.some((item) => item.text === "Creating the worktree…") ? list.filter((item) => item.text !== "Creating the worktree…") : list);
 			if (!result.ok || !result.folder) {
 				setNotice(result.error || "The worktree could not be created.");
 				return null;
 			}
-			setNotice((current) => current === "Creating the worktree…" ? "" : current);
 			created = { ...draft, folder: result.folder, branch: result.branch ?? draft.branch, worktree: shortPath(result.folder), worktreeFolder: result.folder };
 			setDrafts((current) => ({ ...current, [created.id]: current[draft.id] ?? "" }));
 		}
@@ -1683,7 +1750,7 @@ export function App() {
 			setNotice("Reopen this window to copy.");
 			return;
 		}
-		void api.copyText(text).then((result) => setNotice(result.ok ? label : (result.error || "That could not be copied.")));
+		void api.copyText(text).then((result) => setNotice(result.ok ? label : (result.error || "That could not be copied."), result.ok));
 	}
 
 	function openImage(file: string) {
@@ -1881,6 +1948,11 @@ export function App() {
 		}
 		return map;
 	}, [extraChats, busy]);
+	const taskbarState = useMemo(() => {
+		const states = Object.values(activity);
+		return states.includes("needs-you") ? "needs-you" : states.includes("running") ? "running" : "idle";
+	}, [activity]);
+	useEffect(() => { void window.grokCode?.taskbar?.(taskbarState); }, [taskbarState]);
 
 	function openSessionWindow(id: string) {
 		const api = window.grokCode;
@@ -1967,6 +2039,12 @@ export function App() {
 						}).catch(() => ({ ok: false, error: "That file could not be restored." }));
 					}}
 					comments={diffComments}
+					viewed={viewed[session.id] ?? {}}
+					onViewed={(file, fingerprint) => setViewed((current) => {
+						const mine = { ...(current[session.id] ?? {}) };
+						if (fingerprint) { mine[file] = fingerprint; } else { delete mine[file]; }
+						return { ...current, [session.id]: mine };
+					})}
 					onAddComment={(comment) => setComments((current) => ({ ...current, [session.id]: [...(current[session.id] ?? []), { ...comment, id: crypto.randomUUID() }] }))}
 					onRemoveComment={(commentId) => setComments((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((item) => item.id !== commentId) }))}
 					onSendComments={() => {
@@ -1974,7 +2052,7 @@ export function App() {
 						const text = `Comments on the diff:\n\n${diffComments.map((item) => `- ${item.file}:${item.line}${item.side === "old" ? " (old side, before the change)" : ""} — ${item.text}`).join("\n")}`;
 						if (send(text, false)) { setComments((current) => ({ ...current, [session.id]: [] })); }
 					}}
-					onAskGrok={(text) => { if (send(text, false)) { setNotice("Asked Grok to commit."); } }}
+					onAskGrok={(text) => { if (send(text, false)) { setNotice("Asked Grok to commit.", true); } }}
 					branch={branch?.ok && branch.repo !== false && branch.branch ? { branch: branch.branch, base: branch.base ?? "main", ahead: branch.ahead ?? 0 } : undefined}
 					pr={prInfo?.ok ? (prInfo.pr as PrInfo | null) : prInfo ? null : undefined}
 					prError={prInfo && !prInfo.ok ? prInfo.error : undefined}
@@ -2053,7 +2131,7 @@ export function App() {
 					error={browserError}
 					keepCookies={settings.keepCookies}
 					onKeepCookies={(on) => changeSettings({ keepCookies: on })}
-					onClearData={() => { void Promise.all(["persist:grok-code", "temp:grok-code"].map((partition) => window.grokCode?.clearBrowsingData?.(partition))).then((results) => { const failed = results.find((result) => result && !result.ok); setNotice(failed ? (failed.error || "Browsing data could not be cleared.") : "Browsing data cleared."); }); }}
+					onClearData={() => { void Promise.all(["persist:grok-code", "temp:grok-code"].map((partition) => window.grokCode?.clearBrowsingData?.(partition))).then((results) => { const failed = results.find((result) => result && !result.ok); setNotice(failed ? (failed.error || "Browsing data could not be cleared.") : "Browsing data cleared.", !failed); }); }}
 					linksInBuiltIn={settings.linksInBuiltIn}
 					onLinksInBuiltIn={(on) => changeSettings({ linksInBuiltIn: on, linkAsked: true })}
 					devServers={servers2}
@@ -2077,10 +2155,10 @@ export function App() {
 	function startResize(event: MouseEvent) {
 		event.preventDefault();
 		const startX = event.clientX;
-		const startWidth = settings.sideWidth;
+		const startWidth = paneWidth;
 		let width = startWidth;
 		const move = (moveEvent: globalThis.MouseEvent) => {
-			width = Math.min(Math.max(startWidth - (moveEvent.clientX - startX), 320), Math.max(360, window.innerWidth - 640));
+			width = Math.min(Math.max(startWidth - (moveEvent.clientX - startX), 320), sideCap(window.innerWidth, settings.sidebarCollapsed));
 			if (sideCol.current) { sideCol.current.style.width = `${width}px`; }
 		};
 		const up = () => {
@@ -2159,6 +2237,8 @@ export function App() {
 					onShortcuts={() => setShortcuts(true)}
 					onOpenUrl={(url) => openUrl(url, true)}
 					onSignOut={signOut}
+					update={update}
+					onUpdate={() => { void openUpdate(update); }}
 				/>
 			)}
 			<main className="workspace">
@@ -2501,7 +2581,7 @@ export function App() {
 									</div>
 								)}
 							</div>
-							{notice && <div className="note composer-note" role="status">{notice}<button type="button" className="texty" aria-label="Dismiss" onClick={() => setNotice("")}>×</button></div>}
+							{notices.map((item) => <div key={item.id} className="note composer-note" role="status">{item.text}<button type="button" className="texty" aria-label="Dismiss" onClick={() => setNotices((list) => list.filter((entry) => entry.id !== item.id))}>×</button></div>)}
 						</div>
 					</div>
 					{railShown && (
@@ -2524,7 +2604,7 @@ export function App() {
 					{panes.length > 0 && (
 						<>
 							<div className="splitter" role="separator" aria-orientation="vertical" aria-label="Resize panes" onMouseDown={startResize} />
-							<div className="side-col" ref={sideCol} style={{ width: settings.sideWidth }}>
+							<div className="side-col" ref={sideCol} style={{ width: paneWidth }}>
 								{panes.map((id) => sidePane(id))}
 							</div>
 						</>

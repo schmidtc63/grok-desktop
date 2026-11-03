@@ -9,6 +9,42 @@ const { TerminalHost } = require("../electron/terminal.cjs");
 const events = [];
 const host = new TerminalHost((event) => { events.push(event); }, { flushMs: 0 });
 
+function checkTerminalShell() {
+	const source = fs.readFileSync(path.join(__dirname, "../electron/terminal.cjs"), "utf8");
+	const fallback = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+	const preferred = path.join(os.tmpdir(), "PowerShell", "pwsh.exe");
+	for (const [found, expected] of [
+		[{ status: 0, stdout: `pwsh.exe\r\n${preferred}\r\n` }, preferred],
+		[{ status: 1, stdout: preferred }, fallback],
+		[{ status: 0, stdout: "pwsh.exe\r\nnot-an-executable.txt\r\n" }, fallback],
+	]) {
+		let probes = 0;
+		const sandbox = {
+			module: { exports: {} },
+			process,
+			require: (name) => {
+				if (name === "./agent.cjs") { return { folderProblem: () => "" }; }
+				if (name === "child_process") {
+					return { spawnSync: (command, args, options) => {
+						probes++;
+						assert.equal(command, "where.exe");
+						assert.deepEqual(Array.from(args), ["pwsh.exe"]);
+						assert.equal(options.windowsHide, true);
+						assert.equal(options.timeout, 5000);
+						return found;
+					} };
+				}
+				return require(name);
+			},
+		};
+		vm.runInNewContext(source, sandbox, { filename: "terminal.cjs" });
+		assert.equal(sandbox.module.exports.terminalShell(), expected);
+		assert.equal(sandbox.module.exports.terminalShell(), expected);
+		assert.equal(probes, 1, "the shell lookup is cached, including its fallback");
+	}
+	console.log("PASS terminal prefers an absolute pwsh path, falls back on failed/invalid lookup, and caches the result");
+}
+
 function checkOutputBatching() {
 	const timers = new Map();
 	const batched = [];
@@ -85,6 +121,7 @@ function pidOf(id, name) {
 }
 
 async function main() {
+	checkTerminalShell();
 	checkOutputBatching();
 	const tmp = os.tmpdir();
 	const opened = host.open({ cwd: tmp });

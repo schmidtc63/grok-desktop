@@ -23,13 +23,19 @@ npm run desktop
 
 ## Update
 
-Quit Codewomplers Grok Desktop, then run these commands in its folder:
+Codewomplers Grok Desktop checks its git origin for new versions. When one is out, the account button at the bottom of the sidebar says Update available. Open its menu and choose Update. The app closes, updates and opens again.
+
+Versions before 0.2.0 have no updater. Update them once by hand:
 
 ```powershell
 git pull
 npm install
 npm run desktop
 ```
+
+If the update can't run (local changes, another branch, or your own commits), the app shows these commands instead.
+
+If the app doesn't start after an interrupted update, run `node scripts/update-helper.cjs --recover` in its folder.
 
 ## Tests
 

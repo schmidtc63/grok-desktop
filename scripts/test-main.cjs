@@ -13,6 +13,30 @@ let terminals;
 let written;
 let grokLogouts = 0;
 let readinessChecks = 0;
+const windowStateFile = path.join(root, "window-state.json");
+let windowState;
+let cursorArea = { x: 0, y: 0, width: 1920, height: 1080 };
+let matchingArea = cursorArea;
+let updateCheckResult = { ok: true, available: false, reason: "no-releases" };
+let updatePrepared = { ok: true, ready: true, node: "C:\\Node\\node.exe", from: "1234567" };
+let updateMarker = null;
+let updateMarkerLive = false;
+let updateResult;
+const updateChecks = [];
+const updatePrepares = [];
+const helperCopies = [];
+const children = [];
+const resultFile = path.join(root, "update-result.json");
+const helperApi = {
+	readMarker: () => updateMarker,
+	markerLive: async () => updateMarkerLive,
+	findNode: async () => "C:\\Node\\node.exe",
+	writeAtomic: (file, value) => { assert.equal(file, resultFile); updateResult = value; },
+};
+const updateApi = {
+	checkForUpdate: async (...args) => { updateChecks.push(args); return updateCheckResult; },
+	updatePrepare: async (...args) => { updatePrepares.push(args); return updatePrepared; },
+};
 
 class TestWindow extends EventEmitter {
 	constructor(options) {
@@ -25,12 +49,17 @@ class TestWindow extends EventEmitter {
 		windows.push(this);
 	}
 	close() { this.closes = (this.closes || 0) + 1; }
-	static getAllWindows() { return windows; }
+	static getAllWindows() { return windows.filter((win) => !win.isDestroyed()); }
 	static fromWebContents(contents) { return windows.find((win) => win.webContents === contents) || null; }
-	isDestroyed() { return false; }
+	isDestroyed() { return !!this.destroyed; }
 	setIcon() {}
 	setAppDetails(details) { this.appDetails = details; }
-	show() { this.shown = (this.shown || 0) + 1; }
+	show() { this.shown = (this.shown || 0) + 1; this.maximizedWhenShown = this.isMaximized(); }
+	getNormalBounds() { return this.bounds || { x: this.options.x, y: this.options.y, width: this.options.width, height: this.options.height }; }
+	isMaximized() { return !!this.maximized; }
+	maximize() { this.maximized = true; }
+	setProgressBar(value, options) { this.progress = { value, options }; }
+	setOverlayIcon(image, text) { this.overlay = { image, text }; }
 	isMinimized() { return !!this.minimized; }
 	restore() { this.minimized = false; }
 	focus() { this.focused = (this.focused || 0) + 1; }
@@ -98,8 +127,11 @@ const electron = {
 	app,
 	BrowserWindow: TestWindow,
 	ipcMain: { handle: (name, handler) => handlers.set(name, handler), on: (name, handler) => handlers.set(name, handler) },
-	nativeImage: { createFromPath: () => ({ isEmpty: () => true, getSize: () => ({ width: 640, height: 480 }) }) },
-	screen: { getCursorScreenPoint: () => ({ x: 0, y: 0 }), getDisplayNearestPoint: () => ({ workArea: { x: 0, y: 0, width: 1920, height: 1080 } }) },
+	nativeImage: {
+		createFromPath: () => ({ isEmpty: () => true, getSize: () => ({ width: 640, height: 480 }) }),
+		createFromBitmap: (pixels, options) => ({ pixels, options }),
+	},
+	screen: { getCursorScreenPoint: () => ({ x: cursorArea.x, y: cursorArea.y }), getDisplayNearestPoint: () => ({ workArea: cursorArea }), getDisplayMatching: () => ({ workArea: matchingArea }) },
 	Menu: { buildFromTemplate: (template) => Object.assign([...template], { popup: (options) => popups.push({ template, options }) }), setApplicationMenu: (menu) => { appMenu = menu; } },
 	clipboard: { writeText: (text) => { written = ["clipboard", text]; } },
 	powerMonitor: Object.assign(new EventEmitter(), { onBattery: false, isOnBatteryPower() { return this.onBattery; } }),
@@ -163,11 +195,23 @@ const mainContext = {
 	__dirname: path.join(root, "electron"),
 	process,
 	URL,
+	Buffer,
 	require(name) {
 		if (name === "electron") { return electron; }
 		if (name === "fs") {
 			return {
 				...fs,
+				readFileSync(file, ...rest) {
+					if (file === resultFile) { if (!updateResult) { throw new Error("No update result."); } return JSON.stringify(updateResult); }
+					if (file !== windowStateFile) { return fs.readFileSync(file, ...rest); }
+					if (windowState === undefined) { throw new Error("No saved window state."); }
+					return windowState;
+				},
+				writeFileSync(file, text, ...rest) {
+					if (file === windowStateFile) { windowState = text; } else { fs.writeFileSync(file, text, ...rest); }
+				},
+				copyFileSync: (...args) => helperCopies.push(args),
+				unlinkSync(file) { if (file === resultFile) { updateResult = undefined; } else { throw new Error(`Unexpected unlink ${file}`); } },
 				existsSync: (file) => file === imageFile || fs.existsSync(file),
 				statSync: (file, ...rest) => file === path.join(root, "dist", "index.html") ? { mtimeMs: pageTime } : fs.statSync(file, ...rest),
 				readdirSync: (folder, ...rest) => [startMenu, pinnedFolder].includes(folder) ? Object.keys(shortcuts).filter((file) => path.dirname(file) === folder).map((file) => path.basename(file)) : fs.readdirSync(folder, ...rest),
@@ -177,6 +221,11 @@ const mainContext = {
 			const real = require("child_process");
 			return {
 				...real,
+				spawn(command, args, options) {
+					const child = Object.assign(new EventEmitter(), { unref() { this.unreferenced = true; } });
+					children.push({ command, args, options, child });
+					return child;
+				},
 				spawnSync(command, args, options) {
 					if (!/vite\.js$/.test(args?.[0] ?? "")) { return real.spawnSync(command, args, options); }
 					viteBuilds.push({ command, args, options });
@@ -185,6 +234,8 @@ const mainContext = {
 			};
 		}
 		if (name === "./agent.cjs") { return { AgentHost: TestHost }; }
+		if (name === "./updates.cjs") { return updateApi; }
+		if (name === "../scripts/update-helper.cjs") { return helperApi; }
 		if (name === "./git.cjs") { return { prCreate: (...args) => { written = args; return { ok: true }; }, prMergeWhenReady: (...args) => { written = args; return { ok: true }; }, restoreWorktree: (...args) => { written = args; return { ok: true }; } }; }
 		if (name === "./usage.cjs") { return { taskOutput: (...args) => { written = args; return { ok: true, text: "task output" }; }, subagentTranscript: (...args) => { written = args; return { ok: true, messages: [] }; } }; }
 		if (name === "./diff.cjs") { return {}; }
@@ -252,6 +303,24 @@ async function main() {
 	assert.equal(windows.length, 3);
 	const first = { sender: windows[0].webContents };
 	const second = { sender: windows[1].webContents };
+	const taskbar = handlers.get("grok:taskbar");
+	assert.equal(taskbar(first, "running").ok, true);
+	assert.equal(windows[0].progress.value, 2);
+	assert.equal(windows[0].progress.options.mode, "indeterminate");
+	assert.equal(windows[0].overlay.image, null);
+	assert.equal(taskbar(first, "needs-you").ok, true);
+	assert.equal(windows[0].progress.value, -1);
+	assert.equal(windows[0].overlay.text, "Grok needs you");
+	assert.equal(windows[0].overlay.image.options.width, 16);
+	assert.equal(windows[0].overlay.image.options.height, 16);
+	assert.equal(windows[0].overlay.image.pixels.length, 16 * 16 * 4);
+	assert.equal(taskbar(first, "idle").ok, true);
+	assert.equal(windows[0].progress.value, -1);
+	assert.equal(windows[0].overlay.image, null);
+	const unchangedProgress = windows[0].progress;
+	assert.equal(taskbar(first, "other").ok, false);
+	assert.equal(windows[0].progress, unchangedProgress);
+	assert.equal(taskbar({ sender: new EventEmitter() }, "running").ok, false);
 	assert.equal(handlers.get("grok:open-image")(first, imageFile).ok, true);
 	assert.equal(windows.at(-1).options.parent, windows[0], "an image viewer belongs to the window that opened it");
 	assert.equal(windows.at(-1).navigation.file, imageFile);
@@ -346,6 +415,26 @@ async function main() {
 	assert.equal(api.homeDir, require("node:os").homedir(), "the first session's folder comes from this computer, not a fixed path");
 	api.readiness();
 	assert.deepEqual(written, ["grok:readiness"]);
+	api.updateCheck(true);
+	assert.deepEqual(written, ["grok:update-check", true]);
+	api.updatePrepare("v0.2.0");
+	assert.deepEqual(written, ["grok:update-prepare", "v0.2.0"]);
+	api.updateStart("v0.2.0");
+	assert.deepEqual(written, ["grok:update-start", "v0.2.0"]);
+	api.updateResult();
+	assert.deepEqual(written, ["grok:update-result"]);
+	assert.ok(["check", "prepare", "start", "result"].every((name) => handlers.has(`grok:update-${name}`)), "all update IPC handlers are registered");
+	await handlers.get("grok:update-check")({}, true);
+	assert.equal(updateChecks.at(-1)[2].force, true);
+	await handlers.get("grok:update-check")({}, "true");
+	assert.equal(updateChecks.at(-1)[2].force, false);
+	assert.equal(await handlers.get("grok:update-prepare")({}, "v0.2.0"), updatePrepared);
+	assert.deepEqual(updatePrepares.at(-1), [root, "0.1.0", "v0.2.0"]);
+	updateResult = { ok: true, message: "Updated to version 0.2.0." };
+	assert.equal(handlers.get("grok:update-result")().message, "Updated to version 0.2.0.");
+	assert.equal(handlers.get("grok:update-result")(), null, "the update result is read only once");
+	api.taskbar("running");
+	assert.deepEqual(written, ["grok:taskbar", "running"]);
 	assert.equal((await handlers.get("grok:readiness")()).grok.signedIn, true);
 	assert.equal((await handlers.get("grok:readiness")()).grok.signedIn, true);
 	assert.equal(readinessChecks, 2, "every setup check asks the backend again");
@@ -411,6 +500,8 @@ async function main() {
 	const unload = () => windows[2].webContents.emit("will-prevent-unload", { preventDefault: () => { allowed += 1; } });
 	const settle = async () => { for (let i = 0; i < 5; i += 1) { await Promise.resolve(); } };
 	dialogChoice = 1;
+	assert.equal((await handlers.get("grok:update-start")({}, "v0.2.0")).ok, true);
+	assert.equal((await handlers.get("grok:update-start")({}, "v0.2.0")).error, "An update is already running.");
 	app.emit("before-quit");
 	windows[2].emit("close");
 	unload();
@@ -421,6 +512,7 @@ async function main() {
 	assert.equal(windows[2].closes, undefined);
 	assert.equal(terminals.closed.length, closedBeforeUnload, "a canceled close keeps the window's terminals");
 	assert.equal(terminals.closeAllCalls, 0, "a canceled quit leaves terminals running");
+	assert.equal(vm.runInContext("pendingUpdate", mainContext), null, "Keep window open cancels the pending update too");
 	dialogChoice = 0;
 	windows[2].emit("close");
 	unload();
@@ -450,6 +542,31 @@ async function main() {
 	about.click({}, windows[0]);
 	await settle();
 	assert.deepEqual(written, ["clipboard", app.getVersion()], "Copy version copies after the answer");
+	const updateMenu = appMenu.find((item) => item.label === "Help").submenu.find((item) => item.label === "Check for Updates…");
+	for (const [result, message] of [
+		[{ ok: true, available: false, reason: "up-to-date" }, "You have the latest version (0.1.0)."],
+		[{ ok: true, available: false, reason: "no-releases" }, "No releases were found on this copy's origin."],
+		[{ ok: true, available: false, reason: "not-checkout" }, "This copy isn't a git checkout of the app."],
+		[{ ok: false }, "The update check couldn't reach this copy's origin."],
+	]) {
+		updateCheckResult = result;
+		await updateMenu.click({}, windows[0]);
+		assert.equal(dialogs.at(-1).message, message);
+		assert.equal(updateChecks.at(-1)[2].force, true, "the Help check always bypasses the cache");
+		if (result.reason !== "up-to-date") { assert.match(dialogs.at(-1).detail, /git pull, npm install and npm run desktop/); }
+	}
+	updateCheckResult = { ok: true, available: true, current: "0.1.0", latest: "0.2.0", tag: "v0.2.0" };
+	const updateEvents = [];
+	windows[0].webContents.send = (...args) => updateEvents.push(args);
+	dialogChoice = 1;
+	await updateMenu.click({}, windows[0]);
+	assert.equal(updateEvents.length, 0, "Later leaves the update dialog closed");
+	dialogChoice = 0;
+	await updateMenu.click({}, windows[0]);
+	assert.equal(dialogs.at(-1).message, "Version 0.2.0 is available");
+	assert.deepEqual(Array.from(dialogs.at(-1).buttons), ["Update…", "Later"]);
+	assert.equal(updateEvents.at(-1)[0], "grok:event");
+	assert.deepEqual({ ...updateEvents.at(-1)[1] }, { type: "update-open", current: "0.1.0", latest: "0.2.0", tag: "v0.2.0" });
 
 	const contents = new EventEmitter();
 	contents.setWindowOpenHandler = () => {};
@@ -517,7 +634,32 @@ async function main() {
 	shortcuts[path.join(startMenu, "Pinned today.lnk")] = { target: process.execPath, args: "", appUserModelId: "Grok.Code" };
 	app.emit("will-quit");
 	assert.equal(terminals.closeAllCalls, 1, "a completed quit closes every terminal");
+	assert.equal(helperCopies.length, 0, "a later normal quit does not revive a cancelled update");
 	assert.deepEqual(shortcutWrites.slice(2).map(({ file }) => path.basename(file)), ["Pinned today.lnk"], "a pin made while the app ran is repaired at quit, and repaired shortcuts are not rewritten");
+	updateMarkerLive = true;
+	assert.equal((await handlers.get("grok:update-start")({}, "v0.2.0")).error, "An update is already running.");
+	updateMarkerLive = false;
+	updatePrepared = { ok: true, ready: false, reason: "This copy has changes that aren't committed." };
+	assert.equal((await handlers.get("grok:update-start")({}, "v0.2.0")).error, updatePrepared.reason);
+	updatePrepared = { ok: true, ready: true, node: "C:\\Node\\node.exe", from: "1234567" };
+	const starts = await Promise.all([handlers.get("grok:update-start")({}, "v0.2.0"), handlers.get("grok:update-start")({}, "v0.2.0")]);
+	assert.deepEqual(starts.map((value) => value.ok), [true, false], "two concurrent requests prepare only one update");
+	assert.equal(helperCopies.length, 0, "update-start waits for will-quit to launch the helper");
+	app.emit("will-quit");
+	assert.equal(helperCopies.length, 1);
+	assert.equal(helperCopies[0][0], path.join(root, "scripts", "update-helper.cjs"));
+	assert.match(path.basename(helperCopies[0][1]), /^grok-code-update-[\w-]+\.cjs$/);
+	assert.equal(children.at(-1).command, "C:\\Node\\node.exe");
+	assert.equal(children.at(-1).args[0], helperCopies[0][1]);
+	const updateInput = JSON.parse(children.at(-1).args[1]);
+	assert.deepEqual(updateInput, { appDir: root, tag: "v0.2.0", from: "1234567", fromVersion: "0.1.0", waitPid: process.pid, args: process.argv.slice(1), cwd: process.cwd(), userData: root });
+	assert.deepEqual({ ...children.at(-1).options }, { detached: true, windowsHide: true, stdio: "ignore" });
+	assert.equal(children.at(-1).child.unreferenced, true);
+	children.at(-1).child.emit("error", new Error("Access denied"));
+	assert.match(updateResult.message, /couldn't start: Access denied/);
+	assert.equal(updateResult.ok, false);
+	app.emit("will-quit");
+	assert.equal(helperCopies.length, 1, "the pending update is consumed once");
 	const windowCount = windows.length;
 	const secondCopy = Object.assign(new EventEmitter(), {
 		setPath: app.setPath,
@@ -536,6 +678,8 @@ async function main() {
 		require(name) {
 			if (name === "electron") { return { ...electron, app: secondCopy, ipcMain: { handle: () => {}, on: () => {} } }; }
 			if (name === "./agent.cjs") { return { AgentHost: TestHost }; }
+			if (name === "./updates.cjs") { return updateApi; }
+			if (name === "../scripts/update-helper.cjs") { return helperApi; }
 			if (name === "./usage.cjs") { return { taskOutput: () => ({ ok: true }), subagentTranscript: () => ({ ok: true }) }; }
 			if (name === "./diff.cjs" || name === "./git.cjs" || name === "./files.cjs" || name === "./customize.cjs") { return {}; }
 			if (name === "./terminal.cjs") { return { TerminalHost: class { closeAll() {} } }; }
@@ -544,7 +688,89 @@ async function main() {
 	});
 	assert.equal(secondCopy.quitCalls, 1, "a second copy quits");
 	assert.equal(windows.length, windowCount, "and opens no window of its own");
-	console.log("Main ownership, session bootstrap, folder policy, version bridge, question/plan ownership, close dialog, Browser permission, right-click menu and single-instance checks passed.");
+	const openFirstWindow = (saved) => {
+		for (const win of windows) { win.destroyed = true; }
+		windowState = typeof saved === "string" || saved === undefined ? saved : JSON.stringify(saved);
+		mainContext.createWindow();
+		return windows.at(-1);
+	};
+	const dimensions = (win) => [win.options.x, win.options.y, win.options.width, win.options.height];
+	const normal = openFirstWindow();
+	assert.deepEqual(dimensions(normal), [240, 80, 1440, 920]);
+	assert.deepEqual([normal.options.minWidth, normal.options.minHeight], [1100, 560]);
+	normal.bounds = { x: 80, y: 90, width: 1200, height: 700 };
+	normal.maximized = true;
+	normal.emit("close");
+	assert.deepEqual(JSON.parse(windowState), { ...normal.bounds, maximized: true }, "close saves normal bounds and maximized state");
+	const restored = openFirstWindow(windowState);
+	assert.deepEqual(dimensions(restored), [80, 90, 1200, 700]);
+	restored.webContents.emit("did-finish-load");
+	assert.equal(restored.maximizedWhenShown, true, "the first restored window maximizes before showing");
+	for (const saved of ["{broken", { x: 80, y: 90, width: 1000, height: 700 }]) {
+		assert.deepEqual(dimensions(openFirstWindow(saved)), [240, 80, 1440, 920], "invalid state uses centered defaults");
+	}
+	cursorArea = matchingArea = { x: 0, y: 0, width: 1280, height: 672 };
+	assert.deepEqual(dimensions(openFirstWindow()), [0, 0, 1280, 672], "default size fits a small work area");
+	assert.deepEqual(dimensions(openFirstWindow({ x: 0, y: 0, width: 1600, height: 1000 })), [0, 0, 1280, 672], "oversized saved bounds fit the selected display");
+	assert.deepEqual(dimensions(openFirstWindow({ x: 3000, y: -40, width: 1200, height: 600, maximized: true })), [40, 36, 1200, 600], "an offscreen titlebar uses the cursor display");
+	assert.equal(windows.at(-1).isMaximized(), false);
+	matchingArea = { x: 1920, y: 0, width: 3840, height: 2160 };
+	const secondary = openFirstWindow({ x: 2000, y: 50, width: 2000, height: 1100, maximized: true });
+	assert.deepEqual(dimensions(secondary), [2000, 50, 2000, 1100]);
+	mainContext.createWindow();
+	const later = windows.at(-1);
+	assert.deepEqual(dimensions(later), [0, 0, 1280, 672], "later windows fit and center on the cursor display, not the saved secondary");
+	later.webContents.emit("did-finish-load");
+	assert.equal(later.maximizedWhenShown, false, "later windows do not inherit maximized state");
+	const originalProcess = mainContext.process;
+	const appExe = path.join(root, "node_modules", "electron", "dist", "electron.exe");
+	mainContext.process = { ...process, execPath: appExe };
+	const movedPin = path.join(pinnedFolder, "Moved by Windows.lnk");
+	const unrelatedPin = path.join(pinnedFolder, "Other moved checkout.lnk");
+	shortcuts[movedPin] = { target: appExe.replace("node_modules", "NODE_MODULES.UPDATE-OLD"), args: `"${root}" --build-if-stale`, icon: iconFile, appUserModelId: "Grok.Code" };
+	shortcuts[unrelatedPin] = { target: path.join(root, "other-checkout", "node_modules.update-old", "electron", "dist", "electron.exe"), args: "", appUserModelId: "Grok.Code" };
+	mainContext.repairShortcuts();
+	assert.equal(shortcuts[movedPin].target, appExe, "the next launch repairs a pin Windows followed into node_modules.update-old");
+	assert.match(shortcuts[unrelatedPin].target, /other-checkout/, "another checkout's moved pin is left alone");
+	mainContext.process = originalProcess;
+	const guardRun = async (marker, live) => {
+		const notifications = [];
+		const timers = [];
+		let locks = 0;
+		const guarded = Object.assign(new EventEmitter(), { ...app, requestSingleInstanceLock: () => { locks += 1; return true; }, quitCalls: 0 });
+		guarded.quit = () => { guarded.quitCalls += 1; };
+		const before = { windows: windows.length, dialogs: dialogs.length, builds: viteBuilds.length, children: children.length };
+		vm.runInNewContext(fs.readFileSync(path.join(root, "electron/main.cjs"), "utf8"), {
+			__dirname: path.join(root, "electron"), process: { ...process, argv: [...process.argv, "--build-if-stale"] }, URL, Buffer,
+			setTimeout(callback, delay) { timers.push({ callback, delay }); },
+			require(name) {
+				if (name === "electron") { return { ...electron, app: guarded, ipcMain: { handle() {}, on() {} }, Notification: class { constructor(options) { this.options = options; } show() { notifications.push(this.options); } } }; }
+				if (name === "../scripts/update-helper.cjs") { return { ...helperApi, readMarker: () => marker, markerLive: async () => live }; }
+				return mainContext.require(name);
+			},
+		});
+		for (let i = 0; i < 12; i += 1) { await Promise.resolve(); }
+		assert.equal(locks, 0, "the update guard runs before the single-instance lock");
+		assert.equal(windows.length, before.windows, "an update guard opens no window");
+		assert.equal(dialogs.length, before.dialogs, "an update guard never opens a blocking dialog");
+		assert.equal(viteBuilds.length, before.builds, "an update guard never starts a build");
+		return { guarded, notifications, timers, before };
+	};
+	const liveGuard = await guardRun({ pid: 123, pidStart: 456 }, true);
+	assert.equal(liveGuard.notifications[0].title, "Codewomplers Grok Desktop is updating");
+	assert.equal(liveGuard.timers[0].delay, 1500);
+	assert.equal(liveGuard.guarded.quitCalls, 0);
+	liveGuard.timers[0].callback();
+	assert.equal(liveGuard.guarded.quitCalls, 1, "a live marker only notifies then quits");
+	assert.equal(children.length, liveGuard.before.children, "a live marker starts no recover");
+	const staleGuard = await guardRun({ pid: 123, pidStart: 456 }, false);
+	assert.equal(staleGuard.guarded.quitCalls, 1);
+	assert.equal(staleGuard.notifications.length, 0);
+	assert.equal(children.length, staleGuard.before.children + 1);
+	assert.deepEqual(Array.from(children.at(-1).args), [path.join(root, "scripts", "update-helper.cjs"), "--recover", "--wait", String(process.pid), root]);
+	assert.equal(children.at(-1).child.unreferenced, true);
+	assert.deepEqual({ ...children.at(-1).options }, { cwd: root, detached: true, stdio: "ignore", windowsHide: true });
+	console.log("Main ownership, session bootstrap, folder policy, version bridge, update IPC/dialog/quit/recovery/shortcut, question/plan ownership, close dialog, Browser permission, right-click menu and single-instance checks passed.");
 }
 
 main().catch((error) => { console.error(error); process.exitCode = 1; });

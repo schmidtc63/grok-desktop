@@ -174,6 +174,7 @@ check("Markdown links resolve from the document and preserve line targets and li
 const noop = () => {};
 const asyncOk = async () => ({ ok: true });
 const diffProps = {
+	viewed: {}, onViewed() {},
 	snapshot: { ok: true, files: [{ path: "src/a.ts", additions: 2, deletions: 1, hunks: [hunk] }] },
 	scope: "branch", onScope: noop, commits: [{ sha: "abc123", short: "abc123", subject: "Fix" }],
 	selectedFile: "src/a.ts", onSelectFile: noop, onRefresh: noop, onRevert: asyncOk,

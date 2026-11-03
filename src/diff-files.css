@@ -152,6 +152,18 @@
 }
 .dp-send { margin-left: auto; }
 
+.dp-split { display: block; }
+.dp-nav { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.dp-nav-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.dp-viewed-toggle { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+.dp-viewed { color: var(--green); }
+.dp-progress { margin: 0 0 6px; }
+.pane.dp-review .pane-bd { display: flex; flex-direction: column; overflow: hidden; }
+.pane.dp-review .dp-split { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(200px, 28%) minmax(0, 1fr); gap: 12px; }
+.pane.dp-review .dp-files, .pane.dp-review .dp-body { overflow: auto; min-height: 0; }
+.pane.dp-review .file-list { margin-bottom: 0; }
+.pane.dp-review .dp-nav { position: sticky; top: 0; z-index: 1; background: var(--panel); padding-bottom: 6px; }
+
 /* Files pane: fp- prefix */
 .pane.fp-expanded { position: fixed; inset: 24px; z-index: 20; box-shadow: var(--shadow); }
 .pane.fp-expanded .fp-list { max-height: 20vh; }

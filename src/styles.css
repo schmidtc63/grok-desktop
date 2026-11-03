@@ -955,6 +955,7 @@ select {
 .account-btn .avatar { flex: none; width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; background: var(--accent); color: var(--accent-ink); font-size: 12px; font-weight: 600; }
 .account-btn .who { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .account-btn small { display: block; color: var(--muted); font-size: 11px; }
+.account-btn .update-flag { color: var(--accent); }
 .row-pop.account-menu { min-width: 248px; }
 .account-menu button { display: flex; justify-content: space-between; gap: 16px; }
 .account-menu button small { color: var(--muted); }
@@ -968,7 +969,8 @@ select {
 .session .dot.unread { background: var(--blue); }
 .session .dot.completed { background: transparent; border: 1.5px solid var(--green); }
 .session.unread b { font-weight: 650; }
-.session small { display: block; font-size: 11px; color: var(--amber); }
+.session small.needs-you { display: block; font-size: 11px; color: var(--amber); }
+.session-meta { display: block; font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .inline-name {
 	flex: 1;
 	min-width: 0;
@@ -1133,7 +1135,7 @@ select {
 .md-table th { background: var(--panel-2); }
 
 /* Composer */
-.dock { padding: 0 16px 12px; }
+.dock { padding: 0 clamp(0px, calc((100% - 400px) / 2), 16px) 12px; }
 .dock > .composer, .dock > .side-q, .dock > .composer-note { max-width: 760px; margin-left: auto; margin-right: auto; }
 .composer { border-color: var(--line-strong); border-radius: 16px; padding: 6px 8px; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08); }
 .composer textarea { field-sizing: content; min-height: 48px; max-height: 40vh; }

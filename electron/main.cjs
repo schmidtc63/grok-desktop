@@ -1,4 +1,4 @@
-const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, powerMonitor, powerSaveBlocker, screen, session, shell } = require("electron");
+const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Notification, powerMonitor, powerSaveBlocker, screen, session, shell } = require("electron");
 const { spawn, spawnSync } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -26,6 +26,10 @@ const { TerminalHost } = require("./terminal.cjs");
 const { listFiles, readText, writeText, runCommand, locateFile } = require("./files.cjs");
 const usage = require("./usage.cjs");
 const customize = require("./customize.cjs");
+const updates = require("./updates.cjs");
+const updateHelper = require("../scripts/update-helper.cjs");
+let pendingUpdate = null;
+let startingUpdate = false;
 
 const owners = new Map();
 const terminalOwners = new Map();
@@ -71,7 +75,8 @@ function repairShortcuts() {
 			const file = path.join(folder, name);
 			try {
 				const link = shell.readShortcutLink(file);
-				if (link.appUserModelId === "Grok.Code" && path.resolve(link.target).toLowerCase() === process.execPath.toLowerCase() && (link.args !== args || link.icon?.toLowerCase() !== appIconFile.toLowerCase())) {
+				const target = path.resolve(link.target).replace(/[\\/]node_modules\.update-old[\\/]/i, `${path.sep}node_modules${path.sep}`);
+				if (link.appUserModelId === "Grok.Code" && target.toLowerCase() === process.execPath.toLowerCase() && (path.resolve(link.target).toLowerCase() !== process.execPath.toLowerCase() || link.args !== args || link.icon?.toLowerCase() !== appIconFile.toLowerCase())) {
 					shell.writeShortcutLink(file, "update", { target: process.execPath, args, icon: appIconFile, iconIndex: 0 });
 				}
 			} catch {}
@@ -79,12 +84,32 @@ function repairShortcuts() {
 	}
 }
 
+const windowStateFile = path.join(app.getPath("userData"), "window-state.json");
+function windowPlacement(first) {
+	let saved;
+	try {
+		const value = JSON.parse(fs.readFileSync(windowStateFile, "utf8"));
+		if (value && Number.isFinite(value.width) && Number.isFinite(value.height) && value.width >= 1100 && value.height >= 560 && ((value.x === undefined && value.y === undefined) || (Number.isFinite(value.x) && Number.isFinite(value.y)))) { saved = value; }
+	} catch {}
+	const fit = (area) => ({ width: Math.max(1100, Math.min(saved?.width ?? 1440, area.width)), height: Math.max(560, Math.min(saved?.height ?? 920, area.height)) });
+	if (first && saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
+		const area = screen.getDisplayMatching(saved).workArea;
+		const size = fit(area);
+		if (saved.x >= area.x && saved.y >= area.y && saved.x + size.width <= area.x + area.width && saved.y + 32 <= area.y + area.height) {
+			return { bounds: { ...size, x: Math.min(saved.x, area.x + area.width - size.width), y: Math.min(saved.y, area.y + area.height - size.height) }, maximized: saved.maximized === true };
+		}
+	}
+	const area = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea;
+	const size = fit(area);
+	return { bounds: { ...size, x: Math.round(area.x + (area.width - size.width) / 2), y: Math.round(area.y + (area.height - size.height) / 2) }, maximized: false };
+}
+
 function createWindow(uiSessionId) {
+	const placement = windowPlacement(BrowserWindow.getAllWindows().length === 0);
   const win = new BrowserWindow({
-    width: 1440,
-    height: 920,
+		...placement.bounds,
     minWidth: 1100,
-    minHeight: 720,
+		minHeight: 560,
     show: false,
     backgroundColor: "#161513",
     title: "Codewomplers Grok Desktop",
@@ -122,7 +147,10 @@ function createWindow(uiSessionId) {
 	let asking = false;
 	let leave = false;
 	let closing = false;
-	win.on("close", () => { closing = true; });
+	win.on("close", () => {
+		closing = true;
+		try { fs.writeFileSync(windowStateFile, JSON.stringify({ ...win.getNormalBounds(), maximized: win.isMaximized() })); } catch {}
+	});
 	win.webContents.on("did-finish-load", () => { leave = false; });
 	win.webContents.on("will-prevent-unload", (event) => {
 		const wasClosing = closing;
@@ -143,10 +171,10 @@ function createWindow(uiSessionId) {
 			detail: "Keep the window open to finish saving or to send the queued message. If it closes now, that text is lost.",
 		}).then(({ response }) => {
 			asking = false;
-			if (response !== 0 || win.isDestroyed()) { return; }
+			if (response !== 0 || win.isDestroyed()) { pendingUpdate = null; return; }
 			leave = true;
 			if (wasClosing) { win.close(); } else { win.webContents.reload(); }
-		}, () => { asking = false; });
+		}, () => { asking = false; pendingUpdate = null; });
 	});
 	win.webContents.on("destroyed", stopOwnedTurn);
 	win.webContents.on("render-process-gone", stopOwnedTurn);
@@ -173,6 +201,7 @@ function createWindow(uiSessionId) {
   const reveal = () => {
     if (revealed || win.isDestroyed()) return;
     revealed = true;
+		if (placement.maximized) { win.maximize(); }
     win.show();
   };
   win.webContents.on("did-finish-load", () => {
@@ -403,6 +432,29 @@ ipcMain.handle("grok:attention", (event) => {
 	return { ok: true };
 });
 
+let badge = null;
+function badgeImage() {
+	if (badge) { return badge; }
+	const size = 16;
+	const pixels = Buffer.alloc(size * size * 4);
+	for (let y = 0; y < size; y++) {
+		for (let x = 0; x < size; x++) {
+			const dx = x - 7.5;
+			const dy = y - 7.5;
+			if (dx * dx + dy * dy <= 49) { pixels.set([0x62, 0x8a, 0xe0, 0xff], (y * size + x) * 4); }
+		}
+	}
+	badge = nativeImage.createFromBitmap(pixels, { width: size, height: size });
+	return badge;
+}
+ipcMain.handle("grok:taskbar", (event, state) => {
+	const win = BrowserWindow.fromWebContents(event.sender);
+	if (!win || win.isDestroyed() || !["idle", "running", "needs-you"].includes(state)) { return { ok: false }; }
+	win.setProgressBar(state === "running" ? 2 : -1, state === "running" ? { mode: "indeterminate" } : undefined);
+	win.setOverlayIcon(state === "needs-you" ? badgeImage() : null, state === "needs-you" ? "Grok needs you" : "");
+	return { ok: true };
+});
+
 let awakeId = -1;
 let awakeRequest = null;
 function applyKeepAwake() {
@@ -463,6 +515,32 @@ ipcMain.handle("grok:open-image", (event, file) => {
 });
 
 ipcMain.handle("grok:app-info", () => ({ ok: true, version: app.getVersion(), electron: process.versions.electron }));
+ipcMain.handle("grok:update-check", (_event, force) => updates.checkForUpdate(appDir, app.getVersion(), { force: force === true }));
+ipcMain.handle("grok:update-prepare", (_event, tag) => updates.updatePrepare(appDir, app.getVersion(), tag));
+ipcMain.handle("grok:update-start", async (_event, tag) => {
+	if (pendingUpdate || startingUpdate) { return { ok: false, error: "An update is already running." }; }
+	startingUpdate = true;
+	try {
+		if (await updateHelper.markerLive(updateHelper.readMarker(app.getPath("userData")))) { return { ok: false, error: "An update is already running." }; }
+		const prepared = await updates.updatePrepare(appDir, app.getVersion(), tag);
+		if (!prepared.ok || !prepared.ready) { return { ok: false, error: prepared.reason || "The update isn't ready." }; }
+		pendingUpdate = { tag, from: prepared.from, node: prepared.node };
+		app.quit();
+		return { ok: true };
+	} finally {
+		startingUpdate = false;
+	}
+});
+ipcMain.handle("grok:update-result", () => {
+	const file = path.join(app.getPath("userData"), "update-result.json");
+	try {
+		const result = JSON.parse(fs.readFileSync(file, "utf8"));
+		fs.unlinkSync(file);
+		return result;
+	} catch {
+		return null;
+	}
+});
 ipcMain.handle("grok:context-breakdown", (_event, agentSessionId) => usage.contextBreakdown(String(agentSessionId || "")));
 ipcMain.handle("grok:task-output", (_event, file) => usage.taskOutput(String(file || "")));
 ipcMain.handle("grok:subagent-transcript", (_event, id) => usage.subagentTranscript(String(id || "")));
@@ -499,13 +577,29 @@ function aboutDialog(win) {
 	});
 }
 
+async function checkForUpdates(win) {
+	const result = await updates.checkForUpdate(appDir, app.getVersion(), { force: true });
+	if (result.ok && result.available) {
+		const { response } = await dialog.showMessageBox(win, { type: "info", title: "Check for Updates", message: `Version ${result.latest} is available`, buttons: ["Update…", "Later"], defaultId: 1, cancelId: 1 });
+		if (response === 0 && win && !win.isDestroyed()) { win.webContents.send("grok:event", { type: "update-open", current: result.current, latest: result.latest, tag: result.tag }); }
+		return;
+	}
+	const latest = result.ok && result.reason === "up-to-date";
+	const reason = result.reason === "no-releases" ? "No releases were found on this copy's origin." : result.reason === "not-checkout" ? "This copy isn't a git checkout of the app." : "The update check couldn't reach this copy's origin.";
+	await dialog.showMessageBox(win, {
+		type: "info", title: "Check for Updates",
+		message: latest ? `You have the latest version (${app.getVersion()}).` : reason,
+		...(latest ? {} : { detail: `Codewomplers Grok Desktop updates come from its git checkout.\nVersion ${app.getVersion()}. To update, quit Codewomplers Grok Desktop, then in its folder run git pull, npm install and npm run desktop.` }),
+	});
+}
+
 Menu.setApplicationMenu(Menu.buildFromTemplate([
 	{ label: "File", submenu: [{ label: "New Window", accelerator: "Ctrl+Shift+N", click: () => createWindow() }, { type: "separator" }, { role: "quit" }] },
 	{ role: "editMenu" },
 	{ label: "View", submenu: [{ role: "reload" }, { role: "toggleDevTools" }, { type: "separator" }, { role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" }, { type: "separator" }, { role: "togglefullscreen" }] },
 	{ label: "Help", submenu: [
 		{ label: "About Codewomplers Grok Desktop", click: (_item, win) => aboutDialog(win) },
-		{ label: "Check for Updates…", click: (_item, win) => dialog.showMessageBox(win, { type: "info", title: "Check for Updates", message: "Codewomplers Grok Desktop updates come from its git checkout.", detail: `Version ${app.getVersion()}. To update, quit Codewomplers Grok Desktop, then in its folder run git pull, npm install and npm run desktop.` }) },
+		{ label: "Check for Updates…", click: (_item, win) => checkForUpdates(win) },
 	] },
 ]));
 
@@ -588,9 +682,11 @@ app.on("web-contents-created", (_event, contents) => {
 });
 
 // One running copy per profile, so two copies never write the same saved chats. A second launch shows this one.
-if (!app.requestSingleInstanceLock()) {
-	app.quit();
-} else {
+function startApplication() {
+	if (!app.requestSingleInstanceLock()) {
+		app.quit();
+		return;
+	}
 	// The DevTools port is for local automation only: it opens when GROK_CODE_DEBUG_PORT names one, never by default, since any process on the computer could drive the app through it.
 	if (/^\d+$/.test(process.env.GROK_CODE_DEBUG_PORT || "")) { app.commandLine.appendSwitch("remote-debugging-port", process.env.GROK_CODE_DEBUG_PORT); }
 	app.on("second-instance", () => {
@@ -608,11 +704,52 @@ if (!app.requestSingleInstanceLock()) {
 	app.whenReady().then(repairShortcuts);
 }
 
+const startupMarker = updateHelper.readMarker(app.getPath("userData"));
+if (startupMarker) {
+	void (async () => {
+		if (await updateHelper.markerLive(startupMarker)) {
+			await app.whenReady();
+			new Notification({ title: "Codewomplers Grok Desktop is updating", body: "It opens by itself when it's done." }).show();
+			setTimeout(() => app.quit(), 1500);
+			return;
+		}
+		const node = await updateHelper.findNode();
+		if (node) {
+			const child = spawn(node, [path.join(appDir, "scripts", "update-helper.cjs"), "--recover", "--wait", String(process.pid), app.getPath("userData")], { cwd: appDir, detached: true, stdio: "ignore", windowsHide: true });
+			child.on("error", () => {});
+			child.unref();
+		} else {
+			await app.whenReady();
+			new Notification({ title: "Codewomplers Grok Desktop couldn't recover its update", body: "Node.js isn't on PATH. Open the app's folder and run node scripts/update-helper.cjs --recover." }).show();
+		}
+		app.quit();
+	})();
+} else {
+	startApplication();
+}
+
 // After every window has closed, so a quit that a window's unsaved-text question cancels leaves Grok running.
 app.on("will-quit", () => {
 	terminals.closeAll();
 	host.kill();
 	repairShortcuts();
+	if (pendingUpdate) {
+		const update = pendingUpdate;
+		pendingUpdate = null;
+		const failed = (error) => {
+			try { updateHelper.writeAtomic(path.join(app.getPath("userData"), "update-result.json"), { ok: false, message: `The update couldn't start: ${error.message}. Nothing was updated.` }); } catch {}
+		};
+		try {
+			const helper = path.join(os.tmpdir(), `grok-code-update-${crypto.randomUUID()}.cjs`);
+			fs.copyFileSync(path.join(appDir, "scripts", "update-helper.cjs"), helper);
+			const input = { appDir, tag: update.tag, from: update.from, fromVersion: app.getVersion(), waitPid: process.pid, args: process.argv.slice(1), cwd: process.cwd(), userData: app.getPath("userData") };
+			const child = spawn(update.node, [helper, JSON.stringify(input)], { detached: true, windowsHide: true, stdio: "ignore" });
+			child.on("error", failed);
+			child.unref();
+		} catch (error) {
+			failed(error);
+		}
+	}
 });
 
 app.on("window-all-closed", () => {

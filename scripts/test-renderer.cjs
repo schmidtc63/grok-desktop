@@ -184,12 +184,15 @@ function harness(storage = new Map(), search = "", clock = Date, timers = { setT
 		editDiff: (props) => load("Panes.tsx").EditDiff(props),
 		settingsView: (props) => { component = () => settingsTree(load("Settings.tsx").SettingsPage(props)); dirty = true; return render(); },
 		messageTime: (message) => load("Panes.tsx").messageTime(message),
+		sideCap: (width, collapsed) => load("App.tsx").sideCap(width, collapsed),
 		markdown: (props) => { component = () => load("Markdown.tsx").Markdown(props); dirty = true; return render(); },
 		view: (id, model) => { component = () => { const pane = load("Panes.tsx").PaneView({ id, model }); return pane.type(pane.props); }; dirty = true; return render(); },
 		row: (props) => { component = () => load("Panes.tsx").ToolRow(props); dirty = true; return render(); },
 		group: (props) => { component = () => load("Panes.tsx").ToolGroup(props); dirty = true; return render(); },
 		rail: (props) => { component = () => load("SessionRail.tsx").SessionRail(props); dirty = true; return render(); },
 		diffView: (props) => { component = () => load("DiffPane.tsx").DiffPane(props); dirty = true; return render(); },
+		fileFingerprint: (file) => load("DiffPane.tsx").fileFingerprint(file),
+		canMarkViewed: (file) => load("DiffPane.tsx").canMarkViewed(file),
 		filesView: (props) => { component = () => load("FilesPane.tsx").FilesPane({ ...props, autoSave: false }); dirty = true; return render(); },
 		message: (model, readOnly = false) => { component = () => { const pane = load("Panes.tsx").PaneView({ id: "chat", model }); const chat = pane.type(pane.props); const body = nodes(chat).find((node) => node.type.name === "MessageBody"); return body.type({ ...body.props, readOnly }); }; dirty = true; return render(); },
 		emit: (event) => listener(event),
@@ -203,7 +206,8 @@ function harness(storage = new Map(), search = "", clock = Date, timers = { setT
 			}
 			return find((node) => node.type === "FilesPane").props;
 		},
-		notice: () => [find((node) => node.props.className === "note composer-note")?.props.children].flat()[0],
+		notice: () => [nodes(tree).filter((node) => node.props.className === "note composer-note").at(-1)?.props.children].flat()[0],
+		notices: () => nodes(tree).filter((node) => node.props.className === "note composer-note").map((node) => [node.props.children].flat()[0]),
 		node: find,
 		nodes: (value = tree) => nodes(value),
 	};
@@ -2758,7 +2762,7 @@ async function checkResizeChurn() {
 	app.windowEvent("mouseup");
 	await app.settle();
 	assert.equal(app.settingsWrites.length, baseline + 1, "one settings write commits the drag");
-	assert.equal(JSON.parse(app.storage.get("grok-code.settings.v1")).sideWidth, 960, "the final width is clamped to the real window size");
+	assert.equal(JSON.parse(app.storage.get("grok-code.settings.v1")).sideWidth, 926, "the final width leaves room for the sidebar and chat");
 
 	const resized = harness(new Map(), "", Date, timers);
 	resized.window.innerWidth = 1600;
@@ -2774,6 +2778,218 @@ async function checkResizeChurn() {
 	timers.advance(1);
 	await resized.settle();
 	assert.equal(resized.node((node) => node.type === "SessionRail"), undefined, "the new width takes effect after 100 ms");
+}
+
+async function checkSmallUiBatch() {
+	const timers = controlledTimers();
+	const app = await composerWindow(timers);
+	const add = (text) => { app.sidebar().onNotice(text); app.render(); };
+	add("First error");
+	add("Second error");
+	same(app.notices(), ["First error", "Second error"]);
+	add("Third error");
+	add("Fourth error");
+	same(app.notices(), ["Second error", "Third error", "Fourth error"], "only the newest three notices remain");
+	add("Third error");
+	same(app.notices(), ["Second error", "Fourth error", "Third error"], "duplicate text moves to the newest position");
+	const oldest = app.nodes().find((node) => node.props.className === "note composer-note");
+	app.nodes(oldest).find((node) => node.type === "button").props.onClick();
+	app.render();
+	same(app.notices(), ["Fourth error", "Third error"], "dismiss removes only its own notice");
+
+	app.api.copyText = async () => ({ ok: true });
+	const taskbar = [];
+	app.api.taskbar = async (state) => { taskbar.push(state); return { ok: true }; };
+	sendPrompt(app, "A streamed reply");
+	await app.settle();
+	const id = app.model().session.id;
+	const turnId = app.sends.at(-1).turnId;
+	app.model().copyText("Copy this");
+	await app.settle();
+	app.emit({ type: "chunk", uiSessionId: id, turnId, text: "First" });
+	await app.settle();
+	timers.advance(2000);
+	await app.settle();
+	add("Persistent error");
+	app.emit({ type: "chunk", uiSessionId: id, turnId, text: " second" });
+	await app.settle();
+	timers.advance(1999);
+	await app.settle();
+	assert.ok(app.notices().includes("Copied."));
+	timers.advance(1);
+	await app.settle();
+	assert.ok(!app.notices().includes("Copied."), "unrelated notices and successful history checkpoints do not extend the fade");
+	assert.ok(app.notices().includes("Persistent error"));
+	same(taskbar, ["running"], "streamed chunks do not repeat taskbar IPC");
+	app.emit({ type: "tool", uiSessionId: id, turnId, tool: { id: "approval", title: "Edit", waiting: true } });
+	await app.settle();
+	app.emit({ type: "tool", uiSessionId: id, turnId, tool: { id: "approval", waiting: false } });
+	await app.settle();
+	app.emit({ type: "done", uiSessionId: id, turnId });
+	await app.settle();
+	same(taskbar, ["running", "needs-you", "running", "idle"]);
+	app.storage.failWrites = "quota";
+	app.sidebar().onRename(id, "Save failure");
+	await app.settle();
+	assert.ok(app.notices().some((text) => text.startsWith("Chat history is full")));
+	add("Keep reading this");
+	app.storage.failWrites = false;
+	app.sidebar().onRename(id, "Save recovered");
+	await app.settle();
+	assert.ok(!app.notices().some((text) => text.startsWith("Chat history is full")), "recovery clears an older history warning");
+	assert.equal(app.notice(), "Keep reading this");
+
+	app.sidebar().onNewIn({ folder: "C:/project", project: "project", branch: "main", worktree: "project", environment: "Local" });
+	await app.settle();
+	app.node((node) => node.props.className === "toggle field-toggle").props.children[0].props.onChange({ target: { checked: true } });
+	let failWorktree;
+	app.api.addWorktree = () => new Promise((resolve) => { failWorktree = resolve; });
+	sendPrompt(app, "Try this worktree");
+	await app.settle();
+	assert.ok(app.notices().includes("Creating the worktree…"));
+	failWorktree({ ok: false, error: "Worktree failed" });
+	await app.settle();
+	assert.ok(!app.notices().includes("Creating the worktree…"));
+	assert.equal(app.notice(), "Worktree failed");
+
+	const sizing = harness(new Map([["grok-code.settings.v1", JSON.stringify({ sideWidth: 560, railOpen: false })]]), "", Date, timers);
+	sizing.window.innerWidth = 1100;
+	await sizing.settle();
+	sizing.editor();
+	await sizing.settle();
+	assert.equal(sizing.sideCap(1100, false), 426);
+	assert.equal(sizing.sideCap(1100, true), 694);
+	const side = () => sizing.node((node) => node.props.className === "side-col");
+	assert.equal(side().props.style.width, 426);
+	assert.equal(JSON.parse(sizing.storage.get("grok-code.settings.v1")).sideWidth, 560, "narrowing does not change the saved preference");
+	sizing.node((node) => node.props["aria-label"] === "Resize panes").props.onMouseDown({ clientX: 1000, preventDefault() {} });
+	sizing.windowEvent("mousemove", { clientX: 0 });
+	sizing.windowEvent("mouseup");
+	await sizing.settle();
+	assert.equal(side().props.style.width, 426, "the drag uses the same cap as rendering");
+	assert.equal(JSON.parse(sizing.storage.get("grok-code.settings.v1")).sideWidth, 560, "a drag stopped at the existing cap does not overwrite the preference");
+	sizing.window.innerWidth = 1600;
+	sizing.windowEvent("resize");
+	timers.advance(100);
+	await sizing.settle();
+	assert.equal(side().props.style.width, 560, "widening restores the saved preference");
+	sizing.window.innerWidth = 1100;
+	sizing.windowEvent("resize");
+	timers.advance(100);
+	sizing.sidebar().onCollapse();
+	await sizing.settle();
+	sizing.node((node) => node.props["aria-label"] === "Resize panes").props.onMouseDown({ clientX: 1000, preventDefault() {} });
+	sizing.windowEvent("mousemove", { clientX: 1001 });
+	sizing.windowEvent("mouseup");
+	await sizing.settle();
+	assert.equal(side().props.style.width, 559, "a one-pixel drag with the sidebar collapsed does not jump");
+}
+
+async function checkReviewWorkspace() {
+	const app = await composerWindow();
+	const ordinary = (path, id) => ({ path, additions: 1, deletions: 0, hunks: [{ id, loc: "@@ -1 +1,2 @@", lines: [{ kind: "context", text: "Original" }, { kind: "add", text: "Added" }] }] });
+	const snapshot = { ok: true, truncated: true, files: [ordinary("a.txt", "a-1"), ordinary("b.txt", "b-1"), { path: "conflict.txt", hunks: [{ id: "conflict-1", loc: "Conflict", reviewable: false, lines: [{ kind: "context", text: "Unresolved" }] }] }] };
+	app.api.diff = async () => snapshot;
+	app.key({ key: "d", ctrlKey: true, shiftKey: true });
+	await app.settle();
+	const props = () => app.node((node) => node.type === "DiffPane").props;
+	const source = app.model().session.id;
+	const view = harness();
+	const update = async () => { await app.settle(); view.diffView(props()); };
+	await update();
+	assert.equal(view.fileFingerprint({ hunks: [{ id: "one" }, { id: "two" }] }), "one\ntwo");
+	assert.equal(view.canMarkViewed(snapshot.files[0]), true);
+	assert.equal(view.canMarkViewed(snapshot.files[2]), false);
+	const progress = () => textOf(view.node((node) => node.props.className === "meta dp-progress"));
+	const viewed = () => view.node((node) => node.type === "input" && node.props.type === "checkbox");
+	const section = () => view.node((node) => node.type === "section" && node.props["aria-label"] === "Changes");
+	const sectionKey = (key, target = "SECTION") => section().props.onKeyDown({ key, altKey: true, defaultPrevented: false, target: { tagName: target }, preventDefault() {} });
+	assert.equal(progress(), "0 of 3 viewed · more files were left out");
+	assert.equal(button(view, "‹ Previous").props.disabled, true);
+	const scrollers = [];
+	// The side scroller's top is at 100; the diff's Previous / Next bar is 600 px above it, so the bar sits at scrollTop 300.
+	const side = { scrollTop: 900, getBoundingClientRect: () => ({ top: 100 }) };
+	let barTop = -500;
+	view.node((node) => node.props.className === "dp-body").props.ref.current = { scrollTo: () => scrollers.push("diff"), getBoundingClientRect: () => ({ top: barTop }) };
+	section().props.ref.current = { focus() {}, querySelector: () => side };
+	button(view, "Next ›").props.onClick();
+	await update();
+	assert.equal(props().selectedFile, "b.txt");
+	same(scrollers, ["diff"], "a new file resets the Review diff scroller");
+	assert.equal(side.scrollTop, 300, "a reader below the bar in the side pane returns to the bar, not to the list");
+	side.scrollTop = 0;
+	barTop = 400;
+	button(view, "‹ Previous").props.onClick();
+	await update();
+	assert.equal(side.scrollTop, 0, "a reader at the list stays at the list");
+	sectionKey("ArrowDown", "TEXTAREA");
+	await update();
+	assert.equal(props().selectedFile, "a.txt", "typing does not navigate files");
+	sectionKey("ArrowDown");
+	await update();
+	assert.equal(props().selectedFile, "b.txt");
+	sectionKey("ArrowUp");
+	await update();
+	viewed().props.onChange();
+	await update();
+	assert.equal(props().viewed["a.txt"], "a-1");
+	assert.equal(viewed().props.checked, true);
+	assert.equal(progress(), "1 of 3 viewed · more files were left out");
+	assert.ok(view.node((node) => node.props["aria-label"] === "Viewed"));
+	viewed().props.onChange();
+	await update();
+	assert.equal(props().viewed["a.txt"], undefined, "unticking clears the file fingerprint");
+	viewed().props.onChange();
+	await update();
+	snapshot.files[0] = ordinary("a.txt", "a-2");
+	props().onRefresh();
+	await update();
+	assert.equal(viewed().props.checked, false, "a changed hunk loses Viewed");
+	assert.equal(progress(), "0 of 3 viewed · more files were left out");
+
+	const review = () => button(view, "Review in a large view");
+	assert.equal(review().props["aria-pressed"], false);
+	button(view, "Comment on line 1").props.onClick();
+	view.render();
+	view.node((node) => node.type === "textarea").props.onChange({ target: { value: "Retained draft" } });
+	view.render();
+	review().props.onClick();
+	view.render();
+	assert.equal(section().props.className, "pane fp-expanded dp-review");
+	assert.ok(view.node((node) => node.props.className === "fp-backdrop"));
+	assert.equal(view.node((node) => node.type === "textarea").props.value, "Retained draft");
+	button(view, "Return Changes to the side").props.onClick();
+	view.render();
+	assert.equal(view.node((node) => node.type === "textarea").props.value, "Retained draft", "toggle retains the comment draft without a remount");
+	review().props.onClick();
+	view.render();
+	let stopped = false;
+	view.node((node) => node.type === "textarea").props.onKeyDown({ key: "Escape", nativeEvent: { isComposing: false }, preventDefault() {}, stopPropagation() { stopped = true; } });
+	view.render();
+	assert.equal(stopped, true);
+	assert.equal(view.node((node) => node.type === "textarea"), undefined);
+	assert.equal(section().props.className, "pane fp-expanded dp-review", "comment Escape keeps the Review view");
+	sectionKey("Escape");
+	view.render();
+	assert.equal(section().props.className, "pane");
+	review().props.onClick();
+	view.render();
+	view.node((node) => node.props.className === "fp-backdrop").props.onClick();
+	view.render();
+	assert.equal(section().props.className, "pane");
+	props().onSelectFile("conflict.txt");
+	await update();
+	assert.equal(viewed().props.disabled, true);
+	assert.equal(button(view, "Next ›").props.disabled, true);
+	props().onViewed("a.txt", "a-2");
+	await app.settle();
+	const next = await startSession(app, "Another review session");
+	assert.notEqual(next, source);
+	same(props().viewed, {}, "Viewed marks are isolated per session");
+	app.sidebar().onSelect(source);
+	await app.settle();
+	assert.equal(props().viewed["a.txt"], "a-2", "returning to the session retains its marks");
+	assert.equal(savedHistory(app).viewed, undefined, "Viewed is not saved to history");
 }
 
 async function checkCommitButtons() {
@@ -3593,6 +3809,85 @@ async function checkConfirmActions() {
 	}
 }
 
+async function checkAppUpdates() {
+	const timers = controlledTimers();
+	const app = harness(new Map(), "", Date, timers);
+	const info = { current: "0.2.0", latest: "0.2.1", tag: "v0.2.1" };
+	let checks = 0;
+	let checked = { ok: true, available: true, ...info };
+	app.api.updateCheck = async () => { checks++; return checked; };
+	await app.settle();
+	assert.equal(app.sidebar().update, null);
+	timers.advance(14999);
+	await app.settle();
+	assert.equal(checks, 0, "the background check waits 15 seconds");
+	timers.advance(1);
+	await app.settle();
+	assert.equal(checks, 1);
+	same(app.sidebar().update, info);
+	checked = { ok: false };
+	timers.advance(6 * 60 * 60 * 1000);
+	await app.settle();
+	assert.equal(checks, 2, "a background check repeats after six hours");
+	same(app.sidebar().update, info, "an offline check keeps the existing update");
+	checked = { ok: true, available: false, reason: "up-to-date" };
+	timers.advance(6 * 60 * 60 * 1000);
+	await app.settle();
+	assert.equal(app.sidebar().update, null, "a successful check clears an unavailable update");
+
+	const prepared = [];
+	const started = [];
+	app.api.updatePrepare = async (tag) => { prepared.push(tag); return { ok: true, ready: true, notes: `${"N".repeat(1500)} OMITTED`, ...info }; };
+	app.api.updateStart = async (tag) => { started.push(tag); return { ok: false, error: "The copy changed before restart." }; };
+	app.emit({ type: "update-open", ...info });
+	await app.settle();
+	same(app.sidebar().update, info, "Help can open the update before the timed check found it");
+	let dialog = app.node((node) => node.props.role === "alertdialog");
+	assert.equal(dialog.props["aria-label"], "Update to version 0.2.1?");
+	assert.ok(textOf(dialog).includes("N".repeat(1500)));
+	assert.ok(!textOf(dialog).includes("OMITTED"), "notes stop at 1500 characters");
+	assert.ok(textOf(dialog).includes("Running Grok replies and terminals stop."));
+	button(app, "Cancel").props.onClick();
+	await app.settle();
+	assert.deepEqual(started, [], "cancel does not begin an update");
+	app.sidebar().onUpdate();
+	await app.settle();
+	button(app, "Update and restart").props.onClick();
+	await app.settle();
+	assert.deepEqual(prepared, ["v0.2.1", "v0.2.1"]);
+	assert.deepEqual(started, ["v0.2.1"]);
+	assert.equal(app.notice(), "The copy changed before restart.");
+
+	const copied = [];
+	app.api.copyText = async (text) => { copied.push(text); return { ok: true }; };
+	app.api.updatePrepare = async () => ({ ok: true, ready: false, reason: "This copy has changes that aren't committed." });
+	app.sidebar().onUpdate();
+	await app.settle();
+	dialog = app.node((node) => node.props.role === "alertdialog");
+	assert.equal(dialog.props["aria-label"], "Version 0.2.1 is available");
+	assert.ok(textOf(dialog).includes("This copy has changes that aren't committed."));
+	assert.ok(textOf(dialog).includes("Quit the app, then in its folder run: git pull, npm install, npm run desktop"));
+	button(app, "Copy steps").props.onClick();
+	await app.settle();
+	assert.deepEqual(copied, ["git pull\nnpm install\nnpm run desktop"]);
+	assert.equal(app.node((node) => node.props.role === "alertdialog"), undefined, "Copy steps closes the only update dialog");
+	for (const ok of [true, false]) {
+		const resultTimers = controlledTimers();
+		const resultApp = harness(new Map(), "", Date, resultTimers);
+		let reads = 0;
+		const message = ok ? "Updated to version 0.2.1." : "The update was interrupted. The previous version was restored.";
+		resultApp.api.updateResult = async () => { reads++; return { ok, message }; };
+		await resultApp.settle();
+		assert.equal(resultApp.notice(), message);
+		resultApp.sidebar().onNotice("Another notice");
+		await resultApp.settle();
+		assert.equal(reads, 1, "the startup result is consumed once");
+		resultTimers.advance(4000);
+		await resultApp.settle();
+		assert.equal(resultApp.notices().includes(message), !ok, "success fades while a failed update stays visible");
+	}
+}
+
 async function main() {
 	const codeBlocks = harness();
 	for (const lang of ["bash", "sh", "shell", "zsh", "cmd", "bat", "console", "powershell", "pwsh", "ps1", "ps"]) {
@@ -3649,6 +3944,7 @@ async function main() {
 	await checkSteer();
 	await checkStreamHistorySaves();
 	await checkResizeChurn();
+	await checkSmallUiBatch();
 	await checkRefreshScopes();
 	await checkSavedThinkingAndLegacySettings();
 	await checkBackgroundWorkHistory();
@@ -3660,10 +3956,12 @@ async function main() {
 	await checkFileListIdentityAndLimit();
 	await checkModeRestartWarnings();
 	await checkCommitButtons();
+	await checkReviewWorkspace();
 	await checkEditorLanguagesAndSettings();
 	await checkCodeEditorIntegration();
 	await checkConfirmHostAndQueue();
 	await checkConfirmActions();
+	await checkAppUpdates();
 	console.log("Renderer turn and tool-row checks passed: parallel sessions, per-session drafts, queue and Send now, side chat, turn ids, interrupted replies, session order and delete, lost Grok sessions, mode events and folder modes, plan/question/always answers, saved history size, Grok commands/MCP/usage/attachments/settings, and tool rows.");
 }
 

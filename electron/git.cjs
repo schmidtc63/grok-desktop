@@ -27,14 +27,14 @@ function stop(child) {
 	}
 }
 
-function run(command, args, cwd, timeout, maxBytes = MAX_BYTES) {
+function run(command, args, cwd, timeout, maxBytes = MAX_BYTES, options = {}) {
 	return new Promise((resolve) => {
 		let settled = false;
 		let size = 0;
 		let err = "";
 		const chunks = [];
 		const result = (extra) => ({ code: -1, out: Buffer.concat(chunks).toString("utf8"), err, truncated: size > maxBytes, timedOut: false, missing: false, ...extra });
-		const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1", NO_COLOR: "1", GROK_CODE_EMPTY: "", GROK_CODE_FALSE: "false" };
+		const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1", NO_COLOR: "1", GROK_CODE_EMPTY: "", GROK_CODE_FALSE: "false", ...options.env };
 		let child;
 		try {
 			child = spawn(command, args, { cwd, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
@@ -75,7 +75,7 @@ function run(command, args, cwd, timeout, maxBytes = MAX_BYTES) {
 // A repo's own core.fsmonitor program never runs from here.
 // core.hooksPath stops hook files only; a hook set in config ignores it, so the event an index refresh fires is off too.
 function git(args, cwd, timeout = GIT_TIMEOUT, options = {}) {
-	return run("git", ["-c", "core.fsmonitor=false", "-c", "log.showSignature=false", "-c", "diff.suppressBlankEmpty=false", ...(!options.hooks ? ["-c", `core.hooksPath=${os.devNull}`, "-c", "hook.post-index-change.enabled=false"] : []), ...args], cwd, timeout, options.maxBytes);
+	return run("git", ["-c", "core.fsmonitor=false", "-c", "log.showSignature=false", "-c", "diff.suppressBlankEmpty=false", ...(!options.hooks ? ["-c", `core.hooksPath=${os.devNull}`, "-c", "hook.post-index-change.enabled=false"] : []), ...args], cwd, timeout, options.maxBytes, options);
 }
 
 // Tracked and untracked files, relative to cwd; ignored and deleted files are left out.
@@ -421,4 +421,4 @@ async function removeWorktree(cwd, folder, options) {
 	return removed.code === 0 ? { ok: true, dirty } : { ...failure(removed, "Git"), dirty };
 }
 
-module.exports = { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, run };
+module.exports = { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, run, git };

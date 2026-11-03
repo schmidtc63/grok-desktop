@@ -23,6 +23,8 @@ export interface DiffPaneProps {
 	onRefresh: () => void;
 	onRevert: (file: string) => Promise<{ ok: boolean; error?: string }>;
 	comments: DiffComment[];
+	viewed: Record<string, string>;
+	onViewed: (file: string, fingerprint: string | null) => void;
 	onAddComment: (comment: Omit<DiffComment, "id">) => void;
 	onRemoveComment: (id: string) => void;
 	onSendComments: () => void;
@@ -71,6 +73,14 @@ export function checksSummary(checks: PrInfo["checks"]): string {
 		return count > 0 ? `${count} ${CHECK_LABEL[state]}` : ``;
 	}).filter((part) => part !== ``);
 	return parts.length > 0 ? parts.join(` · `) : `No checks`;
+}
+
+export function fileFingerprint(file: DiffFile): string {
+	return file.hunks.map((hunk) => hunk.id).join(`\n`);
+}
+
+export function canMarkViewed(file: DiffFile): boolean {
+	return file.hunks.some((hunk) => hunk.reviewable !== false);
 }
 
 function prStateLabel(pr: PrInfo): string {
@@ -181,6 +191,32 @@ export function DiffPane(props: DiffPaneProps) {
 	const files = snapshot?.files ?? [];
 	const selected = files.some((file) => file.path === selectedFile) ? selectedFile : files[0]?.path ?? ``;
 	const current = files.find((file) => file.path === selected);
+	const [review, setReview] = useState(false);
+	const paneRef = useRef<HTMLElement>(null);
+	const bodyRef = useRef<HTMLDivElement>(null);
+	const index = files.findIndex((file) => file.path === selected);
+	const isViewed = (file: DiffFile) => props.viewed[file.path] === fileFingerprint(file);
+	const viewedCount = files.filter(isViewed).length;
+	useEffect(() => { if (review) { paneRef.current?.focus(); } }, [review]);
+	useEffect(() => {
+		bodyRef.current?.scrollTo?.({ top: 0 });
+		// In the side pane the list sits above the diff: a reader below the Previous / Next bar goes back up to it, one still at the list stays there.
+		const scroller = paneRef.current?.querySelector<HTMLDivElement>(`.pane-bd`);
+		const bar = bodyRef.current?.getBoundingClientRect?.().top;
+		if (scroller && bar !== undefined) {
+			const top = scroller.scrollTop + bar - scroller.getBoundingClientRect().top;
+			if (scroller.scrollTop > top) { scroller.scrollTop = top; }
+		}
+	}, [selected]);
+
+	function go(step: 1 | -1) {
+		const next = files[index + step];
+		if (next) { onSelectFile(next.path); }
+	}
+
+	function toggleViewed(file: DiffFile) {
+		props.onViewed(file.path, isViewed(file) ? null : fileFingerprint(file));
+	}
 
 	function revert() {
 		setMenu(null);
@@ -279,13 +315,26 @@ export function DiffPane(props: DiffPaneProps) {
 	}
 
 	return (
+		<>
+		{review && <div className="fp-backdrop" aria-hidden="true" onClick={() => setReview(false)} />}
 		<section
-			className="pane"
+			ref={paneRef}
+			className={review ? `pane fp-expanded dp-review` : `pane`}
 			aria-label="Changes"
 			tabIndex={-1}
 			onKeyDown={(event) => {
 				if (event.key === `Escape` && menu) {
 					setMenu(null);
+					return;
+				}
+				const typing = (event.target as HTMLElement).tagName === `TEXTAREA` || (event.target as HTMLElement).tagName === `SELECT`;
+				if (event.key === `Escape` && review && !event.defaultPrevented) {
+					setReview(false);
+					return;
+				}
+				if (!typing && event.altKey && (event.key === `ArrowDown` || event.key === `ArrowUp`)) {
+					event.preventDefault();
+					go(event.key === `ArrowDown` ? 1 : -1);
 					return;
 				}
 				if (event.ctrlKey && event.key === `Enter` && comments.length > 0) {
@@ -304,6 +353,7 @@ export function DiffPane(props: DiffPaneProps) {
 					))}
 				</select>
 				<span className="spacer" />
+				<button className="icon-btn" aria-label={review ? `Return Changes to the side` : `Review in a large view`} title={review ? `Return to the side (Esc)` : `Review`} aria-pressed={review} onClick={() => setReview((value) => !value)}>{review ? `⤡` : `⤢`}</button>
 				<button className="icon-btn" aria-label="Changes menu" aria-haspopup="menu" onClick={(event) => setMenu(menuSpot(event))}>⋮</button>
 				<button className="pane-x" aria-label="Close pane" onClick={onClose}>×</button>
 			</div>
@@ -331,23 +381,40 @@ export function DiffPane(props: DiffPaneProps) {
 					</div>
 				)}
 				{files.length > 0 && (
-					<div className="file-list">
-						{files.map((file) => (
-							<button
-								key={file.path}
-								className={file.path === selected ? `file-row on` : `file-row`}
-								title={file.path}
-								onClick={() => onSelectFile(file.path)}
-								onDoubleClick={() => onOpenFile(file.path)}
-								onContextMenu={(event) => { event.preventDefault(); onFileMenu(file.path, event); }}
-							>
-								<span>{file.path}</span>
-								{file.additions !== undefined && file.deletions !== undefined && <span className="dp-stat"><span className="dp-adds">+{file.additions}</span> <span className="dp-dels">−{file.deletions}</span></span>}
-							</button>
-						))}
+					<div className="dp-split">
+						<div className="dp-files">
+							<p className="meta dp-progress">{viewedCount} of {files.length} viewed{snapshot?.truncated ? ` · more files were left out` : ``}</p>
+							<div className="file-list">
+								{files.map((file) => (
+									<button
+										key={file.path}
+										className={file.path === selected ? `file-row on` : `file-row`}
+										title={file.path}
+										onClick={() => onSelectFile(file.path)}
+										onDoubleClick={() => onOpenFile(file.path)}
+										onContextMenu={(event) => { event.preventDefault(); onFileMenu(file.path, event); }}
+									>
+										<span>{isViewed(file) && <span className="dp-viewed" aria-label="Viewed">✓ </span>}{file.path}</span>
+										{file.additions !== undefined && file.deletions !== undefined && <span className="dp-stat"><span className="dp-adds">+{file.additions}</span> <span className="dp-dels">−{file.deletions}</span></span>}
+									</button>
+								))}
+							</div>
+						</div>
+						<div className="dp-body" ref={bodyRef}>
+							{current && (
+								<div className="dp-nav">
+									<button className="texty" disabled={index <= 0} onClick={() => go(-1)} title="Previous file (Alt+Up)">‹ Previous</button>
+									<button className="texty" disabled={index < 0 || index >= files.length - 1} onClick={() => go(1)} title="Next file (Alt+Down)">Next ›</button>
+									<span className="dp-nav-path" title={current.path}>{current.path}</span>
+									<label className="dp-viewed-toggle" title={canMarkViewed(current) ? undefined : `This entry has no content to review`}>
+										<input type="checkbox" checked={isViewed(current)} disabled={!canMarkViewed(current)} onChange={() => toggleViewed(current)} /> Viewed
+									</label>
+								</div>
+							)}
+							{current?.hunks.map((hunk) => renderHunk(current.path, hunk))}
+						</div>
 					</div>
 				)}
-				{current?.hunks.map((hunk) => renderHunk(current.path, hunk))}
 			</div>
 			{comments.length > 0 && (
 				<div className="dp-foot">
@@ -356,5 +423,6 @@ export function DiffPane(props: DiffPaneProps) {
 				</div>
 			)}
 		</section>
+		</>
 	);
 }

@@ -13,6 +13,15 @@ const MAX_HISTORY = 200000;
 // as UTF-8. Interactive mode also prints the prompt and echoes each input line.
 const INIT = "[Console]::InputEncoding = [Console]::OutputEncoding = $OutputEncoding = [Text.UTF8Encoding]::new($false)";
 
+let shellPath = null;
+function terminalShell() {
+	if (shellPath) { return shellPath; }
+	const found = spawnSync("where.exe", ["pwsh.exe"], { encoding: "utf8", windowsHide: true, timeout: 5000 });
+	const first = found.status === 0 ? String(found.stdout || "").split(/\r?\n/).map((line) => line.trim()).find((line) => /\.exe$/i.test(line) && path.isAbsolute(line)) : "";
+	shellPath = first || path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+	return shellPath;
+}
+
 function killTree(child) {
 	if (!child || child.pid === undefined) { return; }
 	spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" }).on("error", () => {});
@@ -30,7 +39,7 @@ class TerminalHost {
 		const problem = folderProblem(cwd);
 		if (problem) { return { ok: false, error: problem }; }
 		if (this.tabs.size >= MAX_TABS) { return { ok: false, error: "Close a terminal tab first." }; }
-		const shell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+		const shell = terminalShell();
 		let child;
 		try {
 			child = spawn(shell, ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "RemoteSigned", "-NoExit", "-Command", INIT], { cwd, windowsHide: true, stdio: "pipe" });
@@ -116,4 +125,4 @@ class TerminalHost {
 	}
 }
 
-module.exports = { TerminalHost };
+module.exports = { TerminalHost, terminalShell };
