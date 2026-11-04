@@ -1232,9 +1232,8 @@ select {
 .ctx-row { display: grid; grid-template-columns: 10px 1fr auto 48px; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
 .ctx-row span:nth-child(n+3) { text-align: right; font-variant-numeric: tabular-nums; }
 .ctx-dot { width: 9px; height: 9px; border-radius: 2px; }
-.ctx-foot { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 6px; }
-.ctx-foot span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ctx-foot button { flex: none; white-space: nowrap; }
+.ctx-foot { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 4px 8px; margin-top: 6px; }
+.ctx-foot button { flex: none; white-space: nowrap; margin-left: auto; }
 
 /* Settings page */
 .settings-page {

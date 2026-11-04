@@ -575,6 +575,7 @@ ipcMain.handle("grok:customize", (_event, cwd) => customize.inventory(cwd));
 ipcMain.handle("grok:customize-change", (_event, cwd, input) => customize.change(cwd, input));
 // Undefined until Grok first starts in this app; null after signing out.
 ipcMain.handle("grok:account", () => host.account);
+ipcMain.handle("grok:billing", () => host.billing());
 ipcMain.handle("grok:sign-out", async () => {
 	if ([...host.turns.values()].some((turn) => !turn.finished)) { return { ok: false, error: "Grok is still answering. Press Stop or wait, then sign out." }; }
 	const result = await customize.signOut();

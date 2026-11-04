@@ -725,6 +725,29 @@ class AgentHost {
 		}
 	}
 
+	async billing() {
+		const proc = [...this.procs.values()].find((item) => !item.lost);
+		if (!proc) {
+			// ponytail: needs a running Grok; spawn a one-shot like probeGrok() if /usage before the first message turns out to matter.
+			return { ok: false, error: "Usage shows once Grok is running. Send a message, then run /usage." };
+		}
+		try {
+			await proc.ready;
+			const result = (await this.request(proc, "_x.ai/billing", {}).promise) || {};
+			const config = result.config || {};
+			const period = config.currentPeriod || {};
+			return {
+				ok: true,
+				percent: typeof config.creditUsagePercent === "number" && Number.isFinite(config.creditUsagePercent) ? config.creditUsagePercent : null,
+				period: period.type === "USAGE_PERIOD_TYPE_WEEKLY" ? "weekly" : (period.type === "USAGE_PERIOD_TYPE_MONTHLY" ? "monthly" : ""),
+				resetsAt: typeof period.end === "string" && Number.isFinite(Date.parse(period.end)) ? period.end : "",
+				tier: typeof result.subscription_tier === "string" ? result.subscription_tier.slice(0, 60) : "",
+			};
+		} catch {
+			return { ok: false, error: "Grok did not return usage." };
+		}
+	}
+
 	branchProblem(input) {
 		const problem = this.inputProblem(input) || folderProblem(input.cwd);
 		if (problem) { return problem; }

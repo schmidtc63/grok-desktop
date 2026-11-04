@@ -332,6 +332,7 @@ interface GrokCodeApi {
 	customize?: (cwd: string) => Promise<GrokInventory>;
 	customizeChange?: (cwd: string, input: GrokCustomizeChange) => Promise<{ ok: boolean; error?: string; message?: string }>;
 	account?: () => Promise<GrokAccount | null | undefined>;
+	billing?: () => Promise<{ ok: true; percent: number | null; period: string; resetsAt: string; tier: string } | { ok: false; error: string }>;
 	signOut?: () => Promise<WriteResult>;
 	devScripts: (cwd: string) => Promise<{ ok: boolean; scripts?: { script: string; command: string }[] }>;
 	terminalOpen?: (payload: { cwd: string }) => Promise<WriteResult & { id?: string }>;

@@ -41,10 +41,36 @@ const SIDE_BUSY = "The side chat is still answering. Wait for it to finish.";
 const VIEWS: TranscriptView[] = ["normal", "thinking", "verbose"];
 const VIEW_LABEL: Record<TranscriptView, string> = { normal: "Normal", thinking: "Thinking", verbose: "Verbose" };
 const PROTECTED = [/^\.mcp\.json$/i, /^\.claude\/settings(\.local)?\.json$/i, /^\.grok\/config\.toml$/i];
+const TAKES_ARG = new Set(["rename", "theme"]);
 const BUILT_INS: GrokCommand[] = [
 	{ name: "btw", description: "Ask a side question that does not join this conversation", hint: "question" },
 	{ name: "config", description: "Open Settings", hint: "" },
 	{ name: "status", description: "Show the app's version, model, mode and folder", hint: "" },
+	{ name: "usage", description: "Show Grok's usage limit and this session's context", hint: "" },
+	{ name: "new", description: "Start a new session", hint: "" },
+	{ name: "rename", description: "Rename this session", hint: "title" },
+	{ name: "delete", description: "Delete this session", hint: "" },
+	{ name: "fork", description: "Fork from the latest sent message", hint: "" },
+	{ name: "rewind", description: "Rewind to before the latest sent message", hint: "" },
+	{ name: "copy", description: "Copy the latest finished reply", hint: "" },
+	{ name: "find", description: "Find in this conversation", hint: "" },
+	{ name: "transcript", description: "Cycle the transcript view", hint: "" },
+	{ name: "tasks", description: "Toggle Background tasks", hint: "" },
+	{ name: "plan", description: "Switch to Plan mode", hint: "" },
+	{ name: "view-plan", description: "Toggle the Plan pane", hint: "" },
+	{ name: "auto", description: "Switch to Auto-review mode", hint: "" },
+	{ name: "model", description: "Choose a model", hint: "" },
+	{ name: "effort", description: "Choose the reasoning effort", hint: "" },
+	{ name: "cd", description: "Choose a folder", hint: "" },
+	{ name: "resume", description: "Pick a session in the sidebar", hint: "" },
+	{ name: "help", description: "Show keyboard shortcuts", hint: "" },
+	{ name: "theme", description: "Change the app's appearance", hint: "system, light or dark" },
+	{ name: "mcps", description: "Open Settings on Connectors", hint: "" },
+	{ name: "skills", description: "Open Settings on Skills", hint: "" },
+	{ name: "marketplace", description: "Open Settings on Plugins", hint: "" },
+	{ name: "doctor", description: "Check Grok setup", hint: "" },
+	{ name: "login", description: "Open the sign-in setup check", hint: "" },
+	{ name: "logout", description: "Sign out of Grok", hint: "" },
 ];
 
 interface History {
@@ -1273,6 +1299,56 @@ export function App() {
 		closePane: () => { const target = focusedPane && panes.includes(focusedPane) ? focusedPane : panes[panes.length - 1]; if (target) { closePane(target); } },
 	};
 
+	const slashActions: Record<string, (arg: string) => void | Promise<void>> = {
+		usage: () => showUsage("/usage"),
+		cost: () => showUsage("/cost"),
+		new: () => keyActions.current.newSession?.(),
+		rename: (arg) => { if (arg) { renameSession(session.id, arg); } else { setRenaming(session.id); } },
+		delete: async () => {
+			if (activity[session.id]) { setNotice("Stop this session before deleting it."); return; }
+			if (await askConfirm({ title: `Delete "${session.title}"?`, body: "Its transcript is removed from this app and cannot be restored.", ok: "Delete", danger: true })) { deleteSession(session.id); }
+		},
+		fork: async () => {
+			if (busy[session.id]) { setNotice("Wait for Grok to finish, then try again."); return; }
+			const latest = [...messages].reverse().find((item) => item.role === "user" && item.point && item.point.agentSessionId === session.agentSessionId);
+			if (!latest) { setNotice("No sent message to fork from yet."); return; }
+			await forkAt(latest);
+		},
+		rewind: async () => {
+			if (busy[session.id]) { setNotice("Wait for Grok to finish, then try again."); return; }
+			const latest = [...messages].reverse().find((item) => item.role === "user" && item.point && item.point.agentSessionId === session.agentSessionId);
+			if (!latest) { setNotice("No sent message to rewind to yet."); return; }
+			await startRewind(latest);
+		},
+		copy: () => {
+			const latest = [...messages].reverse().find((item) => item.role === "grok" && !item.pending && !item.streaming && item.text);
+			if (latest) { copyText(latest.text); }
+		},
+		find: () => keyActions.current.find?.(),
+		transcript: () => keyActions.current.cycleView?.(),
+		expand: () => keyActions.current.cycleView?.(),
+		tasks: () => togglePane("tasks"),
+		"view-plan": () => togglePane("plan"),
+		plan: () => changeMode(session.id, "Plan"),
+		auto: () => changeMode(session.id, "Auto-review"),
+		model: () => setMenu("model"),
+		effort: () => setMenu("effort"),
+		cd: () => setMenu("folder"),
+		resume: () => { changeSettings({ sidebarCollapsed: false }); setNotice("Pick a session in the sidebar, or search for one."); },
+		help: () => setShortcuts(true),
+		theme: (arg) => {
+			if (!arg) { setSettingsOpen("general"); }
+			else if (arg === "system" || arg === "light" || arg === "dark") { changeSettings({ appearance: arg }); }
+			else { setNotice("Use /theme system, light or dark."); }
+		},
+		mcps: () => setSettingsOpen("connectors"),
+		skills: () => setSettingsOpen("skills"),
+		marketplace: () => setSettingsOpen("plugins"),
+		doctor: () => checkSetup(),
+		login: () => checkSetup(),
+		logout: () => signOut(),
+	};
+
 	useEffect(() => {
 		function onKey(event: KeyboardEvent) {
 			// An open confirm owns the keyboard: Escape cancels it without acting underneath it.
@@ -1644,6 +1720,25 @@ export function App() {
 		if (target) { send(text, false, target.id); }
 	}
 
+	function postLocal(text: string, lines: string[]) {
+		const sessionId = session.id;
+		const stamp = crypto.randomUUID();
+		const at = Date.now();
+		setExtraChats((current) => ({ ...current, [sessionId]: [...(current[sessionId] ?? []), { id: `user-${stamp}`, role: "user", text, at, live: true }, { id: `grok-${stamp}`, role: "grok", text: lines.join("\n"), at, live: true }] }));
+		setNotice(lines.join(" · "));
+	}
+
+	async function showUsage(text: string) {
+		const result = await window.grokCode?.billing?.().catch(() => ({ ok: false as const, error: "Grok did not return usage." }));
+		const lines = result?.ok ? [[
+			[result.tier, result.period, "limit", result.percent !== null ? `${result.percent}% used` : ""].filter(Boolean).join(" "),
+			result.resetsAt ? `resets ${new Date(result.resetsAt).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}` : "",
+		].filter(Boolean).join(" · ")] : [result?.error || "Grok did not return usage."];
+		const percent = session.usage?.contextWindow ? Math.min(100, Math.round((session.usage.contextTokens / Math.max(1, session.usage.contextWindow)) * 100)) : null;
+		if (percent !== null) { lines.push(`Context ${percent}% · $${(session.costUsd ?? 0).toFixed(2)}`); }
+		postLocal(text, lines);
+	}
+
 	async function submit(value = prompt) {
 		const text = value.trim();
 		if (!text) { return; }
@@ -1655,7 +1750,6 @@ export function App() {
 			return;
 		}
 		if (text === "/status" || text === "/info") {
-			const sessionId = session.id;
 			const percent = session.usage?.contextWindow ? Math.min(100, Math.round((session.usage.contextTokens / Math.max(1, session.usage.contextWindow)) * 100)) : null;
 			const lines = [
 				appVersion.current ? `Codewomplers Grok Desktop ${appVersion.current}` : "Codewomplers Grok Desktop",
@@ -1663,11 +1757,18 @@ export function App() {
 				session.folder,
 				...(percent != null ? [`Context ${percent}% · $${(session.costUsd ?? 0).toFixed(2)}`] : []),
 			];
-			const stamp = crypto.randomUUID();
-			const at = Date.now();
-			setExtraChats((current) => ({ ...current, [sessionId]: [...(current[sessionId] ?? []), { id: `user-${stamp}`, role: "user", text, at, live: true }, { id: `grok-${stamp}`, role: "grok", text: lines.join("\n"), at, live: true }] }));
-			setNotice(lines.join(" · "));
+			postLocal(text, lines);
 			setPrompt("");
+			return;
+		}
+		const local = /^\/([\w:.-]+)(?:\s+([\s\S]*))?$/.exec(text);
+		const action = local ? slashActions[local[1]] : undefined;
+		if (local && action) {
+			const arg = (local[2] ?? "").trim();
+			if (arg && !TAKES_ARG.has(local[1])) { setNotice(`/${local[1]} takes no argument.`); return; }
+			if (pending && ["rename", "delete", "fork", "rewind", "copy"].includes(local[1])) { setNotice("Send a first message to start this session."); return; }
+			setPrompt("");
+			await action(arg);
 			return;
 		}
 		if (text.startsWith("/btw ")) {
@@ -2038,6 +2139,22 @@ export function App() {
 		if (sessionsRef.current.find((item) => item.id === id)?.title !== title) { updateSession(id, { title, titleAuto: false }); }
 	}
 
+	function deleteSession(id: string) {
+		void window.grokCode?.stopSession?.(id);
+		setDeleted((current) => [...current, id]);
+		// The window always has an unarchived session, so deleting the last one leaves a new one in the same folder.
+		setSessions((current) => {
+			const rest = current.filter((item) => item.id !== id);
+			const gone = current.find((item) => item.id === id);
+			return rest.some((item) => !item.archived) ? rest : [newSession(gone ? { folder: gone.folder, project: gone.project } : undefined), ...rest];
+		});
+		setExtraChats((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id)));
+		// A queue that Stop held would stay unsent forever and make every close warn about it.
+		setQueued((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id)));
+		setGrokTasks((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id && key !== `side-${id}`)));
+		setSubagents((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id && key !== `side-${id}`)));
+	}
+
 	// Archives, or unarchives, a session. Archiving stops its Grok; the sidebar asks first when that would stop work.
 	function archiveSession(id: string, target: Session | undefined) {
 		if (target && !target.archived && target.worktreeFolder && window.grokCode?.removeWorktree && !sharesFolder(target)) {
@@ -2274,21 +2391,7 @@ export function App() {
 						archiveSession(id, target);
 					}}
 					onRename={renameSession}
-					onDelete={(id) => {
-						void window.grokCode?.stopSession?.(id);
-						setDeleted((current) => [...current, id]);
-						// The window always has an unarchived session, so deleting the last one leaves a new one in the same folder.
-						setSessions((current) => {
-							const rest = current.filter((item) => item.id !== id);
-							const gone = current.find((item) => item.id === id);
-							return rest.some((item) => !item.archived) ? rest : [newSession(gone ? { folder: gone.folder, project: gone.project } : undefined), ...rest];
-						});
-						setExtraChats((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id)));
-						// A queue that Stop held would stay unsent forever and make every close warn about it.
-						setQueued((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id)));
-						setGrokTasks((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id && key !== `side-${id}`)));
-						setSubagents((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id && key !== `side-${id}`)));
-					}}
+					onDelete={deleteSession}
 					onMarkUnread={(id, unread) => updateSession(id, { unread })}
 					onMarkCompleted={(id, completed) => updateSession(id, { completed })}
 					onMove={(id, sectionId) => updateSession(id, { sectionId })}

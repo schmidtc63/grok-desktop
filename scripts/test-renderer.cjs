@@ -937,7 +937,7 @@ async function checkGrokState() {
 	await app.settle();
 	assert.ok(strings(app.render()).includes("2 MCP servers from Grok"));
 	assert.ok(JSON.parse(app.storage.get("grok-code.commands.v1")).some((item) => item.name === "review"), "Grok's command list is cached for the next window");
-	typePrompt(app, "/re");
+	typePrompt(app, "/rev");
 	const commandNames = app.nodes(app.node((node) => node.props["aria-label"] === "Commands")).filter((node) => node.props.role === "option").map((node) => [node.props.children].flat()[0]);
 	same(commandNames, ["/review"], "the / menu lists Grok's commands");
 	typePrompt(app, "");
@@ -956,12 +956,12 @@ async function checkGrokState() {
 	assert.ok(app.node((node) => node.type === "SessionRail"), "the rail returns when the pane closes");
 
 	const pressEnter = () => app.node((node) => node.props["aria-label"] === "Prompt").props.onKeyDown({ key: "Enter", shiftKey: false, preventDefault() {}, stopPropagation() {} });
-	typePrompt(app, "/go");
+	typePrompt(app, "/goal");
 	pressEnter();
 	app.render();
 	assert.equal(app.node((node) => node.props["aria-label"] === "Prompt").props.value, "/goal ", "Enter on a command that takes input completes it");
 	assert.equal(app.sends.length, 0);
-	typePrompt(app, "/re");
+	typePrompt(app, "/rev");
 	pressEnter();
 	await app.settle();
 	assert.equal(app.sends.at(-1).text, "/review", "Enter on a command that takes no input runs it");
@@ -1117,6 +1117,89 @@ async function checkGrokState() {
 	app.key({ key: "Escape" });
 	await app.settle();
 	same(app.cancels, [id], "Escape with nothing open stops Grok");
+}
+
+async function checkSlashCommands() {
+	const app = harness();
+	await app.settle();
+	const id = app.model().session.id;
+	app.sidebar().onSelect(id);
+	await app.settle();
+	const run = async (text) => {
+		const sent = app.sends.length;
+		typePrompt(app, text);
+		app.node((node) => node.props["aria-label"] === "Prompt").props.onKeyDown({ key: "Enter", shiftKey: false, preventDefault() {}, stopPropagation() {} });
+		await app.settle();
+		assert.equal(app.sends.length, sent, `${text} stays in the app`);
+	};
+	app.api.billing = async () => ({ ok: true, percent: 90, period: "weekly", resetsAt: "2026-11-04T22:56:56.873+00:00", tier: "SuperGrok" });
+	await run("/usage");
+	assert.match(app.model().messages.at(-1).text, /^SuperGrok weekly limit 90% used · resets /);
+	assert.equal(app.model().messages.at(-2).text, "/usage");
+	app.api.billing = async () => ({ ok: false, error: "Usage is unavailable." });
+	await run("/usage");
+	assert.equal(app.model().messages.at(-1).text, "Usage is unavailable.");
+	await run("/cost");
+	assert.equal(app.model().messages.at(-2).text, "/cost");
+	assert.equal(app.model().messages.at(-1).text, "Usage is unavailable.");
+	await run("/rename New name");
+	assert.equal(app.model().session.title, "New name");
+	await run("/theme dark");
+	assert.equal(JSON.parse(app.storage.get("grok-code.settings.v1")).appearance, "dark");
+	await run("/theme blue");
+	assert.equal(JSON.parse(app.storage.get("grok-code.settings.v1")).appearance, "dark");
+	assert.equal(app.notice(), "Use /theme system, light or dark.");
+	await run("/plan");
+	assert.equal(savedHistory(app).modes[id], "Plan");
+	await run("/auto");
+	assert.equal(savedHistory(app).modes[id], "Auto-review");
+	await run("/plan fix the parser");
+	assert.equal(app.node((node) => node.props["aria-label"] === "Prompt").props.value, "/plan fix the parser");
+	assert.equal(app.notice(), "/plan takes no argument.");
+	assert.equal(savedHistory(app).modes[id], "Auto-review");
+	await run("/tasks");
+	assert.ok(app.node((node) => node.type === "PaneView" && node.props.id === "tasks"));
+	await run("/mcps");
+	const settings = app.node((node) => node.type?.name === "SettingsPage");
+	assert.equal(settings.props.initialTab, "connectors");
+	settings.props.onClose();
+	await app.settle();
+	await run("/fork");
+	assert.equal(app.notice(), "No sent message to fork from yet.");
+	await run("/rewind");
+	assert.equal(app.notice(), "No sent message to rewind to yet.");
+	typePrompt(app, "/us");
+	assert.ok(app.node((node) => node.props.role === "option" && textOf(node).startsWith("/usage")));
+	typePrompt(app, "/cost");
+	assert.equal(app.node((node) => node.props.role === "option" && textOf(node).startsWith("/cost")), undefined);
+	typePrompt(app, "/rename");
+	app.node((node) => node.props["aria-label"] === "Prompt").props.onKeyDown({ key: "Enter", shiftKey: false, preventDefault() {}, stopPropagation() {} });
+	app.render();
+	assert.equal(app.node((node) => node.props["aria-label"] === "Prompt").props.value, "/rename ", "commands with hints complete instead of running");
+	app.sidebar().onNew();
+	await app.settle();
+	await run("/rename x");
+	assert.equal(app.notice(), "Send a first message to start this session.");
+	assert.equal(app.sidebar().sessions.find((item) => item.id === id).title, "New name");
+	app.sidebar().onSelect(id);
+	await app.settle();
+	sendPrompt(app, "working turn");
+	await app.settle();
+	await run("/delete");
+	assert.equal(app.notice(), "Stop this session before deleting it.");
+	assert.ok(app.sidebar().sessions.some((item) => item.id === id));
+	assert.equal(app.node((node) => node.props.role === "alertdialog"), undefined);
+	app.emit({ type: "usage", uiSessionId: id, turnId: app.sends.at(-1).turnId, usage: { contextTokens: 22000, contextWindow: 200000, costUsd: 0.25 } });
+	app.emit({ type: "done", uiSessionId: id, turnId: app.sends.at(-1).turnId });
+	await app.settle();
+	await run("/usage");
+	assert.equal(app.model().messages.at(-1).text, "Usage is unavailable.\nContext 11% · $0.25");
+	await run("/delete");
+	assert.equal(app.node((node) => node.props.role === "alertdialog").props["aria-label"], 'Delete "New name"?');
+	button(app, "Delete").props.onClick();
+	await app.settle();
+	assert.equal(app.sidebar().sessions.some((item) => item.id === id), false);
+	assert.equal(app.sends.length, 1);
 }
 
 async function checkToolRows() {
@@ -4061,6 +4144,7 @@ async function main() {
 	await checkAnswers();
 	await checkSavedSize();
 	await checkGrokState();
+	await checkSlashCommands();
 	await checkToolRows();
 	await checkFixBrief();
 	await checkRoutineBatchB();

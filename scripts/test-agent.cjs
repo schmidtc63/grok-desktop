@@ -1187,6 +1187,31 @@ async function checkPermissionMeta() {
 	assert.equal(requests.length, before, "a session already open in this Grok is not opened again");
 }
 
+async function checkBilling() {
+	const { host, writes, running } = makeHost();
+	const unavailable = { ok: false, error: "Usage shows once Grok is running. Send a message, then run /usage." };
+	assert.deepEqual(plain(await host.billing()), unavailable);
+	host.procs.set("lost", { lost: true });
+	assert.deepEqual(plain(await host.billing()), unavailable, "lost processes cannot serve billing");
+	const proc = running({ uiSessionId: "chat", agentSessionId: "sid-1" });
+	proc.ready = Promise.resolve();
+	async function reply(result, error) {
+		const pending = host.billing();
+		await ticks();
+		const request = writes.at(-1);
+		assert.equal(request.method, "_x.ai/billing");
+		assert.deepEqual(plain(request.params), {});
+		host.onMessage(proc, { id: request.id, ...(error ? { error } : { result }) });
+		return plain(await pending);
+	}
+	const resetsAt = "2026-11-04T22:56:56.873+00:00";
+	assert.deepEqual(await reply({ config: { creditUsagePercent: 90, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: resetsAt }, prepaidBalance: { val: 5 } }, subscription_tier: "SuperGrok", private: "hidden" }), { ok: true, percent: 90, period: "weekly", resetsAt, tier: "SuperGrok" }, "only normalized display fields cross the bridge");
+	assert.deepEqual(await reply({}), { ok: true, percent: null, period: "", resetsAt: "", tier: "" }, "a missing config gives no invented usage");
+	assert.deepEqual(await reply({ config: { creditUsagePercent: Infinity, currentPeriod: { type: "USAGE_PERIOD_TYPE_MONTHLY", end: "invalid" } }, subscription_tier: "x".repeat(70) }), { ok: true, percent: null, period: "monthly", resetsAt: "", tier: "x".repeat(60) });
+	assert.deepEqual(await reply({ config: { creditUsagePercent: "90", currentPeriod: { type: "unknown", end: 1 } }, subscription_tier: 5 }), { ok: true, percent: null, period: "", resetsAt: "", tier: "" });
+	assert.deepEqual(await reply(null, { message: "private failure" }), { ok: false, error: "Grok did not return usage." });
+}
+
 async function checkAccount() {
 	const { host, writes, events, spawns } = makeHost();
 	void host.prompt(input).catch(() => {});
@@ -1632,6 +1657,7 @@ function checkChunkBatching() {
 	await checkBranches();
 	await checkSteer();
 	await checkSessionEnhancements();
+	await checkBilling();
 	await checkAccount();
 	await checkSessions();
 	await checkProcesses();

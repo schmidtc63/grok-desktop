@@ -73,6 +73,9 @@ contextBridge.exposeInMainWorld("grokCode", {
 	account() {
 		return ipcRenderer.invoke("grok:account");
 	},
+	billing() {
+		return ipcRenderer.invoke("grok:billing");
+	},
 	signOut() {
 		return ipcRenderer.invoke("grok:sign-out");
 	},
