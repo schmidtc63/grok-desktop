@@ -1163,6 +1163,9 @@ select {
 	border-radius: 50%;
 	background: conic-gradient(var(--accent) calc(var(--pct) * 1%), var(--line-strong) 0);
 }
+.limit-meter { flex: none; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.limit-meter.warn { color: var(--amber); }
+.limit-meter.high { color: var(--red); }
 .attach-list { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 6px; }
 .attach-chip {
 	display: inline-flex;

@@ -26,11 +26,20 @@ Cursor's API can also run an agent on a registered machine, and `grok worker` re
 
 ### macOS and Linux
 
-Codewomplers Grok Desktop runs on macOS and Linux from source. Still open:
+Codewomplers Grok Desktop runs on macOS and Linux from source. On macOS it also installs as an app with `scripts/install-mac.sh`. Still open:
 
 - The in-app updater is Windows-only: `scripts/update-helper.cjs` stops and relaunches the app with Windows tools, so `updatePrepare` refuses on macOS and Linux and shows the manual steps.
-- On macOS, starting the app from the Dock opens plain Electron, and the menu bar names it "Electron". Both need packaging, which is not planned.
+- The installed macOS app has not been run on a real Mac yet. If you try it, please report what happens.
+- On macOS, a copy run from source and started from the Dock opens plain Electron, and the menu bar names it "Electron". The installed app avoids both.
 - Open in VS Code has not been tried on macOS or Linux.
+
+### Narrower window
+
+The main window has a minimum width of 1100 px (`electron/main.cjs`), so it cannot sit beside an editor on a laptop screen. Check the composer, panes and sidebar at narrower widths, then lower the minimum.
+
+### Collapse long messages like Claude Desktop
+
+A long message shows in full in the chat today. Claude Desktop shows only the first lines of a long message, fades them out and adds a "Show more" button. Do what Claude Desktop does. Check its behavior first (how many lines stay visible, whether pasted text gets a monospace box, whether "Show less" appears, whether Grok's replies collapse too), then build the same.
 
 ### API-key sign-in
 

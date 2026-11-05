@@ -283,6 +283,16 @@ function readAccount(): GrokAccount | null | undefined {
 	}
 }
 
+type GrokLimit = { percent: number | null; period: string; resetsAt: string; tier: string };
+
+// Grok's usage limit as one line, for /usage and the composer meter.
+function limitLine(limit: GrokLimit) {
+	return [
+		[limit.tier, limit.period, "limit", limit.percent !== null ? `${limit.percent}% used` : ""].filter(Boolean).join(" "),
+		limit.resetsAt ? `resets ${new Date(limit.resetsAt).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}` : "",
+	].filter(Boolean).join(" · ");
+}
+
 export function App() {
 	const [history] = useState(readHistory);
 	const [settings, setSettings] = useState<AppSettings>(readSettings);
@@ -353,9 +363,12 @@ export function App() {
 					if (!result.ok) { setNotice(result.error || "The update could not start."); }
 				}
 			} else {
-				const yes = await askConfirm({ title: `Version ${info.latest} is available`, body: `${prepared.reason || "This copy couldn't be prepared for an update."}\n\nQuit the app, then in its folder run: git pull, npm install, npm run desktop`, ok: "Copy steps" });
+				// An installed copy updates by running its install command again; a source copy updates with git.
+				const where = prepared.steps?.includes("install-windows.ps1") ? "PowerShell" : "Terminal";
+				const how = prepared.steps ? `Quit the app, then run this in ${where}:\n${prepared.steps}` : "Quit the app, then in its folder run: git pull, npm install, npm run desktop";
+				const yes = await askConfirm({ title: `Version ${info.latest} is available`, body: `${prepared.reason || "This copy couldn't be prepared for an update."}\n\n${how}`, ok: "Copy steps" });
 				if (yes) {
-					const result = await api.copyText("git pull\nnpm install\nnpm run desktop");
+					const result = await api.copyText(prepared.steps || "git pull\nnpm install\nnpm run desktop");
 					setNotice(result.ok ? "Update steps copied." : result.error || "The steps could not be copied.", result.ok);
 				}
 			}
@@ -421,6 +434,7 @@ export function App() {
 	const [busy, setBusy] = useState<Record<string, boolean>>({});
 	const [breakdown, setBreakdown] = useState<(ContextBreakdown & { id: string }) | null>(null);
 	const [recentUsd, setRecentUsd] = useState<number | null>(null);
+	const [limit, setLimit] = useState<GrokLimit | null>(null);
 	const [account, setAccount] = useState<GrokAccount | null | undefined>(readAccount);
 	const [addingFolder, setAddingFolder] = useState(false);
 	const [windowWidth, setWindowWidth] = useState(() => window.innerWidth ?? 1400);
@@ -437,6 +451,7 @@ export function App() {
 	const autoArchiving = useRef(new Set<string>());
 	const settingsRef = useRef(settings);
 	const keyActions = useRef<Record<string, () => void>>({});
+	const inboundAccept = useRef<(agentSessionId: string, text: string) => InboundResult>(() => ({ accepted: false }));
 	const overlayOpen = useRef(false);
 	const settingsShown = useRef(false);
 	const editorDraftsRef = useRef(editorDrafts);
@@ -545,6 +560,8 @@ export function App() {
 	}
 
 	useEffect(() => { checkSetup(false); }, []);
+
+	useEffect(() => { void window.grokCode?.inbound?.(settings.acceptLocalTurns).then((result) => { if (result && !result.ok) { setNotice(result.error || "Turns from local tools could not be switched."); } }); }, [settings.acceptLocalTurns]);
 
 	useEffect(() => {
 		const reload = (event: StorageEvent) => {
@@ -749,6 +766,7 @@ export function App() {
 		const api = window.grokCode;
 		if (!api) { return; }
 		return api.onEvent((event) => {
+			if (event.type === "inbound" && event.requestId) { void api.inboundResult?.(event.requestId, inboundAccept.current(event.agentSessionId ?? "", event.text ?? "")); return; }
 			if (event.type === "update-open" && event.current && event.latest && event.tag) {
 				const info = { current: event.current, latest: event.latest, tag: event.tag };
 				setUpdate(info);
@@ -1284,6 +1302,21 @@ export function App() {
 		return sessionsRef.current.some((other) => other.id !== item.id && !other.archived && folderKey(other.folder) === folderKey(item.folder));
 	}
 
+	inboundAccept.current = (agentSessionId, text) => {
+		const target = sessions.find((item) => item.agentSessionId === agentSessionId && !item.archived);
+		if (!target) { return { accepted: false }; }
+		// Modes, archive state and folders are not synced between windows, so check this window against the saved history.
+		const saved = readHistory();
+		const stored = saved?.sessions.find((item) => item.id === target.id);
+		const modeHere = knownMode(modes[target.id] ?? settings.defaultMode, settings);
+		const modeSaved = knownMode(saved?.modes?.[target.id] ?? settings.defaultMode, settings);
+		if (!stored || stored.archived || stored.folder !== target.folder || stored.agentSessionId !== agentSessionId || modeSaved !== modeHere) { return { accepted: false, stale: true }; }
+		const waiting = (queuedRef.current[target.id] ?? []).length > 0;
+		const status = held[target.id] ? "held" : (busy[target.id] || turnTargets.current[target.id] || waiting ? "queued" : "sent");
+		setQueued((list) => ({ ...list, [target.id]: [...(list[target.id] ?? []), { id: crypto.randomUUID(), text: `[Sent by a local tool, not typed in Grok Code]\n\n${text}`, attachments: [] }] }));
+		return { accepted: true, status };
+	};
+
 	keyActions.current = {
 		newSession: () => createSession(),
 		next: () => stepSession(1),
@@ -1730,10 +1763,8 @@ export function App() {
 
 	async function showUsage(text: string) {
 		const result = await window.grokCode?.billing?.().catch(() => ({ ok: false as const, error: "Grok did not return usage." }));
-		const lines = result?.ok ? [[
-			[result.tier, result.period, "limit", result.percent !== null ? `${result.percent}% used` : ""].filter(Boolean).join(" "),
-			result.resetsAt ? `resets ${new Date(result.resetsAt).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}` : "",
-		].filter(Boolean).join(" · ")] : [result?.error || "Grok did not return usage."];
+		if (result?.ok) { setLimit(result); }
+		const lines = result?.ok ? [limitLine(result)] : [result?.error || "Grok did not return usage."];
 		const percent = session.usage?.contextWindow ? Math.min(100, Math.round((session.usage.contextTokens / Math.max(1, session.usage.contextWindow)) * 100)) : null;
 		if (percent !== null) { lines.push(`Context ${percent}% · $${(session.costUsd ?? 0).toFixed(2)}`); }
 		postLocal(text, lines);
@@ -2180,13 +2211,15 @@ export function App() {
 	}
 
 	const usage = session.usage;
-	// The context split and the week's spend are read from Grok's files when a turn ends or the session changes.
+	// The context split and the week's spend are read from Grok's files, and the usage limit from a running Grok, when a turn ends or the session changes.
 	const agentId = session.agentSessionId ?? "";
 	const idle = !busy[session.id];
 	useEffect(() => {
 		if (!idle) { return; }
 		const api = window.grokCode;
 		void api?.recentSpend?.().then((result) => { if (result.ok && result.usd != null) { setRecentUsd(result.usd); } });
+		// A failed read keeps the last limit shown; before any Grok runs there is none.
+		void api?.billing?.().then((result) => { if (result.ok) { setLimit(result); } }).catch(() => {});
 		if (!agentId) { return; }
 		void api?.contextBreakdown?.(agentId).then((result) => {
 			if (result.ok && result.parts) { setBreakdown({ id: agentId, parts: result.parts, autoCompactPercent: result.autoCompactPercent ?? 85 }); }
@@ -2365,6 +2398,9 @@ export function App() {
 	}
 
 	const contextPercent = usage ? Math.min(100, Math.round((usage.contextTokens / Math.max(1, usage.contextWindow)) * 100)) : null;
+	const limitLeft = limit && limit.percent !== null ? Math.max(0, Math.round(100 - limit.percent)) : null;
+	const limitName = limit?.period ? `${limit.period[0].toUpperCase()}${limit.period.slice(1)}` : "Limit";
+	const limitTitle = limit ? limitLine(limit) : "Grok's usage limit shows here once Grok is running.";
 
 	return (
 		<div className={settings.sidebarCollapsed ? "app collapsed" : "app"}>
@@ -2396,6 +2432,7 @@ export function App() {
 					onMarkCompleted={(id, completed) => updateSession(id, { completed })}
 					onMove={(id, sectionId) => updateSession(id, { sectionId })}
 					onOpenWindow={openSessionWindow}
+					onCopySessionId={(id) => copyText(id, "Grok session ID copied.")}
 					onSettings={() => setSettingsOpen("general")}
 					onCollapse={() => changeSettings({ sidebarCollapsed: true })}
 					onNotice={setNotice}
@@ -2601,6 +2638,7 @@ export function App() {
 									<MenuButton label={shortPath(session.folder)} title={session.folder} open={menu === "folder"} onClick={() => setMenu(menu === "folder" ? null : "folder")} />
 									<MenuButton label={mode} title={keyLabel("Permission mode (Ctrl+Shift+M)")} open={menu === "mode"} onClick={() => setMenu(menu === "mode" ? null : "mode")} />
 									<span className="spacer" />
+									<span className={`limit-meter${limitLeft === null ? "" : limitLeft <= 10 ? " high" : limitLeft <= 25 ? " warn" : ""}`} title={limitTitle} aria-label={limitTitle}>{limitLeft === null ? "Limit" : `${limitName} - ${limitLeft}% left`}</span>
 									{contextPercent !== null && <span className="usage-ring" title={`Context about ${contextPercent}% used · session cost $${(session.costUsd ?? 0).toFixed(2)}${recentUsd !== null ? `\nGrok, last 7 days on this computer: $${recentUsd.toFixed(2)}` : ""}`} style={{ ["--pct" as string]: `${contextPercent}` }} aria-label={`Context ${contextPercent}% used`} />}
 									<MenuButton label={`${baseModel}${fastOn ? " · fast" : ""} · ${effort}`} title={keyLabel("Model (Ctrl+Shift+I) and effort (Ctrl+Shift+E)")} open={menu === "model" || menu === "effort"} onClick={() => setMenu(menu === "model" ? null : "model")} />
 									<button

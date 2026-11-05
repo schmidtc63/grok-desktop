@@ -5,6 +5,13 @@ const { findNode } = require("../scripts/update-helper.cjs");
 const TAG = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const QUIET = { env: { GCM_INTERACTIVE: "never" } };
 const cache = new Map();
+// An installed copy (scripts/install-mac.sh or scripts/install-windows.ps1) is not a git checkout; it learns about releases from GitHub.
+const RELEASES = "https://api.github.com/repos/schmidtc63/grok-desktop/releases/latest";
+function installCommand(platform = process.platform) {
+	if (platform === "win32") { return "irm https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-windows.ps1 | iex"; }
+	return "curl -fsSL https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-mac.sh | bash";
+}
+const INSTALL_COMMAND = installCommand("darwin");
 
 function parseVersion(text) {
 	if (typeof text !== "string") { return null; }
@@ -37,23 +44,35 @@ function latestTag(output) {
 	return latest;
 }
 
-async function checkForUpdate(appDir, current, { force = false, runGit = git } = {}) {
+async function latestRelease(fetchUrl) {
+	const response = await fetchUrl(RELEASES, { headers: { accept: "application/vnd.github+json" }, signal: AbortSignal.timeout(20000) });
+	if (response.status === 404) { return null; }
+	if (!response.ok) { throw new Error(`GitHub answered ${response.status}.`); }
+	const tag = (await response.json()).tag_name;
+	return typeof tag === "string" && TAG.test(tag) && parseVersion(tag) ? { tag, version: tag.slice(1) } : null;
+}
+
+function releaseResult(release, current) {
+	if (!release) { return { ok: true, available: false, reason: "no-releases", current }; }
+	const available = newer(release.version, current);
+	return { ok: true, available, ...(!available ? { reason: "up-to-date" } : {}), current, latest: release.version, tag: release.tag };
+}
+
+async function checkForUpdate(appDir, current, { force = false, runGit = git, packaged = false, fetchUrl } = {}) {
 	const key = `${path.resolve(appDir).toLowerCase()}\n${current}`;
 	const previous = cache.get(key);
 	if (!force && previous && Date.now() - previous.at < 60 * 60 * 1000) { return previous.result; }
 	let result;
 	try {
-		const root = await runGit(["rev-parse", "--show-toplevel"], appDir, 20000, QUIET);
-		if (root.code !== 0 || path.resolve(root.out.trim()).toLowerCase() !== path.resolve(appDir).toLowerCase()) {
-			result = { ok: true, available: false, reason: "not-checkout", current };
+		if (packaged) {
+			result = releaseResult(await latestRelease(fetchUrl || fetch), current);
 		} else {
-			const remote = await runGit(["ls-remote", "--tags", "--refs", "origin"], appDir, 20000, QUIET);
-			if (remote.code !== 0) {
-				result = { ok: false };
+			const root = await runGit(["rev-parse", "--show-toplevel"], appDir, 20000, QUIET);
+			if (root.code !== 0 || path.resolve(root.out.trim()).toLowerCase() !== path.resolve(appDir).toLowerCase()) {
+				result = { ok: true, available: false, reason: "not-checkout", current };
 			} else {
-				const release = latestTag(remote.out);
-				result = !release ? { ok: true, available: false, reason: "no-releases", current }
-					: { ok: true, available: newer(release.version, current), ...(!newer(release.version, current) ? { reason: "up-to-date" } : {}), current, latest: release.version, tag: release.tag };
+				const remote = await runGit(["ls-remote", "--tags", "--refs", "origin"], appDir, 20000, QUIET);
+				result = remote.code !== 0 ? { ok: false } : releaseResult(latestTag(remote.out), current);
 			}
 		}
 	} catch {
@@ -63,10 +82,14 @@ async function checkForUpdate(appDir, current, { force = false, runGit = git } =
 	return result;
 }
 
-async function updatePrepare(appDir, current, tag, { runGit = git, findNode: locateNode = findNode, platform = process.platform } = {}) {
+async function updatePrepare(appDir, current, tag, { runGit = git, findNode: locateNode = findNode, platform = process.platform, packaged = false } = {}) {
 	const info = { ok: true, ready: false, notes: "", current, latest: typeof tag === "string" ? tag.slice(1) : "", tag };
 	const refuse = (reason) => ({ ...info, reason });
 	if (typeof tag !== "string" || !TAG.test(tag) || !parseVersion(tag)) { return refuse("That release tag isn't valid."); }
+	if (packaged) {
+		const name = platform === "win32" ? "Windows" : "macOS";
+		return { ...refuse(`This copy was installed with the ${name} install command.`), steps: installCommand(platform) };
+	}
 	// ponytail: scripts/update-helper.cjs stops and relaunches the app with Windows tools only; port it before offering this elsewhere.
 	if (platform !== "win32") { return refuse("On macOS and Linux, update by hand: quit the app, then in its folder run git pull, npm install and npm run desktop."); }
 	const run = (args, timeout = 20000) => runGit(args, appDir, timeout, QUIET);
@@ -97,4 +120,4 @@ async function updatePrepare(appDir, current, tag, { runGit = git, findNode: loc
 	}
 }
 
-module.exports = { TAG, parseVersion, newer, latestTag, checkForUpdate, updatePrepare };
+module.exports = { TAG, INSTALL_COMMAND, installCommand, parseVersion, newer, latestTag, checkForUpdate, updatePrepare };

@@ -26,6 +26,12 @@ contextBridge.exposeInMainWorld("grokCode", {
 	keepAwake(payload) {
 		return ipcRenderer.invoke("grok:keep-awake", payload);
 	},
+	inbound(enabled) {
+		return ipcRenderer.invoke("grok:inbound", enabled === true);
+	},
+	inboundResult(requestId, result) {
+		return ipcRenderer.invoke("grok:inbound-result", requestId, result);
+	},
 	saveImage(base64) {
 		return ipcRenderer.invoke("grok:save-image", base64);
 	},

@@ -116,6 +116,7 @@ const app = new EventEmitter();
 app.commandLine = { switches: [], appendSwitch(...args) { this.switches.push(args); } };
 app.setPath = () => {};
 app.getVersion = () => "0.1.0";
+app.isPackaged = false;
 app.setName = () => {};
 app.setAppUserModelId = () => {};
 app.getPath = () => root;
@@ -249,6 +250,7 @@ const mainContext = {
 		if (name === "./files.cjs") {
 			return { writeText: (...args) => { written = args; return { ok: true }; }, locateFile: (cwd, file) => file === "missing" ? { ok: false, error: "Missing file." } : { ok: true, target: path.join(cwd, file) } };
 		}
+		if (name === "./inbound.cjs") { return require("../electron/inbound.cjs"); }
 		return require(name);
 	},
 };
@@ -455,7 +457,9 @@ async function main() {
 	await handlers.get("grok:update-check")({}, "true");
 	assert.equal(updateChecks.at(-1)[2].force, false);
 	assert.equal(await handlers.get("grok:update-prepare")({}, "v0.2.0"), updatePrepared);
-	assert.deepEqual(updatePrepares.at(-1), [root, "0.1.0", "v0.2.0"]);
+	// The options object comes from main.cjs's context, so compare its field rather than the object.
+	assert.deepEqual([...updatePrepares.at(-1).slice(0, 3), updatePrepares.at(-1)[3].packaged], [root, "0.1.0", "v0.2.0", false]);
+	assert.equal(updateChecks.at(-1)[2].packaged, false, "a copy run from source checks its git origin");
 	updateResult = { ok: true, message: "Updated to version 0.2.0." };
 	assert.equal(handlers.get("grok:update-result")().message, "Updated to version 0.2.0.");
 	assert.equal(handlers.get("grok:update-result")(), null, "the update result is read only once");
@@ -695,14 +699,25 @@ async function main() {
 		whenReady: app.whenReady,
 		requestSingleInstanceLock: () => false,
 		quitCalls: 0,
+		isPackaged: true,
 	});
 	secondCopy.quit = () => { secondCopy.quitCalls += 1; };
-	// The second copy runs as on macOS: it quits at once, but it still builds the application menu.
+	// The second copy runs as an installed Mac app: started from the Dock with launchd's PATH, it takes PATH from the login shell.
+	const macEnv = { ...process.env, SHELL: "/bin/zsh", PATH: "/usr/bin:/bin" };
+	const shellRuns = [];
+	const childProcess = require("child_process");
+	const macChildProcess = { ...childProcess, spawnSync: (command, args, options) => {
+		if (command !== "/bin/zsh") { return childProcess.spawnSync(command, args, options); }
+		shellRuns.push({ args, options });
+		return { stdout: "Last login: today\n__GROK_PATH__\n/opt/homebrew/bin:/usr/bin:/bin\n" };
+	} };
+	// It quits at once, but it still builds the application menu.
 	vm.runInNewContext(fs.readFileSync(path.join(root, "electron/main.cjs"), "utf8"), {
 		__dirname: path.join(root, "electron"),
-		process: { ...process, platform: "darwin" },
+		process: { ...process, platform: "darwin", env: macEnv },
 		URL,
 		require(name) {
+			if (name === "child_process") { return macChildProcess; }
 			if (name === "electron") { return { ...electron, app: secondCopy, ipcMain: { handle: () => {}, on: () => {} } }; }
 			if (name === "./agent.cjs") { return { AgentHost: TestHost }; }
 			if (name === "./updates.cjs") { return updateApi; }
@@ -710,10 +725,15 @@ async function main() {
 			if (name === "./usage.cjs") { return { taskOutput: () => ({ ok: true }), subagentTranscript: () => ({ ok: true }) }; }
 			if (name === "./diff.cjs" || name === "./git.cjs" || name === "./files.cjs" || name === "./customize.cjs") { return {}; }
 			if (name === "./terminal.cjs") { return { TerminalHost: class { closeAll() {} } }; }
+			if (name === "./inbound.cjs") { return require("../electron/inbound.cjs"); }
 			return require(name);
 		},
 	});
 	assert.equal(secondCopy.quitCalls, 1, "a second copy quits");
+	assert.equal(shellRuns.length, 1, "an installed Mac app asks the login shell for PATH once");
+	assert.deepEqual([...shellRuns[0].args], ["-ilc", "echo __GROK_PATH__; /usr/bin/printenv PATH"]);
+	assert.equal(shellRuns[0].options.timeout, 5000);
+	assert.equal(macEnv.PATH, "/opt/homebrew/bin:/usr/bin:/bin", "and uses it in place of launchd's PATH");
 	assert.equal(appMenu[0].role, "appMenu", "macOS gets the application menu first");
 	assert.equal(appMenu[1].submenu[0].accelerator, "CmdOrCtrl+Shift+N", "New Window is Cmd+Shift+N on macOS");
 	assert.equal(windows.length, windowCount, "and opens no window of its own");

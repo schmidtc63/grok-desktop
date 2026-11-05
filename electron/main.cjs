@@ -15,6 +15,16 @@ if (process.env.npm_lifecycle_event) {
 		if (/^npm_/i.test(key) || key === "INIT_CWD") { delete process.env[key]; }
 	}
 }
+// Started from Finder or the Dock, a Mac app gets launchd's PATH (/usr/bin:/bin:/usr/sbin:/sbin), without Homebrew's git, gh and code.
+// The installed app takes PATH from the user's login shell, as Terminal would. printenv prints it colon-separated in any shell, fish included.
+// ponytail: blocks startup for the shell's start time (5 s cap); move it off the startup path if a slow shell makes launch drag.
+if (process.platform === "darwin" && app.isPackaged) {
+	try {
+		const shellOut = spawnSync(process.env.SHELL || "/bin/zsh", ["-ilc", "echo __GROK_PATH__; /usr/bin/printenv PATH"], { encoding: "utf8", timeout: 5000, env: { ...process.env, DISABLE_AUTO_UPDATE: "true" } }).stdout || "";
+		const shellPath = shellOut.split("__GROK_PATH__\n")[1]?.split("\n")[0];
+		if (shellPath) { process.env.PATH = shellPath; }
+	} catch {}
+}
 app.setPath("userData", path.join(app.getPath("appData"), "grok-code"));
 app.setName("Codewomplers Grok Desktop");
 if (process.platform === "win32") app.setAppUserModelId("Grok.Code");
@@ -23,6 +33,7 @@ const { AgentHost } = require("./agent.cjs");
 const { readDiff, revertFile } = require("./diff.cjs");
 const git = require("./git.cjs");
 const { TerminalHost } = require("./terminal.cjs");
+const { createInbound, candidatesFor, askInOrder } = require("./inbound.cjs");
 const { listFiles, readText, writeText, runCommand, locateFile } = require("./files.cjs");
 const usage = require("./usage.cjs");
 const customize = require("./customize.cjs");
@@ -47,6 +58,27 @@ const host = new AgentHost((event) => {
 	}
 	broadcast(event);
 }, { rulesFile: () => path.join(app.getPath("userData"), "always-allow.json") });
+
+const inbound = createInbound({ registryFile: path.join(app.getPath("userData"), "inbound.json"), deliver: deliverInbound });
+const inboundWindows = new Set();
+const inboundWaits = new Map();
+
+function focusedContents() {
+	return BrowserWindow.getFocusedWindow()?.webContents ?? null;
+}
+
+async function deliverInbound({ agentSessionId, text }) {
+	let requestId;
+	try {
+		return await askInOrder(candidatesFor({ agentSessionId, sessions: host.sessions, owners, registered: inboundWindows, focused: focusedContents() }), (contents) => new Promise((resolve) => {
+			requestId = crypto.randomUUID();
+			inboundWaits.set(requestId, { contents, resolve });
+			contents.send("grok:event", { type: "inbound", requestId, agentSessionId, text });
+		}), 3000);
+	} finally {
+		inboundWaits.delete(requestId);
+	}
+}
 
 const terminals = new TerminalHost((event) => {
 	if (event.type === "terminal-exit") { terminalOwners.delete(event.id); }
@@ -540,14 +572,14 @@ ipcMain.handle("grok:open-image", (event, file) => {
 });
 
 ipcMain.handle("grok:app-info", () => ({ ok: true, version: app.getVersion(), electron: process.versions.electron }));
-ipcMain.handle("grok:update-check", (_event, force) => updates.checkForUpdate(appDir, app.getVersion(), { force: force === true }));
-ipcMain.handle("grok:update-prepare", (_event, tag) => updates.updatePrepare(appDir, app.getVersion(), tag));
+ipcMain.handle("grok:update-check", (_event, force) => updates.checkForUpdate(appDir, app.getVersion(), { force: force === true, packaged: app.isPackaged }));
+ipcMain.handle("grok:update-prepare", (_event, tag) => updates.updatePrepare(appDir, app.getVersion(), tag, { packaged: app.isPackaged }));
 ipcMain.handle("grok:update-start", async (_event, tag) => {
 	if (pendingUpdate || startingUpdate) { return { ok: false, error: "An update is already running." }; }
 	startingUpdate = true;
 	try {
 		if (await updateHelper.markerLive(updateHelper.readMarker(app.getPath("userData")))) { return { ok: false, error: "An update is already running." }; }
-		const prepared = await updates.updatePrepare(appDir, app.getVersion(), tag);
+		const prepared = await updates.updatePrepare(appDir, app.getVersion(), tag, { packaged: app.isPackaged });
 		if (!prepared.ok || !prepared.ready) { return { ok: false, error: prepared.reason || "The update isn't ready." }; }
 		pendingUpdate = { tag, from: prepared.from, node: prepared.node };
 		app.quit();
@@ -575,6 +607,20 @@ ipcMain.handle("grok:customize", (_event, cwd) => customize.inventory(cwd));
 ipcMain.handle("grok:customize-change", (_event, cwd, input) => customize.change(cwd, input));
 // Undefined until Grok first starts in this app; null after signing out.
 ipcMain.handle("grok:account", () => host.account);
+ipcMain.handle("grok:inbound", (event, enabled) => {
+	if (!inboundWindows.has(event.sender)) {
+		inboundWindows.add(event.sender);
+		event.sender.once("destroyed", () => inboundWindows.delete(event.sender));
+	}
+	return inbound.setEnabled(enabled === true).then(() => ({ ok: true }), (error) => ({ ok: false, error: error.message }));
+});
+ipcMain.handle("grok:inbound-result", (event, requestId, result) => {
+	const wait = inboundWaits.get(requestId);
+	if (wait && wait.contents === event.sender) {
+		inboundWaits.delete(requestId);
+		wait.resolve(result);
+	}
+});
 ipcMain.handle("grok:billing", () => host.billing());
 ipcMain.handle("grok:sign-out", async () => {
 	if ([...host.turns.values()].some((turn) => !turn.finished)) { return { ok: false, error: "Grok is still answering. Press Stop or wait, then sign out." }; }
@@ -604,18 +650,23 @@ function aboutDialog(win) {
 }
 
 async function checkForUpdates(win) {
-	const result = await updates.checkForUpdate(appDir, app.getVersion(), { force: true });
+	const result = await updates.checkForUpdate(appDir, app.getVersion(), { force: true, packaged: app.isPackaged });
 	if (result.ok && result.available) {
 		const { response } = await dialog.showMessageBox(win, { type: "info", title: "Check for Updates", message: `Version ${result.latest} is available`, buttons: ["Update…", "Later"], defaultId: 1, cancelId: 1 });
 		if (response === 0 && win && !win.isDestroyed()) { win.webContents.send("grok:event", { type: "update-open", current: result.current, latest: result.latest, tag: result.tag }); }
 		return;
 	}
 	const latest = result.ok && result.reason === "up-to-date";
-	const reason = result.reason === "no-releases" ? "No releases were found on this copy's origin." : result.reason === "not-checkout" ? "This copy isn't a git checkout of the app." : "The update check couldn't reach this copy's origin.";
+	const origin = app.isPackaged ? "GitHub" : "this copy's origin";
+	const reason = result.reason === "no-releases" ? `No releases were found on ${origin}.` : result.reason === "not-checkout" ? "This copy isn't a git checkout of the app." : `The update check couldn't reach ${origin}.`;
+	const where = process.platform === "win32" ? "PowerShell" : "Terminal";
+	const detail = app.isPackaged
+		? `Codewomplers Grok Desktop updates come from its GitHub releases.\nVersion ${app.getVersion()}. To update, quit Codewomplers Grok Desktop, then run this in ${where}:\n${updates.installCommand()}`
+		: `Codewomplers Grok Desktop updates come from its git checkout.\nVersion ${app.getVersion()}. To update, quit Codewomplers Grok Desktop, then in its folder run git pull, npm install and npm run desktop.`;
 	await dialog.showMessageBox(win, {
 		type: "info", title: "Check for Updates",
 		message: latest ? `You have the latest version (${app.getVersion()}).` : reason,
-		...(latest ? {} : { detail: `Codewomplers Grok Desktop updates come from its git checkout.\nVersion ${app.getVersion()}. To update, quit Codewomplers Grok Desktop, then in its folder run git pull, npm install and npm run desktop.` }),
+		...(latest ? {} : { detail }),
 	});
 }
 
@@ -761,6 +812,7 @@ if (startupMarker) {
 // After every window has closed, so a quit that a window's unsaved-text question cancels leaves Grok running.
 app.on("will-quit", () => {
 	terminals.closeAll();
+	inbound.close();
 	host.kill();
 	repairShortcuts();
 	if (pendingUpdate) {

@@ -1119,6 +1119,39 @@ async function checkGrokState() {
 	same(app.cancels, [id], "Escape with nothing open stops Grok");
 }
 
+async function checkLimitMeter() {
+	const app = harness();
+	const meter = () => app.node((node) => String(node.props.className || "").startsWith("limit-meter"));
+	let billing = { ok: false, error: "Usage shows once Grok is running. Send a message, then run /usage." };
+	app.api.billing = async () => billing;
+	await app.settle();
+	const id = app.model().session.id;
+	assert.equal(textOf(meter()), "Limit", "no limit before Grok runs");
+	assert.equal(meter().props.className, "limit-meter");
+	assert.match(meter().props.title, /once Grok is running/);
+	billing = { ok: true, percent: 80, period: "weekly", resetsAt: "2026-11-04T22:56:56.873+00:00", tier: "SuperGrok" };
+	sendPrompt(app, "first");
+	await app.settle();
+	app.emit({ type: "done", uiSessionId: id, turnId: app.sends.at(-1).turnId });
+	await app.settle();
+	assert.equal(textOf(meter()), "Weekly - 20% left", "a finished turn reads the limit");
+	assert.equal(meter().props.className, "limit-meter warn");
+	assert.match(meter().props.title, /^SuperGrok weekly limit 80% used · resets /);
+	billing = { ok: false, error: "Grok did not return usage." };
+	sendPrompt(app, "second");
+	await app.settle();
+	app.emit({ type: "done", uiSessionId: id, turnId: app.sends.at(-1).turnId });
+	await app.settle();
+	assert.equal(textOf(meter()), "Weekly - 20% left", "a failed read keeps the last limit");
+	billing = { ok: true, percent: 92.4, period: "monthly", resetsAt: "", tier: "SuperGrok" };
+	sendPrompt(app, "third");
+	await app.settle();
+	app.emit({ type: "done", uiSessionId: id, turnId: app.sends.at(-1).turnId });
+	await app.settle();
+	assert.equal(textOf(meter()), "Monthly - 8% left");
+	assert.equal(meter().props.className, "limit-meter high");
+}
+
 async function checkSlashCommands() {
 	const app = harness();
 	await app.settle();
@@ -1369,6 +1402,56 @@ async function checkToolRows() {
 	const verboseView = harness();
 	verboseView.group({ tools: groupTools.slice(0, 3), m: { ...groupedModel, view: "verbose" } });
 	assert.equal(verboseView.nodes(verboseView.render()).filter((node) => node.type.name === "ToolRow").length, 3, "Verbose opens groups");
+}
+
+async function checkInboundTurns() {
+	const app = await composerWindow();
+	const id = app.model().session.id;
+	const agentSessionId = app.model().session.agentSessionId;
+	const answers = [];
+	const marker = "[Sent by a local tool, not typed in Grok Code]";
+	app.api.inboundResult = async (requestId, result) => { answers.push([requestId, result]); };
+	const inbound = async (requestId, text, target = agentSessionId) => {
+		app.emit({ type: "inbound", requestId, agentSessionId: target, text });
+		await app.settle();
+		return answers.at(-1);
+	};
+	same(await inbound("idle", "/always-approve"), ["idle", { accepted: true, status: "sent" }]);
+	assert.equal(app.sends.length, 2);
+	assert.equal(app.sends.at(-1).text, `${marker}\n\n/always-approve`, "the marker prevents a local turn from running a slash command");
+	assert.equal(app.sends.at(-1).mode, "Normal");
+	same(await inbound("busy", "wait for this turn"), ["busy", { accepted: true, status: "queued" }]);
+	assert.equal(app.sends.length, 2);
+	same(savedHistory(app).queued[id].map((item) => item.text), [`${marker}\n\nwait for this turn`]);
+	button(app, "Stop").props.onClick();
+	app.emit({ type: "done", uiSessionId: id, turnId: app.sends.at(-1).turnId, stopReason: "cancelled" });
+	await app.settle();
+	same(await inbound("held", "stay on hold"), ["held", { accepted: true, status: "held" }]);
+	assert.equal(app.sends.length, 2, "an inbound turn does not release held messages");
+	same(savedHistory(app).queued[id].map((item) => item.text), [`${marker}\n\nwait for this turn`, `${marker}\n\nstay on hold`]);
+	assert.ok(app.nodes().some((node) => node.props.className === "note" && textOf(node).includes("Held until")), "the session stays held");
+	const queued = JSON.stringify(savedHistory(app).queued);
+	same(await inbound("unknown", "unknown target", "unknown-session"), ["unknown", { accepted: false }]);
+	assert.equal(app.sends.length, 2);
+	assert.equal(JSON.stringify(savedHistory(app).queued), queued);
+	app.sidebar().onArchive(id);
+	await app.settle();
+	same(await inbound("archived", "archived target"), ["archived", { accepted: false }]);
+	assert.equal(app.sends.length, 2);
+	assert.equal(JSON.stringify(savedHistory(app).queued), queued);
+
+	const stale = await composerWindow();
+	const staleId = stale.model().session.id;
+	const staleAnswers = [];
+	stale.api.inboundResult = async (...answer) => { staleAnswers.push(answer); };
+	const saved = savedHistory(stale);
+	saved.modes[staleId] = "Plan";
+	stale.storage.set("grok-code.history.v1", JSON.stringify(saved));
+	stale.emit({ type: "inbound", requestId: "stale", agentSessionId: stale.model().session.agentSessionId, text: "use the current mode" });
+	await stale.settle();
+	same(staleAnswers, [["stale", { accepted: false, stale: true }]]);
+	assert.equal(stale.sends.length, 1);
+	same(savedHistory(stale).queued, {}, "a stale window queues nothing");
 }
 
 async function checkQueue() {
@@ -4104,6 +4187,24 @@ async function checkAppUpdates() {
 	await app.settle();
 	assert.deepEqual(copied, ["git pull\nnpm install\nnpm run desktop"]);
 	assert.equal(app.node((node) => node.props.role === "alertdialog"), undefined, "Copy steps closes the only update dialog");
+	app.api.updatePrepare = async () => ({ ok: true, ready: false, reason: "This copy was installed with the macOS install command.", steps: "curl -fsSL https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-mac.sh | bash" });
+	app.sidebar().onUpdate();
+	await app.settle();
+	dialog = app.node((node) => node.props.role === "alertdialog");
+	assert.ok(textOf(dialog).includes("run this in Terminal:"));
+	button(app, "Copy steps").props.onClick();
+	await app.settle();
+	app.api.updatePrepare = async () => ({ ok: true, ready: false, reason: "This copy was installed with the Windows install command.", steps: "irm https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-windows.ps1 | iex" });
+	app.sidebar().onUpdate();
+	await app.settle();
+	dialog = app.node((node) => node.props.role === "alertdialog");
+	assert.ok(textOf(dialog).includes("run this in PowerShell:"));
+	button(app, "Copy steps").props.onClick();
+	await app.settle();
+	assert.deepEqual(copied.slice(-2), [
+		"curl -fsSL https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-mac.sh | bash",
+		"irm https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-windows.ps1 | iex",
+	]);
 	for (const ok of [true, false]) {
 		const resultTimers = controlledTimers();
 		const resultApp = harness(new Map(), "", Date, resultTimers);
@@ -4129,6 +4230,7 @@ async function main() {
 		assert.equal(!!button(codeBlocks, "Run"), ["powershell", "pwsh", "ps1", "ps"].includes(lang), `${lang} only has Run for PowerShell`);
 	}
 	await check();
+	await checkInboundTurns();
 	await checkQueue();
 	await checkQueueRelaunch();
 	await checkQueueFailedClose();
@@ -4145,6 +4247,7 @@ async function main() {
 	await checkSavedSize();
 	await checkGrokState();
 	await checkSlashCommands();
+	await checkLimitMeter();
 	await checkToolRows();
 	await checkFixBrief();
 	await checkRoutineBatchB();

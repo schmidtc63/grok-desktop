@@ -145,8 +145,12 @@ interface GrokAccount {
 	version: string;
 }
 
+type InboundResult = { accepted: true; status: "sent" | "queued" | "held" } | { accepted: false; stale?: true };
+
 interface GrokEvent {
-	type: "chunk" | "thought" | "tool" | "done" | "error" | "mode" | "usage" | "context" | "commands" | "models" | "mcp" | "mcp-status" | "terminal-data" | "terminal-exit" | "account" | "bg-tasks" | "subagent" | "title" | "steer" | "turn-start" | "update-open";
+	type: "chunk" | "thought" | "tool" | "done" | "error" | "mode" | "usage" | "context" | "commands" | "models" | "mcp" | "mcp-status" | "terminal-data" | "terminal-exit" | "account" | "bg-tasks" | "subagent" | "title" | "steer" | "turn-start" | "update-open" | "inbound";
+	requestId?: string;
+	agentSessionId?: string;
 	current?: string;
 	latest?: string;
 	tag?: string;
@@ -310,11 +314,13 @@ interface GrokCodeApi {
 	attention: () => Promise<WriteResult>;
 	taskbar?: (state: "idle" | "running" | "needs-you") => Promise<WriteResult>;
 	keepAwake: (payload: { working: boolean; onBattery: boolean }) => Promise<WriteResult>;
+	inbound?: (enabled: boolean) => Promise<WriteResult>;
+	inboundResult?: (requestId: string, result: InboundResult) => Promise<void>;
 	saveImage: (base64: string) => Promise<WriteResult & { path?: string }>;
 	openImage: (file: string) => Promise<WriteResult>;
 	appInfo: () => Promise<{ ok: boolean; version?: string; electron?: string }>;
 	updateCheck?: (force?: boolean) => Promise<{ ok: boolean; available?: boolean; reason?: string; current?: string; latest?: string; tag?: string }>;
-	updatePrepare?: (tag: string) => Promise<{ ok: boolean; ready?: boolean; reason?: string; notes?: string; current?: string; latest?: string; tag?: string }>;
+	updatePrepare?: (tag: string) => Promise<{ ok: boolean; ready?: boolean; reason?: string; notes?: string; steps?: string; current?: string; latest?: string; tag?: string }>;
 	updateStart?: (tag: string) => Promise<WriteResult>;
 	updateResult?: () => Promise<{ ok: boolean; message: string } | null>;
 	contextBreakdown?: (agentSessionId: string) => Promise<{ ok: boolean; error?: string } & Partial<ContextBreakdown>>;

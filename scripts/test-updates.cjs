@@ -10,13 +10,13 @@ const localRequire = createRequire(file);
 const moduleState = { exports: {} };
 let now = 0;
 vm.runInNewContext(fs.readFileSync(file, "utf8"), {
-	module: moduleState, Date: { now: () => now }, process: { platform: "win32" },
+	module: moduleState, Date: { now: () => now }, process: { platform: "win32" }, AbortSignal,
 	require(name) {
 		if (name === "../scripts/update-helper.cjs") { return { findNode: async () => process.execPath }; }
 		return localRequire(name);
 	},
 });
-const { parseVersion, newer, latestTag, checkForUpdate, updatePrepare } = moduleState.exports;
+const { INSTALL_COMMAND, installCommand, parseVersion, newer, latestTag, checkForUpdate, updatePrepare } = moduleState.exports;
 const appDir = path.resolve(__dirname, "..");
 const sha = "a".repeat(40);
 const replies = {
@@ -107,6 +107,43 @@ async function main() {
 	assert.equal(cached.calls.length, 2);
 	await checkForUpdate(appDir, "0.9.0", { ...cached, force: true });
 	assert.equal(cached.calls.length, 4);
+	// A copy installed with scripts/install-mac.sh has no checkout: it asks GitHub's release API and never runs git.
+	const noGit = () => { throw new Error("git ran"); };
+	const github = (status, body) => async (url, options) => {
+		assert.equal(url, "https://api.github.com/repos/schmidtc63/grok-desktop/releases/latest");
+		assert.ok(options.signal, "the release request has a timeout");
+		return { status, ok: status >= 200 && status < 300, json: async () => body };
+	};
+	const installed = (fetchUrl, current = "0.9.0") => checkForUpdate(appDir, current, { force: true, packaged: true, runGit: noGit, fetchUrl });
+	const found = await installed(github(200, { tag_name: "v0.10.0" }));
+	assert.deepEqual([found.ok, found.available, found.tag, found.latest], [true, true, "v0.10.0", "0.10.0"]);
+	assert.equal((await installed(github(200, { tag_name: "v0.10.0" }), "0.10.0")).reason, "up-to-date");
+	assert.equal((await installed(github(404, {}))).reason, "no-releases");
+	assert.equal((await installed(github(200, { tag_name: "v0.10.0-rc.1" }))).reason, "no-releases");
+	assert.equal((await installed(github(500, {}))).ok, false);
+	const installedPrepare = await updatePrepare(appDir, "0.9.0", "v0.10.0", { runGit: noGit, packaged: true, platform: "darwin" });
+	assert.equal(installedPrepare.ready, false);
+	assert.equal(installedPrepare.steps, INSTALL_COMMAND);
+	assert.ok(installedPrepare.reason.includes("macOS"), installedPrepare.reason);
+	assert.ok(INSTALL_COMMAND.endsWith("/scripts/install-mac.sh | bash"), INSTALL_COMMAND);
+	const windowsPrepare = await updatePrepare(appDir, "0.9.0", "v0.10.0", { runGit: noGit, packaged: true, platform: "win32" });
+	assert.equal(windowsPrepare.ready, false);
+	assert.equal(windowsPrepare.steps, installCommand("win32"));
+	assert.ok(windowsPrepare.reason.includes("Windows"), windowsPrepare.reason);
+	assert.ok(windowsPrepare.steps.endsWith("/scripts/install-windows.ps1 | iex"), windowsPrepare.steps);
+	const defaultPrepare = await updatePrepare(appDir, "0.9.0", "v0.10.0", { runGit: noGit, packaged: true });
+	assert.equal(defaultPrepare.steps, installCommand("win32"), "the test double's platform is win32");
+	const installScript = fs.readFileSync(path.join(appDir, "scripts", "install-windows.ps1"), "utf8");
+	const packageScript = fs.readFileSync(path.join(appDir, "scripts", "package-windows.ps1"), "utf8");
+	assert.ok(installScript.includes("Codewomplers-Grok-Desktop-win-x64.zip"));
+	assert.ok(packageScript.includes("Codewomplers-Grok-Desktop-win-x64.zip"));
+	assert.ok(packageScript.includes("--no-asar"));
+	assert.ok(installScript.includes("$env:LOCALAPPDATA"));
+	assert.ok(installScript.includes("Microsoft\\Windows\\Start Menu\\Programs\\Codewomplers Grok Desktop.lnk"));
+	assert.equal(installScript.trim().split(/\r?\n/).at(-1), "Install-GrokDesktop -Tag $tagValue");
+	const preferenceAt = installScript.indexOf("$ErrorActionPreference = \"Stop\"");
+	assert.ok(preferenceAt > installScript.indexOf("function Install-GrokDesktop"), "ErrorActionPreference stays inside the function");
+	assert.equal(installScript.split("$ErrorActionPreference = \"Stop\"").length, 2);
 	assert.equal((await checkPrepare({}, undefined, "v0.10.0;evil")).calls.length, 0);
 	for (const [overrides, reason] of [
 		[{ "rev-parse --abbrev-ref HEAD": "feature" }, "on branch feature"],

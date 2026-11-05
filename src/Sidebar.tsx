@@ -177,6 +177,7 @@ export function Sidebar({
 	onMarkCompleted,
 	onMove,
 	onOpenWindow,
+	onCopySessionId,
 	onSettings,
 	onCollapse,
 	onNotice,
@@ -205,6 +206,7 @@ export function Sidebar({
 	onMarkCompleted: (id: string, completed: boolean) => void;
 	onMove: (id: string, sectionId: string | undefined) => void;
 	onOpenWindow: (id: string) => void;
+	onCopySessionId: (agentSessionId: string) => void;
 	onSettings: () => void;
 	onCollapse: () => void;
 	onNotice: (text: string) => void;
@@ -500,6 +502,7 @@ export function Sidebar({
 					<button onMouseEnter={() => setSub(null)} onClick={() => { onMarkCompleted(rowSession.id, !rowSession.completed); closeAll(); }}>{rowSession.completed ? "Mark as not completed" : "Mark as completed"}</button>
 					<Cascade label="Move to section" value="" open={sub?.kind === "move"} onOpen={(event) => openSub("move", event)} />
 					<button onMouseEnter={() => setSub(null)} onClick={() => { onOpenWindow(rowSession.id); closeAll(); }}>Open in a new window</button>
+					{rowSession.agentSessionId && <button onMouseEnter={() => setSub(null)} onClick={() => { onCopySessionId(rowSession.agentSessionId!); closeAll(); }}>Copy Grok session ID</button>}
 					<hr />
 					<button onMouseEnter={() => setSub(null)} onClick={() => { onArchive(rowSession.id); closeAll(); }}>{rowSession.archived ? "Unarchive" : "Archive"}</button>
 					<button

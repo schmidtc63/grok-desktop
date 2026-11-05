@@ -24,6 +24,7 @@ export interface AppSettings {
 	keepAwake: boolean;
 	keepAwakeOnBattery: boolean;
 	autoArchiveDays: number;
+	acceptLocalTurns: boolean;
 	branchPrefix: string;
 	defaultMode: PermissionMode;
 	defaultView: TranscriptView;
@@ -53,6 +54,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
 	keepAwake: true,
 	keepAwakeOnBattery: true,
 	autoArchiveDays: 14,
+	acceptLocalTurns: false,
 	branchPrefix: "grok",
 	defaultMode: "Normal",
 	defaultView: "normal",
@@ -179,6 +181,7 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 						{row("Default permission mode", `The mode each new session starts in. ${MODES.find((item) => item.id === settings.defaultMode)?.detail ?? ""}`, choose("defaultMode", "Default permission mode", MODES.map((item) => [item.id, item.id])))}
 						{row("Transcript view", keyLabel("How much each session shows until you change it with Ctrl+O. Thinking adds Grok's reasoning; Verbose also opens tool details."), choose("defaultView", "Transcript view", [["normal", "Normal"], ["thinking", "Thinking"], ["verbose", "Verbose"]]))}
 						{row("Archive inactive sessions", "Archive sessions with no activity for this long. Clean worktree folders are removed; their branches stay. Pinned and running sessions stay.", choose("autoArchiveDays", "Archive inactive sessions", [[0, "Never"], [1, "1 day"], [2, "2 days"], [7, "7 days"], [14, "14 days"], [30, "30 days"]]))}
+						{row("Accept turns from local tools", "Lets programs on this computer that hold the private token add a message to an open session. The message waits in that session's queue and runs with that session's mode and approvals. Off by default.", toggle("acceptLocalTurns", "Accept turns from local tools"))}
 						{row("Branch prefix", "Added to the branch names of new worktree sessions.", (
 							<span className="set-inline">
 								<input aria-label="Branch prefix" value={prefix} onChange={(event) => setPrefix(event.target.value)} onBlur={() => { if (validPrefix(prefix) && prefix !== settings.branchPrefix) { onChange({ branchPrefix: prefix }); } }} />

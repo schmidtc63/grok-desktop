@@ -1,0 +1,82 @@
+name: release-mac
+# Builds the macOS and Windows release zips for each version tag and attaches the zips the install scripts download.
+# Tags exist only on the public repository, so only it publishes. A tag with a hyphen (v0.6.0-rc.1) becomes a prerelease.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  mac:
+    runs-on: macos-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm run build
+      - run: bash scripts/package-mac.sh
+      # The page must load, not just the process stay up: Electron keeps running after a main-process error, showing a dialog.
+      - name: Launch check (arm64)
+        run: |
+          GROK_CODE_DEBUG_PORT=9333 "out/Codewomplers Grok Desktop-darwin-arm64/Codewomplers Grok Desktop.app/Contents/MacOS/Codewomplers Grok Desktop" &
+          pid=$!
+          sleep 20
+          kill -0 "$pid"
+          curl -s http://127.0.0.1:9333/json | grep -q "dist/index.html"
+          kill "$pid"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: out/Codewomplers-Grok-Desktop-mac-*.zip
+          if-no-files-found: error
+  windows:
+    runs-on: windows-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm run build
+      - run: pwsh -File scripts/package-windows.ps1
+      # Same check as macOS: DevTools must list the page. Stop the process even when the check fails.
+      - name: Launch check
+        shell: pwsh
+        run: |
+          $env:GROK_CODE_DEBUG_PORT = "9333"
+          $exe = "out\Codewomplers Grok Desktop-win32-x64\Codewomplers Grok Desktop.exe"
+          $p = Start-Process -FilePath $exe -PassThru
+          try {
+            Start-Sleep -Seconds 20
+            if ($p.HasExited) { throw "The packaged app exited before the page loaded." }
+            $json = curl.exe -s http://127.0.0.1:9333/json
+            if ($json -notmatch "dist/index.html") { throw "DevTools did not list dist/index.html." }
+          } finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/Codewomplers-Grok-Desktop-win-x64.zip
+          if-no-files-found: error
+  publish:
+    needs: [mac, windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      # gh release create needs this checkout to find the repository, and --notes-from-tag reads the tag from it.
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --notes-from-tag $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease) release/mac/*.zip release/windows/*.zip
