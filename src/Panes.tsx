@@ -519,7 +519,22 @@ function Thought({ text, view }: { text: string; view: TranscriptView }) {
 	);
 }
 
-function MessageBody({ message, m, readOnly = false }: { message: ChatMessage; m: PaneModel; readOnly?: boolean }) {
+// Eight lines, then a fade, matches how Claude Desktop shows a long message.
+// shortcut: 88 characters is one line of the user bubble at the chat column's max width; measure the bubble if that width changes.
+export const USER_MESSAGE_LINES = 8;
+export const USER_LINE_CHARS = 88;
+
+export function userMessageOverflows(text: string): boolean {
+	let rows = 0;
+	for (const line of text.split("\n")) {
+		rows += Math.max(1, Math.ceil(line.length / USER_LINE_CHARS));
+		if (rows > USER_MESSAGE_LINES) { return true; }
+	}
+	return false;
+}
+
+function MessageBody({ message, m, readOnly = false, find = "" }: { message: ChatMessage; m: PaneModel; readOnly?: boolean; find?: string }) {
+	const [userOpen, setUserOpen] = useState(false);
 	const known = m.folderFiles?.files;
 	const hits = useMemo(() => readOnly ? [] : mentionedFiles(message.text, message.tools, m.session.folder, known ?? []), [readOnly, message.text, message.tools, m.session.folder, known]);
 	const hitFiles = useMemo(() => hits.map((hit) => hit.file), [hits]);
@@ -544,6 +559,9 @@ function MessageBody({ message, m, readOnly = false }: { message: ChatMessage; m
 	if (message.role === "user") {
 		const files = message.attachments ?? [];
 		const others = files.filter((file) => !imageSrc(file));
+		const overflows = userMessageOverflows(message.text);
+		const found = find !== "" && message.text.toLowerCase().includes(find.toLowerCase());
+		const clipped = overflows && !userOpen && !found;
 		return (
 			<>
 				{files.filter((file) => imageSrc(file)).map((file) => (
@@ -552,7 +570,14 @@ function MessageBody({ message, m, readOnly = false }: { message: ChatMessage; m
 					</button>
 				))}
 				<div className="user-bubble">
-					<div className="message-text">{message.text}</div>
+					<div className={clipped ? "user-clip clipped" : "user-clip"}>
+						<div className="message-text">{message.text}</div>
+					</div>
+					{overflows && !found && (
+						<button type="button" className="show-more" aria-expanded={userOpen} onClick={() => setUserOpen((value) => !value)}>
+							{userOpen ? "Show less" : "Show more"}
+						</button>
+					)}
 					{!!others.length && (
 						<div className="attach-list">
 							{others.map((file) => <span className="attach-chip" key={file} title={file}>{file.split(/[\\/]/).pop()}</span>)}
@@ -764,7 +789,7 @@ function Chat({ m }: { m: PaneModel }) {
 						const time = messageTime(message);
 						return (
 							<article className={message.role === "user" ? "msg user" : "msg grok"} key={message.id} tabIndex={time ? 0 : undefined}>
-								<MessageBody message={message} m={m} />
+								<MessageBody message={message} m={m} find={find ?? ""} />
 								<div className="msg-foot">
 									{time && <time className="msg-time" dateTime={new Date(time.at).toISOString()} title={time.full}>{time.full}</time>}
 									{!message.pending && !message.streaming && message.text.trim() && (

@@ -194,7 +194,10 @@ function harness(storage = new Map(), search = "", clock = Date, timers = { setT
 		fileFingerprint: (file) => load("DiffPane.tsx").fileFingerprint(file),
 		canMarkViewed: (file) => load("DiffPane.tsx").canMarkViewed(file),
 		filesView: (props) => { component = () => load("FilesPane.tsx").FilesPane({ ...props, autoSave: false }); dirty = true; return render(); },
-		message: (model, readOnly = false) => { component = () => { const pane = load("Panes.tsx").PaneView({ id: "chat", model }); const chat = pane.type(pane.props); const body = nodes(chat).find((node) => node.type.name === "MessageBody"); return body.type({ ...body.props, readOnly }); }; dirty = true; return render(); },
+		message: (model, readOnly = false, extra = {}) => { component = () => { const pane = load("Panes.tsx").PaneView({ id: "chat", model }); const chat = pane.type(pane.props); const body = nodes(chat).find((node) => node.type.name === "MessageBody"); return body.type({ ...body.props, readOnly, ...extra }); }; dirty = true; return render(); },
+		userMessageOverflows: (text) => load("Panes.tsx").userMessageOverflows(text),
+		USER_MESSAGE_LINES: () => load("Panes.tsx").USER_MESSAGE_LINES,
+		USER_LINE_CHARS: () => load("Panes.tsx").USER_LINE_CHARS,
 		emit: (event) => listener(event),
 		model: () => find((node) => node.type === "PaneView").props.model,
 		sidebar: () => find((node) => node.type === "Sidebar").props,
@@ -3560,6 +3563,42 @@ async function checkTaskDetails() {
 	assert.equal(row().props["aria-expanded"], false);
 }
 
+async function checkLongMessages() {
+	const app = harness();
+	await app.settle();
+	const lines = app.USER_MESSAGE_LINES();
+	const width = app.USER_LINE_CHARS();
+	assert.equal(app.userMessageOverflows("hello"), false);
+	assert.equal(app.userMessageOverflows(Array.from({ length: lines }, () => "line").join("\n")), false, "eight lines stay open");
+	assert.equal(app.userMessageOverflows(Array.from({ length: lines + 1 }, () => "line").join("\n")), true);
+	assert.equal(app.userMessageOverflows("x".repeat(width * lines)), false);
+	assert.equal(app.userMessageOverflows("x".repeat(width * lines + 1)), true, "a wrapped line past eight rows collapses");
+	const long = Array.from({ length: 12 }, (_, index) => `report line ${index}`).join("\n");
+	const model = { ...app.model(), messages: [{ id: "long-user", role: "user", text: long }, { id: "long-reply", role: "grok", text: long }] };
+	const view = harness();
+	view.message(model);
+	assert.equal(view.node((node) => node.props.className === "user-clip clipped").props.className, "user-clip clipped");
+	const more = view.node((node) => node.type === "button" && node.props.children === "Show more");
+	assert.equal(more.props["aria-expanded"], false);
+	more.props.onClick();
+	view.render();
+	assert.equal(view.node((node) => node.type === "button" && node.props.children === "Show less").props["aria-expanded"], true);
+	assert.equal(view.node((node) => node.props.className === "user-clip clipped"), undefined, "Show less removes the clip");
+	const reply = harness();
+	reply.message({ ...app.model(), messages: [{ id: "long-reply", role: "grok", text: long }] });
+	assert.equal(reply.node((node) => node.props.children === "Show more"), undefined, "Grok's replies stay open");
+	const found = harness();
+	found.message(model, false, { find: "report line 11" });
+	assert.equal(found.node((node) => node.props.className === "user-clip clipped"), undefined, "a find match opens the whole message");
+	assert.equal(found.node((node) => node.props.children === "Show more"), undefined);
+	const missed = harness();
+	missed.message(model, false, { find: "not in the report" });
+	assert.ok(missed.node((node) => node.props.className === "user-clip clipped"));
+	const short = harness();
+	short.message({ ...app.model(), messages: [{ id: "short-user", role: "user", text: "hello" }] });
+	assert.equal(short.node((node) => node.props.children === "Show more"), undefined);
+}
+
 async function checkReadOnlyMessages() {
 	const app = await composerWindow();
 	const links = [];
@@ -4287,6 +4326,7 @@ async function main() {
 	await checkSavedThinkingAndLegacySettings();
 	await checkBackgroundWorkHistory();
 	await checkTaskDetails();
+	await checkLongMessages();
 	await checkReadOnlyMessages();
 	await checkEditDiffs();
 	await checkSetupSheet();

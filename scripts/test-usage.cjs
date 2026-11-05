@@ -44,7 +44,11 @@ fs.writeFileSync(path.join(folder, "usage.json"), JSON.stringify({ turns: [
 	{ endedAt: "2026-10-25T08:00:00+00:00", costUsdTicks: 1e10 },
 	{ endedAt: "2026-10-20T08:00:00+00:00", costUsdTicks: 9e10 },
 ] }));
-assert.deepEqual(recentSpend(now, root), { ok: true, usd: 3.5 }, "turns from the last seven days count, older ones do not");
+const stale = path.join(path.dirname(folder), "01a10000-0000-0000-0000-000000000000", "usage.json");
+fs.mkdirSync(path.dirname(stale));
+fs.writeFileSync(stale, JSON.stringify({ turns: [{ endedAt: "2026-10-28T08:00:00+00:00", costUsdTicks: 5e10 }] }));
+fs.utimesSync(stale, new Date(now - 8 * 864e5), new Date(now - 8 * 864e5));
+assert.deepEqual(recentSpend(now, root), { ok: true, usd: 3.5 }, "turns from the last seven days count, older ones and files untouched for a week do not");
 console.log("PASS recentSpend: sums the last seven days of turn costs");
 
 const config = path.join(root, "config.toml");

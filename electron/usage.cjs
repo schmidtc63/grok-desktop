@@ -81,7 +81,8 @@ function recentSpend(now = Date.now(), root = sessionsRoot()) {
 			try { sessions = fs.readdirSync(path.join(root, name)); } catch { continue; }
 			for (const id of sessions) {
 				const file = path.join(root, name, id, "usage.json");
-				if (!fs.existsSync(file)) { continue; }
+				// Grok rewrites usage.json at each turn end, so a file untouched for a week holds no turn from it.
+				try { if (now - fs.statSync(file).mtimeMs > WEEK_MS) { continue; } } catch { continue; }
 				let usage;
 				try { usage = JSON.parse(fs.readFileSync(file, "utf8")); } catch { continue; }
 				for (const turn of Array.isArray(usage.turns) ? usage.turns : []) {

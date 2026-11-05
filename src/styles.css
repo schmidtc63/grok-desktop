@@ -1062,6 +1062,19 @@ select {
 	border-radius: 14px;
 	padding: 8px 12px;
 }
+.user-clip { position: relative; }
+.user-clip.clipped { max-height: calc(8 * 1.45em); overflow: hidden; }
+.user-clip.clipped::after {
+	content: "";
+	position: absolute;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	height: 1.6em;
+	background: linear-gradient(transparent, var(--bubble));
+	pointer-events: none;
+}
+.show-more { display: block; margin-top: 6px; padding: 0; border: 0; background: transparent; text-align: left; }
 .steer-note { max-width: 85%; margin: 8px 0 8px auto; padding: 6px 10px; border-radius: 12px; background: var(--bubble); }
 .steer-note small { display: block; color: var(--faint); }
 .msg.grok { line-height: 1.6; }

@@ -37,9 +37,9 @@ Codewomplers Grok Desktop runs on macOS and Linux from source. On macOS it also 
 
 The main window has a minimum width of 1100 px (`electron/main.cjs`), so it cannot sit beside an editor on a laptop screen. Check the composer, panes and sidebar at narrower widths, then lower the minimum.
 
-### Collapse long messages like Claude Desktop
+### Collapse long messages like Claude Desktop (built)
 
-A long message shows in full in the chat today. Claude Desktop shows only the first lines of a long message, fades them out and adds a "Show more" button. Do what Claude Desktop does. Check its behavior first (how many lines stay visible, whether pasted text gets a monospace box, whether "Show less" appears, whether Grok's replies collapse too), then build the same.
+A long user message shows eight lines, fades, and offers Show more / Show less. Grok's replies stay open. Known gap: the eight-line check counts characters instead of measuring the bubble, so a message that just fits can get a fade and a Show more that opens nothing.
 
 ### API-key sign-in
 
