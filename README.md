@@ -153,9 +153,9 @@ Turning the setting off closes the listener and removes the registry.
 
 Codewomplers Grok Desktop checks for new versions: a copy run from source asks its git origin, and an installed copy on Windows or macOS asks GitHub. When one is out, the account button at the bottom of the sidebar says Update available. Open its menu and choose Update. A copy run from source on Windows closes, updates and opens again.
 
-On Windows, quit the installed app and run the install command again. To install an older release instead, set its tag first: `$GrokDesktopTag = "v0.6.0"; irm https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-windows.ps1 | iex`.
+On Windows, quit the installed app and run the install command again. To install an older release instead (downloads start at v0.6.1), set its tag first: `$GrokDesktopTag = "v0.6.1"; irm https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-windows.ps1 | iex`.
 
-On macOS, quit the app and run the install command again. To install an older release instead, add its tag: `curl -fsSL https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-mac.sh | bash -s -- v0.6.0`.
+On macOS, quit the app and run the install command again. To install an older release instead (downloads start at v0.6.1), add its tag: `curl -fsSL https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-mac.sh | bash -s -- v0.6.1`.
 
 On Linux, in a copy run from source on macOS, and in versions before 0.2.0, update by hand: quit the app, then in its folder run:
 

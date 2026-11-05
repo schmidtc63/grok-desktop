@@ -1,7 +1,7 @@
 # Installs or updates Codewomplers Grok Desktop on Windows:
 #   irm https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-windows.ps1 | iex
 # To install a release instead of the latest, set $GrokDesktopTag first:
-#   $GrokDesktopTag = "v0.6.0"; irm https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-windows.ps1 | iex
+#   $GrokDesktopTag = "v0.6.1"; irm https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-windows.ps1 | iex
 # The body is a function called on the last line, so a download that stops partway installs nothing.
 # irm | iex runs in the current session: failures throw, and this script never calls exit.
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
