@@ -1,16 +1,15 @@
 #!/bin/bash
-# Builds the macOS release zips into out/. Run npm ci and npm run build first. macOS only (sips, codesign, ditto).
+# Builds the macOS release zips into out/. Run npm ci and npm run build first. macOS only (codesign, plutil, ditto).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 name="Codewomplers Grok Desktop"
 version="$(node -p 'require("./package.json").version')"
 rm -rf out
 mkdir out
-sips -z 1024 1024 assets/codewomplers-grok-desktop.png --out out/icon.png >/dev/null
-sips -s format icns out/icon.png --out out/icon.icns >/dev/null
+# The .icns is committed: sips failed to write it on the GitHub macOS runner (Error 13, v0.6.0 release run).
 # No asar archive: the update helper and the startup recovery read the app folder as plain files.
 # node_modules stays out: the main process needs only Node built-ins and Electron, and Vite bundles the page into dist/.
-npx electron-packager . "$name" --platform=darwin --arch=arm64,x64 --icon=out/icon.icns --app-bundle-id=com.codewomplers.grokdesktop --app-copyright="Copyright (c) 2026 Codewomplers" --out=out --no-asar --no-prune --ignore='^/(node_modules|src|out|\.github)(/|$)'
+npx electron-packager . "$name" --platform=darwin --arch=arm64,x64 --icon=assets/codewomplers-grok-desktop.icns --app-bundle-id=com.codewomplers.grokdesktop --app-copyright="Copyright (c) 2026 Codewomplers" --out=out --no-asar --no-prune --ignore='^/(node_modules|src|out|\.github)(/|$)'
 for arch in arm64 x64; do
 	app="out/$name-darwin-$arch/$name.app"
 	# Packaging edits the bundle Electron shipped signed. Apple silicon runs only signed code, so sign it again ad hoc (no certificate).

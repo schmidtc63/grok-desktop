@@ -56,7 +56,8 @@ jobs:
           try {
             Start-Sleep -Seconds 20
             if ($p.HasExited) { throw "The packaged app exited before the page loaded." }
-            $json = curl.exe -s http://127.0.0.1:9333/json
+            # One string: on an array of lines, -notmatch returns the lines without a match, so the check failed even when the page loaded.
+            $json = curl.exe -s http://127.0.0.1:9333/json | Out-String
             if ($json -notmatch "dist/index.html") { throw "DevTools did not list dist/index.html." }
           } finally {
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
