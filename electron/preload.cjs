@@ -70,6 +70,12 @@ contextBridge.exposeInMainWorld("grokCode", {
 	readiness() {
 		return ipcRenderer.invoke("grok:readiness");
 	},
+	installGrok() {
+		return ipcRenderer.invoke("grok:install-grok");
+	},
+	installGit() {
+		return ipcRenderer.invoke("grok:install-git");
+	},
 	customize(cwd) {
 		return ipcRenderer.invoke("grok:customize", cwd);
 	},

@@ -21,27 +21,33 @@ The **Files**, **Terminal** and **Browser** panes sit beside the chat for editin
 
 - Windows 10 or 11, macOS, or a 64-bit Linux desktop.
 - Node.js 22.12 or later, except for the Windows and macOS install commands.
-- Git 2.31 or later.
-- The Grok CLI installed and signed in. If it is not on PATH, set `GROK_PATH` to its full executable path. The app's setup check shows the install command for your system.
+- Git 2.31 or later. On Windows and macOS the app's setup check installs it.
+- The Grok CLI, signed in. On Windows and macOS the app's setup check installs it. If it is installed somewhere else, set `GROK_PATH` to its full executable path.
 - GitHub CLI (`gh`), optional, for pull-request features. Sign in with `gh auth login` to use them.
 
-On Windows and macOS one command installs the app. On Linux, and on Windows or macOS if you prefer a plain install, install from this repository and run the app from its folder.
+On Windows and macOS a download or one command installs the app. On Linux, and on Windows or macOS if you prefer a plain install, install from this repository and run the app from its folder.
 
 ## Install on Windows
 
-1. Install Git from [git-scm.com](https://git-scm.com/download/win) if `git` is not already available in PowerShell. The app uses Git for its file list, diffs and branches.
-2. Install the Grok CLI: `irm https://x.ai/cli/install.ps1 | iex`, then sign in.
-3. In PowerShell:
+Download [Codewomplers-Grok-Desktop-Setup.exe](https://github.com/schmidtc63/grok-desktop/releases/latest) from the latest release and run it. Windows says it protected your PC because the app isn't signed: click More info, then Run anyway.
+
+Or run this in PowerShell, which shows no warning:
 
 ```powershell
 irm https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-windows.ps1 | iex
 ```
 
-The command puts Codewomplers Grok Desktop in `%LOCALAPPDATA%\Programs` and adds a Start menu shortcut. It doesn't need Node.js. Open it from the Start menu.
+Either one puts Codewomplers Grok Desktop in `%LOCALAPPDATA%\Programs` and adds a Start menu shortcut. It doesn't need Node.js. Open it from the Start menu.
+
+The first launch opens the setup check. **Install Grok CLI** installs Grok and its Git. The first message opens Grok's sign-in.
 
 ### Plain install on Windows
 
-The same app can be installed from this repository. This needs Node.js from [nodejs.org](https://nodejs.org). In PowerShell:
+The same app can be installed from this repository. This needs Git, the Grok CLI and Node.js.
+
+1. Install Git from [git-scm.com](https://git-scm.com/download/win) if `git` is not already available in PowerShell. The app uses Git for its file list, diffs and branches.
+2. Install the Grok CLI: `irm https://x.ai/cli/install.ps1 | iex`, then sign in.
+3. Install Node.js from [nodejs.org](https://nodejs.org). In PowerShell:
 
 ```powershell
 git clone https://github.com/schmidtc63/grok-desktop.git
@@ -54,9 +60,11 @@ Start a copy installed this way with `npm run desktop` from its folder each time
 
 ## Install on macOS
 
-1. Install Git with the Xcode Command Line Tools (`xcode-select --install`) or Homebrew. The app uses Git for its file list, diffs and branches.
-2. Install the Grok CLI: `curl -fsSL https://x.ai/cli/install.sh | bash`, then sign in.
-3. In Terminal:
+Download the disk image for your Mac from the [latest release](https://github.com/schmidtc63/grok-desktop/releases/latest): `Codewomplers-Grok-Desktop-mac-arm64.dmg` for Apple silicon, or `Codewomplers-Grok-Desktop-mac-x64.dmg` for Intel. Open it and drag the app to Applications.
+
+The first time, macOS blocks the app because it isn't signed: open System Settings > Privacy & Security and click Open Anyway.
+
+Or run this in Terminal, which shows no warning:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-mac.sh | bash
@@ -64,11 +72,13 @@ curl -fsSL https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/script
 
 The command puts Codewomplers Grok Desktop in Applications, or in `~/Applications` when you can't write to Applications. Open it from Launchpad, Spotlight or the Dock. It doesn't need Node.js.
 
-The app isn't signed by Apple. Installed this way it carries no download mark, so macOS opens it without the "can't be verified" block. Each update is a new build, so macOS may ask again for access to folders such as Documents.
+The first launch opens the setup check. **Install Grok CLI** installs Grok. **Install Git** opens Apple's window, which installs the Command Line Tools, including Git. The first message opens Grok's sign-in.
+
+The app isn't signed by Apple. A copy installed by the Terminal command carries no download mark, so macOS opens it without the "can't be verified" block. A copy from the disk image needs Open Anyway, as above. Each update is a new build, so macOS may ask again for access to folders such as Documents.
 
 ### Run from source on macOS
 
-For working on the app itself, install Node.js from [nodejs.org](https://nodejs.org) or Homebrew as well, then in Terminal:
+For working on the app itself, install Git with the Xcode Command Line Tools (`xcode-select --install`) or Homebrew, install the Grok CLI with `curl -fsSL https://x.ai/cli/install.sh | bash` and sign in, and install Node.js from [nodejs.org](https://nodejs.org) or Homebrew as well, then in Terminal:
 
 ```bash
 git clone https://github.com/schmidtc63/grok-desktop.git

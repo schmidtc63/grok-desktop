@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds the macOS release zips into out/. Run npm ci and npm run build first. macOS only (codesign, plutil, ditto).
+# Builds the macOS release zips into out/. Run npm ci and npm run build first. macOS only (codesign, plutil, ditto, hdiutil).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 name="Codewomplers Grok Desktop"
@@ -20,4 +20,10 @@ for arch in arm64 x64; do
 	test -f "$app/Contents/Resources/app/dist/index.html"
 	# ditto keeps the symlinks inside Electron Framework.framework; zip -r would break them and the signature.
 	ditto -c -k --keepParent "$app" "out/Codewomplers-Grok-Desktop-mac-$arch.zip"
+	# A disk image with an Applications link: open it and drag the app across.
+	mkdir "out/dmg-$arch"
+	ditto "$app" "out/dmg-$arch/$name.app"
+	ln -s /Applications "out/dmg-$arch/Applications"
+	hdiutil create -volname "$name" -srcfolder "out/dmg-$arch" -ov -format UDZO "out/Codewomplers-Grok-Desktop-mac-$arch.dmg"
+	hdiutil verify "out/Codewomplers-Grok-Desktop-mac-$arch.dmg"
 done

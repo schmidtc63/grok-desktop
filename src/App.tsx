@@ -380,7 +380,7 @@ export function App() {
 	const [rewindAsk, setRewindAsk] = useState<{ sessionId: string; message: ChatMessage; files: string[]; conflicts: string[] } | null>(null);
 	const [branching, setBranching] = useState<string | null>(null);
 	const [settingsOpen, setSettingsOpen] = useState<SettingsTab | null>(null);
-	const [setup, setSetup] = useState<{ result?: GrokReadiness; open: boolean; checking: boolean }>({ open: false, checking: false });
+	const [setup, setSetup] = useState<{ result?: GrokReadiness; open: boolean; checking: boolean; installing: "" | "grok" | "git" }>({ open: false, checking: false, installing: "" });
 	const setupCheck = useRef(0);
 	const [confirms, setConfirms] = useState<ConfirmItem[]>([]);
 	const confirmQueue = useRef<ConfirmItem[]>([]);
@@ -551,12 +551,27 @@ export function App() {
 		setSetup((current) => ({ ...current, open: open || current.open, checking: true }));
 		void api.readiness().then((result) => {
 			if (check !== setupCheck.current) { return; }
-			setSetup((current) => ({ result, open: current.open || !result.grok.ok || !result.grok.signedIn, checking: false }));
+			setSetup((current) => ({ ...current, result, open: current.open || !result.grok.ok || !result.grok.signedIn, checking: false }));
 		}).catch(() => {
 			if (check !== setupCheck.current) { return; }
 			setSetup((current) => ({ ...current, checking: false }));
 			setNotice("Setup could not be checked. Try again.");
 		});
+	}
+
+	async function runInstall(kind: "grok" | "git") {
+		const call = kind === "grok" ? window.grokCode?.installGrok : window.grokCode?.installGit;
+		if (!call || setup.installing) { return; }
+		setSetup((current) => ({ ...current, installing: kind }));
+		try {
+			const result = await call();
+			if (result && !result.ok && result.error) { setNotice(result.error); }
+		} catch {
+			setNotice(kind === "grok" ? "Installing the Grok CLI failed." : "Installing Git failed.");
+		} finally {
+			setSetup((current) => ({ ...current, installing: "" }));
+		}
+		checkSetup();
 	}
 
 	useEffect(() => { checkSetup(false); }, []);
@@ -2867,7 +2882,7 @@ export function App() {
 				</div>
 			)}
 			{settingsOpen && <SettingsPage settings={settings} onChange={changeSettings} onClose={() => setSettingsOpen(null)} onCheckSetup={() => { setSettingsOpen(null); checkSetup(); }} servers={servers} folder={session.folder} onRun={(text) => void runFromSettings(text)} initialTab={settingsOpen} />}
-			{setup.open && <Setup result={setup.result} checking={setup.checking} onCheck={() => checkSetup()} onCopy={(text) => void copyText(text)} onClose={() => setSetup((current) => ({ ...current, open: false }))} />}
+			{setup.open && <Setup result={setup.result} checking={setup.checking} installing={setup.installing} onInstallGrok={() => void runInstall("grok")} onInstallGit={() => void runInstall("git")} onCheck={() => checkSetup()} onCopy={(text) => void copyText(text)} onClose={() => setSetup((current) => ({ ...current, open: false }))} />}
 			{confirms[0] && (
 				<div key={confirms[0].id} className="overlay confirm-overlay">
 					<div className="sheet" role="alertdialog" aria-modal="true" aria-label={confirms[0].title}>

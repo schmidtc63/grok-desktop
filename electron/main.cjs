@@ -32,6 +32,7 @@ const appIcon = nativeImage.createFromPath(path.join(__dirname, "..", "assets", 
 const { AgentHost } = require("./agent.cjs");
 const { readDiff, revertFile } = require("./diff.cjs");
 const git = require("./git.cjs");
+if (process.platform === "win32") { git.useBundledGit(); }
 const { TerminalHost } = require("./terminal.cjs");
 const { createInbound, candidatesFor, askInOrder } = require("./inbound.cjs");
 const { listFiles, readText, writeText, runCommand, locateFile } = require("./files.cjs");
@@ -603,6 +604,12 @@ ipcMain.handle("grok:task-output", (_event, file) => usage.taskOutput(String(fil
 ipcMain.handle("grok:subagent-transcript", (_event, id) => usage.subagentTranscript(String(id || "")));
 ipcMain.handle("grok:recent-spend", () => usage.recentSpend());
 ipcMain.handle("grok:readiness", () => customize.readiness());
+ipcMain.handle("grok:install-grok", async () => {
+	const result = await customize.installGrok();
+	if (process.platform === "win32") { git.useBundledGit(); }
+	return result;
+});
+ipcMain.handle("grok:install-git", () => customize.installGit());
 ipcMain.handle("grok:customize", (_event, cwd) => customize.inventory(cwd));
 ipcMain.handle("grok:customize-change", (_event, cwd, input) => customize.change(cwd, input));
 // Undefined until Grok first starts in this app; null after signing out.

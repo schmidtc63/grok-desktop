@@ -1,5 +1,5 @@
 name: release-mac
-# Builds the macOS and Windows release zips for each version tag and attaches the zips the install scripts download.
+# Builds the macOS and Windows release files for each version tag and attaches the zips, disk images and Setup.exe.
 # Tags exist only on the public repository, so only it publishes. A tag with a hyphen (v0.6.0-rc.1) becomes a prerelease.
 on:
   push:
@@ -32,7 +32,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: mac
-          path: out/Codewomplers-Grok-Desktop-mac-*.zip
+          path: |
+            out/Codewomplers-Grok-Desktop-mac-*.zip
+            out/Codewomplers-Grok-Desktop-mac-*.dmg
           if-no-files-found: error
   windows:
     runs-on: windows-latest
@@ -46,6 +48,18 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: pwsh -File scripts/package-windows.ps1
+      - name: Build Setup.exe
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $version = node -p "require('./package.json').version"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" scripts\windows-setup.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed." }
+      - name: Setup.exe installs the app
+        shell: pwsh
+        run: |
+          Start-Process -FilePath out\Codewomplers-Grok-Desktop-Setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait
+          if (-not (Test-Path "$env:LOCALAPPDATA\Programs\Codewomplers Grok Desktop\Codewomplers Grok Desktop.exe")) { throw "Setup.exe did not install the app." }
       # Same check as macOS: DevTools must list the page. Stop the process even when the check fails.
       - name: Launch check
         shell: pwsh
@@ -65,7 +79,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: out/Codewomplers-Grok-Desktop-win-x64.zip
+          path: |
+            out/Codewomplers-Grok-Desktop-win-x64.zip
+            out/Codewomplers-Grok-Desktop-Setup.exe
           if-no-files-found: error
   publish:
     needs: [mac, windows]
@@ -80,4 +96,4 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --verify-tag --notes-from-tag $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease) release/mac/*.zip release/windows/*.zip
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --notes-from-tag $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease) release/mac/*.zip release/mac/*.dmg release/windows/*.zip release/windows/*.exe

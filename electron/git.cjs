@@ -421,4 +421,22 @@ async function removeWorktree(cwd, folder, options) {
 	return removed.code === 0 ? { ok: true, dirty } : { ...failure(removed, "Git"), dirty };
 }
 
-module.exports = { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, run, git };
+// The Grok CLI installer puts a portable Git in %LOCALAPPDATA%\grok\git\<version>\cmd on Windows.
+// ponytail: Grok's own layout, not a documented interface; if it moves, the setup check shows Git as missing again.
+function bundledGitDir(localAppData = process.env.LOCALAPPDATA) {
+	if (!localAppData) { return ""; }
+	const root = path.join(localAppData, "grok", "git");
+	try {
+		return fs.readdirSync(root).sort((a, b) => b.localeCompare(a, undefined, { numeric: true })).map((name) => path.join(root, name, "cmd")).find((dir) => fs.existsSync(path.join(dir, "git.exe"))) || "";
+	} catch {
+		return "";
+	}
+}
+
+// Appended, so a Git already on PATH still wins. The app, its terminals and Grok inherit it.
+function useBundledGit() {
+	const dir = bundledGitDir();
+	if (dir && !(process.env.PATH || "").split(path.delimiter).includes(dir)) { process.env.PATH = `${process.env.PATH}${path.delimiter}${dir}`; }
+}
+
+module.exports = { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, run, git, bundledGitDir, useBundledGit };

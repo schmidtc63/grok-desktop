@@ -3752,6 +3752,47 @@ async function checkSetupSheet() {
 	const latest = setupNode(overlap);
 	assert.equal(latest.props.result.grok.version, "SECOND", "older setup check cannot replace the newest result");
 	assert.equal(latest.props.checking, false);
+	const sheetText = (app) => textOf(setupNode(app).type(setupNode(app).props));
+	const sheetButton = (app, label) => app.nodes(setupNode(app).type(setupNode(app).props)).find((node) => node.type === "button" && textOf(node) === label);
+	const clicked = harness();
+	let installs = 0;
+	let finishInstall;
+	let installChecks = 0;
+	const missingWin = { ...healthy, grok: { ok: false, error: "Grok is not installed." }, git: { ok: false }, platform: "win32" };
+	clicked.api.readiness = async () => { installChecks += 1; return missingWin; };
+	clicked.api.installGrok = () => new Promise((resolve) => { installs += 1; finishInstall = resolve; });
+	await clicked.settle();
+	assert.equal(installChecks, 1);
+	assert.ok(sheetText(clicked).includes("Install Grok CLI"));
+	assert.ok(sheetText(clicked).includes("Or run this in a terminal:"));
+	assert.ok(sheetText(clicked).includes("Installing the Grok CLI also installs Git."));
+	sheetButton(clicked, "Install Grok CLI").props.onClick();
+	clicked.render();
+	assert.equal(installs, 1, "the button calls installGrok");
+	assert.equal(sheetButton(clicked, "Installing…").props.disabled, true);
+	assert.equal(installChecks, 1, "readiness waits until the install finishes");
+	finishInstall({ ok: true });
+	await clicked.settle();
+	assert.equal(installChecks, 2, "a finished install checks readiness again");
+	assert.ok(setupNode(clicked), "the sheet stays open after installing");
+	const failed = harness();
+	failed.api.readiness = async () => missingWin;
+	failed.api.installGrok = async () => ({ ok: false, error: "The Grok installer failed." });
+	await failed.settle();
+	sheetButton(failed, "Install Grok CLI").props.onClick();
+	await failed.settle();
+	assert.equal(failed.notice(), "The Grok installer failed.");
+	const Setup = setupNode(clicked).type;
+	const baseProps = setupNode(clicked).props;
+	const gitSheet = (result) => textOf(Setup({ ...baseProps, result, installing: "" }));
+	const gitMissing = { ...healthy, git: { ok: false } };
+	const winGit = gitSheet({ ...gitMissing, platform: "win32" });
+	assert.ok(winGit.includes("Git is not installed."));
+	assert.ok(winGit.includes("Install Git from git-scm.com."));
+	const darwin = gitSheet({ ...gitMissing, platform: "darwin" });
+	assert.ok(darwin.includes("Install Git"));
+	assert.ok(darwin.includes("Apple's window installs the Command Line Tools, which include Git. Press Check again when it finishes."));
+	assert.ok(gitSheet({ ...gitMissing, platform: "linux" }).includes("Install Git with your package manager."));
 }
 
 function referenceFileHits(text, known, tools) {

@@ -242,7 +242,7 @@ const mainContext = {
 		if (name === "./agent.cjs") { return { AgentHost: TestHost }; }
 		if (name === "./updates.cjs") { return updateApi; }
 		if (name === "../scripts/update-helper.cjs") { return helperApi; }
-		if (name === "./git.cjs") { return { prCreate: (...args) => { written = args; return { ok: true }; }, prMergeWhenReady: (...args) => { written = args; return { ok: true }; }, restoreWorktree: (...args) => { written = args; return { ok: true }; } }; }
+		if (name === "./git.cjs") { return { useBundledGit() {}, prCreate: (...args) => { written = args; return { ok: true }; }, prMergeWhenReady: (...args) => { written = args; return { ok: true }; }, restoreWorktree: (...args) => { written = args; return { ok: true }; } }; }
 		if (name === "./usage.cjs") { return { taskOutput: (...args) => { written = args; return { ok: true, text: "task output" }; }, subagentTranscript: (...args) => { written = args; return { ok: true, messages: [] }; } }; }
 		if (name === "./diff.cjs") { return {}; }
 		if (name === "./customize.cjs") { return { signOut: async () => { grokLogouts += 1; return { ok: true }; }, readiness: async () => { readinessChecks += 1; return { grok: { ok: true, signedIn: true } }; } }; }

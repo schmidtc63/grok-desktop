@@ -9,6 +9,8 @@ const { run } = require("./git.cjs");
 const LIST_TIMEOUT = 30000;
 const CHANGE_TIMEOUT = 180000;
 const LIST_BYTES = 8 * 1024 * 1024;
+const GROK_INSTALL = { win32: "irm https://x.ai/cli/install.ps1 | iex", other: "curl -fsSL https://x.ai/cli/install.sh | bash" };
+const INSTALL_TIMEOUT = 10 * 60 * 1000;
 const MISSING = "Grok is not installed, or not on PATH. Set GROK_PATH to its full path.";
 // Grok admits a server's tools only when its name starts with a letter or underscore; that also keeps a name from reading as a flag.
 const SERVER_NAME = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
@@ -231,8 +233,28 @@ function readinessOf({ grok, git, gh, ghAuth, platform }) {
 		grok: grok.ok ? { ok: true, version: grok.version, signedIn: grok.signedIn } : { ok: false, error: grok.error },
 		git: { ok: git.code === 0 },
 		gh: gh.code === 0 ? { ok: true, signedIn: !!ghAuth && ghAuth.code === 0 } : { ok: false },
-		install: platform === "win32" ? "irm https://x.ai/cli/install.ps1 | iex" : "curl -fsSL https://x.ai/cli/install.sh | bash",
+		install: platform === "win32" ? GROK_INSTALL.win32 : GROK_INSTALL.other,
+		platform,
 	};
+}
+
+// x.ai's installer calls exit on errors, so it runs as its own process. Pure: tests assert this and never run it.
+function installArgs(platform) {
+	return platform === "win32"
+		? ["powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", GROK_INSTALL.win32]]
+		: ["/bin/bash", ["-c", GROK_INSTALL.other]];
+}
+
+async function installGrok() {
+	const [command, args] = installArgs(process.platform);
+	const result = await run(command, args, os.homedir(), INSTALL_TIMEOUT);
+	return result.code === 0 ? { ok: true } : { ok: false, error: failure(result, "Installing the Grok CLI") };
+}
+
+// macOS only. xcode-select --install opens Apple's Command Line Tools window and returns at once.
+async function installGit() {
+	const result = await run("xcode-select", ["--install"], os.homedir(), 30000);
+	return result.code === 0 ? { ok: true } : { ok: false, error: failure(result, "Installing Git") };
 }
 
 async function readiness() {
@@ -246,4 +268,4 @@ async function readiness() {
 	return readinessOf({ grok, git, gh, ghAuth, platform: process.platform });
 }
 
-module.exports = { inventory, change, changeArgs, signOut, shape, tomlList, words, readiness, readinessOf };
+module.exports = { inventory, change, changeArgs, signOut, shape, tomlList, words, readiness, readinessOf, installArgs, installGrok, installGit };

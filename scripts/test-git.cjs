@@ -7,7 +7,7 @@ const { createRequire } = require("module");
 const { EventEmitter } = require("events");
 const { execFileSync, spawn } = require("child_process");
 const { readDiff, FILTER_NOT_OFF } = require("../electron/diff.cjs");
-const { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree } = require("../electron/git.cjs");
+const { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, bundledGitDir } = require("../electron/git.cjs");
 
 // Never let gh resolve a real GitHub repository from the environment; the temp origin is a local bare repo.
 delete process.env.GH_REPO;
@@ -192,7 +192,27 @@ async function checkTruncatedDiffCounts() {
 	console.log("PASS diff counts: staged and unstaged truncated runs add their complete counts");
 }
 
+function checkBundledGitDir() {
+	const local = fs.mkdtempSync(path.join(tempBase, "bundled-"));
+	try {
+		assert.equal(bundledGitDir(""), "");
+		assert.equal(bundledGitDir(path.join(local, "missing")), "");
+		const versions = path.join(local, "grok", "git");
+		for (const version of ["2.9.0.windows.1", "2.55.0.windows.5"]) {
+			const dir = path.join(versions, version, "cmd");
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(path.join(dir, "git.exe"), "");
+		}
+		fs.mkdirSync(path.join(versions, "9.0.0.windows.1", "cmd"), { recursive: true });
+		assert.equal(bundledGitDir(local), path.join(versions, "2.55.0.windows.5", "cmd"));
+	} finally {
+		fs.rmSync(local, { recursive: true, force: true });
+	}
+	console.log("PASS bundledGitDir: newest folder that has git.exe; a missing root and an empty localAppData are blank");
+}
+
 async function main() {
+	checkBundledGitDir();
 	await checkTruncatedRepoFiles();
 	await checkTruncatedDiffCounts();
 	git(["init", "--quiet", "--bare", origin], root);

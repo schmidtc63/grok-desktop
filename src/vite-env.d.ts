@@ -90,6 +90,7 @@ interface GrokReadiness {
 	git: { ok: boolean };
 	gh: { ok: boolean; signedIn?: boolean };
 	install: string;
+	platform: string;
 }
 
 // What `grok inspect`, `grok mcp list` and `grok plugin list` report for one folder.
@@ -335,6 +336,8 @@ interface GrokCodeApi {
 	homeDir?: string;
 	platform?: string;
 	readiness?: () => Promise<GrokReadiness>;
+	installGrok?: () => Promise<{ ok: boolean; error?: string }>;
+	installGit?: () => Promise<{ ok: boolean; error?: string }>;
 	customize?: (cwd: string) => Promise<GrokInventory>;
 	customizeChange?: (cwd: string, input: GrokCustomizeChange) => Promise<{ ok: boolean; error?: string; message?: string }>;
 	account?: () => Promise<GrokAccount | null | undefined>;

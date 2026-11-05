@@ -1,5 +1,5 @@
 const assert = require("assert/strict");
-const { changeArgs, shape, tomlList, words, readinessOf } = require("../electron/customize.cjs");
+const { changeArgs, shape, tomlList, words, readinessOf, installArgs } = require("../electron/customize.cjs");
 
 const config = [
 	"disabled_mcp_servers = [\"chrome\", 'gone']",
@@ -84,10 +84,12 @@ for (const [input, why] of [
 	assert.throws(() => changeArgs(input), undefined, why);
 }
 const missing = { grok: { ok: false, error: "Missing", secret: "hidden" }, git: { code: -1, err: "hidden" }, gh: { code: -1, err: "hidden" }, ghAuth: null };
-assert.deepEqual(readinessOf({ ...missing, platform: "win32" }), { grok: { ok: false, error: "Missing" }, git: { ok: false }, gh: { ok: false }, install: "irm https://x.ai/cli/install.ps1 | iex" });
+assert.deepEqual(readinessOf({ ...missing, platform: "win32" }), { grok: { ok: false, error: "Missing" }, git: { ok: false }, gh: { ok: false }, install: "irm https://x.ai/cli/install.ps1 | iex", platform: "win32" });
 assert.equal(readinessOf({ ...missing, platform: "linux" }).install, "curl -fsSL https://x.ai/cli/install.sh | bash");
 const ready = { grok: { ok: true, version: "1.0.70", signedIn: true, secret: "hidden" }, git: { code: 0 }, gh: { code: 0 }, ghAuth: { code: 0, out: "hidden" }, platform: "win32" };
-assert.deepEqual(readinessOf(ready), { grok: { ok: true, version: "1.0.70", signedIn: true }, git: { ok: true }, gh: { ok: true, signedIn: true }, install: "irm https://x.ai/cli/install.ps1 | iex" });
+assert.deepEqual(readinessOf(ready), { grok: { ok: true, version: "1.0.70", signedIn: true }, git: { ok: true }, gh: { ok: true, signedIn: true }, install: "irm https://x.ai/cli/install.ps1 | iex", platform: "win32" });
+assert.deepEqual(installArgs("win32"), ["powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "irm https://x.ai/cli/install.ps1 | iex"]]);
+assert.deepEqual(installArgs("darwin"), ["/bin/bash", ["-c", "curl -fsSL https://x.ai/cli/install.sh | bash"]]);
 assert.deepEqual(readinessOf({ ...ready, ghAuth: { code: 1, err: "Offline" } }).gh, { ok: true, signedIn: false });
 assert.equal(readinessOf({ ...ready, grok: { ok: true, version: "1.0.70", signedIn: false } }).grok.signedIn, false);
 console.log("PASS changeArgs and readiness: fixed Grok commands, invalid inputs refused, setup checks shape only safe fields");

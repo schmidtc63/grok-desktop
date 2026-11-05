@@ -1,9 +1,12 @@
-export function Setup({ result, checking, onCheck, onCopy, onClose }: {
+export function Setup({ result, checking, onCheck, onCopy, onClose, onInstallGrok, onInstallGit, installing }: {
 	result?: GrokReadiness;
 	checking: boolean;
 	onCheck: () => void;
 	onCopy: (text: string) => void;
 	onClose: () => void;
+	onInstallGrok: () => void;
+	onInstallGit: () => void;
+	installing: "" | "grok" | "git";
 }) {
 	return (
 		<div className="overlay" onClick={onClose}>
@@ -17,6 +20,8 @@ export function Setup({ result, checking, onCheck, onCopy, onClose }: {
 							{result.grok.ok ? <p className="result">Grok{result.grok.version ? ` ${result.grok.version}` : ""} is installed.</p> : (
 								<>
 									<p className="note">{result.grok.error}</p>
+									<button type="button" disabled={installing !== ""} onClick={onInstallGrok}>{installing === "grok" ? "Installing…" : "Install Grok CLI"}</button>
+									<p className="note">Or run this in a terminal:</p>
 									<pre className="tool-code">{result.install}</pre>
 									<button type="button" className="texty" onClick={() => onCopy(result.install)}>Copy</button>
 									<p className="note">Then press Check again. If Grok is installed somewhere else, set GROK_PATH to its full path and restart this app.</p>
@@ -38,7 +43,19 @@ export function Setup({ result, checking, onCheck, onCopy, onClose }: {
 						)}
 						<div className="setup-row">
 							<h3>Git</h3>
-							<p className={result.git.ok ? "result" : "note"}>{result.git.ok ? "Git is installed." : "Git is not installed. The Changes pane, worktrees and pull requests need it."}</p>
+							{result.git.ok ? <p className="result">Git is installed.</p> : (
+								<>
+									{result.platform === "win32" && !result.grok.ok ? <p className="note">Installing the Grok CLI also installs Git.</p> : <p className="note">Git is not installed. The Changes pane, worktrees and pull requests need it.</p>}
+									{result.platform === "win32" && result.grok.ok && <p className="note">Install Git from git-scm.com.</p>}
+									{result.platform === "darwin" && (
+										<>
+											<button type="button" disabled={installing !== ""} onClick={onInstallGit}>{installing === "git" ? "Installing…" : "Install Git"}</button>
+											<p className="note">Apple's window installs the Command Line Tools, which include Git. Press Check again when it finishes.</p>
+										</>
+									)}
+									{result.platform === "linux" && <p className="note">Install Git with your package manager.</p>}
+								</>
+							)}
 						</div>
 						<div className="setup-row">
 							<h3>GitHub CLI</h3>
