@@ -7,10 +7,12 @@ type GroupBy = "date" | "project" | "state" | "section" | "none";
 type SortBy = "recency" | "name" | "created";
 type StatusFilter = "active" | "archived" | "all";
 type Activity = Record<string, "running" | "needs-you" | undefined>;
-type RowState = "needs-you" | "running" | "unread" | "completed" | "idle";
+type RowState = "needs-you" | "failed" | "running" | "unread" | "completed" | "idle";
 type Submenu = "group" | "sort" | "status" | "days" | "move";
 type Section = { id: string; name: string };
 type SessionGroup = { id: string; label: string; items: Session[]; seed?: ProjectSeed; section?: Section };
+type CliPick = { id: string; title: string; folder: string; lastActive: number };
+type CliList = { top: number; left: number; token: object; loading: boolean; error: string; sessions: CliPick[] };
 interface SidebarView { groupBy: GroupBy; sortBy: SortBy; status: StatusFilter; days: number }
 
 const viewKey = "grok-code.sidebar.v1";
@@ -21,8 +23,8 @@ const GROUP_LABEL: Record<GroupBy, string> = { date: "Date", project: "Project",
 const SORT_LABEL: Record<SortBy, string> = { recency: "Recency", name: "Name", created: "Created" };
 const STATUS_LABEL: Record<StatusFilter, string> = { active: "Active", archived: "Archived", all: "All" };
 const DAYS: [number, string][] = [[0, "Any time"], [1, "Last day"], [3, "Last 3 days"], [7, "Last 7 days"], [30, "Last 30 days"]];
-const STATE_LABEL: Record<RowState, string> = { "needs-you": "Needs you", running: "Working", unread: "Unread", idle: "Idle", completed: "Completed" };
-const STATE_ORDER: RowState[] = ["needs-you", "running", "unread", "idle", "completed"];
+const STATE_LABEL: Record<RowState, string> = { "needs-you": "Needs you", failed: "Failed", running: "Working", unread: "Unread", idle: "Idle", completed: "Completed" };
+const STATE_ORDER: RowState[] = ["needs-you", "failed", "running", "unread", "idle", "completed"];
 
 function readView(): SidebarView {
 	try {
@@ -74,6 +76,7 @@ function stateOf(session: Session, activity: Activity): RowState {
 	const live = activity[session.id];
 	if (live) { return live; }
 	if (session.completed) { return "completed"; }
+	if (session.failed) { return "failed"; }
 	return session.unread ? "unread" : "idle";
 }
 
@@ -159,6 +162,15 @@ export function textHit(messages: ChatMessage[] | undefined, needle: string) {
 	return undefined;
 }
 
+function accountName(account: GrokAccount | null | undefined, signIn: "saved" | "key" | "none" | undefined, menu: boolean) {
+	if (account?.email) { return account.email; }
+	if (signIn === "key") { return menu ? "Signed in with an API key" : "API key"; }
+	if (signIn === "saved") { return "Saved sign-in"; }
+	if (account) { return menu ? "Signed in to Grok" : "Grok"; }
+	if (account === null || signIn === "none") { return "Signed out"; }
+	return menu ? "Grok account" : "Grok";
+}
+
 export function Sidebar({
 	sessions,
 	chats,
@@ -178,10 +190,15 @@ export function Sidebar({
 	onMove,
 	onOpenWindow,
 	onCopySessionId,
+	onExportMarkdown,
+	onListCliSessions,
+	onOpenCliSession,
+	loopCounts,
 	onSettings,
 	onCollapse,
 	onNotice,
 	account,
+	signIn,
 	recentUsd,
 	onShortcuts,
 	onOpenUrl,
@@ -207,10 +224,15 @@ export function Sidebar({
 	onMove: (id: string, sectionId: string | undefined) => void;
 	onOpenWindow: (id: string) => void;
 	onCopySessionId: (agentSessionId: string) => void;
+	onExportMarkdown: (agentSessionId: string, title: string) => void;
+	onListCliSessions: () => Promise<{ ok: boolean; error?: string; sessions?: CliPick[] }>;
+	onOpenCliSession: (agentSessionId: string) => void;
+	loopCounts?: Record<string, number>;
 	onSettings: () => void;
 	onCollapse: () => void;
 	onNotice: (text: string) => void;
 	account: GrokAccount | null | undefined;
+	signIn?: "saved" | "key" | "none";
 	recentUsd: number | null;
 	onShortcuts: () => void;
 	onOpenUrl: (url: string) => void;
@@ -227,6 +249,7 @@ export function Sidebar({
 	const [renaming, setRenaming] = useState<string | null>(null);
 	const [sectionMenu, setSectionMenu] = useState<{ id: string; top: number; left: number } | null>(null);
 	const [accountMenu, setAccountMenu] = useState<{ bottom: number; left: number } | null>(null);
+	const [cli, setCli] = useState<CliList | null>(null);
 	const [now, setNow] = useState(Date.now());
 
 	useEffect(() => { store(viewKey, view); }, [view]);
@@ -244,7 +267,7 @@ export function Sidebar({
 	}, []);
 
 	useEffect(() => {
-		if (!menu && !rowMenu && !sectionMenu && !accountMenu) { return; }
+		if (!menu && !rowMenu && !sectionMenu && !accountMenu && !cli) { return; }
 		function onKey(event: KeyboardEvent) {
 			if (event.key !== "Escape") { return; }
 			event.stopPropagation();
@@ -252,7 +275,7 @@ export function Sidebar({
 		}
 		window.addEventListener("keydown", onKey, true);
 		return () => window.removeEventListener("keydown", onKey, true);
-	}, [menu, rowMenu, sectionMenu, accountMenu]);
+	}, [menu, rowMenu, sectionMenu, accountMenu, cli]);
 
 	const needle = query.trim().toLowerCase();
 	const cutoff = view.days ? Date.now() - view.days * DAY : 0;
@@ -286,6 +309,21 @@ export function Sidebar({
 		setRowMenu(null);
 		setSectionMenu(null);
 		setAccountMenu(null);
+		setCli(null);
+	}
+
+	async function toggleCli(event: React.MouseEvent) {
+		if (cli) { setCli(null); return; }
+		const token = {};
+		closeAll();
+		setCli({ ...place(event, 360, 280), token, loading: true, sessions: [], error: "" });
+		let result: { ok: boolean; error?: string; sessions?: CliPick[] };
+		try {
+			result = await onListCliSessions();
+		} catch {
+			result = { ok: false, error: "Grok's sessions could not be read." };
+		}
+		setCli((current) => (current && current.token === token ? { ...current, loading: false, error: result.ok ? "" : (result.error || "Grok's sessions could not be read."), sessions: result.sessions ?? [] } : current));
 	}
 
 	function place(event: React.MouseEvent, width: number, height: number) {
@@ -346,6 +384,7 @@ export function Sidebar({
 				setRenaming(null);
 			},
 			onStartRename: () => setRenaming(session.id),
+			loops: loopCounts?.[session.id] || 0,
 		};
 	}
 
@@ -358,6 +397,9 @@ export function Sidebar({
 				<button className="new-btn" aria-label="New session" title={keyLabel("New session (Ctrl+N)")} onClick={onNew}>
 					<PlusIcon /> New session
 				</button>
+				<button className="new-btn" aria-label="Open a CLI session" title="Open a session started in the Grok CLI" onClick={(event) => { void toggleCli(event); }}>
+					CLI…
+				</button>
 				<span className="spacer" />
 				<button className="side-icon" aria-label="Search sessions" title="Search sessions" onClick={() => setSearchOpen((value) => !value || !!query)}>
 					<SearchIcon />
@@ -366,6 +408,22 @@ export function Sidebar({
 					<SlidersIcon />
 				</button>
 			</div>
+			{cli && (
+				<>
+					<button className="menu-back" aria-label="Close CLI sessions" onClick={() => setCli(null)} />
+					<div className="row-pop cli-sessions" style={{ top: cli.top, left: cli.left }}>
+						{cli.loading && <div className="meta">Looking…</div>}
+						{!cli.loading && cli.error && <div className="meta">{cli.error}</div>}
+						{!cli.loading && !cli.error && cli.sessions.length === 0 && <div className="meta">No other CLI sessions.</div>}
+						{!cli.loading && cli.sessions.map((item) => (
+							<button key={item.id} title={item.folder} onClick={() => { setCli(null); onOpenCliSession(item.id); }}>
+								{item.title}
+								<small>{item.folder}{item.lastActive ? ` · ${ago(item.lastActive, now)}` : ""}</small>
+							</button>
+						))}
+					</div>
+				</>
+			)}
 			{searchOpen && (
 				<div className="side-search">
 					<input
@@ -435,7 +493,7 @@ export function Sidebar({
 					}}
 				>
 					<span className="avatar">{(account?.email || "G").charAt(0).toUpperCase()}</span>
-					<span className="who">{account?.email || (account === null ? "Signed out" : "Grok")}{account?.plan && <small>{account.plan}</small>}{update && <small className="update-flag">Update available · {update.latest}</small>}</span>
+					<span className="who">{accountName(account, signIn, false)}{account?.plan && <small>{account.plan}</small>}{update && <small className="update-flag">Update available · {update.latest}</small>}</span>
 				</button>
 				<button className="side-icon" aria-label="Collapse sidebar" title="Collapse sidebar" onClick={onCollapse}>«</button>
 			</div>
@@ -445,10 +503,12 @@ export function Sidebar({
 			{accountMenu && (
 				<div className="row-pop account-menu" style={{ bottom: accountMenu.bottom, left: accountMenu.left }} role="menu" aria-label="Account">
 					<div className="account-head">
-						<b>{account ? account.email || "Signed in to Grok" : account === null ? "Signed out" : "Grok account"}</b>
+						<b>{accountName(account, signIn, true)}</b>
 						{account && <span>{[account.plan, account.team].filter(Boolean).join(" · ")}</span>}
-						{account === undefined && <span>Your account shows once Grok starts. Send a message to start it.</span>}
-						{account === null && <span>Grok asks you to sign in when you next send a message.</span>}
+						{signIn === "key" && !account?.email && <span>The API key is XAI_API_KEY. This app never shows it.</span>}
+						{signIn === "saved" && !account?.email && <span>A saved sign-in is on this computer. Your account shows once Grok starts.</span>}
+						{account === undefined && signIn !== "key" && signIn !== "saved" && signIn !== "none" && <span>Your account shows once Grok starts. Send a message to start it.</span>}
+						{(account === null || signIn === "none") && signIn !== "key" && signIn !== "saved" && <span>Grok asks you to sign in when you next send a message.</span>}
 						{recentUsd !== null && <span>Grok on this computer, last 7 days: ${recentUsd.toFixed(2)}</span>}
 					</div>
 					<hr />
@@ -457,7 +517,7 @@ export function Sidebar({
 					<button onClick={() => { closeAll(); onShortcuts(); }}>Keyboard shortcuts<small>{keyLabel("Ctrl+/")}</small></button>
 					<button onClick={() => { closeAll(); onOpenUrl("https://console.x.ai"); }}>Get xAI API keys<small>↗</small></button>
 					<hr />
-					<button disabled={account === null} onClick={() => { closeAll(); onSignOut(); }}>Sign out</button>
+					<button disabled={(account === null && signIn !== "saved") || (signIn === "key" && !account)} onClick={() => { closeAll(); onSignOut(); }}>Sign out</button>
 					{account?.version && <div className="account-foot">Grok {account.version}</div>}
 				</div>
 			)}
@@ -503,6 +563,7 @@ export function Sidebar({
 					<Cascade label="Move to section" value="" open={sub?.kind === "move"} onOpen={(event) => openSub("move", event)} />
 					<button onMouseEnter={() => setSub(null)} onClick={() => { onOpenWindow(rowSession.id); closeAll(); }}>Open in a new window</button>
 					{rowSession.agentSessionId && <button onMouseEnter={() => setSub(null)} onClick={() => { onCopySessionId(rowSession.agentSessionId!); closeAll(); }}>Copy Grok session ID</button>}
+					{rowSession.agentSessionId && <button onMouseEnter={() => setSub(null)} onClick={() => { onExportMarkdown(rowSession.agentSessionId!, rowSession.title); closeAll(); }}>Export as Markdown…</button>}
 					<hr />
 					<button onMouseEnter={() => setSub(null)} onClick={() => { onArchive(rowSession.id); closeAll(); }}>{rowSession.archived ? "Unarchive" : "Archive"}</button>
 					<button
@@ -600,6 +661,7 @@ function Row({
 	onOpenMenu,
 	onRename,
 	onStartRename,
+	loops = 0,
 }: {
 	session: Session;
 	now: number;
@@ -612,6 +674,7 @@ function Row({
 	onOpenMenu: (id: string, event: React.MouseEvent) => void;
 	onRename: (title: string | null) => void;
 	onStartRename: () => void;
+	loops?: number;
 }) {
 	const time = stamp(session);
 	const meta = [session.worktreeFolder ? session.branch : "", time ? ago(time, now) : ""].filter(Boolean).join(" · ");
@@ -623,9 +686,10 @@ function Row({
 			) : (
 				<button className="session-hit" title={`${session.title}\n${session.folder}${time ? `\n${new Date(time).toLocaleString()}` : ""}`} onClick={(event) => onSelect(session.id, event)} onDoubleClick={onStartRename}>
 					<b>{session.title}</b>
-					{state === "needs-you" ? <small className="needs-you">Needs you</small> : excerpt !== undefined ? <small className="session-meta">{excerpt}</small> : meta && <small className="session-meta">{meta}</small>}
+					{state === "needs-you" ? <small className="needs-you">Needs you</small> : state === "failed" ? <small className="failed">Stopped with an error</small> : excerpt !== undefined ? <small className="session-meta">{excerpt}</small> : meta && <small className="session-meta">{meta}</small>}
 				</button>
 			)}
+			{loops > 0 && <small className="loop-count" title={loops === 1 ? "1 scheduled loop" : `${loops} scheduled loops`} aria-label={loops === 1 ? "1 scheduled loop" : `${loops} scheduled loops`}>{String(loops)}</small>}
 			<button className="icon-btn" aria-label={`Actions for ${session.title}`} aria-expanded={menuOpen} onClick={(event) => onOpenMenu(session.id, event)}>⋯</button>
 		</div>
 	);

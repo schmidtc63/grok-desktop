@@ -3,15 +3,17 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { createHash } = require("crypto");
+const { isUtf8 } = require("buffer");
 const { folderProblem, resolvedEditPath, killTree, OWN_GROUP } = require("./agent.cjs");
 
 const MAX_BYTES = 180000;
 const MAX_LINES = 700;
 const MAX_FILES = 40;
 const MAX_UNTRACKED_BYTES = 48 * 1024;
+const MAX_REVERT_BYTES = 200 * 1024;
 const FILTER_NOT_OFF = "This repository's git config names a filter the app cannot turn off.";
 
-function runGit(args, cwd, timeout = 8000) {
+function runGit(args, cwd, timeout = 8000, raw = false) {
   return new Promise((resolve) => {
     let settled = false;
     let truncated = false;
@@ -23,6 +25,7 @@ function runGit(args, cwd, timeout = 8000) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+			if (raw) { value.bytes = Buffer.concat(chunks); }
       resolve(value);
     };
     // A repo's own config must not start a program just because the Changes pane opened.
@@ -117,7 +120,8 @@ function parseNames(text) {
 	const names = [];
 	for (let index = 0; index < parts.length - 1;) {
 		const header = parts[index++];
-		const status = header.split(" ").pop();
+		const fields = header.split(" ");
+		const status = fields.pop();
 		const first = parts[index++];
 		if (!status || !first) { break; }
 		if (/^[RC]/.test(status)) {
@@ -125,7 +129,7 @@ function parseNames(text) {
 			if (!next) { break; }
 			names.push({ path: next, from: first, status });
 		} else {
-			names.push({ path: first, status, unmerged: header.startsWith("::") || status === "U" });
+			names.push({ path: first, status, mode: fields[0].slice(1), nextMode: fields[1], unmerged: header.startsWith("::") || status === "U" });
 		}
 	}
 	return names;
@@ -136,11 +140,25 @@ function parseGitDiff(text, label, inputTruncated = false) {
 	const inventory = parseNames(boundary < 0 ? text : text.slice(0, boundary + 1));
 	const unmerged = new Set(inventory.filter((change) => change.unmerged).map((change) => change.path));
 	const parsed = parseUnified(boundary < 0 ? "" : text.slice(boundary + 2), label, inventory.filter((change) => !unmerged.has(change.path)), inputTruncated);
+	if (!label && !parsed.truncated) {
+		for (const change of inventory) {
+			if (change.status !== "M" || !["100644", "100755"].includes(change.mode) || !["100644", "100755"].includes(change.nextMode)) { continue; }
+			for (const hunk of parsed.files.find((file) => file.path === change.path)?.hunks ?? []) {
+				const range = hunkRange(hunk.loc);
+				if (range && hunk.lines.filter((line) => line.kind !== "add").length === range.oldCount && hunk.lines.filter((line) => line.kind !== "del").length === range.newCount) { hunk.revertible = true; }
+			}
+		}
+	}
 	for (const file of unmerged) {
 		if (parsed.files.length >= MAX_FILES) { parsed.truncated = true; break; }
 		parsed.files.push({ path: file, additions: 0, deletions: 0, conflicted: true, hunks: [{ id: "", loc: "Unresolved merge conflict", reviewable: false, lines: [{ kind: "context", text: "Unresolved merge conflict. Combined conflict content is not shown here; resolve it in the editor or a Git merge tool." }] }] });
 	}
 	return parsed;
+}
+
+function hunkRange(loc) {
+	const found = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(loc);
+	return found ? { oldStart: Number(found[1]), oldCount: Number(found[2] ?? 1), newStart: Number(found[3]), newCount: Number(found[4] ?? 1) } : null;
 }
 
 function parseUnified(text, label, inventory = [], inputTruncated = false) {
@@ -400,6 +418,22 @@ async function readDiff(cwd) {
     if (from) { entry.from = from; } else { delete entry.from; }
     visible.push(entry);
   }
+	const candidates = visible.filter((file) => file.hunks.some((hunk) => hunk.revertible));
+	if (candidates.length) {
+		const attributes = await runGit(["--literal-pathspecs", "check-attr", "-z", "filter", "--", ...candidates.map((file) => file.path)], cwd);
+		const values = attributes.out.split("\0");
+		const filtered = new Set();
+		for (let index = 0; index + 2 < values.length; index += 3) { if (!["unspecified", "unset"].includes(values[index + 2])) { filtered.add(values[index]); } }
+		for (const file of candidates) {
+			let supported = attributes.code === 0 && !attributes.truncated && !filtered.has(file.path);
+			try {
+				const target = fs.realpathSync(path.resolve(folder, file.path));
+				const stat = fs.statSync(target);
+				supported = supported && inside(folder, target) && stat.isFile() && stat.size <= MAX_REVERT_BYTES;
+			} catch { supported = false; }
+			if (!supported) { for (const hunk of file.hunks) { delete hunk.revertible; } }
+		}
+	}
   assignIds(visible);
   return { ok: true, repo: true, truncated, files: visible };
 }
@@ -461,4 +495,54 @@ async function revertFile(cwd, relative) {
   return { ok: true };
 }
 
-module.exports = { readDiff, parseUnified, revertFile, localFilterOff, FILTER_NOT_OFF };
+async function revertHunk(cwd, relative, input) {
+	const { locateFile, readText, writeText } = require("./files.cjs");
+	const located = locateFile(cwd, relative);
+	if (!located.ok) { return { ok: false, error: located.error }; }
+	const stale = { ok: false, error: "This change is no longer in the file. Refresh, then try again." };
+	if (!input || typeof input.id !== "string" || typeof input.loc !== "string" || !Array.isArray(input.lines)) { return stale; }
+	const filterOff = await localFilterOff(cwd);
+	if (filterOff === null) { return { ok: false, error: FILTER_NOT_OFF }; }
+	const attributes = await runGit(["--literal-pathspecs", "check-attr", "-z", "filter", "--", relative], cwd);
+	if (attributes.code !== 0 || attributes.truncated) { return { ok: false, error: "This file's Git attributes could not be checked." }; }
+	if (!["unspecified", "unset"].includes(attributes.out.split("\0")[2])) { return { ok: false, error: "This file uses a Git filter. Revert it from a terminal." }; }
+	const current = await readDiff(cwd);
+	if (!current.ok) { return { ok: false, error: current.error }; }
+	const file = current.files?.find((entry) => entry.path === relative);
+	const hunk = file?.hunks.find((entry) => entry.revertible === true && entry.id === input.id && entry.loc === input.loc && entry.lines.length === input.lines.length && entry.lines.every((line, index) => line.kind === input.lines[index]?.kind && line.text === input.lines[index]?.text));
+	if (!hunk) { return stale; }
+	const working = readText(cwd, relative);
+	if (!working.ok) { return { ok: false, error: working.error }; }
+	if (working.binary) { return { ok: false, error: "This change cannot be reverted on its own." }; }
+	const index = await runGit(["--literal-pathspecs", "show", `:./${relative}`], cwd, 8000, true);
+	if (index.code !== 0 || index.truncated || index.out.includes("\0")) { return { ok: false, error: "The file's index content could not be read." }; }
+	if (!isUtf8(index.bytes)) { return { ok: false, error: "The file's index content is not valid UTF-8. Revert it from a terminal." }; }
+	const split = (text) => (text.match(/[^\n]*\n|[^\n]+$/g) ?? []).map((raw) => {
+		const ending = raw.endsWith("\r\n") ? "\r\n" : raw.endsWith("\n") ? "\n" : "";
+		return { raw, text: raw.slice(0, raw.length - ending.length), ending };
+	});
+	const now = split(working.text);
+	const before = split(index.out);
+	const endings = [...new Set(now.map((line) => line.ending).filter(Boolean))];
+	const range = hunkRange(hunk.loc);
+	let oldAt = range.oldCount === 0 ? range.oldStart : range.oldStart - 1;
+	let newAt = range.newCount === 0 ? range.newStart : range.newStart - 1;
+	const start = newAt;
+	const replacement = [];
+	for (const line of hunk.lines) {
+		if (line.kind !== "add" && before[oldAt]?.text !== line.text) { return stale; }
+		if (line.kind !== "del" && now[newAt]?.text !== line.text) { return stale; }
+		if (line.kind === "context") {
+			replacement.push(now[newAt].raw);
+		} else if (line.kind === "del") {
+			const original = before[oldAt];
+			replacement.push(`${original.text}${original.ending ? endings.length === 1 ? endings[0] : original.ending : ""}`);
+		}
+		if (line.kind !== "add") { oldAt++; }
+		if (line.kind !== "del") { newAt++; }
+	}
+	const text = `${now.slice(0, start).map((line) => line.raw).join("")}${replacement.join("")}${now.slice(newAt).map((line) => line.raw).join("")}`;
+	return writeText(cwd, relative, text, working.version);
+}
+
+module.exports = { readDiff, parseUnified, revertFile, revertHunk, localFilterOff, FILTER_NOT_OFF };

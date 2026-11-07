@@ -8,10 +8,11 @@ rm -rf out
 mkdir out
 # The .icns is committed: sips failed to write it on the GitHub macOS runner (Error 13, v0.6.0 release run).
 # No asar archive: the update helper and the startup recovery read the app folder as plain files.
-# node_modules stays out: the main process needs only Node built-ins and Electron, and Vite bundles the page into dist/.
+# Copy only node-pty's runtime after packaging; Vite bundles the renderer dependencies into dist/.
 npx electron-packager . "$name" --platform=darwin --arch=arm64,x64 --icon=assets/codewomplers-grok-desktop.icns --app-bundle-id=com.codewomplers.grokdesktop --app-copyright="Copyright (c) 2026 Codewomplers" --out=out --no-asar --no-prune --ignore='^/(node_modules|src|out|\.github)(/|$)'
 for arch in arm64 x64; do
 	app="out/$name-darwin-$arch/$name.app"
+	node scripts/package-node-pty.cjs "$app/Contents/Resources/app" darwin "$arch"
 	# Packaging edits the bundle Electron shipped signed. Apple silicon runs only signed code, so sign it again ad hoc (no certificate).
 	codesign --force --deep --sign - "$app"
 	codesign --verify --deep --strict "$app"

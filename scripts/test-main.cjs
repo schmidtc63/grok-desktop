@@ -8,11 +8,22 @@ const root = path.resolve(__dirname, "..");
 const imageFile = path.join(root, "test-image.png");
 const handlers = new Map();
 const windows = [];
+const browserCalls = [];
+const browserAgentApi = {
+	server: async () => ({ type: "http", name: "browser_pane", url: "http://127.0.0.1:12345/mcp", headers: [] }),
+	setTabs: (...args) => { browserCalls.push(["tabs", ...args]); return { ok: true }; },
+	stop: (id) => { browserCalls.push(["stop", id]); return { ok: true }; },
+	resume: (id) => { browserCalls.push(["resume", id]); return { ok: true }; },
+	guestSession() {},
+	close() {},
+};
 let host;
 let terminals;
 let written;
 let grokLogouts = 0;
 let readinessChecks = 0;
+const readinessCalls = [];
+let grokUpdates = 0;
 const windowStateFile = path.join(root, "window-state.json");
 let windowState;
 let cursorArea = { x: 0, y: 0, width: 1920, height: 1080 };
@@ -42,6 +53,7 @@ class TestWindow extends EventEmitter {
 	constructor(options) {
 		super();
 		this.options = options;
+		this.id = windows.length + 1;
 		this.webContents = new EventEmitter();
 		this.webContents.isDestroyed = () => !!(this.destroyed || this.webContents.gone);
 		this.webContents.send = () => {
@@ -79,6 +91,7 @@ class TestHost {
 		this.decisions = [];
 		this.folderUpdates = [];
 		this.steered = [];
+		this.procs = new Map();
 	}
 	prompt(input) {
 		if (this.turns.has(input.uiSessionId)) { return Promise.resolve({ ok: false }); }
@@ -108,11 +121,18 @@ class TestTerminals {
 		this.closeAllCalls = 0;
 	}
 	open({ cwd }) { return cwd ? { ok: true, id: `terminal-${++this.nextId}` } : { ok: false }; }
+	write() { return { ok: true }; }
+	input() { return { ok: true }; }
+	resize() { return { ok: true }; }
+	history() { return "terminal history"; }
+	interrupt() { return { ok: true }; }
 	close(id) { this.closed.push(id); this.emit({ type: "terminal-exit", id }); }
 	closeAll() { this.closeAllCalls += 1; }
 }
 
 const app = new EventEmitter();
+const windowsDockBadges = [];
+app.dock = { setBadge: (badge) => windowsDockBadges.push(badge) };
 app.commandLine = { switches: [], appendSwitch(...args) { this.switches.push(args); } };
 app.setPath = () => {};
 app.getVersion = () => "0.1.0";
@@ -143,7 +163,7 @@ const electron = {
 	powerSaveBlocker: { active: false, start() { this.active = true; return 1; }, stop() { this.active = false; } },
 	shell: {
 		openExternal: () => Promise.resolve(),
-		openPath: () => Promise.resolve(""),
+		openPath: (target) => { written = target; return Promise.resolve(""); },
 		showItemInFolder: (target) => { written = target; },
 		readShortcutLink: (file) => {
 			if (!shortcuts[file]) { throw new Error("Not a shortcut."); }
@@ -165,9 +185,15 @@ const electron = {
 	},
 	session: {
 		fromPartition(name) {
+			if (partitions.has(name)) { return partitions.get(name); }
 			const handlersFor = {
 				setPermissionRequestHandler(handler) { this.request = handler; },
 				setPermissionCheckHandler(handler) { this.check = handler; },
+				webRequest: {
+					errors: [], completed: [],
+					onErrorOccurred(filter, listener) { this.errors.push({ filter, listener }); },
+					onCompleted(filter, listener) { this.completed.push({ filter, listener }); },
+				},
 			};
 			partitions.set(name, handlersFor);
 			return handlersFor;
@@ -199,7 +225,7 @@ const shortcutWrites = [];
 // These checks cover the Windows behavior (shortcut repair, Ctrl+R) on every host; checkMacMenu loads a macOS copy.
 const mainContext = {
 	__dirname: path.join(root, "electron"),
-	process: Object.create(process, { platform: { value: "win32" } }),
+	process: Object.create(process, { platform: { value: "win32" }, versions: { value: { ...process.versions, electron: "45.0.0" } } }),
 	URL,
 	Buffer,
 	require(name) {
@@ -239,17 +265,20 @@ const mainContext = {
 				},
 			};
 		}
-		if (name === "./agent.cjs") { return { AgentHost: TestHost }; }
+		if (name === "./agent.cjs") { return { AgentHost: TestHost, grokHome: () => path.join(root, "no-such-grok") }; }
+		if (name === "./browser-agent.cjs") { return { createBrowserAgent: () => browserAgentApi }; }
+		if (name === "./loops.cjs") { return require("../electron/loops.cjs"); }
 		if (name === "./updates.cjs") { return updateApi; }
 		if (name === "../scripts/update-helper.cjs") { return helperApi; }
-		if (name === "./git.cjs") { return { useBundledGit() {}, prCreate: (...args) => { written = args; return { ok: true }; }, prMergeWhenReady: (...args) => { written = args; return { ok: true }; }, restoreWorktree: (...args) => { written = args; return { ok: true }; } }; }
+		if (name === "./git.cjs") { return { useBundledGit() {}, prStatus: (...args) => { written = args; return { ok: true }; }, prCreate: (...args) => { written = args; return { ok: true }; }, commitFiles: (...args) => { written = args; return { ok: true }; }, prMergeWhenReady: (...args) => { written = args; return { ok: true }; }, restoreWorktree: (...args) => { written = args; return { ok: true }; } }; }
 		if (name === "./usage.cjs") { return { taskOutput: (...args) => { written = args; return { ok: true, text: "task output" }; }, subagentTranscript: (...args) => { written = args; return { ok: true, messages: [] }; } }; }
-		if (name === "./diff.cjs") { return {}; }
-		if (name === "./customize.cjs") { return { signOut: async () => { grokLogouts += 1; return { ok: true }; }, readiness: async () => { readinessChecks += 1; return { grok: { ok: true, signedIn: true } }; } }; }
+		if (name === "./diff.cjs") { return { revertHunk: (...args) => { written = args; return { ok: true }; } }; }
+		if (name === "./customize.cjs") { return { signOut: async () => { grokLogouts += 1; return { ok: true }; }, readiness: async (...args) => { readinessChecks += 1; readinessCalls.push(args); return { grok: { ok: true, signedIn: true } }; }, updateGrok: async () => { grokUpdates += 1; return { ok: true }; } }; }
 		if (name === "./terminal.cjs") { return { TerminalHost: TestTerminals }; }
 		if (name === "./files.cjs") {
-			return { writeText: (...args) => { written = args; return { ok: true }; }, locateFile: (cwd, file) => file === "missing" ? { ok: false, error: "Missing file." } : { ok: true, target: path.join(cwd, file) } };
+			return { DEFAULT_APP_EXT: require("../electron/files.cjs").DEFAULT_APP_EXT, readImage: (...args) => { written = args; return { ok: true, dataUrl: "data:image/png;base64,AA==" }; }, writeText: (...args) => { written = args; return { ok: true }; }, locateFile: (cwd, file) => file === "missing" ? { ok: false, error: "Missing file." } : { ok: true, target: path.join(cwd, file === "disguised.pdf" ? "tool.exe" : file) } };
 		}
+		if (name === "./export.cjs") { return { chooseExport: async () => ({ ok: true, cancelled: true }) }; }
 		if (name === "./inbound.cjs") { return require("../electron/inbound.cjs"); }
 		return require(name);
 	},
@@ -284,17 +313,43 @@ async function main() {
 	powerMonitor.emit("on-ac");
 	assert.equal(powerSaveBlocker.active, true, "back on mains power the hold returns");
 	handlers.get("grok:keep-awake")({}, { working: false, onBattery: false });
+	host.procs.set("live-chat", {});
+	const liveLoops = handlers.get("grok:session-loops")({}, "live-chat", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+	assert.equal(liveLoops.ok, true);
+	assert.equal(liveLoops.live, true, "a running Grok keeps the notified loops");
+	host.procs.delete("live-chat");
+	const stoppedLoops = handlers.get("grok:session-loops")({}, "stopped-chat", "not-a-session");
+	assert.equal(stoppedLoops.ok, true);
+	assert.deepEqual(JSON.parse(JSON.stringify(stoppedLoops.loops)), [], "a stopped session with no saved loops reads as none");
 	assert.equal(powerSaveBlocker.active, false);
 	assert.equal(handlers.get("grok:reveal")({}, root, "a b,c.txt").ok, true);
 	assert.equal(written, path.join(root, "a b,c.txt"), "Explorer receives the complete path, including spaces and commas");
 	written = null;
 	assert.equal(handlers.get("grok:reveal")({}, root, "missing").error, "Missing file.");
 	assert.equal(written, null, "a failed lookup never opens Explorer");
+	for (const file of ["tool.exe", "tool.bat", "tool.cmd", "tool.ps1", "tool.vbs", "tool.js", "tool.lnk", "disguised.pdf"]) {
+		assert.equal((await handlers.get("grok:open-in")({}, { target: "explorer", cwd: root, file })).error, "That kind of file doesn't open from here.");
+		assert.equal(written, null, "disallowed file types never reach the OS, including a PDF link targeting an executable");
+	}
+	assert.equal((await handlers.get("grok:open-in")({}, { target: "explorer", cwd: root, file: "report.PDF" })).ok, true);
+	assert.equal(written, path.join(root, "report.PDF"));
+	assert.equal((await handlers.get("grok:open-in")({}, { target: "explorer", cwd: root })).ok, true);
+	assert.equal(written, root, "opening the session folder still works");
+	written = null;
+	assert.equal((await handlers.get("grok:open-in")({}, { target: "explorer", cwd: path.join(root, "electron", "main.cjs") })).error, "That folder is not on this computer.");
+	assert.equal(written, null, "a file passed as cwd cannot bypass the default-app extension guard");
+	console.log("PASS open-in IPC: allowed documents and folders open, executable types and disguised links are refused");
 	handlers.get("grok:pr-create")({}, "folder", "feature");
 	assert.equal(written[0], "folder");
 	assert.equal(written[1].expected, "feature");
 	handlers.get("grok:pr-create")({}, "folder", { invalid: true });
 	assert.equal(written[1].expected, undefined);
+	handlers.get("grok:pr-status")({}, "folder", 42);
+	assert.deepEqual(written, ["folder", 42]);
+	for (const number of [undefined, 0, -1, 1.5, "42"]) {
+		handlers.get("grok:pr-status")({}, "folder", number);
+		assert.deepEqual(written, ["folder", undefined], "invalid PR selectors use the current branch");
+	}
 	handlers.get("grok:pr-merge")({}, "folder", 42);
 	assert.deepEqual(written, ["folder", 42]);
 	handlers.get("grok:restore-worktree")({}, "worktree", "grok/topic");
@@ -328,6 +383,7 @@ async function main() {
 	assert.equal(taskbar(first, "other").ok, false);
 	assert.equal(windows[0].progress, unchangedProgress);
 	assert.equal(taskbar({ sender: new EventEmitter() }, "running").ok, false);
+	assert.deepEqual(windowsDockBadges, [], "Windows taskbar updates never use the Dock");
 	assert.equal(handlers.get("grok:open-image")(first, imageFile).ok, true);
 	assert.equal(windows.at(-1).options.parent, windows[0], "an image viewer belongs to the window that opened it");
 	assert.equal(windows.at(-1).navigation.file, imageFile);
@@ -344,6 +400,22 @@ async function main() {
 	}
 	const firstTerminal = handlers.get("grok:terminal-open")(first, { cwd: root }).id;
 	const secondTerminal = handlers.get("grok:terminal-open")(second, { cwd: root }).id;
+	for (const [channel, args] of [["write", ["echo x"]], ["input", ["x"]], ["resize", [80, 24]], ["interrupt", []]]) {
+		assert.equal(handlers.get(`grok:terminal-${channel}`)(second, firstTerminal, ...args).ok, false, "another window cannot control a terminal");
+		assert.equal(handlers.get(`grok:terminal-${channel}`)(first, firstTerminal, ...args).ok, true);
+	}
+	assert.equal(handlers.get("grok:terminal-history")(second, firstTerminal), "");
+	assert.equal(handlers.get("grok:terminal-history")(first, firstTerminal), "terminal history");
+	assert.equal(handlers.get("grok:terminal-close")(second, firstTerminal).ok, false);
+	assert.deepEqual(terminals.closed, []);
+	const terminalDelivery = [[], []];
+	const terminalSenders = [first.sender.send, second.sender.send];
+	first.sender.send = (...args) => terminalDelivery[0].push(args);
+	second.sender.send = (...args) => terminalDelivery[1].push(args);
+	terminals.emit({ type: "terminal-data", id: firstTerminal, data: "private terminal output" });
+	assert.equal(terminalDelivery[0].length, 1);
+	assert.equal(terminalDelivery[1].length, 0, "terminal output stays in its owning window");
+	[first.sender.send, second.sender.send] = terminalSenders;
 	assert.equal(handlers.get("grok:terminal-open")(first, { cwd: "" }).ok, false);
 	const endedTerminal = handlers.get("grok:terminal-open")(first, { cwd: root }).id;
 	terminals.emit({ type: "terminal-exit", id: endedTerminal });
@@ -364,6 +436,14 @@ async function main() {
 	assert.equal(terminals.closeAllCalls, 0);
 	assert.equal((await handlers.get("grok:send")(first, { uiSessionId: "first" })).ok, true);
 	assert.equal((await handlers.get("grok:send")(second, { uiSessionId: "first" })).ok, false);
+	const browserReport = { uiSessionId: "first", enabled: true, visible: false, activeId: "", tabs: [] };
+	assert.equal(handlers.get("grok:browser-tabs")(first, browserReport).ok, true);
+	assert.deepEqual(browserCalls.at(-1), ["tabs", first.sender, browserReport]);
+	for (const action of ["stop", "resume"]) {
+		assert.equal(handlers.get(`grok:browser-${action}`)(second, "first").ok, false, "another window cannot change browser control");
+		assert.equal(handlers.get(`grok:browser-${action}`)(first, "first").ok, true);
+		assert.deepEqual(browserCalls.at(-1), [action, "first"]);
+	}
 	assert.equal((await handlers.get("grok:sign-out")()).ok, false, "signing out waits for a running reply");
 	assert.equal(grokLogouts, 0);
 	const running = host.turns.get("first");
@@ -406,6 +486,26 @@ async function main() {
 	windows[1].webContents.emit("destroyed");
 	assert.equal(host.cancelled.length, 0);
 	assert.equal(handlers.get("grok:decide")(first, { uiSessionId: "first", toolId: "native" }).ok, true);
+	for (const source of ["about:srcdoc", "about:srcdoc#section"]) {
+		for (const url of ["https://example.test/", "file:///private.txt"]) {
+			let prevented = false;
+			windows[0].webContents.emit("will-frame-navigate", { isMainFrame: false, frame: { url: source }, url, preventDefault() { prevented = true; } });
+			assert.equal(prevented, true, "HTML previews cannot navigate to network or file destinations");
+		}
+	}
+	for (const details of [
+		{ isMainFrame: false, frame: { url: "about:blank" }, url: "about:srcdoc" },
+		{ isMainFrame: false, frame: { url: "about:srcdoc" }, url: "about:srcdoc" },
+		{ isMainFrame: false, frame: { url: "https://example.test/" }, url: "https://example.test/next" },
+		{ isMainFrame: false, frame: { url: "about:srcdocarbitrary" }, url: "https://example.test/" },
+		{ isMainFrame: true, frame: { url: "about:srcdoc" }, url: "https://example.test/" },
+		{ isMainFrame: false, url: "https://example.test/" },
+	]) {
+		let prevented = false;
+		windows[0].webContents.emit("will-frame-navigate", { ...details, preventDefault() { prevented = true; } });
+		assert.equal(prevented, false, "initial loads, preview refreshes, unrelated frames and main navigation stay unchanged");
+	}
+	console.log("PASS HTML preview navigation: network and local navigation blocked, initial loads and refreshes allowed");
 	windows[0].webContents.emit("did-start-navigation", { isMainFrame: false, isSameDocument: false });
 	windows[0].webContents.emit("did-start-navigation", { isMainFrame: true, isSameDocument: true });
 	assert.equal(host.cancelled.length, 0);
@@ -429,20 +529,46 @@ async function main() {
 	handlers.get("grok:write")(first, "folder", "file", "text", "version");
 	assert.deepEqual(written, ["folder", "file", "text", "version"]);
 	let api;
+	const preloadEvents = new EventEmitter();
 	vm.runInNewContext(fs.readFileSync(path.join(root, "electron/preload.cjs"), "utf8"), {
 		require: () => ({
 			contextBridge: { exposeInMainWorld: (_name, value) => { api = value; } },
 			ipcRenderer: {
 				invoke: (...args) => { written = args; },
 				sendSync: (name) => { const event = {}; handlers.get(name)(event); return event.returnValue; },
+				on: (...args) => preloadEvents.on(...args),
+				removeListener: (...args) => preloadEvents.removeListener(...args),
 			},
 		}),
 		process: { platform: "darwin" },
 	});
 	assert.equal(api.homeDir, require("node:os").homedir(), "the first session's folder comes from this computer, not a fixed path");
 	assert.equal(api.platform, "darwin", "the renderer learns the platform from the preload");
+	api.browserTabs(browserReport);
+	assert.deepEqual(written, ["grok:browser-tabs", browserReport]);
+	api.browserStop("first");
+	assert.deepEqual(written, ["grok:browser-stop", "first"]);
+	api.browserResume("first");
+	assert.deepEqual(written, ["grok:browser-resume", "first"]);
+	const browserProblems = [];
+	const removeBrowserProblems = api.onBrowserProblem((problem) => browserProblems.push(problem));
+	const browserProblem = { webContentsId: 17, url: "https://example.test/", message: "HTTP 404", at: 123 };
+	preloadEvents.emit("grok:browser-problem", { sender: "private IPC event" }, browserProblem);
+	assert.deepEqual(browserProblems, [browserProblem], "the browser subscription forwards only its problem payload");
+	removeBrowserProblems();
+	preloadEvents.emit("grok:browser-problem", {}, browserProblem);
+	assert.equal(browserProblems.length, 1, "the Browser pane subscription can be removed");
+	api.readImage("folder", "image.png");
+	assert.deepEqual(written, ["grok:read-image", "folder", "image.png"]);
+	assert.equal(handlers.get("grok:read-image")({}, "folder", "image.png").dataUrl, "data:image/png;base64,AA==");
+	assert.deepEqual(written, ["folder", "image.png"]);
 	api.readiness();
-	assert.deepEqual(written, ["grok:readiness"]);
+	assert.deepEqual(written, ["grok:readiness", undefined]);
+	const setupRequest = { folder: root, full: true };
+	api.readiness(setupRequest);
+	assert.deepEqual(written, ["grok:readiness", setupRequest], "the preload forwards the full setup request");
+	api.updateGrokCli();
+	assert.deepEqual(written, ["grok:update-grok-cli"]);
 	api.updateCheck(true);
 	assert.deepEqual(written, ["grok:update-check", true]);
 	api.updatePrepare("v0.2.0");
@@ -465,11 +591,26 @@ async function main() {
 	assert.equal(handlers.get("grok:update-result")(), null, "the update result is read only once");
 	api.taskbar("running");
 	assert.deepEqual(written, ["grok:taskbar", "running"]);
-	assert.equal((await handlers.get("grok:readiness")()).grok.signedIn, true);
-	assert.equal((await handlers.get("grok:readiness")()).grok.signedIn, true);
-	assert.equal(readinessChecks, 2, "every setup check asks the backend again");
+	const launchReadiness = await handlers.get("grok:readiness")();
+	assert.equal(launchReadiness.grok.signedIn, true);
+	assert.deepEqual(readinessCalls.at(-1), ["", false], "a launch setup check stays light");
+	assert.deepEqual({ ...launchReadiness.app }, { version: "0.1.0", electron: "45.0.0", os: `win32 ${require("node:os").release()} ${process.arch}` }, "setup includes app, Electron and OS versions");
+	assert.equal((await handlers.get("grok:readiness")({}, setupRequest)).grok.signedIn, true);
+	assert.deepEqual(readinessCalls.at(-1), [root, true], "full setup checks forward the session folder");
+	await handlers.get("grok:readiness")({}, { folder: 123, full: "true" });
+	assert.deepEqual(readinessCalls.at(-1), ["", false], "malformed setup requests use a light check and no folder");
+	assert.equal(readinessChecks, 3, "every setup check asks the backend again");
+	assert.equal((await handlers.get("grok:update-grok-cli")()).ok, true);
+	assert.equal(grokUpdates, 1, "Grok CLI updates use customize.updateGrok");
+	console.log("PASS doctor IPC: request forwarding, light defaults, app metadata and mocked Grok CLI update");
 	api.writeFile("folder", "file", "text", "version");
 	assert.deepEqual(written, ["grok:write", "folder", "file", "text", "version"]);
+	const revertHunk = { id: "hunk", loc: "@@ -1 +1 @@", lines: [{ kind: "del", text: "before" }, { kind: "add", text: "after" }] };
+	api.revertHunk("folder", "file", revertHunk);
+	assert.deepEqual(written, ["grok:revert-hunk", "folder", "file", revertHunk]);
+	assert.equal(handlers.get("grok:revert-hunk")({}, "folder", "file", revertHunk).ok, true);
+	assert.deepEqual(written, ["folder", "file", revertHunk]);
+	console.log("PASS hunk revert IPC: captured file and hunk forwarded through preload and host handler");
 	api.taskOutput("task.log");
 	assert.deepEqual(written, ["grok:task-output", "task.log"]);
 	assert.equal(handlers.get("grok:task-output")({}, "task.log").text, "task output");
@@ -490,6 +631,17 @@ async function main() {
 	assert.deepEqual(written, ["grok:pr-merge", "folder", 42]);
 	api.prCreate("folder", "feature");
 	assert.deepEqual(written, ["grok:pr-create", "folder", "feature"]);
+	const commitOptions = { paths: ["a.txt"], message: "Fix it", push: false, expected: "feature" };
+	api.gitCommit("folder", commitOptions);
+	assert.deepEqual(written, ["grok:git-commit", "folder", commitOptions]);
+	assert.equal(handlers.get("grok:git-commit")({}, "folder", commitOptions).ok, true);
+	assert.deepEqual(written, ["folder", commitOptions], "the direct commit bridge forwards options without executing Git");
+	console.log("PASS direct commit IPC: options forwarding through preload and host handler");
+	api.prStatus("folder", 42);
+	assert.deepEqual(written, ["grok:pr-status", "folder", 42]);
+	api.prStatus("folder");
+	assert.deepEqual(written, ["grok:pr-status", "folder", undefined]);
+	console.log("PASS PR status IPC: valid selector forwarding, invalid selector defaults and preload arguments");
 	api.restoreWorktree("worktree", "grok/topic");
 	assert.deepEqual(written, ["grok:restore-worktree", "worktree", "grok/topic"]);
 	api.stopSession("gone");
@@ -626,6 +778,80 @@ async function main() {
 	page.session = { addWordToSpellCheckerDictionary: (word) => added.push(word) };
 	page.setWindowOpenHandler = () => {};
 	app.emit("web-contents-created", {}, page);
+	const otherPage = windows[1].webContents;
+	otherPage.setWindowOpenHandler = () => {};
+	app.emit("web-contents-created", {}, otherPage);
+	const browserDeliveries = [[], []];
+	const previousBrowserSends = [page.send, otherPage.send];
+	page.send = (...args) => browserDeliveries[0].push(args);
+	otherPage.send = (...args) => browserDeliveries[1].push(args);
+	const attachBrowserGuest = (owner, id, partition, validate = true) => {
+		if (validate) { owner.emit("will-attach-webview", { preventDefault() {} }, {}, { src: "https://example.test/", partition }); }
+		const attached = new EventEmitter();
+		attached.id = id;
+		attached.session = electron.session.fromPartition(partition);
+		attached.hostWebContents = owner;
+		attached.isDestroyed = () => !!attached.gone;
+		attached.setWindowOpenHandler = () => {};
+		owner.emit("did-attach-webview", {}, attached);
+		return attached;
+	};
+	assert.equal(guest.webRequest.errors.length, 0, "validation without an actual Browser pane attachment installs no diagnostics");
+	const tabOne = attachBrowserGuest(page, 201, "temp:grok-1");
+	attachBrowserGuest(page, 202, "temp:grok-1");
+	attachBrowserGuest(otherPage, 203, "temp:grok-1");
+	assert.equal(guest.webRequest.errors.length, 1, "a shared partition installs its error listener once across tabs and app windows");
+	assert.equal(guest.webRequest.completed.length, 1);
+	const failRequest = guest.webRequest.errors[0].listener;
+	const completedRequest = guest.webRequest.completed[0].listener;
+	const failedDetails = { webContentsId: 201, url: "https://user:password@example.test/api?token=secret#private", error: "net::ERR_CONNECTION_REFUSED", statusLine: "private status text", referrer: "https://private.test/?secret=referrer" };
+	for (const field of ["requestHeaders", "responseHeaders", "uploadData", "cookies", "body"]) {
+		Object.defineProperty(failedDetails, field, { get() { throw new Error(`Diagnostics must not read ${field}`); } });
+	}
+	failRequest(failedDetails);
+	assert.equal(browserDeliveries[0].length, 1);
+	assert.equal(browserDeliveries[1].length, 0, "request failures go only to their guest's host window");
+	assert.equal(browserDeliveries[0][0][0], "grok:browser-problem");
+	const problemPayload = browserDeliveries[0][0][1];
+	assert.deepEqual(Object.keys(problemPayload).sort(), ["at", "message", "url", "webContentsId"]);
+	assert.equal(problemPayload.url, "https://example.test/api");
+	assert.equal(problemPayload.message, "net::ERR_CONNECTION_REFUSED");
+	assert.equal(problemPayload.webContentsId, 201);
+	assert.ok(Number.isFinite(problemPayload.at));
+	completedRequest({ webContentsId: 202, url: "https://example.test/missing?token=secret#section", statusCode: 404, responseHeaders: { "set-cookie": ["private-cookie"] } });
+	assert.equal(browserDeliveries[0][1][1].webContentsId, 202, "same-window tabs keep their distinct guest IDs");
+	assert.equal(browserDeliveries[0][1][1].message, "HTTP 404");
+	failRequest({ webContentsId: 203, url: "wss://user:password@example.test/socket?token=secret#fragment", error: "net::ERR_FAILED" });
+	assert.equal(browserDeliveries[1][0][1].url, "wss://example.test/socket");
+	const beforeIgnored = browserDeliveries[0].length;
+	for (const statusCode of [200, 302, 399]) { completedRequest({ webContentsId: 201, url: "https://example.test/", statusCode }); }
+	for (const error of ["net::ERR_ABORTED", "ERR_ABORTED"]) { failRequest({ webContentsId: 201, url: "https://example.test/", error }); }
+	for (const webContentsId of [undefined, 999, page.id]) { failRequest({ webContentsId, url: "https://unrelated.test/?private=1", error: "net::ERR_FAILED" }); }
+	for (const url of ["data:text/plain,private-body", "not a URL"]) { failRequest({ webContentsId: 201, url, error: "net::ERR_FAILED" }); }
+	assert.equal(browserDeliveries[0].length, beforeIgnored, "successes, cancellations, unknown pages, data bodies and invalid URLs are ignored");
+	failRequest({ webContentsId: 201, url: "https://example.test/", error: "private error https://private.test/?secret=1" });
+	assert.equal(browserDeliveries[0].at(-1)[1].message, "Network request failed.", "arbitrary error descriptions cannot leak URLs or private text");
+	failRequest({ webContentsId: 201, url: "https://example.test/", error: `net::ERR_${"X".repeat(1000)}` });
+	assert.equal(browserDeliveries[0].at(-1)[1].message.length, 500);
+	const permanentTab = attachBrowserGuest(page, 204, "persist:grok-code");
+	const temporaryTab = attachBrowserGuest(page, 205, "temp:grok-2");
+	assert.equal(permanentTab.session.webRequest.errors.length, 1);
+	assert.equal(temporaryTab.session.webRequest.errors.length, 1, "each allowed partition installs its own listener");
+	const refusedTab = attachBrowserGuest(page, 206, "persist:other");
+	assert.equal(refusedTab.session.webRequest.errors.length, 0, "a forbidden partition is never observed");
+	attachBrowserGuest(contents, 207, "temp:grok-1");
+	failRequest({ webContentsId: 207, url: "https://not-an-app-window.test/", error: "net::ERR_FAILED" });
+	const beforeClosed = browserDeliveries[0].length;
+	tabOne.emit("destroyed");
+	failRequest(failedDetails);
+	page.gone = true;
+	completedRequest({ webContentsId: 202, url: "https://example.test/", statusCode: 500 });
+	page.gone = false;
+	assert.equal(browserDeliveries[0].length, beforeClosed, "destroyed tabs are unregistered and destroyed hosts receive no problems");
+	completedRequest({ webContentsId: 202, url: "https://example.test/", statusCode: 500 });
+	assert.equal(browserDeliveries[0].length, beforeClosed + 1, "another tab in the same partition still receives failures after cleanup");
+	[page.send, otherPage.send] = previousBrowserSends;
+	console.log("PASS Browser diagnostics: once per partition, own-tab/window routing, privacy projection, cancellations and cleanup");
 	const menuFor = (params) => {
 		const before = popups.length;
 		page.emit("context-menu", {}, params);
@@ -691,6 +917,8 @@ async function main() {
 	app.emit("will-quit");
 	assert.equal(helperCopies.length, 1, "the pending update is consumed once");
 	const windowCount = windows.length;
+	const macHandlers = new Map();
+	const macDockBadges = [];
 	const secondCopy = Object.assign(new EventEmitter(), {
 		setPath: app.setPath,
 		setName: app.setName,
@@ -700,6 +928,7 @@ async function main() {
 		requestSingleInstanceLock: () => false,
 		quitCalls: 0,
 		isPackaged: true,
+		dock: { setBadge: (badge) => macDockBadges.push(badge) },
 	});
 	secondCopy.quit = () => { secondCopy.quitCalls += 1; };
 	// The second copy runs as an installed Mac app: started from the Dock with launchd's PATH, it takes PATH from the login shell.
@@ -716,14 +945,17 @@ async function main() {
 		__dirname: path.join(root, "electron"),
 		process: { ...process, platform: "darwin", env: macEnv },
 		URL,
+		Buffer,
 		require(name) {
 			if (name === "child_process") { return macChildProcess; }
-			if (name === "electron") { return { ...electron, app: secondCopy, ipcMain: { handle: () => {}, on: () => {} } }; }
-			if (name === "./agent.cjs") { return { AgentHost: TestHost }; }
+			if (name === "electron") { return { ...electron, app: secondCopy, ipcMain: { handle: (name, handler) => macHandlers.set(name, handler), on: () => {} } }; }
+			if (name === "./agent.cjs") { return { AgentHost: TestHost, grokHome: () => path.join(root, "no-such-grok") }; }
+			if (name === "./browser-agent.cjs") { return { createBrowserAgent: () => browserAgentApi }; }
+			if (name === "./loops.cjs") { return require("../electron/loops.cjs"); }
 			if (name === "./updates.cjs") { return updateApi; }
 			if (name === "../scripts/update-helper.cjs") { return helperApi; }
 			if (name === "./usage.cjs") { return { taskOutput: () => ({ ok: true }), subagentTranscript: () => ({ ok: true }) }; }
-			if (name === "./diff.cjs" || name === "./git.cjs" || name === "./files.cjs" || name === "./customize.cjs") { return {}; }
+			if (name === "./diff.cjs" || name === "./git.cjs" || name === "./files.cjs" || name === "./customize.cjs" || name === "./export.cjs") { return { chooseExport: async () => ({ ok: true, cancelled: true }) }; }
 			if (name === "./terminal.cjs") { return { TerminalHost: class { closeAll() {} } }; }
 			if (name === "./inbound.cjs") { return require("../electron/inbound.cjs"); }
 			return require(name);
@@ -737,6 +969,24 @@ async function main() {
 	assert.equal(appMenu[0].role, "appMenu", "macOS gets the application menu first");
 	assert.equal(appMenu[1].submenu[0].accelerator, "CmdOrCtrl+Shift+N", "New Window is Cmd+Shift+N on macOS");
 	assert.equal(windows.length, windowCount, "and opens no window of its own");
+	const macTaskbar = macHandlers.get("grok:taskbar");
+	const macFirst = new TestWindow({});
+	const macSecond = new TestWindow({});
+	const macFirstEvent = { sender: macFirst.webContents };
+	const macSecondEvent = { sender: macSecond.webContents };
+	assert.equal(macTaskbar(macFirstEvent, "needs-you").ok, true);
+	assert.equal(macDockBadges.at(-1), "•", "one Mac window needing input sets the Dock badge");
+	macTaskbar(macSecondEvent, "idle");
+	assert.equal(macDockBadges.at(-1), "•", "an idle Mac window keeps another window's Dock badge");
+	macTaskbar(macFirstEvent, "idle");
+	assert.equal(macDockBadges.at(-1), "", "resolving the last Mac window clears the Dock badge");
+	macTaskbar(macFirstEvent, "needs-you");
+	assert.equal(macFirst.listenerCount("closed"), 1, "each window gets one badge cleanup listener");
+	macFirst.destroyed = true;
+	Object.defineProperty(macFirst, "id", { get() { throw new TypeError("Object has been destroyed"); } });
+	macFirst.emit("closed");
+	assert.equal(macDockBadges.at(-1), "", "closing the window needing input clears the Dock badge without reading its destroyed id");
+	console.log("PASS macOS Dock badge: needs-you, multi-window aggregation, resolution, and close cleanup; Windows skips Dock");
 	const openFirstWindow = (saved) => {
 		for (const win of windows) { win.destroyed = true; }
 		windowState = typeof saved === "string" || saved === undefined ? saved : JSON.stringify(saved);
@@ -746,7 +996,7 @@ async function main() {
 	const dimensions = (win) => [win.options.x, win.options.y, win.options.width, win.options.height];
 	const normal = openFirstWindow();
 	assert.deepEqual(dimensions(normal), [240, 80, 1440, 920]);
-	assert.deepEqual([normal.options.minWidth, normal.options.minHeight], [1100, 560]);
+	assert.deepEqual([normal.options.minWidth, normal.options.minHeight], [680, 560]);
 	normal.bounds = { x: 80, y: 90, width: 1200, height: 700 };
 	normal.maximized = true;
 	normal.emit("close");
@@ -755,8 +1005,15 @@ async function main() {
 	assert.deepEqual(dimensions(restored), [80, 90, 1200, 700]);
 	restored.webContents.emit("did-finish-load");
 	assert.equal(restored.maximizedWhenShown, true, "the first restored window maximizes before showing");
-	for (const saved of ["{broken", { x: 80, y: 90, width: 1000, height: 700 }]) {
+	for (const width of [680, 900, 1400]) {
+		assert.deepEqual(dimensions(openFirstWindow({ x: 80, y: 90, width, height: 560 })), [80, 90, width, 560], "saved narrow and wide bounds retain their width on startup");
+	}
+	for (const saved of ["{broken", { x: 80, y: 90, width: 679, height: 700 }]) {
 		assert.deepEqual(dimensions(openFirstWindow(saved)), [240, 80, 1440, 920], "invalid state uses centered defaults");
+	}
+	for (const width of [680, 900, 1400]) {
+		cursorArea = matchingArea = { x: 0, y: 0, width, height: 560 };
+		assert.deepEqual(dimensions(openFirstWindow()), [0, 0, width, 560], "default startup bounds fit narrow and wide work areas");
 	}
 	cursorArea = matchingArea = { x: 0, y: 0, width: 1280, height: 672 };
 	assert.deepEqual(dimensions(openFirstWindow()), [0, 0, 1280, 672], "default size fits a small work area");

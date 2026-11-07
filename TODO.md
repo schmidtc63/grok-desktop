@@ -32,15 +32,9 @@ Codewomplers Grok Desktop runs on macOS and Linux from source. On macOS it also 
 - The installed macOS app has not been run on a real Mac yet. If you try it, please report what happens.
 - On macOS, a copy run from source and started from the Dock opens plain Electron, and the menu bar names it "Electron". The installed app avoids both.
 - Open in VS Code has not been tried on macOS or Linux.
+- The Dock badge that shows when Grok needs you has not been tried on a real Mac.
+- The Linux `.tar.gz` and `.deb` packages have not been installed and run on Linux yet.
 
-### Narrower window
+### API-key sign-in (built, not tried with a real key)
 
-The main window has a minimum width of 1100 px (`electron/main.cjs`), so it cannot sit beside an editor on a laptop screen. Check the composer, panes and sidebar at narrower widths, then lower the minimum.
-
-### Collapse long messages like Claude Desktop (built)
-
-A long user message shows eight lines, fades, and offers Show more / Show less. Grok's replies stay open. Known gap: the eight-line check counts characters instead of measuring the bubble, so a message that just fits can get a fade and a Show more that opens nothing.
-
-### API-key sign-in
-
-Grok accepts an API key in `XAI_API_KEY` when no saved sign-in exists, and the app passes its environment through to Grok. This has not been tested with a real key. The setup check at launch counts only a saved sign-in, so it may report "Grok is not signed in" to someone who uses a key. Test it, make the setup check accept a key, document it in the README, and consider showing which sign-in is in use.
+The setup check counts a non-blank `XAI_API_KEY` as signed in when there is no saved sign-in, says which sign-in is in use, and never shows the key. Still open: try it with a real key, including whether a key-only user gets past the app's `authenticate` call. If you use a key, please report what happens.

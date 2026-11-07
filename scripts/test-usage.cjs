@@ -2,7 +2,7 @@ const assert = require("assert/strict");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { contextBreakdown, recentSpend, autoCompactPercent, taskOutput, subagentTranscript } = require("../electron/usage.cjs");
+const { contextBreakdown, recentSpend, autoCompactPercent, taskOutput, subagentTranscript, listCliSessions, openCliSession } = require("../electron/usage.cjs");
 
 const tempBase = path.resolve(os.tmpdir(), process.env.CODEX_THREAD_ID || "grokcode-usage");
 fs.mkdirSync(tempBase, { recursive: true });
@@ -120,5 +120,79 @@ assert.equal(tail.messages[1].text, "tail", "only the last 5 MiB is parsed and a
 fs.unlinkSync(transcriptFile);
 assert.equal(subagentTranscript(id, root).ok, false, "missing updates fail softly");
 console.log("PASS subagentTranscript: ordered replay, merged tool metadata, readonly fields and bounded tails");
+
+const cliRoot = fs.mkdtempSync(path.join(tempBase, "cli-"));
+const cliWork = fs.mkdtempSync(path.join(tempBase, "work-"));
+const olderId = "01a18843-d800-74f1-ab16-67f5d5375a3a";
+const newerId = "01a19999-aaaa-7bbb-8ccc-ddddeeeeffff";
+const knownId = "01a17777-1111-7222-8333-444455556666";
+function plant(sessionId, cwd, summary, lines) {
+	const dir = path.join(cliRoot, encodeURIComponent(cwd), sessionId);
+	fs.mkdirSync(dir, { recursive: true });
+	fs.writeFileSync(path.join(dir, "summary.json"), JSON.stringify(summary));
+	fs.writeFileSync(path.join(dir, "chat_history.jsonl"), `${lines.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+	return dir;
+}
+const user = (text, extra = {}) => ({ type: "user", content: [{ type: "text", text }], ...extra });
+const assistant = (text) => ({ type: "assistant", content: text });
+plant(olderId, cliWork, { generated_title: "Older chat", info: { id: olderId, cwd: cliWork }, last_active_at: "2026-11-01T08:00:00.000000Z", head_branch: "main", current_model_id: "grok-4.6", reasoning_effort: "low" }, [
+	user(`<user_info>rules</user_info><user_query>first question</user_query>`),
+	user("ignored rules", { synthetic_reason: "system_reminder" }),
+	assistant("first answer"),
+]);
+plant(newerId, cliWork, { generated_title: "  Fix\nthe door  ", info: { cwd: cliWork }, last_active_at: "2026-11-05T18:04:01.379428700Z", head_branch: "feature/cli", current_model_id: "grok-4.7", reasoning_effort: "high" }, [
+	user("<user_info>secret rules</user_info><rules>more</rules>"),
+	user("<user_query>open the door</user_query>"),
+	{ type: "reasoning", content: "hidden" },
+	{ type: "assistant", content: [{ type: "text", text: "Opened." }] },
+	{ type: "tool_result", content: "tool output" },
+]);
+plant(knownId, cliWork, { generated_title: "Already open", info: { cwd: cliWork }, last_active_at: "2026-11-06T00:00:00Z" }, [user("already")]);
+fs.mkdirSync(path.join(cliRoot, encodeURIComponent(cliWork), "not-a-session"));
+const listed = listCliSessions([knownId.toUpperCase()], cliRoot);
+assert.equal(listed.ok, true);
+assert.deepEqual(listed.sessions.map((item) => item.id), [newerId, olderId], "newest first, and a session the app already has is left out");
+assert.equal(listed.sessions[0].title, "Fix the door");
+assert.equal(listed.sessions[0].folder, cliWork);
+assert.equal(listed.sessions[0].lastActive, Date.parse("2026-11-05T18:04:01.379Z"));
+const bare = path.join(cliRoot, encodeURIComponent("C:/plain"), "01a16666-2222-7333-8444-555566667777");
+fs.mkdirSync(bare, { recursive: true });
+fs.writeFileSync(path.join(bare, "chat_history.jsonl"), `${JSON.stringify(user("plain question"))}\n`);
+const bareListed = listCliSessions([], cliRoot).sessions.find((item) => item.folder === "C:/plain");
+assert.equal(bareListed.title, "CLI session", "a session without a summary still lists its folder");
+assert.equal(listCliSessions([], path.join(cliRoot, "missing")).ok, false);
+const opened = openCliSession(newerId, cliRoot);
+assert.equal(opened.ok, true);
+assert.equal(opened.truncated, false);
+assert.equal(opened.session.folder, cliWork);
+assert.equal(opened.session.branch, "feature/cli");
+assert.equal(opened.session.model, "grok-4.7");
+assert.equal(opened.session.effort, "high");
+assert.deepEqual(opened.messages, [
+	{ role: "user", text: "open the door" },
+	{ role: "grok", text: "Opened." },
+], "rules, reminders, reasoning and tool results stay out of the opened chat");
+const historyFile = path.join(cliRoot, encodeURIComponent(cliWork), newerId, "chat_history.jsonl");
+const before = fs.readFileSync(historyFile);
+assert.equal(fs.readFileSync(historyFile).equals(before), true);
+const goneFolder = "C:/no/such/cli-folder";
+plant("01a15555-3333-7444-8555-666677778888", goneFolder, { info: { cwd: goneFolder }, generated_title: "Missing" }, [user("hi")]);
+const refused = openCliSession("01a15555-3333-7444-8555-666677778888", cliRoot);
+assert.equal(refused.ok, false);
+assert.match(refused.error, /folder is gone/);
+assert.equal(fs.existsSync(goneFolder), false, "refusing a missing folder does not create it");
+assert.match(openCliSession("01a10000-0000-7000-8000-000000000000", cliRoot).error, /gone/);
+assert.match(openCliSession("../secret", cliRoot).error, /gone/);
+const huge = openCliSession(olderId, cliRoot, { messageCap: 4, totalCap: 4 });
+assert.equal(huge.truncated, true);
+assert.equal(huge.messages.at(-1).text.endsWith("…"), true);
+const wide = plant("01a14444-5555-7666-8777-888899990000", cliWork, { info: { cwd: cliWork }, generated_title: "Wide" }, [user("keep"), assistant("tail")]);
+fs.appendFileSync(path.join(wide, "chat_history.jsonl"), `${"x".repeat(80)}\n${JSON.stringify(assistant("tail"))}\n`);
+const tailed = openCliSession("01a14444-5555-7666-8777-888899990000", cliRoot, { fileLimit: 40 });
+assert.equal(tailed.truncated, true);
+assert.equal(tailed.messages.at(-1).text, "tail");
+fs.rmSync(cliRoot, { recursive: true, force: true });
+fs.rmSync(cliWork, { recursive: true, force: true });
+console.log("PASS CLI sessions: newest first, known ids left out, transcript without rules, missing folder refused");
 
 fs.rmSync(root, { recursive: true, force: true });

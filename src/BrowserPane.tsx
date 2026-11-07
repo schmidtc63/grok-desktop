@@ -1,10 +1,17 @@
 import { createElement, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { cleanUrl, problemsPrompt, sanitizeProblem, type BrowserProblem, type BrowserProblemInput } from "./browserDiagnostics";
 
-export interface BrowserTab { id: string; url: string; title: string }
+export interface BrowserTab { id: string; url: string; title: string; problems?: BrowserProblem[] }
 
 export interface DevServer { script: string; command: string; running: boolean }
 
 export interface BrowserPaneProps {
+	uiSessionId: string;
+	controlEnabled: boolean;
+	controlStopped: boolean;
+	controlActivity?: { text: string; running?: boolean };
+	onStopControl: () => void;
+	onResumeControl: () => void;
 	tabs: BrowserTab[];
 	activeId: string;
 	onActivate: (id: string) => void;
@@ -24,6 +31,9 @@ export interface BrowserPaneProps {
 	onStopAll: () => void;
 	selectTick: number;
 	onPicked: (pick: { url: string; selector: string; html: string; text: string }) => void;
+	onProblem: (tabId: string, problem: BrowserProblemInput) => void;
+	onClearProblems: (tabId: string) => void;
+	onDiagnostics: (text: string) => void;
 	onClose: () => void;
 }
 
@@ -32,6 +42,7 @@ interface ElementPick { selector: string; html: string; text: string }
 interface WebviewElement extends HTMLElement {
 	getURL(): string;
 	getTitle(): string;
+	getWebContentsId(): number;
 	canGoBack(): boolean;
 	canGoForward(): boolean;
 	goBack(): void;
@@ -42,7 +53,7 @@ interface WebviewElement extends HTMLElement {
 
 type ViewRef = (element: HTMLElement | null) => (() => void) | undefined;
 
-const PAGE_EVENTS = ["did-navigate", "did-navigate-in-page", "page-title-updated"];
+const PAGE_EVENTS = ["dom-ready", "did-navigate", "did-navigate-in-page", "page-title-updated"];
 
 // Runs in the page's main world. Resolves the clicked element, or null on Escape or when a newer picker replaces it.
 export const PICKER_SCRIPT: string = `(() => new Promise((resolve) => {
@@ -167,6 +178,7 @@ function tabLabel(tab: BrowserTab): string {
 export function BrowserPane(props: BrowserPaneProps) {
 	const { tabs, activeId, error, keepCookies, linksInBuiltIn, devServers, selectTick } = props;
 	const latest = useRef(props);
+	const mounted = useRef(true);
 	const views = useRef<Record<string, WebviewElement>>({});
 	const viewRefs = useRef<Record<string, ViewRef>>({});
 	const srcs = useRef<Record<string, string>>({});
@@ -182,6 +194,8 @@ export function BrowserPane(props: BrowserPaneProps) {
 	const [draft, setDraft] = useState(activeUrl);
 	const [menu, setMenu] = useState<"" | "servers" | "more">("");
 	const [pickingId, setPickingId] = useState("");
+	const [problemsId, setProblemsId] = useState("");
+	const problemTab = tabs.find((tab) => tab.id === problemsId);
 	const partition = keepCookies ? "persist:grok-code" : "temp:grok-code";
 
 	// A webview cannot change partition, so the key carries it; a fresh partition starts every tab again from its url.
@@ -193,6 +207,35 @@ export function BrowserPane(props: BrowserPaneProps) {
 	useLayoutEffect(() => {
 		latest.current = props;
 	});
+	useLayoutEffect(() => {
+		mounted.current = true;
+		return () => { mounted.current = false; reportTabs(false); };
+	}, [props.uiSessionId]);
+	useLayoutEffect(() => { reportTabs(); }, [props.uiSessionId, props.controlEnabled, tabs, activeId]);
+
+	function reportTabs(visible = true) {
+		const current = latest.current;
+		if (!current.uiSessionId || (visible && !mounted.current)) { return; }
+		const guests = visible ? current.tabs.flatMap((tab) => {
+			const view = views.current[tab.id];
+			const webContentsId = attempt(() => view?.getWebContentsId(), 0);
+			if (!Number.isInteger(webContentsId) || !webContentsId || webContentsId < 1) { return []; }
+			const liveUrl = cleanUrl(attempt(() => view.getURL(), ""));
+			const url = liveUrl || cleanUrl(tab.url);
+			const page = attempt(() => new URL(liveUrl), null);
+			const origin = page && (page.protocol === "http:" || page.protocol === "https:") ? page.origin : "";
+			const problems = (tab.problems ?? []).filter((entry) => origin && attempt(() => new URL(cleanUrl(entry.url || entry.source)).origin, "") === origin);
+			return [{ id: tab.id, webContentsId, url, problems: problemsPrompt(url, problems) }];
+		}) : [];
+		void window.grokCode?.browserTabs?.({ uiSessionId: current.uiSessionId, enabled: current.controlEnabled, visible, activeId: visible ? current.activeId : "", tabs: guests }).catch(() => {});
+	}
+
+	useEffect(() => window.grokCode?.onBrowserProblem?.((problem) => {
+		const tab = latest.current.tabs.find((item) => attempt(() => views.current[item.id]?.getWebContentsId(), -1) === problem.webContentsId);
+		if (tab) {
+			latest.current.onProblem(tab.id, sanitizeProblem({ kind: "request", url: problem.url, message: problem.message, at: problem.at }));
+		}
+	}), []);
 
 	useEffect(() => {
 		if (document.activeElement !== addressRef.current) {
@@ -288,33 +331,54 @@ export function BrowserPane(props: BrowserPaneProps) {
 				}
 				const view = element as WebviewElement;
 				views.current[tabId] = view;
+				reportTabs();
 				const sync = (event: Event) => {
 					const info = event as Event & { url?: string; title?: string; isMainFrame?: boolean };
 					if (info.isMainFrame === false) {
 						return;
 					}
+					reportTabs();
 					const url = attempt(() => view.getURL(), info.url ?? "");
 					const title = attempt(() => view.getTitle(), info.title ?? "");
 					if (!url) {
 						return;
 					}
 					seen.current[tabId] = url;
+					if (event.type === "did-navigate" || event.type === "did-navigate-in-page") {
+						latest.current.onProblem(tabId, sanitizeProblem({ kind: "navigation", url, message: "navigated to" }));
+					}
 					if (event.type === "did-navigate" && pick.current.tabId === tabId) {
 						pick.current = { run: pick.current.run + 1, tabId: "" };
 						setPickingId("");
 					}
 					latest.current.onPageChanged(tabId, url, title);
 				};
+				const consoleProblem = (event: Event) => {
+					const info = event as Event & { level?: number | string; message?: string; sourceId?: string; line?: number; lineNumber?: number };
+					const level = info.level === 2 || info.level === "warning" ? "warning" : info.level === 3 || info.level === "error" ? "error" : "";
+					if (!level || !latest.current.tabs.some((tab) => tab.id === tabId)) { return; }
+					latest.current.onProblem(tabId, sanitizeProblem({ kind: "console", level, message: info.message ?? "", source: info.sourceId, line: info.line ?? info.lineNumber, url: attempt(() => view.getURL(), "") }));
+				};
+				const loadProblem = (event: Event) => {
+					const info = event as Event & { errorCode?: number; errorDescription?: string; validatedURL?: string };
+					if (info.errorCode === -3 || !latest.current.tabs.some((tab) => tab.id === tabId)) { return; }
+					latest.current.onProblem(tabId, sanitizeProblem({ kind: "load", message: `${info.errorDescription || "Page load failed"} (${info.errorCode ?? "unknown"})`, url: info.validatedURL || attempt(() => view.getURL(), "") }));
+				};
 				for (const name of PAGE_EVENTS) {
 					view.addEventListener(name, sync);
 				}
+				view.addEventListener("console-message", consoleProblem);
+				view.addEventListener("did-fail-load", loadProblem);
 				return () => {
 					for (const name of PAGE_EVENTS) {
 						view.removeEventListener(name, sync);
 					}
+					view.removeEventListener("console-message", consoleProblem);
+					view.removeEventListener("did-fail-load", loadProblem);
 					if (views.current[tabId] === view) {
 						delete views.current[tabId];
 					}
+					reportTabs();
 				};
 			};
 		}
@@ -400,6 +464,7 @@ export function BrowserPane(props: BrowserPaneProps) {
 						</button>
 						{menu === "more" && (
 							<div className="bp-menu" role="group" aria-label="Browser options">
+								{props.controlEnabled && props.controlStopped && <button className="bp-item" onClick={() => { props.onResumeControl(); setMenu(""); }}>Let Grok use this browser</button>}
 								<label className="bp-item">
 									<input type="checkbox" checked={keepCookies} onChange={(event) => props.onKeepCookies(event.target.checked)} />
 									Keep cookies
@@ -423,6 +488,10 @@ export function BrowserPane(props: BrowserPaneProps) {
 				</div>
 				<button className="pane-x" aria-label="Close pane" onClick={props.onClose}>×</button>
 			</div>
+			{props.controlEnabled && props.controlActivity && <div className="bp-control" role="status">
+				<div><b>{props.controlActivity.text}</b><small>Stop blocks later actions. An already-sent action may still finish.</small></div>
+				<button className="texty" disabled={props.controlStopped} onClick={props.onStopControl}>Stop</button>
+			</div>}
 			<div className="bp-tabs">
 				{tabs.map((tab) => (
 					<div className={tab.id === activeId ? "bp-tab on" : "bp-tab"} key={tab.id}>
@@ -434,11 +503,26 @@ export function BrowserPane(props: BrowserPaneProps) {
 						>
 							{tabLabel(tab)}
 						</button>
+						<button className="bp-problems-btn" aria-label={`Problems for ${tabLabel(tab)}`} aria-expanded={problemsId === tab.id} onClick={() => { props.onActivate(tab.id); setProblemsId(problemsId === tab.id ? "" : tab.id); }}>
+							Problems{tab.problems?.some((entry) => entry.kind !== "navigation") && <span className="bp-problem-count">{tab.problems.filter((entry) => entry.kind !== "navigation").reduce((count, entry) => count + entry.count, 0)}</span>}
+						</button>
 						<button className="bp-tab-x" aria-label="Close browser tab" onClick={() => props.onCloseTab(tab.id)}>×</button>
 					</div>
 				))}
 				<button className="bp-new" aria-label="New browser tab" onClick={props.onNewTab}>+</button>
 			</div>
+			{problemTab && (
+				<section className="bp-problems" aria-label="Browser problems">
+					<div className="bp-problems-hd">
+						<b>Problems</b>
+						<span className="spacer" />
+						<button className="texty" disabled={!problemTab.problems?.length} onClick={() => props.onDiagnostics(problemsPrompt(problemTab.url, problemTab.problems ?? []))}>Add to prompt</button>
+						<button className="texty" disabled={!problemTab.problems?.length} onClick={() => props.onClearProblems(problemTab.id)}>Clear</button>
+					</div>
+					{!problemTab.problems?.length && <p className="meta">No problems recorded.</p>}
+					<ul>{problemTab.problems?.map((entry, index) => <li key={index}><b>{entry.level}</b> {entry.message}{entry.url && <span> — {entry.url}</span>}{entry.source && <span> ({entry.source}{entry.line ? `:${entry.line}` : ""})</span>}{entry.count > 1 && <b> ×{entry.count}</b>}</li>)}</ul>
+				</section>
+			)}
 			<div className="bp-bar">
 				<button className="bp-icon" aria-label="Back" disabled={!activeUrl} onClick={() => go("back")}>←</button>
 				<button className="bp-icon" aria-label="Forward" disabled={!activeUrl} onClick={() => go("forward")}>→</button>

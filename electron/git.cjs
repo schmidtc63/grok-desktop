@@ -15,6 +15,7 @@ const GH_MISSING = "GitHub CLI (gh) is not installed.";
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/;
 const SHA_PATTERN = /^[0-9a-f]{7,40}$/i;
 const EXCLUDE_LINE = ".grok/worktrees/";
+const committing = new Set();
 // A dirty-submodule check runs git status inside the submodule, which loads that submodule's own filters.
 const DIFF_ARGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short", "--ignore-submodules=dirty", "--relative", "--raw", "-z", "-p", "-U3"];
 const CHECK_STATES = { SUCCESS: "pass", FAILURE: "fail", ERROR: "fail", CANCELLED: "fail", TIMED_OUT: "fail", ACTION_REQUIRED: "fail", STARTUP_FAILURE: "fail", NEUTRAL: "skip", SKIPPED: "skip", STALE: "skip", IN_PROGRESS: "run" };
@@ -98,7 +99,7 @@ function gh(args, cwd) {
 
 function failure(result, what) {
 	if (result.timedOut) { return { ok: false, error: `${what} timed out.` }; }
-	const line = result.err.split(/\r?\n/).map((text) => text.trim()).filter(Boolean).find((text, index, lines) => /^(fatal|error):/i.test(text) || index === lines.length - 1) || `${what} failed.`;
+	const line = result.err.split(/\r?\n/).map((text) => text.trim()).filter((text) => text && !/^warning:/i.test(text)).find((text, index, lines) => /^(fatal|error):/i.test(text) || index === lines.length - 1) || `${what} failed.`;
 	return { ok: false, error: line.replace(/^(fatal|error):\s*/i, "").slice(0, 300) };
 }
 
@@ -254,11 +255,14 @@ function checkState(entry) {
 	return CHECK_STATES[key] || "wait";
 }
 
-async function prStatus(cwd) {
+const PR_FEEDBACK_JQ = ".comments |= map({author, createdAt, isMinimized}) | .reviews |= map({author, submittedAt, state})";
+
+async function prStatus(cwd, number) {
 	const problem = await repoProblem(cwd);
 	if (problem === NOT_REPO) { return { ok: true, pr: null }; }
 	if (problem) { return { ok: false, error: problem }; }
-	const view = await gh(["pr", "view", "--json", "number,title,url,state,isDraft,mergeable,autoMergeRequest,statusCheckRollup"], cwd);
+	// gh drops comment and review bodies itself, so a PR with long bot reviews stays under MAX_BYTES.
+	const view = await gh(["pr", "view", ...(Number.isInteger(number) && number > 0 ? [String(number)] : []), "--json", "number,title,url,state,isDraft,mergeable,autoMergeRequest,statusCheckRollup,author,comments,reviews", "--jq", PR_FEEDBACK_JQ], cwd);
 	if (view.missing) { return { ok: false, error: GH_MISSING }; }
 	if (view.code !== 0 && /no pull requests found/i.test(view.err)) { return { ok: true, pr: null }; }
 	if (view.code !== 0) { return failure(view, "GitHub CLI"); }
@@ -269,6 +273,13 @@ async function prStatus(cwd) {
 		return { ok: false, error: "GitHub CLI sent an answer that could not be read." };
 	}
 	const rollup = Array.isArray(data.statusCheckRollup) ? data.statusCheckRollup : [];
+	const comments = Array.isArray(data.comments) ? data.comments : [];
+	const reviews = Array.isArray(data.reviews) ? data.reviews : [];
+	const author = data.author && data.author.login;
+	const feedback = [
+		...comments.filter((entry) => entry && typeof entry.author?.login === "string" && entry.author.login !== author && entry.isMinimized !== true && typeof entry.createdAt === "string").map((entry) => ({ at: entry.createdAt, who: entry.author.login, kind: "comment" })),
+		...reviews.filter((entry) => entry && typeof entry.author?.login === "string" && entry.author.login !== author && !["APPROVED", "DISMISSED", "PENDING"].includes(entry.state) && typeof entry.submittedAt === "string").map((entry) => ({ at: entry.submittedAt, who: entry.author.login, kind: "review" })),
+	];
 	return {
 		ok: true,
 		pr: {
@@ -280,6 +291,7 @@ async function prStatus(cwd) {
 			mergeable: data.mergeable,
 			autoMerge: Boolean(data.autoMergeRequest),
 			checks: rollup.map((entry) => ({ name: entry.name || entry.context || "Check", state: checkState(entry), url: entry.detailsUrl || entry.targetUrl || "" })),
+			feedback,
 		},
 	};
 }
@@ -315,6 +327,95 @@ async function prCreate(cwd, options) {
 		return { ok: true, url: urls ? urls.pop() : "", message: `Pull request opened.${count ? ` ${count} uncommitted files are not in this pull request.` : ""}` };
 	}
 	return { ok: false, error: `The branch was pushed, but the pull request was not created: ${created.missing ? GH_MISSING : failure(created, "GitHub CLI").error}` };
+}
+
+async function commitFiles(cwd, options, limits = {}) {
+	if (!options || typeof options !== "object" || ![Object.prototype, null].includes(Object.getPrototypeOf(options))) { return { ok: false, error: "Choose files and enter a commit message." }; }
+	if (!Array.isArray(options.paths) || options.paths.length < 1 || options.paths.length > 1000) { return { ok: false, error: "Choose between 1 and 1000 files to commit." }; }
+	if (typeof cwd !== "string" || !cwd) { return { ok: false, error: "Choose a folder to commit from." }; }
+	const folder = path.resolve(cwd);
+	const paths = [];
+	for (const file of options.paths) {
+		if (typeof file !== "string" || !file || /[\0\r\n]/.test(file) || path.isAbsolute(file)) { return { ok: false, error: "Commit paths must be relative files inside this folder." }; }
+		const relative = path.relative(folder, path.resolve(folder, file));
+		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) { return { ok: false, error: "Commit paths must stay inside this folder." }; }
+		paths.push(relative.split(path.sep).join("/") || ".");
+	}
+	if (typeof options.message !== "string" || !options.message.trim() || options.message.length > 10000 || options.message.includes("\0")) { return { ok: false, error: "Enter a commit message of at most 10000 characters without NUL." }; }
+	if (options.push !== undefined && typeof options.push !== "boolean") { return { ok: false, error: "Choose whether to push with a boolean value." }; }
+	const problem = await repoProblem(cwd);
+	if (problem) { return { ok: false, error: problem }; }
+	const branch = await currentBranch(cwd);
+	if (options.expected && options.expected !== branch) { return { ok: false, error: `The checkout changed to ${branch}. Refresh, then commit again.` }; }
+	if (options.push && (!branch || branch === "HEAD")) { return { ok: false, error: "Switch to a branch before pushing." }; }
+	const top = await git(["rev-parse", "--show-toplevel"], cwd);
+	if (top.code !== 0 || !top.out.trim()) { return failure(top, "Git"); }
+	const repository = process.platform === "win32" ? path.resolve(top.out.trim()).toLowerCase() : path.resolve(top.out.trim());
+	if (committing.has(repository)) { return { ok: false, error: "A commit is already running in this repository." }; }
+	committing.add(repository);
+	let temporary;
+	try {
+		temporary = fs.mkdtempSync(path.join(os.tmpdir(), "grok-commit-"));
+		const writePaths = (name, files) => {
+			const file = path.join(temporary, name);
+			fs.writeFileSync(file, `${files.map((entry) => `:(literal)${entry}`).join("\0")}\0`);
+			return file;
+		};
+		const list = writePaths("paths", paths);
+		const message = path.join(temporary, "message");
+		fs.writeFileSync(message, options.message.trim());
+		const key = (file) => process.platform === "win32" ? file.toLowerCase() : file;
+		const selected = new Set(paths.map(key));
+		const deletions = await git(["diff", "--cached", "--relative", "--no-renames", "--diff-filter=D", "--name-only", "-z"], cwd);
+		if (deletions.code !== 0 || deletions.truncated) { return failure(deletions, "Checking staged deletions"); }
+		for (const file of deletions.out.split("\0").filter((entry) => selected.has(key(entry)))) {
+			if (fs.existsSync(path.resolve(cwd, file))) { return { ok: false, error: `${file} is staged to be deleted but is still on disk, so committing it here would commit the file. Commit it from a terminal.` }; }
+		}
+		const untracked = await git(["ls-files", "--others", "--exclude-standard", "-z"], cwd, GIT_TIMEOUT, { maxBytes: 2 * 1024 * 1024 });
+		if (untracked.truncated) { return { ok: false, error: "This folder has too many untracked files to check. Commit from a terminal." }; }
+		if (untracked.code !== 0) { return failure(untracked, "Checking untracked files"); }
+		const newPaths = untracked.out.split("\0").filter((entry) => entry && selected.has(key(entry)));
+		const newList = newPaths.length ? writePaths("new-paths", newPaths) : "";
+		const rollback = async (error) => {
+			if (newList) {
+				const reset = await git(["reset", "-q", `--pathspec-from-file=${newList}`, "--pathspec-file-nul"], cwd);
+				if (reset.code !== 0) { error += ` The files ${newPaths.join(", ")} were left marked as new in the index: ${failure(reset, "Resetting new files").error}`; }
+			}
+			return { ok: false, error };
+		};
+		if (newList) {
+			const added = await git(["add", "--intent-to-add", `--pathspec-from-file=${newList}`, "--pathspec-file-nul"], cwd);
+			if (added.code !== 0) { return await rollback(failure(added, "Adding new files").error); }
+		}
+		const before = await git(["rev-parse", "--verify", "--quiet", "HEAD"], cwd);
+		const timeout = limits.timeout ?? 10 * 60 * 1000;
+		const committed = await git(["commit", "--only", "-F", message, `--pathspec-from-file=${list}`, "--pathspec-file-nul"], cwd, timeout, { hooks: true });
+		if (committed.code !== 0) {
+			const after = await git(["rev-parse", "--verify", "--quiet", "HEAD"], cwd);
+			const reason = `${failure(committed, "Git").error}${committed.timedOut ? " Git was stopped. If git later says .git/index.lock exists and no git program is running, delete that file." : ""}`;
+			if (after.code === 0 && after.out.trim() !== before.out.trim()) {
+				const short = await git(["rev-parse", "--short", "HEAD"], cwd);
+				const sha = short.out.trim() || after.out.trim();
+				return { ok: false, committed: true, sha, error: `Committed ${sha}, but git did not finish cleanly: ${reason}` };
+			}
+			return await rollback(reason);
+		}
+		const short = await git(["rev-parse", "--short", "HEAD"], cwd);
+		const sha = short.out.trim();
+		if (options.push) {
+			const upstream = await git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd);
+			const pushed = await git(upstream.code === 0 ? ["push"] : ["push", "-u", "origin", "HEAD"], cwd, timeout, { hooks: true });
+			if (pushed.code !== 0) { return { ok: false, committed: true, sha, error: `Committed ${sha}, but the push failed: ${failure(pushed, "Git").error}` }; }
+		}
+		const status = await git(["status", "--porcelain"], cwd);
+		const count = status.out.split(/\r?\n/).filter(Boolean).length;
+		return { ok: true, committed: true, sha, message: `Committed ${sha}${options.push ? ` and pushed ${branch}` : ""}.${count ? ` ${count} other changed files are not in this commit.` : ""}` };
+	} catch (error) {
+		return { ok: false, error: `The commit could not be completed: ${error.message}` };
+	} finally {
+		committing.delete(repository);
+		try { if (temporary) { fs.rmSync(temporary, { recursive: true, force: true }); } } catch { /* Cleanup must not replace the commit result. */ }
+	}
 }
 
 async function prMergeWhenReady(cwd, number) {
@@ -439,4 +540,4 @@ function useBundledGit() {
 	if (dir && !(process.env.PATH || "").split(path.delimiter).includes(dir)) { process.env.PATH = `${process.env.PATH}${path.delimiter}${dir}`; }
 }
 
-module.exports = { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, run, git, bundledGitDir, useBundledGit };
+module.exports = { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, commitFiles, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, run, git, bundledGitDir, useBundledGit };

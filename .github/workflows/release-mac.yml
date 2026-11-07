@@ -1,5 +1,5 @@
 name: release-mac
-# Builds the macOS and Windows release files for each version tag and attaches the zips, disk images and Setup.exe.
+# Builds the macOS, Windows and Linux release files for each version tag and attaches the packages.
 # Tags exist only on the public repository, so only it publishes. A tag with a hyphen (v0.6.0-rc.1) becomes a prerelease.
 on:
   push:
@@ -83,8 +83,29 @@ jobs:
             out/Codewomplers-Grok-Desktop-win-x64.zip
             out/Codewomplers-Grok-Desktop-Setup.exe
           if-no-files-found: error
+  linux:
+    runs-on: ubuntu-24.04
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: npm ci
+        env:
+          npm_config_build_from_source: "true"
+      - run: npm run build
+      - run: bash scripts/package-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            out/Codewomplers-Grok-Desktop-linux-x64.tar.gz
+            out/codewomplers-grok-desktop_*_amd64.deb
+          if-no-files-found: error
   publish:
-    needs: [mac, windows]
+    needs: [mac, windows, linux]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -93,7 +114,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: release
+      - name: Checksums
+        run: (cd release/mac && sha256sum *.zip *.dmg; cd ../windows && sha256sum *.zip *.exe; cd ../linux && sha256sum *.tar.gz *.deb) > release/SHA256SUMS.txt
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --verify-tag --notes-from-tag $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease) release/mac/*.zip release/mac/*.dmg release/windows/*.zip release/windows/*.exe
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --notes-from-tag $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease) release/mac/*.zip release/mac/*.dmg release/windows/*.zip release/windows/*.exe release/linux/*.tar.gz release/linux/*.deb release/SHA256SUMS.txt

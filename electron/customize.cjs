@@ -36,16 +36,43 @@ function sourceLabel(source, vendor) {
 	return from && from !== where ? `${where} · ${from}` : where;
 }
 
-// Only the program or address: arguments, query strings, env and headers can hold secrets.
-function serverTarget(item) {
-	const target = String(item.url || item.command || item.target || "");
-	if (!/^[a-z][\w+.-]*:\/\//i.test(target)) { return target; }
+function hiddenValue(value) {
+	return typeof value === "string" && /^(?:Bearer )?\$\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(value) ? value : "[hidden]";
+}
+
+function connectorCommand(value) {
+	if (typeof value !== "string" || !value || /[\0\r\n?#]/.test(value)) { return ""; }
+	if (/^[a-z][\w+.-]*:\/\//i.test(value)) { return connectorTarget(value); }
+	if (hiddenValue(value) !== "[hidden]") { return value; }
+	if (/^[A-Za-z0-9_@./\\:-]+$/.test(value)) { return value; }
+	return path.isAbsolute(value) && /\.(exe|cmd|bat|com|ps1|sh|py|js|cjs|mjs)$/i.test(value) && !/["'`$;&|<>=]/.test(value) ? value : "[hidden]";
+}
+
+function connectorTarget(value) {
+	if (typeof value !== "string") { return ""; }
+	if (/^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(value)) { return value; }
 	try {
-		const url = new URL(target);
-		return `${url.origin}${url.pathname}`;
+		const url = new URL(value);
+		return url.protocol === "https:" || url.protocol === "http:" ? `${url.origin}${url.pathname}` : "";
 	} catch {
 		return "";
 	}
+}
+
+function connectorSettings(item) {
+	const rawTarget = typeof (item.url || item.command || item.target) === "string" ? (item.url || item.command || item.target) : "";
+	const transport = ["http", "sse", "stdio"].includes(item.transport) ? item.transport : item.url || /^https?:\/\//i.test(rawTarget) ? "http" : "stdio";
+	const command = transport === "stdio" ? connectorCommand(rawTarget) : "";
+	const target = transport === "stdio" ? command : connectorTarget(rawTarget);
+	const args = (Array.isArray(item.args) ? item.args : []).slice(0, 200).map((arg) => {
+		if (typeof arg !== "string") { return "[hidden]"; }
+		if (/^--?[A-Za-z][A-Za-z0-9_-]*$/.test(arg)) { return arg; }
+		const option = /^(--?[A-Za-z][A-Za-z0-9_-]*)=(.*)$/.exec(arg);
+		return option ? `${option[1]}=${hiddenValue(option[2])}` : hiddenValue(arg);
+	});
+	const names = (value, pattern) => value && typeof value === "object" && !Array.isArray(value)
+		? Object.entries(value).filter(([name]) => pattern.test(name)).slice(0, 200).map(([name, entry]) => ({ name, value: hiddenValue(entry) })) : [];
+	return { transport, target, command, args, env: names(item.env, /^[A-Za-z_][A-Za-z0-9_]{0,127}$/), headers: names(item.headers, /^[A-Za-z0-9-]{1,128}$/) };
 }
 
 function shape({ inspect, servers, plugins, marketplaces, config }) {
@@ -60,11 +87,13 @@ function shape({ inspect, servers, plugins, marketplaces, config }) {
 
 	const rows = new Map();
 	for (const item of servers) {
-		rows.set(item.name, { name: item.name, detail: serverTarget(item), source: item.scope === "project" ? "This project" : "Grok", enabled: item.enabled !== false, removable: true });
+		const settings = connectorSettings(item);
+		rows.set(item.name, { name: item.name, detail: settings.target, source: item.scope === "project" ? "This project" : "Grok", enabled: item.enabled !== false, removable: true, ...settings });
 	}
 	for (const item of inspect.mcpServers || []) {
 		if (!rows.has(item.name)) {
-			rows.set(item.name, { name: item.name, detail: [item.transport, serverTarget(item)].filter(Boolean).join(" · "), source: sourceLabel(item.source, item.vendor), enabled: true, removable: false });
+			const settings = connectorSettings(item);
+			rows.set(item.name, { name: item.name, detail: [settings.transport, settings.target].filter(Boolean).join(" · "), source: sourceLabel(item.source, item.vendor), enabled: true, removable: false, ...settings });
 		}
 	}
 	// Grok drops a disabled server from inspect, so the user's off list keeps it on screen to turn back on.
@@ -135,6 +164,38 @@ async function inventory(cwd) {
 		return shape({ inspect, servers: Array.isArray(servers) ? servers : [], plugins: Array.isArray(plugins) ? plugins : [], marketplaces: Array.isArray(marketplaces) ? marketplaces : [], config });
 	} catch (error) {
 		return { ok: false, error: error.message };
+	}
+}
+
+async function skillExcerpt(cwd, skillPath) {
+	const problem = folderProblem(cwd);
+	if (problem) { return { ok: false, error: problem }; }
+	const pathKey = (value) => process.platform === "win32" ? path.resolve(value).toLowerCase() : path.resolve(value);
+	if (typeof skillPath !== "string" || !path.isAbsolute(skillPath) || /[\0\r\n]/.test(skillPath) || skillPath.split(/[\\/]/).includes("..") || path.basename(skillPath) !== "SKILL.md") {
+		return { ok: false, error: "Choose a skill's own SKILL.md file." };
+	}
+	let descriptor;
+	try {
+		const result = await run(grokPath(), ["inspect", "--json"], cwd, LIST_TIMEOUT, LIST_BYTES);
+		if (result.code !== 0 || result.truncated) { return { ok: false, error: "Grok's skill list could not be read." }; }
+		const inspected = JSON.parse(result.out);
+		const listed = Array.isArray(inspected.skills) && inspected.skills.some((skill) => skill && skill.source && typeof skill.source.path === "string" && path.isAbsolute(skill.source.path) && pathKey(skill.source.path) === pathKey(skillPath));
+		if (!listed) { return { ok: false, error: "This skill is no longer in Grok's inventory." }; }
+		const folder = fs.realpathSync(path.dirname(skillPath));
+		const file = fs.realpathSync(skillPath);
+		if (pathKey(path.dirname(file)) !== pathKey(folder) || path.basename(file) !== "SKILL.md") {
+			return { ok: false, error: "That file is outside this skill's folder." };
+		}
+		descriptor = fs.openSync(file, "r");
+		if (!fs.fstatSync(descriptor).isFile()) { return { ok: false, error: "That path is not a skill file." }; }
+		const buffer = Buffer.alloc(16 * 1024);
+		const bytes = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+		const text = buffer.subarray(0, bytes).toString("utf8").split(/\r?\n/).slice(0, 80).join("\n");
+		return { ok: true, text, folder };
+	} catch {
+		return { ok: false, error: "This skill's SKILL.md could not be read." };
+	} finally {
+		if (descriptor !== undefined) { fs.closeSync(descriptor); }
 	}
 }
 
@@ -228,14 +289,106 @@ async function signOut() {
 	return { ok: true };
 }
 
-function readinessOf({ grok, git, gh, ghAuth, platform }) {
+function tilde(file, home) {
+	const normalized = file.replace(/\\/g, "/");
+	const base = home.replace(/\\/g, "/").replace(/\/+$/, "");
+	return normalized.toLowerCase() === base.toLowerCase() || normalized.toLowerCase().startsWith(`${base.toLowerCase()}/`) ? `~${normalized.slice(base.length)}` : file;
+}
+
+function envValue(env, names) {
+	const source = env && typeof env === "object" ? env : {};
+	const keys = Object.keys(source);
+	for (const name of names) {
+		if (typeof source[name] === "string" && source[name].trim()) { return source[name]; }
+		const found = keys.find((key) => key.toLowerCase() === name.toLowerCase() && typeof source[key] === "string" && source[key].trim());
+		if (found) { return source[found]; }
+	}
+	return "";
+}
+
+// Scheme, host and port only. A user name or password, or a value that cannot be parsed, never leaves this function.
+function proxyEndpoint(value) {
+	const raw = typeof value === "string" ? value.trim() : "";
+	if (!raw) { return "not set"; }
+	const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
+	let url;
+	try { url = new URL(withScheme); } catch { return "set"; }
+	if (!url.hostname) { return "set"; }
+	const host = url.hostname.includes(":") ? `[${url.hostname}]` : url.hostname;
+	const shown = `${url.protocol}//${host}${url.port ? `:${url.port}` : ""}`;
+	const secrets = [url.username, url.password].filter(Boolean).map((part) => { try { return decodeURIComponent(part); } catch { return part; } });
+	if (secrets.some((secret) => secret && (shown.includes(secret) || shown.includes(encodeURIComponent(secret))))) { return "set"; }
+	return shown;
+}
+
+function noProxyValue(value) {
+	const raw = typeof value === "string" ? value.trim() : "";
+	if (!raw) { return "not set"; }
+	if (!/^[\w.*:\-,[\] ]+$/.test(raw)) { return "set"; }
+	return raw.length > 180 ? `${raw.slice(0, 180)}…` : raw;
+}
+
+function caCertValue(value, exists, home) {
+	const raw = typeof value === "string" ? value.trim() : "";
+	if (!raw) { return "not set"; }
+	if (/[\0\r\n]/.test(raw)) { return "set"; }
+	let found = false;
+	try { found = typeof exists === "function" && exists(raw) === true; } catch { found = false; }
+	const shown = (home ? tilde(raw, home) : raw).slice(0, 300);
+	return `${shown} (${found ? "found" : "missing"})`;
+}
+
+function networkOf(env, exists, home) {
 	return {
-		grok: grok.ok ? { ok: true, version: grok.version, signedIn: grok.signedIn } : { ok: false, error: grok.error },
+		httpsProxy: proxyEndpoint(envValue(env, ["HTTPS_PROXY", "https_proxy"])),
+		httpProxy: proxyEndpoint(envValue(env, ["HTTP_PROXY", "http_proxy"])),
+		noProxy: noProxyValue(envValue(env, ["NO_PROXY", "no_proxy"])),
+		caCerts: caCertValue(envValue(env, ["NODE_EXTRA_CA_CERTS"]), exists, home),
+	};
+}
+
+function readinessOf({ grok, git, gh, ghAuth, platform, grokAt, update, inspect, home, env, certExists }) {
+	const result = {
+		grok: grok.ok ? {
+			ok: true,
+			version: grok.version,
+			signedIn: grok.signedIn,
+			...(grok.signIn === "saved" || grok.signIn === "key" || grok.signIn === "none" ? { signIn: grok.signIn } : {}),
+			...(grok.apiKey === true ? { apiKey: true } : {}),
+		} : { ok: false, error: grok.error },
 		git: { ok: git.code === 0 },
 		gh: gh.code === 0 ? { ok: true, signedIn: !!ghAuth && ghAuth.code === 0 } : { ok: false },
 		install: platform === "win32" ? GROK_INSTALL.win32 : GROK_INSTALL.other,
 		platform,
 	};
+	if (grok.ok && grokAt) { result.grok.at = { source: grokAt.source, path: tilde(grokAt.path, home) }; }
+	if (update) {
+		result.grok.update = { checked: false };
+		try {
+			const value = JSON.parse(update.out);
+			if (update.code === 0 && value && value.error === null) {
+				result.grok.update = { checked: true, current: typeof value.currentVersion === "string" ? value.currentVersion : "", latest: typeof value.latestVersion === "string" ? value.latestVersion : "", available: value.updateAvailable === true, autoUpdate: value.autoUpdate === true };
+				if (typeof value.channel === "string") { result.grok.update.channel = value.channel; }
+			}
+		} catch { /* no readable update result */ }
+	}
+	if (inspect) {
+		result.config = { ok: false };
+		try {
+			const value = JSON.parse(inspect.out);
+			if (inspect.code === 0 && value && typeof value === "object") {
+				const layers = Array.isArray(value.configSources?.layers) ? value.configSources.layers : [];
+				const warnings = Array.isArray(value.configWarnings) ? value.configWarnings : [];
+				result.config = {
+					ok: true,
+					files: layers.filter((layer) => layer && typeof layer.role === "string" && typeof layer.path === "string").map((layer) => ({ role: layer.role, path: tilde(layer.path, home), broken: layer.note === "parse error" })),
+					warnings: warnings.filter((warning) => warning && typeof warning.path === "string" && typeof warning.reason === "string").map((warning) => `${warning.path} (${warning.reason})`),
+				};
+			}
+		} catch { /* no readable config result */ }
+	}
+	result.network = networkOf(env, certExists, home);
+	return result;
 }
 
 // x.ai's installer calls exit on errors, so it runs as its own process. Pure: tests assert this and never run it.
@@ -251,13 +404,18 @@ async function installGrok() {
 	return result.code === 0 ? { ok: true } : { ok: false, error: failure(result, "Installing the Grok CLI") };
 }
 
+async function updateGrok() {
+	const result = await run(grokPath(), ["update"], os.homedir(), INSTALL_TIMEOUT);
+	return result.code === 0 ? { ok: true } : { ok: false, error: failure(result, "Updating Grok") };
+}
+
 // macOS only. xcode-select --install opens Apple's Command Line Tools window and returns at once.
 async function installGit() {
 	const result = await run("xcode-select", ["--install"], os.homedir(), 30000);
 	return result.code === 0 ? { ok: true } : { ok: false, error: failure(result, "Installing Git") };
 }
 
-async function readiness() {
+async function readiness(folder, full) {
 	const home = os.homedir();
 	const [grok, git, gh] = await Promise.all([
 		probeGrok(),
@@ -265,7 +423,15 @@ async function readiness() {
 		run("gh", ["--version"], home, LIST_TIMEOUT),
 	]);
 	const ghAuth = gh.code === 0 ? await run("gh", ["auth", "status"], home, 5000) : null;
-	return readinessOf({ grok, git, gh, ghAuth, platform: process.platform });
+	const grokFile = grokPath();
+	const source = process.env.GROK_PATH ? "GROK_PATH" : grokFile !== "grok" ? "installer" : "PATH";
+	let update;
+	let inspect;
+	if (full === true && grok.ok) {
+		update = await run(grokFile, ["update", "--check", "--json"], home, 20000);
+		inspect = await run(grokFile, ["inspect", "--json"], folderProblem(folder) ? home : folder, LIST_TIMEOUT, LIST_BYTES);
+	}
+	return readinessOf({ grok, git, gh, ghAuth, platform: process.platform, grokAt: { source, path: grokFile }, update, inspect, home, env: process.env, certExists: (file) => fs.existsSync(file) });
 }
 
-module.exports = { inventory, change, changeArgs, signOut, shape, tomlList, words, readiness, readinessOf, installArgs, installGrok, installGit };
+module.exports = { inventory, skillExcerpt, change, changeArgs, signOut, shape, tomlList, words, readiness, readinessOf, tilde, installArgs, installGrok, updateGrok, installGit };

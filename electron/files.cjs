@@ -8,11 +8,15 @@ const { promisify } = require("util");
 const { folderProblem, killTree, OWN_GROUP } = require("./agent.cjs");
 const { repoFiles } = require("./git.cjs");
 
+const IMAGE_MIME = new Map([[".png", "image/png"], [".jpg", "image/jpeg"], [".jpeg", "image/jpeg"], [".gif", "image/gif"], [".webp", "image/webp"], [".bmp", "image/bmp"], [".ico", "image/x-icon"], [".avif", "image/avif"]]);
+const DEFAULT_APP_EXT = new Set(".pdf .doc .docx .xls .xlsx .ppt .pptx .odt .ods .odp .rtf .mp3 .wav .mp4 .mov .webm".split(" "));
+const PREVIEW_BINARY_EXT = new Set([...IMAGE_MIME.keys(), ...DEFAULT_APP_EXT]);
 const SKIP = new Set(["node_modules", ".git", "dist", "build", "coverage", ".vite"]);
-const SKIP_EXT = new Set("png jpg jpeg gif webp bmp ico tif tiff psd ai pdf doc docx xls xlsx xlsm ppt pptx zip 7z rar gz tgz tar mp3 mp4 mov avi wav m4a webm woff woff2 ttf otf eot exe dll so dylib bin pdb class jar o obj db sqlite mdb accdb bak mdf ldf".split(" "));
+const SKIP_EXT = new Set("png jpg jpeg gif webp bmp ico tif tiff psd ai pdf doc docx xls xlsx xlsm ppt pptx zip 7z rar gz tgz tar mp3 mp4 mov avi wav m4a webm woff woff2 ttf otf eot exe dll so dylib bin pdb class jar o obj db sqlite mdb accdb bak mdf ldf".split(" ").filter((extension) => !PREVIEW_BINARY_EXT.has(`.${extension}`)));
 const MAX_FILES = 5000;
 const MAX_DEPTH = 6;
 const MAX_FILE_BYTES = 200 * 1024;
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const MAX_OUTPUT = 80 * 1024;
 const RUN_MS = 20000;
 
@@ -120,11 +124,29 @@ function locateFile(cwd, relative) {
 function readText(cwd, relative) {
   const located = locateFile(cwd, relative);
   if (!located.ok) return located;
+	if (PREVIEW_BINARY_EXT.has(path.extname(located.target).toLowerCase())) {
+		return { ok: true, binary: true, text: "", version: `${located.stat.size}:${located.stat.mtimeMs}:${located.stat.ctimeMs}` };
+	}
   if (located.stat.size > MAX_FILE_BYTES) return { ok: false, error: "That file is too large to show here." };
   const buf = fs.readFileSync(located.target);
   if (buf.includes(0)) return { ok: true, binary: true, text: "" };
 	if (!isUtf8(buf)) { return { ok: false, error: "This file is not valid UTF-8 and cannot be edited here." }; }
 	return { ok: true, binary: false, text: buf.toString("utf8"), version: createHash("sha256").update(buf).digest("hex") };
+}
+
+function readImage(cwd, relative) {
+	const located = locateFile(cwd, relative);
+	if (!located.ok) { return located; }
+	const mime = IMAGE_MIME.get(path.extname(located.target).toLowerCase());
+	if (!mime || !IMAGE_MIME.has(path.extname(relative).toLowerCase())) { return { ok: false, error: "That file is not an image." }; }
+	if (located.stat.size > MAX_IMAGE_BYTES) { return { ok: false, error: "That image is too large to show here." }; }
+	try {
+		const buffer = fs.readFileSync(located.target);
+		if (buffer.length > MAX_IMAGE_BYTES) { return { ok: false, error: "That image is too large to show here." }; }
+		return { ok: true, dataUrl: `data:${mime};base64,${buffer.toString("base64")}`, bytes: buffer.length };
+	} catch {
+		return { ok: false, error: "That image could not be read." };
+	}
 }
 
 function revealFile(cwd, relative) {
@@ -332,4 +354,4 @@ function runCommand(cwd, command) {
   });
 }
 
-module.exports = { listFiles, readText, writeText, runCommand, locateFile, revealFile };
+module.exports = { listFiles, readText, readImage, writeText, runCommand, locateFile, revealFile, DEFAULT_APP_EXT };

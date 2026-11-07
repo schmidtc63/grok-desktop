@@ -10,22 +10,38 @@ Not affiliated with or endorsed by xAI. Grok is a trademark of its owner.
 
 ## A typical task
 
-1. Choose **New session**, pick a project folder and describe the change.
-2. Grok reads and edits files in that folder. In **Normal** mode it asks before each edit or command, and you choose **Allow** or **Deny**. **Plan** mode explores and writes a plan first. **Auto-review** lets Grok's safety check approve calls, and **Always-approve** runs tools without asking. Ctrl+Shift+M switches modes.
+1. Choose **New session**, pick a project folder and describe the change. **CLI…** beside it opens a conversation started in the Grok CLI and continues that same session.
+2. Grok reads and edits files in that folder. In **Normal** mode it asks before each edit or command, and you choose **Allow** or **Deny**. **Plan** mode explores and writes a plan first. **Auto-review** lets Grok's safety check approve calls, and **Always-approve** runs tools without asking. Ctrl+Shift+M opens the mode menu.
 3. Open the **Changes** pane (Ctrl+Shift+D) to review the diff. Click **+** beside a line to comment, then **Send to Grok** to ask for fixes.
-4. Choose **Commit** or **Commit and push**, and Grok makes the commit. With the GitHub CLI signed in, **Create PR** opens a pull request and **Merge when ready** merges it when its checks pass.
+4. Choose **Commit** or **Commit and push** to enter a message and commit the checked files directly, or hand the commit to Grok. With the GitHub CLI signed in, **Create PR** opens a pull request and **Merge when ready** merges it when its checks pass.
+
+The **+** menu's **Context from another chat** attaches up to three earlier chats, including archived ones, to the message being written. Grok receives a labelled snapshot of each conversation, with the newest part kept when it is long. The chat shows your text and a chip for each source, not the snapshot.
 
 The **Files**, **Terminal** and **Browser** panes sit beside the chat for editing by hand, running commands and checking a dev server.
+
+Browser control is off by default. Enable **Settings > Let Grok use the Browser pane** to let Grok read pages and use navigate, click, fill, select and scroll in the current session's active tab. Grok uses your Browser-pane sign-ins, and what it reads goes to xAI as part of the conversation. Other sites ask for permission even in Always-approve; sensitive fields always ask separately.
+
+Grok's Problems tool includes only entries from the current page's origin. The pane keeps its full history for you to review.
+
+The Browser pane shows each browser call with **Stop**. Stop blocks later browser calls immediately, but an already-sent action may still finish. A timed-out action has an uncertain outcome; browser calls stay blocked until it settles or the page navigates or closes. **Browser menu > Let Grok use this browser** resumes a stopped session.
+
+Save reusable composer text from the **+** menu, insert it at the cursor with **Saved prompts** (Ctrl+Shift+P; Cmd+Shift+P on macOS), and rename, edit or delete it in **Settings → Saved prompts**. Inserting never sends the message.
 
 ## Requirements
 
 - Windows 10 or 11, macOS, or a 64-bit Linux desktop.
-- Node.js 22.12 or later, except for the Windows and macOS install commands.
+- Node.js 22.12 or later when running from source. Release downloads include their runtime.
 - Git 2.31 or later. On Windows and macOS the app's setup check installs it.
 - The Grok CLI, signed in. On Windows and macOS the app's setup check installs it. If it is installed somewhere else, set `GROK_PATH` to its full executable path.
 - GitHub CLI (`gh`), optional, for pull-request features. Sign in with `gh auth login` to use them.
 
-On Windows and macOS a download or one command installs the app. On Linux, and on Windows or macOS if you prefer a plain install, install from this repository and run the app from its folder.
+An API key can stand in for `grok login`. Set `XAI_API_KEY` in the environment this app starts with: a user environment variable, or the terminal you launch the app from. The setup check says when that key is in use and never shows the key. A saved sign-in still wins while it exists.
+
+Behind a proxy, set `HTTPS_PROXY` or `HTTP_PROXY`, and `NO_PROXY` for hosts that bypass it. A company certificate can be named in `NODE_EXTRA_CA_CERTS`. The app passes these through to Grok. The setup check shows the proxy's scheme, host and port, without a user name or password, and whether the certificate file is there.
+
+Download the app for your platform below, or run it from this repository if you prefer a source install.
+
+To check a download, run `Get-FileHash <file> -Algorithm SHA256` on Windows, `shasum -a 256 <file>` on macOS, or `sha256sum <file>` on Linux, replacing `<file>` with the downloaded file's name. Compare the result with its line in `SHA256SUMS.txt` on the release page.
 
 ## Install on Windows
 
@@ -93,15 +109,47 @@ Shortcuts use Cmd where Windows uses Ctrl, except Ctrl+Tab, Ctrl+Shift+Tab and C
 
 ## Install on Linux
 
-1. Install Git and Node.js with your package manager, or Node.js from [nodejs.org](https://nodejs.org).
-2. Electron needs GTK 3, NSS, ALSA and GBM. On Ubuntu 24.04 and later:
+Download the Linux x64 `.deb` or `Codewomplers-Grok-Desktop-linux-x64.tar.gz` from the [latest release](https://github.com/schmidtc63/grok-desktop/releases/latest). Both include Electron and need no separate Node.js install. Install Git with your package manager and install the Grok CLI with `curl -fsSL https://x.ai/cli/install.sh | bash`, then sign in.
+
+### Debian or Ubuntu package
+
+In the folder containing the downloaded `.deb`, run:
+
+```bash
+sudo apt install ./codewomplers-grok-desktop_*_amd64.deb
+```
+
+This installs the app under `/opt/codewomplers-grok-desktop`, its desktop menu entry and icon, and the `codewomplers-grok-desktop` command. Installation configures the sandbox helper's root ownership and mode 4755. Open the app from your desktop menu or run `codewomplers-grok-desktop`. To remove it, run `sudo apt remove codewomplers-grok-desktop`.
+
+### Tar archive
+
+Electron needs GTK 3, NSS, ALSA and GBM. On Ubuntu 24.04 and later:
 
 ```bash
 sudo apt install libnss3 libgtk-3-0t64 libasound2t64 libgbm1
 ```
 
-3. Install the Grok CLI: `curl -fsSL https://x.ai/cli/install.sh | bash`, then sign in.
-4. In a terminal:
+Extract the archive into a folder you want to keep, configure the sandbox helper, and start the app:
+
+```bash
+tar -xzf Codewomplers-Grok-Desktop-linux-x64.tar.gz
+cd Codewomplers-Grok-Desktop-linux-x64
+sudo chown root:root chrome-sandbox
+sudo chmod 4755 chrome-sandbox
+./codewomplers-grok-desktop
+```
+
+Repeat the sandbox commands after replacing the folder with a new release. To remove this copy, delete its extracted folder.
+
+### Run from source on Linux
+
+Install Node.js 22.12 or later as well. On Debian or Ubuntu, install `build-essential` and `python3` before `npm install` so node-pty can build the native terminal:
+
+```bash
+sudo apt install build-essential python3
+```
+
+If the native module cannot load, the Terminal pane falls back to pipes and says so. Then in a terminal:
 
 ```bash
 git clone https://github.com/schmidtc63/grok-desktop.git
@@ -121,11 +169,11 @@ Don't start the app with `--no-sandbox`: its Browser pane loads web pages.
 
 ## Terminal
 
-On Windows the Terminal pane and the Run buttons use PowerShell (PowerShell 7 when it is installed). On macOS and Linux they use bash. Either way the shell starts without your profile, and programs that need a full terminal, such as `vim` or `top`, don't work there.
+On Windows the Terminal pane and the Run buttons use PowerShell (PowerShell 7 when it is installed). On macOS and Linux they use bash. The shell starts without your profile. The native terminal supports interactive programs, colors, Ctrl+C and resizing. Run buttons open a fresh native terminal so they don't type into an existing program or unfinished command. If its native module cannot load, the pane says it is using a pipe terminal, where full-screen programs such as `vim` and `top` are unavailable. Closing the pane stops its terminals.
 
 ## Turns from local tools
 
-In Settings > Sessions, turn on **Accept turns from local tools** to let programs on this computer that hold the private token add a message to an open session. This is off by default. Use **Copy Grok session ID** in a sidebar session's menu to get its ID after its first turn.
+In Settings > Sessions, turn on **Accept turns from local tools** to let programs on this computer that hold the private token add a message to an open session. This is off by default. Use **Copy Grok session ID** in a sidebar session's menu to get its ID after its first turn. **Export as Markdown…** in that menu saves the transcript.
 
 A message joins that session's queue and runs with its mode and approvals. In Auto-review or Always-approve, its tool calls run without approval cards. Every inbound message starts with this line, even when the supplied text starts with a slash command:
 
@@ -159,6 +207,10 @@ These statuses confirm acceptance, not that Grok has answered. A rejected reques
 
 Turning the setting off closes the listener and removes the registry.
 
+## Troubleshooting
+
+Open Settings > Check setup, or run `/doctor`, to check Grok, its sign-in, its config files and whether a newer Grok is out, along with Git and the GitHub CLI. **Copy support report** copies a summary you can paste into an issue; it has no sign-in details.
+
 ## Update
 
 Codewomplers Grok Desktop checks for new versions: a copy run from source asks its git origin, and an installed copy on Windows or macOS asks GitHub. When one is out, the account button at the bottom of the sidebar says Update available. Open its menu and choose Update. A copy run from source on Windows closes, updates and opens again.
@@ -167,7 +219,9 @@ On Windows, quit the installed app and run the install command again. To install
 
 On macOS, quit the app and run the install command again. To install an older release instead (downloads start at v0.6.1), add its tag: `curl -fsSL https://raw.githubusercontent.com/schmidtc63/grok-desktop/main/scripts/install-mac.sh | bash -s -- v0.6.1`.
 
-On Linux, in a copy run from source on macOS, and in versions before 0.2.0, update by hand: quit the app, then in its folder run:
+On Linux, quit the app and install the new `.deb`, or extract the new tar archive and repeat its sandbox setup above.
+
+In a copy run from source on Linux or macOS, and in versions before 0.2.0, update by hand: quit the app, then in its folder run:
 
 ```bash
 git pull

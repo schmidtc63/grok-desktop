@@ -1,14 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type MouseEvent, type SetStateAction } from "react";
 import { caseKey, FILE_MANAGER, keyLabel, modKey, PLATFORM, SHORTCUTS } from "./data";
+import { addContextPick, CONTEXT_PICK_LIMIT, contextChoices, contextForGrok, contextPicksFrom, contextSnapshot, type ContextPick } from "./context-from-chat";
 import { BrowserPane, type BrowserTab, type DevServer } from "./BrowserPane";
+import { addProblem } from "./browserDiagnostics";
 import { askConfirm, setConfirmHost, type PendingConfirm } from "./confirm";
 import { DiffPane, type DiffComment, type PrInfo } from "./DiffPane";
 import { FilesPane } from "./FilesPane";
 import { PaneView, SideLog, type BackgroundTask, type EditorDraft, type FolderFiles, type OpenFile, type PaneModel } from "./Panes";
+import { prAlertText, prFixPrompt, prWatchStep } from "./prWatch";
 import { SessionRail } from "./SessionRail";
 import { Setup } from "./Setup";
 import { DEFAULT_SETTINGS, readSettings, settingsKey, SettingsPage, type AppSettings, type SettingsTab } from "./Settings";
 import { Sidebar } from "./Sidebar";
+import { SavedPromptPicker } from "./SavedPromptPicker";
+import { insertSavedPrompt, MAX_PROMPT_TEXT, MAX_SAVED_PROMPTS, promptNameError } from "./saved-prompts";
 import { TerminalPane, type TerminalTab } from "./TerminalPane";
 import {
 	EFFORT_DETAIL,
@@ -35,6 +40,7 @@ type Notice = { id: number; text: string };
 type BackgroundWork = Record<string, { tasks: GrokBgTask[]; agents: GrokSubagent[] }>;
 
 const historyKey = "grok-code.history.v1";
+const PR_POLL_MS = 180000;
 const commandsKey = "grok-code.commands.v1";
 const accountKey = "grok-code.account.v1";
 const SIDE_BUSY = "The side chat is still answering. Wait for it to finish.";
@@ -91,6 +97,7 @@ interface Queued {
 	id: string;
 	text: string;
 	attachments: string[];
+	contextFrom?: ContextPick[];
 }
 
 interface TurnTarget {
@@ -233,7 +240,11 @@ function permissionGroup(mode: PermissionMode) {
 }
 
 export function sideCap(windowWidth: number, sidebarCollapsed: boolean): number {
-	return Math.max(320, windowWidth - (sidebarCollapsed ? 0 : 268) - 6 - 400);
+	return Math.max(320, windowWidth - (sidebarCollapsed ? 0 : 268) - 6 - (windowWidth < 1100 ? 320 : 400));
+}
+
+export function shouldCollapseSidebar(windowWidth: number, panesOpen: boolean): boolean {
+	return windowWidth < 1100 && panesOpen;
 }
 
 function folderKey(folder: string) {
@@ -316,9 +327,11 @@ export function App() {
 		...(restoredForm && history?.newSessionDraft ? { [restoredForm.id]: history.newSessionDraft.text } : {}),
 	}));
 	const [attachments, setAttachmentsState] = useState<Record<string, string[]>>(() => Object.fromEntries(Object.entries(history?.attachments ?? {}).filter(([id]) => sessions.some((item) => item.id === id))));
+	const [contextPicks, setContextPicks] = useState<Record<string, ContextPick[]>>({});
 	const [queued, setQueuedState] = useState<Record<string, Queued[]>>(() => Object.fromEntries(Object.entries(history?.queued ?? {}).filter(([id]) => sessions.some((item) => item.id === id))));
 	const [held, setHeld] = useState<Record<string, boolean>>(() => Object.fromEntries(Object.keys(queued).map((id) => [id, true])));
 	const [grokTasks, setGrokTasks] = useState<Record<string, GrokBgTask[]>>(() => Object.fromEntries(Object.entries(history?.backgroundWork ?? {}).filter(([id]) => sessions.some((item) => item.id === (id.startsWith("side-") ? id.slice(5) : id))).map(([id, work]) => [id, work.tasks])));
+	const [loops, setLoops] = useState<Record<string, GrokLoop[]>>({});
 	const [subagents, setSubagents] = useState<Record<string, GrokSubagent[]>>(() => Object.fromEntries(Object.entries(history?.backgroundWork ?? {}).filter(([id]) => sessions.some((item) => item.id === (id.startsWith("side-") ? id.slice(5) : id))).map(([id, work]) => [id, work.agents])));
 	const backgroundWorkRef = useRef<BackgroundWork>(history?.backgroundWork ?? {});
 	const backgroundWork = useMemo(() => Object.fromEntries([...new Set([...Object.keys(grokTasks), ...Object.keys(subagents)])].map((id) => {
@@ -336,6 +349,7 @@ export function App() {
 	const popupList = useRef<HTMLDivElement>(null);
 	const [popClosed, setPopClosed] = useState("");
 	const [sideOpen, setSideOpen] = useState(false);
+	const [promptLibrary, setPromptLibrary] = useState<{ mode: "save" | "insert"; sessionId: string; text: string; start: number; end: number } | null>(null);
 	const [sideText, setSideText] = useState("");
 	const [sideChats, setSideChats] = useState<Record<string, ChatMessage[]>>({});
 	const [sideAgents, setSideAgents] = useState<Record<string, string>>({});
@@ -380,7 +394,7 @@ export function App() {
 	const [rewindAsk, setRewindAsk] = useState<{ sessionId: string; message: ChatMessage; files: string[]; conflicts: string[] } | null>(null);
 	const [branching, setBranching] = useState<string | null>(null);
 	const [settingsOpen, setSettingsOpen] = useState<SettingsTab | null>(null);
-	const [setup, setSetup] = useState<{ result?: GrokReadiness; open: boolean; checking: boolean; installing: "" | "grok" | "git" }>({ open: false, checking: false, installing: "" });
+	const [setup, setSetup] = useState<{ result?: GrokReadiness; open: boolean; checking: boolean; installing: "" | "grok" | "git" | "update" }>({ open: false, checking: false, installing: "" });
 	const setupCheck = useRef(0);
 	const [confirms, setConfirms] = useState<ConfirmItem[]>([]);
 	const confirmQueue = useRef<ConfirmItem[]>([]);
@@ -419,19 +433,40 @@ export function App() {
 	const [editorLine, setEditorLine] = useState<{ line?: number; tick: number }>({ tick: 0 });
 	const [fileTick, setFileTick] = useState(0);
 	const [terminals, setTerminals] = useState<Record<string, TerminalTab[]>>({});
+	const terminalsRef = useRef(terminals);
+	terminalsRef.current = terminals;
+	const terminalVisible = useRef(false);
+	const terminalGeneration = useRef(0);
 	const [activeTerminal, setActiveTerminal] = useState<Record<string, string>>({});
 	const [terminalError, setTerminalError] = useState("");
 	const [browserTabs, setBrowserTabs] = useState<Record<string, BrowserTab[]>>({});
 	const [activeBrowser, setActiveBrowser] = useState<Record<string, string>>({});
 	const [browserError, setBrowserError] = useState("");
+	const [browserActivity, setBrowserActivity] = useState<Record<string, { text: string; running: boolean }>>({});
+	const [browserStopped, setBrowserStopped] = useState<Record<string, boolean>>({});
+	const browserActivityTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+	useEffect(() => () => { for (const timer of Object.values(browserActivityTimers.current)) { clearTimeout(timer); } }, []);
 	const [devScripts, setDevScripts] = useState<Record<string, { script: string; command: string }[]>>({});
 	const [devTabs, setDevTabs] = useState<Record<string, string>>({});
+	useEffect(() => {
+		const visible = panes.includes("terminal");
+		if (terminalVisible.current && !visible) {
+			terminalGeneration.current += 1;
+			for (const tab of Object.values(terminalsRef.current).flat()) { void window.grokCode?.terminalClose?.(tab.id); }
+			setTerminals({});
+			setActiveTerminal({});
+			setDevTabs({});
+		}
+		terminalVisible.current = visible;
+	}, [panes]);
 	const [selectTick, setSelectTick] = useState(0);
 	const [modes, setModes] = useState<Record<string, PermissionMode>>(history?.modes ?? {});
 	const [prePlan, setPrePlan] = useState<Record<string, PermissionMode>>(history?.prePlan ?? {});
 	const modesRef = useRef(modes);
 	const sentModes = useRef<Record<string, PermissionMode>>({});
 	const [busy, setBusy] = useState<Record<string, boolean>>({});
+	// shortcut: the warning is once per session, not once per later collision
+	const [collisionSeen, setCollisionSeen] = useState<Record<string, true>>({});
 	const [breakdown, setBreakdown] = useState<(ContextBreakdown & { id: string }) | null>(null);
 	const [recentUsd, setRecentUsd] = useState<number | null>(null);
 	const [limit, setLimit] = useState<GrokLimit | null>(null);
@@ -441,6 +476,8 @@ export function App() {
 	const sideCol = useRef<HTMLDivElement | null>(null);
 	const turnTargets = useRef<Record<string, TurnTarget>>({});
 	const sessionsRef = useRef(sessions);
+	const loopEpoch = useRef<Record<string, number>>({});
+	const openingCli = useRef(new Map<string, string>());
 	const activeIdRef = useRef(activeId);
 	const pendingRef = useRef(pending);
 	// The new-session form, kept with its text while another session is on screen; New session brings it back.
@@ -460,7 +497,7 @@ export function App() {
 	const promptRef = useRef<HTMLTextAreaElement | null>(null);
 	const appVersion = useRef("");
 	sessionsRef.current = sessions;
-	overlayOpen.current = menu !== null || fileMenu !== null || shortcuts || settingsOpen !== null || rewindAsk !== null || setup.open;
+	overlayOpen.current = menu !== null || fileMenu !== null || shortcuts || settingsOpen !== null || rewindAsk !== null || setup.open || promptLibrary !== null;
 	settingsShown.current = settingsOpen !== null;
 	confirmShown.current = confirms.length > 0;
 	pendingRef.current = pending;
@@ -549,8 +586,11 @@ export function App() {
 		if (!api?.readiness) { return; }
 		const check = ++setupCheck.current;
 		setSetup((current) => ({ ...current, open: open || current.open, checking: true }));
-		void api.readiness().then((result) => {
+		void api.readiness({ folder: session.folder, full: open }).then((result) => {
 			if (check !== setupCheck.current) { return; }
+			// The account menu keeps the version from the last Grok session start, and Grok may have updated itself since.
+			const version = result.grok.ok ? result.grok.version : "";
+			if (version) { setAccount((current) => (current && current.version !== version ? { ...current, version } : current)); }
 			setSetup((current) => ({ ...current, result, open: current.open || !result.grok.ok || !result.grok.signedIn, checking: false }));
 		}).catch(() => {
 			if (check !== setupCheck.current) { return; }
@@ -559,15 +599,15 @@ export function App() {
 		});
 	}
 
-	async function runInstall(kind: "grok" | "git") {
-		const call = kind === "grok" ? window.grokCode?.installGrok : window.grokCode?.installGit;
+	async function runInstall(kind: "grok" | "git" | "update") {
+		const call = kind === "grok" ? window.grokCode?.installGrok : kind === "git" ? window.grokCode?.installGit : window.grokCode?.updateGrokCli;
 		if (!call || setup.installing) { return; }
 		setSetup((current) => ({ ...current, installing: kind }));
 		try {
 			const result = await call();
 			if (result && !result.ok && result.error) { setNotice(result.error); }
 		} catch {
-			setNotice(kind === "grok" ? "Installing the Grok CLI failed." : "Installing Git failed.");
+			setNotice(kind === "grok" ? "Installing the Grok CLI failed." : kind === "git" ? "Installing Git failed." : "Updating Grok failed.");
 		} finally {
 			setSetup((current) => ({ ...current, installing: "" }));
 		}
@@ -591,6 +631,28 @@ export function App() {
 					: current);
 				const last = lastSaved.current;
 				if (!last) { return; }
+				const remoteSessions = new Map((saved?.sessions ?? []).map((item) => [item.id, item]));
+				const watchPatches = new Map<string, Partial<Session>>();
+				for (const item of sessionsRef.current) {
+					const remote = remoteSessions.get(item.id);
+					const old = last.sessions.find((entry) => entry.id === item.id);
+					if (!remote && saved?.deleted.includes(item.id)) { watchPatches.set(item.id, { prWatch: undefined }); }
+					if (!remote || (!item.prWatch && !remote.prWatch)) { continue; }
+					const patch: Partial<Session> = {};
+					if (item.prWatch === old?.prWatch && JSON.stringify(item.prWatch) !== JSON.stringify(remote.prWatch)) {
+						patch.prWatch = remote.prWatch;
+						if (item.unread === old?.unread) { patch.unread = remote.unread; }
+					}
+					if (item.archived === old?.archived && item.archived !== remote.archived) { patch.archived = remote.archived; }
+					if (Object.keys(patch).length) { watchPatches.set(item.id, patch); }
+				}
+				const added = (saved?.sessions ?? []).filter((item) => item.prWatch && !sessionsRef.current.some((entry) => entry.id === item.id));
+				if (watchPatches.size || added.length) { setSessions((current) => [...current.map((item) => watchPatches.has(item.id) ? { ...item, ...watchPatches.get(item.id) } : item), ...added.filter((item) => !current.some((entry) => entry.id === item.id))]); }
+				if (added.length) {
+					const chats = restoredChats(Object.fromEntries(added.map((item) => [item.id, saved?.extraChats[item.id] ?? []])));
+					lastSaved.current = { ...lastSaved.current!, sessions: [...last.sessions, ...added], extraChats: { ...last.extraChats, ...chats } };
+					setChatState((current) => ({ ...chats, ...current }));
+				}
 				const savedQueue = saved?.queued ?? {};
 				const mine = queuedRef.current;
 				const adopt = [...new Set([...Object.keys(mine), ...Object.keys(savedQueue)])].filter((id) => mine[id] === last.queued?.[id] && JSON.stringify(mine[id] ?? []) !== JSON.stringify(savedQueue[id] ?? []));
@@ -761,9 +823,9 @@ export function App() {
 		if (target.where === "side") { setSideChats(apply); } else if (streamed) { setChatState(apply); } else { setExtraChats(apply); }
 	}, []);
 
-	function notify(kind: "permission" | "question" | "done", sessionId: string, body: string) {
+	function notify(kind: "permission" | "question" | "done" | "pr", sessionId: string, body: string) {
 		const current = settingsRef.current;
-		const level = kind === "permission" ? current.notifyPermission : kind === "question" ? current.notifyQuestion : current.notifyDone;
+		const level = kind === "permission" ? current.notifyPermission : kind === "question" ? current.notifyQuestion : kind === "pr" ? current.notifyPr : current.notifyDone;
 		const away = typeof document === "undefined" || !document.hasFocus?.() || sessionId !== activeIdRef.current;
 		if (!away) { return; }
 		if (current.attention) { void window.grokCode?.attention?.(); }
@@ -779,9 +841,80 @@ export function App() {
 
 	useEffect(() => {
 		const api = window.grokCode;
+		if (!api?.prStatus || !navigator.locks) { return; }
+		const controller = new AbortController();
+		let timer: ReturnType<typeof setTimeout>;
+		let release: (() => void) | undefined;
+		const poll = async () => {
+			for (const item of sessionsRef.current) {
+				if (controller.signal.aborted) { return; }
+				if (!item.prWatch || item.archived) { continue; }
+				try {
+					const status = await api.prStatus!(item.folder, item.prWatch.number);
+					const latest = sessionsRef.current.find((entry) => entry.id === item.id);
+					if (controller.signal.aborted || !latest?.prWatch || latest.archived || latest.folder !== item.folder || latest.prWatch.number !== item.prWatch.number) { continue; }
+					const step = prWatchStep(latest.prWatch, status);
+					if (!step.stop && step.watch === latest.prWatch) { continue; }
+					const away = item.id !== activeIdRef.current;
+					setSessions((current) => current.map((entry) => entry.id === item.id && entry.prWatch === latest.prWatch ? { ...entry, prWatch: step.watch, unread: step.alert && away ? true : entry.unread } : entry));
+					if (step.alert) { notify("pr", item.id, prAlertText(item.prWatch.number, step.alert)); }
+				} catch { /* A failed background read leaves the watch for the next pass. */ }
+			}
+			if (!controller.signal.aborted) { timer = setTimeout(() => { void poll(); }, PR_POLL_MS); }
+		};
+		void navigator.locks.request("grok-code.pr-watch", { signal: controller.signal }, () => new Promise<void>((resolve) => {
+			release = resolve;
+			if (controller.signal.aborted) { resolve(); return; }
+			timer = setTimeout(() => { void poll(); }, 10000);
+		})).catch(() => {});
+		return () => { controller.abort(); clearTimeout(timer); release?.(); };
+	}, []);
+
+	// A cold read must not replace a next run that arrived while it was in flight. Live notices bump the epoch.
+	function readColdLoops(uiSessionId: string) {
+		if (!uiSessionId || uiSessionId.startsWith("side-")) { return; }
+		const item = sessionsRef.current.find((entry) => entry.id === uiSessionId);
+		const agentSessionId = item?.agentSessionId;
+		const read = window.grokCode?.sessionLoops;
+		if (!agentSessionId || !read) { return; }
+		const epoch = loopEpoch.current[uiSessionId] ?? 0;
+		void read(uiSessionId, agentSessionId).then((result) => {
+			if ((loopEpoch.current[uiSessionId] ?? 0) !== epoch) { return; }
+			if (!result || result.ok === false || result.live) { return; }
+			setLoops((current) => ({ ...current, [uiSessionId]: result.loops ?? [] }));
+		}).catch(() => {});
+	}
+
+	useEffect(() => {
+		const api = window.grokCode;
 		if (!api) { return; }
 		return api.onEvent((event) => {
 			if (event.type === "inbound" && event.requestId) { void api.inboundResult?.(event.requestId, inboundAccept.current(event.agentSessionId ?? "", event.text ?? "")); return; }
+			if (event.type === "browser-open") {
+				if (!settingsRef.current.browserControl || event.uiSessionId !== activeIdRef.current || !event.url) { return; }
+				let url: URL;
+				try { url = new URL(event.url); } catch { return; }
+				if (url.protocol !== "http:" && url.protocol !== "https:") { return; }
+				const id = crypto.randomUUID();
+				setBrowserTabs((current) => ({ ...current, [event.uiSessionId]: [...(current[event.uiSessionId] ?? []), { id, url: url.toString(), title: url.host }] }));
+				setActiveBrowser((current) => ({ ...current, [event.uiSessionId]: id }));
+				showPane("browser");
+				return;
+			}
+			if (event.type === "browser-activity") {
+				const id = event.uiSessionId;
+				if (!sessionsRef.current.some((item) => item.id === id)) { return; }
+				clearTimeout(browserActivityTimers.current[id]);
+				if (typeof event.stopped === "boolean") { setBrowserStopped((current) => ({ ...current, [id]: event.stopped! })); }
+				setBrowserActivity((current) => ({ ...current, [id]: { text: event.text || "Browser call finished.", running: event.running === true } }));
+				if (event.running !== true) {
+					browserActivityTimers.current[id] = setTimeout(() => {
+						setBrowserActivity((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id)));
+						delete browserActivityTimers.current[id];
+					}, 5000);
+				}
+				return;
+			}
 			if (event.type === "update-open" && event.current && event.latest && event.tag) {
 				const info = { current: event.current, latest: event.latest, tag: event.tag };
 				setUpdate(info);
@@ -810,13 +943,20 @@ export function App() {
 			if (event.type === "terminal-data" && event.id) {
 				const id = event.id;
 				const data = event.data ?? "";
-				setTerminals((current) => Object.fromEntries(Object.entries(current).map(([sessionId, tabs]) => [sessionId, tabs.map((tab) => (tab.id === id ? { ...tab, output: `${tab.output}${data}`.slice(-200000) } : tab))])));
+				setTerminals((current) => Object.fromEntries(Object.entries(current).map(([sessionId, tabs]) => [sessionId, tabs.map((tab) => (tab.id === id ? { ...tab, output: `${tab.output}${data}`.slice(-200000), received: (tab.received ?? tab.output.length) + data.length } : tab))])));
 				return;
 			}
 			if (event.type === "terminal-exit" && event.id) {
 				const id = event.id;
 				setTerminals((current) => Object.fromEntries(Object.entries(current).map(([sessionId, tabs]) => [sessionId, tabs.map((tab) => (tab.id === id ? { ...tab, running: false } : tab))])));
 				setDevTabs((current) => Object.fromEntries(Object.entries(current).filter(([, tabId]) => tabId !== id)));
+				return;
+			}
+			if (event.type === "loops" && event.uiSessionId) {
+				const id = event.uiSessionId;
+				loopEpoch.current[id] = (loopEpoch.current[id] ?? 0) + 1;
+				setLoops((current) => ({ ...current, [id]: event.loops ?? [] }));
+				if (event.reset) { readColdLoops(id); }
 				return;
 			}
 			if (event.type === "bg-tasks" && event.uiSessionId) {
@@ -896,7 +1036,7 @@ export function App() {
 				setFileTick((value) => value + 1);
 				if (target.where === "main") {
 					const away = sessionId !== activeIdRef.current;
-					setSessions((current) => current.map((item) => (item.id === sessionId ? { ...item, lastActivityAt: Date.now(), unread: away || item.unread, completed: false } : item)));
+					setSessions((current) => current.map((item) => (item.id === sessionId ? { ...item, lastActivityAt: Date.now(), unread: away || item.unread, completed: false, failed: event.type === "error" } : item)));
 					notify("done", sessionId, event.type === "error" ? "Grok stopped with an error." : "Grok finished.");
 				}
 			}
@@ -971,9 +1111,15 @@ export function App() {
 
 	const visible = pending ?? sessions.find((item) => item.id === activeId) ?? sessions.find((item) => !item.archived) ?? sessions[0];
 	const session = visible;
+	useEffect(() => {
+		if (!panes.includes("browser")) {
+			void window.grokCode?.browserTabs?.({ uiSessionId: session.id, enabled: settings.browserControl, visible: false, activeId: "", tabs: [] }).catch(() => {});
+		}
+	}, [session.id, settings.browserControl, panes]);
 	useEffect(() => { setRewindAsk(null); }, [session.id]);
 	// The session on screen, which is the first one before any is picked; a new-session page is none.
 	activeIdRef.current = pending ? "" : session.id;
+	useEffect(() => { if (!pending) { readColdLoops(session.id); } }, [pending, session.id, session.agentSessionId]);
 	const mode = knownMode(modes[session.id] ?? settings.defaultMode, settings);
 	const view = views[session.id] ?? settings.defaultView;
 	const prompt = drafts[session.id] ?? "";
@@ -989,9 +1135,10 @@ export function App() {
 	const scope = diffScope[session.id] ?? "uncommitted";
 	const diffOpen = panes.includes("diff");
 	const railOpen = settings.railOpen;
-	const paneWidth = Math.min(settings.sideWidth, sideCap(windowWidth, settings.sidebarCollapsed));
+	const sidebarCollapsed = settings.sidebarCollapsed || shouldCollapseSidebar(windowWidth, panes.length > 0);
+	const paneWidth = Math.min(settings.sideWidth, sideCap(windowWidth, sidebarCollapsed));
 	// Like Claude's rail, it steps aside when the chat column would get too narrow.
-	const railShown = railOpen && windowWidth - (settings.sidebarCollapsed ? 0 : 260) - (panes.length ? paneWidth : 0) - 280 >= 560;
+	const railShown = railOpen && windowWidth - (sidebarCollapsed ? 0 : 260) - (panes.length ? paneWidth : 0) - 280 >= 560;
 	const model = session.model ?? settings.model;
 	const effort = session.effort ?? settings.effort;
 	const modelInfo = models.find((item) => item.id === model);
@@ -1027,7 +1174,16 @@ export function App() {
 		const folder = session.folder;
 		const api = window.grokCode;
 		let cancel = false;
-		void api?.prStatus?.(folder).then((result) => { if (!cancel) { setPrs((current) => ({ ...current, [id]: result })); } }).catch(() => {});
+		void api?.prStatus?.(folder).then((result) => {
+			if (cancel) { return; }
+			setPrs((current) => ({ ...current, [id]: result }));
+			const pr = result.ok && result.pr;
+			if (pr && pr.state === "OPEN") {
+				const feedback = (pr.feedback ?? []).map((item) => item.at).sort();
+				const watch = { number: pr.number, failing: pr.checks.filter((check) => check.state === "fail").map((check) => check.name), seenAt: feedback.at(-1) || new Date().toISOString() };
+				setSessions((current) => current.map((item) => item.id === id && !item.prWatch ? { ...item, prWatch: watch } : item));
+			}
+		}).catch(() => {});
 		if (diffOpen) {
 			void api?.listCommits?.(folder).then((result) => { if (!cancel && result.ok) { setCommits((current) => ({ ...current, [id]: result.commits ?? [] })); } }).catch(() => {});
 		}
@@ -1080,7 +1236,22 @@ export function App() {
 	function createPr() {
 		const api = window.grokCode;
 		if (!api?.prCreate) { return Promise.resolve({ ok: false, error: "Reopen this window to create a pull request." }); }
-		return api.prCreate(session.folder, branches[session.id]?.branch).then((result) => { setDiffTick((value) => value + 1); setRemoteTick((value) => value + 1); return result; });
+		return api.prCreate(session.folder, branches[session.id]?.branch).then((result) => {
+			const number = result.ok && /\/pull\/(\d+)/.exec(result.url ?? "")?.[1];
+			if (number) { updateSession(session.id, { prWatch: { number: Number(number), failing: [], seenAt: new Date().toISOString() } }); }
+			setDiffTick((value) => value + 1);
+			setRemoteTick((value) => value + 1);
+			return result;
+		});
+	}
+
+	function dismissPrAlert() {
+		setSessions((current) => current.map((item) => item.id === session.id && item.prWatch ? { ...item, prWatch: { ...item.prWatch, alert: undefined } } : item));
+	}
+
+	function askGrokToFix() {
+		const watch = session.prWatch;
+		if (watch?.alert && send(prFixPrompt(watch.number, watch.alert), false, session.id)) { dismissPrAlert(); }
 	}
 
 	function mergeWhenReady() {
@@ -1283,6 +1454,7 @@ export function App() {
 		setMenu(null);
 		if (find) { setFindAt((current) => ({ tick: current.tick + 1, text: find })); }
 		setSessions((current) => (current.some((item) => item.id === id && item.unread) ? current.map((item) => (item.id === id ? { ...item, unread: false } : item)) : current));
+		readColdLoops(id);
 	}
 
 	function createSession(seed?: Partial<ProjectSeed>) {
@@ -1317,6 +1489,15 @@ export function App() {
 		return sessionsRef.current.some((other) => other.id !== item.id && !other.archived && folderKey(other.folder) === folderKey(item.folder));
 	}
 
+	function folderBusy(item: Session) {
+		return sessionsRef.current.some((other) => other.id !== item.id && !other.archived && folderKey(other.folder) === folderKey(item.folder) && (busy[other.id] || busy[`side-${other.id}`]));
+	}
+
+	function noteFolderClash(item: Session) {
+		if (collisionSeen[item.id] || !folderBusy(item)) { return; }
+		setCollisionSeen((current) => (current[item.id] ? current : { ...current, [item.id]: true }));
+	}
+
 	inboundAccept.current = (agentSessionId, text) => {
 		const target = sessions.find((item) => item.agentSessionId === agentSessionId && !item.archived);
 		if (!target) { return { accepted: false }; }
@@ -1332,6 +1513,45 @@ export function App() {
 		return { accepted: true, status };
 	};
 
+	function openPromptLibrary(mode: "save" | "insert") {
+		const field = promptRef.current;
+		setMenu(null);
+		setPromptLibrary({ mode, sessionId: session.id, text: prompt, start: field?.selectionStart ?? prompt.length, end: field?.selectionEnd ?? prompt.length });
+	}
+
+	function closePromptLibrary() {
+		setPromptLibrary(null);
+		setTimeout(() => promptRef.current?.focus?.(), 0);
+	}
+
+	function savePrompt(name: string, text: string): string {
+		const saved = settingsRef.current.savedPrompts;
+		const error = promptNameError(saved, name);
+		if (error) { return error; }
+		if (!text.trim()) { return "Write a prompt before saving it."; }
+		if (text.length > MAX_PROMPT_TEXT) { return `Use at most ${MAX_PROMPT_TEXT.toLocaleString()} characters.`; }
+		if (saved.length >= MAX_SAVED_PROMPTS) { return `You can save up to ${MAX_SAVED_PROMPTS} prompts.`; }
+		changeSettings({ savedPrompts: [...saved, { id: crypto.randomUUID(), name: name.trim(), text }] });
+		return "";
+	}
+
+	function insertPrompt(text: string) {
+		if (!promptLibrary) { return; }
+		if (session.id !== promptLibrary.sessionId || prompt !== promptLibrary.text) {
+			setNotice("The draft changed. Open saved prompts again to insert here.");
+			return;
+		}
+		const inserted = insertSavedPrompt(prompt, text, promptLibrary.start, promptLibrary.end);
+		setPrompt(inserted.text);
+		setTimeout(() => {
+			const field = promptRef.current;
+			if ((pendingRef.current?.id ?? activeIdRef.current) === promptLibrary.sessionId && field?.value === inserted.text) {
+				field.focus();
+				field.setSelectionRange(inserted.cursor, inserted.cursor);
+			}
+		}, 0);
+	}
+
 	keyActions.current = {
 		newSession: () => createSession(),
 		next: () => stepSession(1),
@@ -1340,6 +1560,7 @@ export function App() {
 		cycleView: () => setViews((current) => ({ ...current, [session.id]: VIEWS[(VIEWS.indexOf(current[session.id] ?? settingsRef.current.defaultView) + 1) % VIEWS.length] })),
 		find: () => setFindTick((value) => value + 1),
 		side: () => setSideOpen((value) => !value),
+		savedPrompts: () => openPromptLibrary("insert"),
 		terminal: () => togglePane("terminal"),
 		diff: () => togglePane("diff"),
 		browser: () => togglePane("browser"),
@@ -1399,6 +1620,7 @@ export function App() {
 
 	useEffect(() => {
 		function onKey(event: KeyboardEvent) {
+			if (document.querySelector?.("[data-commit-dialog]") || document.querySelector?.("[data-saved-prompts-dialog]")) { return; }
 			// An open confirm owns the keyboard: Escape cancels it without acting underneath it.
 			if (confirmShown.current) {
 				if (event.key === "Escape") { event.preventDefault(); answerRef.current(false); }
@@ -1406,6 +1628,7 @@ export function App() {
 			}
 			// The Files editor handled this key; the app's shortcut must not run too.
 			if (event.defaultPrevented && (event.target as Element | null)?.closest?.(".cm-editor")) { return; }
+			if ((event.target as Element | null)?.closest?.(".xterm")) { return; }
 			const run = (name: string) => { event.preventDefault(); keyActions.current[name]?.(); };
 			const key = event.key.toLowerCase();
 			if (event.key === "Escape") {
@@ -1417,6 +1640,7 @@ export function App() {
 					setMenu(null);
 					setFileMenu(null);
 					setShortcuts(false);
+					setPromptLibrary(null);
 					setRewindAsk(null);
 					setSettingsOpen(null);
 					setSetup((current) => ({ ...current, open: false }));
@@ -1449,6 +1673,7 @@ export function App() {
 			if (event.shiftKey && key === "b") { run("browser"); return; }
 			if (event.shiftKey && key === "d") { run("diff"); return; }
 			if (event.shiftKey && key === "s") { run("select"); return; }
+			if (event.shiftKey && key === "p") { run("savedPrompts"); return; }
 			if (event.shiftKey && key === "m") { event.preventDefault(); setMenu("mode"); return; }
 			if (event.shiftKey && key === "i") { event.preventDefault(); setMenu("model"); return; }
 			if (event.shiftKey && key === "e") { event.preventDefault(); setMenu("effort"); return; }
@@ -1512,11 +1737,12 @@ export function App() {
 	}
 
 	// `steer` is set for what the user types: during a turn it goes into that turn. Everything else waits in the queue.
-	function send(text: string, side: boolean, targetId = session.id, files: string[] = [], steer = false) {
+	function send(text: string, side: boolean, targetId = session.id, files: string[] = [], steer = false, contextFrom: ContextPick[] = []) {
 		const body = text.trim();
 		const target = sessionsRef.current.find((item) => item.id === targetId);
 		if (!body || !target) { return false; }
 		const sessionId = target.id;
+		const picks = side ? [] : contextPicksFrom(contextFrom, sessionId);
 		const uiId = side ? `side-${sessionId}` : sessionId;
 		const folder = target.folder;
 		const current = settingsRef.current;
@@ -1527,16 +1753,17 @@ export function App() {
 			setNotice("SSH and Cloud execution are not available. Choose Local before sending.");
 			return false;
 		}
+		if (!side) { noteFolderClash(target); }
 		if (!side) { invalidateSuggestion(sessionId); }
 		if (turnTargets.current[uiId] || (!side && branching === sessionId)) {
 			if (side) {
 				setNotice(SIDE_BUSY);
 				return false;
 			}
-			const item = { id: crypto.randomUUID(), text: body, attachments: files };
+			const item = { id: crypto.randomUUID(), text: body, attachments: files, ...(picks.length ? { contextFrom: picks } : {}) };
 			setHeld((list) => ({ ...list, [sessionId]: false }));
-			// Attachments and commands cannot go into a running turn, so they wait; a steer Grok refuses joins the queue.
-			if (steer && turnTargets.current[uiId] && window.grokCode?.steer && !files.length && !body.startsWith("/")) {
+			// Attachments, earlier-chat context and commands cannot go into a running turn, so they wait; a steer Grok refuses joins the queue.
+			if (steer && turnTargets.current[uiId] && window.grokCode?.steer && !files.length && !picks.length && !body.startsWith("/")) {
 				void steerQueued(item, sessionId, true);
 				return true;
 			}
@@ -1556,7 +1783,7 @@ export function App() {
 		const replyId = `${side ? "side-grok" : "grok"}-${stamp}`;
 		const turnId = crypto.randomUUID();
 		turnTargets.current[uiId] = { sessionId, replyId, turnId, where: side ? "side" : "main" };
-		const userMessage: ChatMessage = { id: `${side ? "side-user" : "user"}-${stamp}`, role: "user", text: body, at: stamp, live: true, ...(files.length ? { attachments: files } : {}) };
+		const userMessage: ChatMessage = { id: `${side ? "side-user" : "user"}-${stamp}`, role: "user", text: body, at: stamp, live: true, ...(files.length ? { attachments: files } : {}), ...(picks.length ? { contextFrom: picks } : {}) };
 		const replyMessage: ChatMessage = { id: replyId, role: "grok", text: "", pending: true, streaming: true, live: true };
 		const store = side ? setSideChats : setExtraChats;
 		store((list) => ({ ...list, [sessionId]: [...(list[sessionId] ?? []), userMessage, replyMessage] }));
@@ -1572,7 +1799,8 @@ export function App() {
 		// A side question carries the main-chat messages it has not seen yet; a reply still streaming waits for the next one.
 		const main = (extraChats[sessionId] ?? []).filter((message) => !message.streaming);
 		const seen = sideAgent ? main.findIndex((message) => message.id === sideSeen.current[sessionId]) : -1;
-		const outgoing = side ? `${sideContext(main.slice(seen + 1))}${body}` : body;
+		const blocks = picks.map((pick) => contextSnapshot(pick.title, extraChats[pick.id] ?? []));
+		const outgoing = side ? `${sideContext(main.slice(seen + 1))}${body}` : contextForGrok(blocks, body);
 		if (side && main.length) { sideSeen.current[sessionId] = main[main.length - 1].id; }
 		void api.send({
 			uiSessionId: uiId,
@@ -1584,6 +1812,7 @@ export function App() {
 			mode: chosenMode,
 			agentSessionId: side ? sideAgent : target.agentSessionId,
 			allowedFolders: target.allowedFolders ?? [],
+			browser: !side && settings.browserControl,
 			...(files.length ? { attachments: files } : {}),
 		}).then((result) => {
 			if (!side && result.ok) { sentModes.current[sessionId] = chosenMode; }
@@ -1619,7 +1848,7 @@ export function App() {
 		for (const [sessionId, items] of Object.entries(queued)) {
 			if (!items.length || queuedRef.current[sessionId] !== items || held[sessionId] || busy[sessionId] || turnTargets.current[sessionId] || branching === sessionId) { continue; }
 			setQueued((current) => ({ ...current, [sessionId]: (current[sessionId] ?? []).filter((item) => item.id !== items[0].id) }));
-			send(items[0].text, false, sessionId, items[0].attachments);
+			send(items[0].text, false, sessionId, items[0].attachments, false, items[0].contextFrom ?? []);
 		}
 	}, [queued, held, busy, branching]);
 
@@ -1639,13 +1868,17 @@ export function App() {
 		setQueued((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((entry) => entry.id !== latest.id) }));
 		setPrompt((current) => (current.trim() ? `${current}\n\n${latest.text}` : latest.text));
 		if (latest.attachments.length) { setAttachments((current) => ({ ...current, [session.id]: [...new Set([...(current[session.id] ?? []), ...latest.attachments])] })); }
+		if (latest.contextFrom?.length) {
+			const carried = latest.contextFrom;
+			setContextPicks((current) => ({ ...current, [session.id]: carried.reduce(addContextPick, current[session.id] ?? []) }));
+		}
 		promptRef.current?.focus?.();
 	}
 
 	// A queued row, or with `typed` a message not queued yet, goes into the running turn; if Grok refuses it, it waits in the queue.
 	async function steerQueued(item: Queued, sessionId = session.id, typed = false) {
 		const api = window.grokCode;
-		if (!api?.steer || !turnTargets.current[sessionId] || item.attachments.length) { return; }
+		if (!api?.steer || !turnTargets.current[sessionId] || item.attachments.length || item.contextFrom?.length) { return; }
 		const at = typed ? Infinity : (queuedRef.current[sessionId] ?? []).findIndex((entry) => entry.id === item.id);
 		if (at < 0) { return; }
 		if (!typed) { setQueued((current) => ({ ...current, [sessionId]: (current[sessionId] ?? []).filter((entry) => entry.id !== item.id) })); }
@@ -1761,6 +1994,40 @@ export function App() {
 		return created;
 	}
 
+	function startWorktreeFromHere() {
+		const source = session;
+		let target = pendingRef.current;
+		if (!target) {
+			if (keptForm.current && draftsRef.current[keptForm.current.session.id]) {
+				setNotice("Finish or clear the unsent New session draft before starting another worktree.");
+				return;
+			}
+			flushEditor();
+			target = { ...newSession({ folder: source.folder, project: source.project, branch: source.branch, worktree: source.worktree, environment: source.environment }), ...(source.model ? { model: source.model } : {}), ...(source.effort ? { effort: source.effort } : {}) };
+			const nextDrafts = { ...draftsRef.current, [source.id]: "", [target.id]: draftsRef.current[source.id] ?? "" };
+			draftsRef.current = nextDrafts;
+			setDrafts(nextDrafts);
+			keptForm.current = null;
+			pendingRef.current = target;
+			setPending(target);
+		}
+		useWorktreeRef.current = true;
+		setUseWorktree(true);
+		const targetId = target.id;
+		setCollisionSeen((current) => ({ ...current, [source.id]: true, [targetId]: true }));
+		setMenu(null);
+		setSideOpen(false);
+		setTimeout(() => promptRef.current?.focus?.(), 0);
+	}
+
+	function startFreshSession() {
+		const source = session;
+		const created: Session = { ...newSession({ folder: source.folder, project: source.project, branch: source.branch, worktree: source.worktree, environment: source.environment }), ...(source.model ? { model: source.model } : {}), ...(source.effort ? { effort: source.effort } : {}) };
+		sessionsRef.current = [created, ...sessionsRef.current.filter((item) => item.id !== created.id)];
+		setSessions((current) => [created, ...current.filter((item) => item.id !== created.id)]);
+		selectSession(created.id);
+	}
+
 	// A command picked in Settings, such as /create-skill, goes to this session and leaves its draft alone.
 	async function runFromSettings(text: string) {
 		setSettingsOpen(null);
@@ -1825,9 +2092,11 @@ export function App() {
 		const target = await commitPending();
 		if (!target) { return; }
 		const files = attachments[session.id] ?? [];
-		if (send(text, false, target.id, files, true)) {
+		const picks = contextPicks[session.id] ?? [];
+		if (send(text, false, target.id, files, true, picks)) {
 			setDrafts((current) => ((current[target.id] ?? "") === prompt ? { ...current, [session.id]: "", [target.id]: "" } : current));
 			setAttachments((current) => ({ ...current, [session.id]: [], [target.id]: [] }));
+			setContextPicks((current) => ({ ...current, [session.id]: [], [target.id]: [] }));
 		}
 	}
 
@@ -1904,6 +2173,16 @@ export function App() {
 		showPane("browser");
 	}
 
+	function browserAccess(stopped: boolean) {
+		const id = session.id;
+		const action = stopped ? window.grokCode?.browserStop : window.grokCode?.browserResume;
+		if (!action) { setNotice("Reopen this window to change browser access."); return; }
+		void action(id).then((result) => {
+			if (!result.ok) { setNotice(result.error || "Browser access could not be changed."); return; }
+			setBrowserStopped((current) => ({ ...current, [id]: stopped }));
+		}).catch(() => setNotice("Browser access could not be changed."));
+	}
+
 	function openLink(href: string, event: MouseEvent) {
 		let url: URL | null = null;
 		try { url = new URL(href); } catch { url = null; }
@@ -1943,6 +2222,90 @@ export function App() {
 		void api.copyText(text).then((result) => setNotice(result.ok ? label : (result.error || "That could not be copied."), result.ok));
 	}
 
+	function exportMarkdown(agentSessionId: string, title: string) {
+		const api = window.grokCode;
+		if (!api?.exportMarkdown) {
+			setNotice("Reopen this window to export.");
+			return;
+		}
+		void api.exportMarkdown({ agentSessionId, title }).then((result) => {
+			if (!result || result.cancelled) { return; }
+			setNotice(result.ok && result.path ? `Saved ${result.path}` : (result.error || "That session could not be exported."), Boolean(result.ok && result.path));
+		}).catch(() => setNotice("That session could not be exported."));
+	}
+
+	function knownCliIds() {
+		const ids = new Set<string>();
+		for (const item of [...sessionsRef.current, ...(readHistory()?.sessions ?? [])]) {
+			if (item.agentSessionId) { ids.add(item.agentSessionId); }
+		}
+		return [...ids];
+	}
+
+	function listCliSessions() {
+		const api = window.grokCode;
+		if (!api?.listCliSessions) { return Promise.resolve({ ok: false, error: "Reopen this window to open a CLI session." }); }
+		return api.listCliSessions(knownCliIds());
+	}
+
+	function showExistingCli(item: Session) {
+		openingCli.current.delete(item.agentSessionId?.toLowerCase() ?? "");
+		if (!sessionsRef.current.some((entry) => entry.id === item.id)) {
+			setSessions((list) => (list.some((entry) => entry.id === item.id) ? list : [{ ...item, archived: false }, ...list]));
+			const messages = readHistory()?.extraChats[item.id];
+			if (messages) { setExtraChats((list) => (list[item.id] ? list : { ...list, [item.id]: messages })); }
+		} else if (item.archived) {
+			updateSession(item.id, { archived: false, pinned: false, lastActivityAt: Date.now() });
+		}
+		selectSession(item.id);
+	}
+
+	function openCliSession(agentSessionId: string) {
+		const key = agentSessionId.toLowerCase();
+		const existing = sessionsRef.current.find((item) => item.agentSessionId?.toLowerCase() === key) ?? readHistory()?.sessions.find((item) => item.agentSessionId?.toLowerCase() === key);
+		if (existing) { showExistingCli(existing); return; }
+		const pendingId = openingCli.current.get(key);
+		if (pendingId !== undefined) { if (pendingId) { selectSession(pendingId); } return; }
+		const api = window.grokCode;
+		if (!api?.openCliSession) { setNotice("Reopen this window to open a CLI session."); return; }
+		openingCli.current.set(key, "");
+		void api.openCliSession(agentSessionId).then((result) => {
+			const again = sessionsRef.current.find((item) => item.agentSessionId?.toLowerCase() === key) ?? readHistory()?.sessions.find((item) => item.agentSessionId?.toLowerCase() === key);
+			if (again) { showExistingCli(again); return; }
+			if (!result?.ok || !result.session?.folder) {
+				openingCli.current.delete(key);
+				setNotice(result?.error || "That session could not be opened.");
+				return;
+			}
+			const folder = result.session.folder;
+			const project = shortPath(folder);
+			const created = newSession({ folder, project, branch: result.session.branch || "main", worktree: project, environment: "Local" });
+			const opened: Session = {
+				...created,
+				title: result.session.title || "CLI session",
+				titleAuto: false,
+				detail: "CLI",
+				agentSessionId: result.session.id || agentSessionId,
+				...(result.session.model ? { model: result.session.model } : {}),
+				...(result.session.effort ? { effort: result.session.effort } : {}),
+				lastActivityAt: result.session.lastActive || created.lastActivityAt,
+			};
+			openingCli.current.set(key, opened.id);
+			const messages: ChatMessage[] = (result.messages ?? []).filter((message) => message && (message.role === "user" || message.role === "grok") && typeof message.text === "string").map((message, index) => ({
+				id: `cli-${opened.id}-${index}`,
+				role: message.role,
+				text: message.text,
+			}));
+			setSessions((list) => (list.some((item) => item.agentSessionId?.toLowerCase() === key || item.id === opened.id) ? list : [opened, ...list]));
+			setExtraChats((list) => ({ ...list, [opened.id]: messages }));
+			selectSession(opened.id);
+			if (result.truncated) { setNotice("Older messages were left out. The next message still continues this Grok session.", true); }
+		}).catch(() => {
+			openingCli.current.delete(key);
+			setNotice("That session could not be opened.");
+		});
+	}
+
 	function openImage(file: string) {
 		const api = window.grokCode;
 		if (!api?.openImage) {
@@ -1958,21 +2321,23 @@ export function App() {
 			setTerminalError("Reopen this window to open a terminal.");
 			return "";
 		}
+		const generation = terminalGeneration.current;
 		const result = await api.terminalOpen({ cwd: folder });
 		if (!result.ok || !result.id) {
 			setTerminalError(result.error || "The terminal could not start.");
 			return "";
 		}
 		const id = result.id;
+		if (generation !== terminalGeneration.current) { void api.terminalClose?.(id); return ""; }
 		setTerminalError("");
-		setTerminals((current) => ({ ...current, [sessionId]: [...(current[sessionId] ?? []), { id, title: title || `Terminal ${(current[sessionId]?.length ?? 0) + 1}`, cwd: folder, running: true, output: "" }] }));
+		setTerminals((current) => ({ ...current, [sessionId]: [...(current[sessionId] ?? []), { id, title: title || `Terminal ${(current[sessionId]?.length ?? 0) + 1}`, cwd: folder, running: true, output: "", received: 0, backend: result.backend }] }));
 		setActiveTerminal((current) => ({ ...current, [sessionId]: id }));
 		return id;
 	}
 
 	async function runInTerminal(code: string) {
 		showPane("terminal");
-		const tabs = (terminals[session.id] ?? []).filter((tab) => tab.running && folderKey(tab.cwd) === folderKey(session.folder) && !Object.values(devTabs).includes(tab.id));
+		const tabs = (terminals[session.id] ?? []).filter((tab) => tab.backend !== "pty" && tab.running && folderKey(tab.cwd) === folderKey(session.folder) && !Object.values(devTabs).includes(tab.id));
 		const id = tabs.find((tab) => tab.id === activeTerminal[session.id])?.id ?? tabs[0]?.id ?? await openTerminal();
 		if (!id) { return; }
 		setActiveTerminal((current) => ({ ...current, [session.id]: id }));
@@ -2062,6 +2427,8 @@ export function App() {
 			openImage,
 			runInTerminal: (code) => { void runInTerminal(code); },
 			closePane: (id) => closePane(id),
+			diffView: settings.diffView === "split" ? "split" : "unified",
+			setDiffView: (diffView) => changeSettings({ diffView }),
 		};
 	}
 	const modelForPanes = paneModel(session.id, messages);
@@ -2199,6 +2566,7 @@ export function App() {
 		setQueued((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id)));
 		setGrokTasks((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id && key !== `side-${id}`)));
 		setSubagents((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id && key !== `side-${id}`)));
+		setLoops((current) => Object.fromEntries(Object.entries(current).filter(([key]) => key !== id && key !== `side-${id}`)));
 	}
 
 	// Archives, or unarchives, a session. Archiving stops its Grok; the sidebar asks first when that would stop work.
@@ -2226,7 +2594,7 @@ export function App() {
 	}
 
 	const usage = session.usage;
-	// The context split and the week's spend are read from Grok's files, and the usage limit from a running Grok, when a turn ends or the session changes.
+	// The context split and the week's spend are read from Grok's files, and the usage limit from Grok (a one-shot Grok when none is running), when a turn ends or the session changes.
 	const agentId = session.agentSessionId ?? "";
 	const idle = !busy[session.id];
 	useEffect(() => {
@@ -2242,6 +2610,8 @@ export function App() {
 	}, [agentId, idle]);
 	const queue = queued[session.id] ?? [];
 	const files = attachments[session.id] ?? [];
+	const chatChoices = contextChoices(sessions, session.id);
+	const chosenChats = contextPicks[session.id] ?? [];
 	const isBusy = !!busy[session.id];
 	const suggestion = settings.promptSuggestions && !prompt && !isBusy && !pending ? suggestions[session.id] ?? "" : "";
 	const sendLabel = isBusy && !prompt.trim() ? "Stop" : "Send";
@@ -2266,6 +2636,13 @@ export function App() {
 					selectedFile={diffFile}
 					onSelectFile={setDiffFile}
 					onRefresh={() => { setDiffTick((value) => value + 1); setRemoteTick((value) => value + 1); }}
+					busy={isBusy}
+					onCommit={async (input) => {
+						const commit = window.grokCode?.gitCommit;
+						const result: WriteResult & { message?: string; committed?: boolean; sha?: string } = commit ? await commit(session.folder, { ...input, expected: branches[session.id]?.branch }).catch(() => ({ ok: false, error: "The commit could not be checked. Refresh to see what happened." })) : { ok: false, error: "Reopen this window to commit." };
+						setNotice(result.ok ? result.message || "Committed." : result.error || "The commit could not be checked. Refresh to see what happened.", result.ok);
+						return result;
+					}}
 					onRevert={(file) => {
 						const api = window.grokCode;
 						if (!api?.revertFile) { return Promise.resolve({ ok: false, error: "Reopen this window to restore this file." }); }
@@ -2273,6 +2650,14 @@ export function App() {
 							if (result.ok) { setDiffTick((value) => value + 1); setFileTick((value) => value + 1); }
 							return result;
 						}).catch(() => ({ ok: false, error: "That file could not be restored." }));
+					}}
+					onRevertHunk={(file, hunk) => {
+						const api = window.grokCode;
+						if (!api?.revertHunk) { return Promise.resolve({ ok: false, error: "Reopen this window to revert this change." }); }
+						return api.revertHunk(session.folder, file, hunk).then((result) => {
+							if (result.ok) { setFileTick((value) => value + 1); }
+							return result;
+						}).catch(() => ({ ok: false, error: "That change could not be reverted." }));
 					}}
 					comments={diffComments}
 					viewed={viewed[session.id] ?? {}}
@@ -2339,7 +2724,12 @@ export function App() {
 						setTerminals((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((tab) => tab.id !== tabId) }));
 					}}
 					onInput={(tabId, text) => {
-						void window.grokCode?.terminalWrite?.(tabId, text).then((result) => { if (!result.ok) { setTerminalError(result.error || "That line could not be sent."); } });
+						const api = window.grokCode;
+						const send = sessionTerminals.find((tab) => tab.id === tabId)?.backend === "pty" ? api?.terminalInput : api?.terminalWrite;
+						void send?.(tabId, text).then((result) => { if (!result.ok) { setTerminalError(result.error || "That input could not be sent."); } });
+					}}
+					onResize={(tabId, cols, rows) => {
+						void window.grokCode?.terminalResize?.(tabId, cols, rows).then((result) => { if (!result.ok) { setTerminalError(result.error || "The terminal could not resize."); } });
 					}}
 					onInterrupt={(tabId) => {
 						void window.grokCode?.terminalInterrupt?.(tabId).then((result) => {
@@ -2353,6 +2743,13 @@ export function App() {
 		} else if (id === "browser") {
 			body = (
 				<BrowserPane
+					key={session.id}
+					uiSessionId={session.id}
+					controlEnabled={settings.browserControl}
+					controlStopped={browserStopped[session.id] ?? false}
+					controlActivity={browserActivity[session.id]}
+					onStopControl={() => browserAccess(true)}
+					onResumeControl={() => browserAccess(false)}
 					tabs={browserList}
 					activeId={browserList.find((tab) => tab.id === activeBrowser[session.id])?.id ?? browserList[0]?.id ?? ""}
 					onActivate={(tabId) => setActiveBrowser((current) => ({ ...current, [session.id]: tabId }))}
@@ -2385,6 +2782,12 @@ export function App() {
 						setPrompt((current) => `${current}${current ? "\n\n" : ""}Selected element on ${pick.url}: \`${pick.selector}\`\n\`\`\`html\n${pick.html}\n\`\`\``);
 						promptRef.current?.focus?.();
 					}}
+					onProblem={(tabId, problem) => setBrowserTabs((current) => ({ ...current, [session.id]: (current[session.id] ?? []).map((tab) => tab.id === tabId ? { ...tab, problems: addProblem(tab.problems ?? [], problem) } : tab) }))}
+					onClearProblems={(tabId) => setBrowserTabs((current) => ({ ...current, [session.id]: (current[session.id] ?? []).map((tab) => tab.id === tabId ? { ...tab, problems: [] } : tab) }))}
+					onDiagnostics={(text) => {
+						setPrompt((current) => `${current}${current ? "\n\n" : ""}${text}`);
+						promptRef.current?.focus?.();
+					}}
 					onClose={() => closePane("browser")}
 				/>
 			);
@@ -2400,7 +2803,7 @@ export function App() {
 		const startWidth = paneWidth;
 		let width = startWidth;
 		const move = (moveEvent: globalThis.MouseEvent) => {
-			width = Math.min(Math.max(startWidth - (moveEvent.clientX - startX), 320), sideCap(window.innerWidth, settings.sidebarCollapsed));
+			width = Math.min(Math.max(startWidth - (moveEvent.clientX - startX), 320), sideCap(window.innerWidth, settings.sidebarCollapsed || shouldCollapseSidebar(window.innerWidth, panes.length > 0)));
 			if (sideCol.current) { sideCol.current.style.width = `${width}px`; }
 		};
 		const up = () => {
@@ -2415,12 +2818,16 @@ export function App() {
 	const contextPercent = usage ? Math.min(100, Math.round((usage.contextTokens / Math.max(1, usage.contextWindow)) * 100)) : null;
 	const limitLeft = limit && limit.percent !== null ? Math.max(0, Math.round(100 - limit.percent)) : null;
 	const limitName = limit?.period ? `${limit.period[0].toUpperCase()}${limit.period.slice(1)}` : "Limit";
-	const limitTitle = limit ? limitLine(limit) : "Grok's usage limit shows here once Grok is running.";
+	const limitTitle = limit ? limitLine(limit) : "Grok's usage limit isn't available.";
+	const showFolderWarn = !collisionSeen[session.id] && folderBusy(session);
+	// shortcut: the disconnect choice is the main chat only; a side-chat exit keeps its error text
+	const lastGrok = [...messages].reverse().find((message) => message.role === "grok" && !message.pending);
+	const showDisconnect = !pending && session.failed === true && !busy[session.id] && !!lastGrok?.text.split("\n").some((line) => line.startsWith("Grok exited."));
 
 	return (
-		<div className={settings.sidebarCollapsed ? "app collapsed" : "app"}>
+		<div className={sidebarCollapsed ? "app collapsed" : "app"}>
 			{(menu || fileMenu) && <button className="backdrop" aria-label="Close menu" onClick={() => { setMenu(null); setFileMenu(null); }} />}
-			{!settings.sidebarCollapsed && (
+			{!sidebarCollapsed && (
 				<Sidebar
 					sessions={sessions}
 					chats={extraChats}
@@ -2448,10 +2855,15 @@ export function App() {
 					onMove={(id, sectionId) => updateSession(id, { sectionId })}
 					onOpenWindow={openSessionWindow}
 					onCopySessionId={(id) => copyText(id, "Grok session ID copied.")}
+					onExportMarkdown={exportMarkdown}
+					onListCliSessions={listCliSessions}
+					onOpenCliSession={openCliSession}
+					loopCounts={Object.fromEntries(sessions.map((item) => [item.id, (loops[item.id]?.length ?? 0) + (loops[`side-${item.id}`]?.length ?? 0)]))}
 					onSettings={() => setSettingsOpen("general")}
 					onCollapse={() => changeSettings({ sidebarCollapsed: true })}
 					onNotice={setNotice}
 					account={account}
+					signIn={setup.result?.grok.ok ? setup.result.grok.signIn : undefined}
 					recentUsd={recentUsd}
 					onShortcuts={() => setShortcuts(true)}
 					onOpenUrl={(url) => openUrl(url, true)}
@@ -2462,7 +2874,14 @@ export function App() {
 			)}
 			<main className="workspace">
 				<header className="topbar">
-					{settings.sidebarCollapsed && <button className="icon-btn" aria-label="Show sidebar" title="Show sidebar" onClick={() => changeSettings({ sidebarCollapsed: false })}>☰</button>}
+					{sidebarCollapsed && <button className="icon-btn" aria-label="Show sidebar" title={shouldCollapseSidebar(windowWidth, panes.length > 0) ? "Show sidebar and return to chat" : "Show sidebar"} onClick={() => {
+						if (shouldCollapseSidebar(windowWidth, panes.length > 0)) {
+							if (panes.includes("editor")) { flushEditor(); }
+							setPanes([]);
+							setFocusedPane(null);
+						}
+						if (settings.sidebarCollapsed) { changeSettings({ sidebarCollapsed: false }); }
+					}}>☰</button>}
 					<div className="session-title">
 						{renaming === session.id ? (
 							<input
@@ -2583,17 +3002,32 @@ export function App() {
 								</div>
 							)}
 							<div className="composer">
+								{session.prWatch?.alert && <div className="queue pr-alert">
+									<span>{prAlertText(session.prWatch.number, session.prWatch.alert)}</span>
+									<button className="texty" onClick={askGrokToFix}>Ask Grok to fix</button>
+										<button className="texty" aria-label="Dismiss pull request alert" onClick={dismissPrAlert}>×</button>
+									</div>}
 								{queue.length > 0 && (
 									<div className="queue">
 										{held[session.id] && <p className="note">Held until you press Send now or send a new message.</p>}
 										{queue.map((item) => (
 											<div className="queued" key={item.id}>
-												<span>{item.text}</span>
-												{busy[session.id] && !held[session.id] && !item.attachments.length && !item.text.trim().startsWith("/") && <button className="texty" onClick={() => void steerQueued(item)}>Steer</button>}
+												<span>{item.text}{item.contextFrom?.length ? ` · ${item.contextFrom.map((pick) => pick.title).join(", ")}` : ""}</span>
+												{busy[session.id] && !held[session.id] && !item.attachments.length && !item.contextFrom?.length && !item.text.trim().startsWith("/") && <button className="texty" onClick={() => void steerQueued(item)}>Steer</button>}
 												<button className="texty" onClick={() => sendNow(session.id, item.id)}>Send now</button>
 												<button className="texty" onClick={() => editQueued(item)}>Edit</button>
 												<button className="texty" aria-label="Remove queued message" onClick={() => setQueued((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((entry) => entry.id !== item.id) }))}>×</button>
 											</div>
+										))}
+									</div>
+								)}
+								{(contextPicks[session.id] ?? []).length > 0 && (
+									<div className="attach-list">
+										{(contextPicks[session.id] ?? []).map((pick) => (
+											<span className="attach-chip" key={pick.id} title={`Earlier context from ${pick.title}`}>
+												{pick.title}
+												<button type="button" aria-label={`Remove context from ${pick.title}`} onClick={() => setContextPicks((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((item) => item.id !== pick.id) }))}>×</button>
+											</span>
 										))}
 									</div>
 								)}
@@ -2620,6 +3054,24 @@ export function App() {
 										{popup.items.length === 0 && <div className="item">{popup.kind === "slash" ? "No commands match." : folderFiles?.status === "ready" ? "No files match." : ""}</div>}
 									</div>
 								)}
+								{showFolderWarn && (
+									<div className="folder-warn">
+										<p>Another session is working in this folder, so edits can collide.</p>
+										<button type="button" className="texty" onClick={startWorktreeFromHere}>Start a worktree</button>
+									</div>
+								)}
+								{showDisconnect && (
+									<div className="disconnect-choice">
+										<p>Grok disconnected. The next message continues this conversation. New session starts fresh in this folder.</p>
+										<button type="button" className="texty" onClick={() => promptRef.current?.focus?.()}>Resume</button>
+										<button type="button" className="texty" onClick={startFreshSession}>New session</button>
+									</div>
+								)}
+								{(loops[session.id] ?? []).map((loop) => {
+									const at = Date.parse(loop.nextFireAt);
+									const when = loop.nextFireAt && Number.isFinite(at) ? new Date(at).toLocaleString() : "";
+									return <p className="loop-line" key={loop.id}>{loop.prompt} · {loop.schedule || "interval unknown"} · {when ? `next ${when}` : "next run unknown"}</p>;
+								})}
 								<textarea
 									ref={promptRef}
 									aria-label="Prompt"
@@ -2660,7 +3112,7 @@ export function App() {
 										type="button"
 										className={sendLabel === "Stop" ? "send-btn stop" : "send-btn"}
 										aria-label={sendLabel}
-										title={sendLabel === "Stop" ? "Stop (Esc)" : isBusy ? (prompt.trim().startsWith("/") || (attachments[session.id] ?? []).length ? "Queue (Enter)" : "Steer (Enter)") : "Send (Enter)"}
+										title={sendLabel === "Stop" ? "Stop (Esc)" : isBusy ? (prompt.trim().startsWith("/") || files.length || chosenChats.length ? "Queue (Enter)" : "Steer (Enter)") : "Send (Enter)"}
 										disabled={sendLabel === "Send" && !prompt.trim()}
 										onClick={() => { if (sendLabel === "Stop") { stop(session.id); } else { void submit(); } }}
 									>
@@ -2688,9 +3140,28 @@ export function App() {
 										</button>
 										<button type="button" className="item" disabled={addingFolder} onClick={() => void addFolder()}>{addingFolder ? "Adding folder…" : "Add folder"}<small>Grok can also work in this folder.</small></button>
 										<button type="button" className="item" onClick={() => { setPrompt("/"); setPopClosed(""); setMenu(null); promptRef.current?.focus?.(); }}>Slash commands</button>
-										<button type="button" className="item" onClick={() => { setSettingsOpen("skills"); setMenu(null); }}>Connectors and skills<small>{servers.length ? `${servers.length} MCP servers from Grok` : "Managed in Grok's configuration"}</small></button>
+										<button type="button" className="item" onClick={() => openPromptLibrary("insert")}>Saved prompts<small>{keyLabel("Search and insert without sending (Ctrl+Shift+P)")}</small></button>
+										<button type="button" className="item" disabled={!prompt.trim()} onClick={() => openPromptLibrary("save")}>Save current prompt</button>
+										<button type="button" className="item" onClick={() => setMenu("context")}>Context from another chat<small>Up to three earlier chats, labelled as context.</small></button>
+										<button type="button" className="item" onClick={() => { setSettingsOpen("skills"); setMenu(null); }}>Skills and tools<small>{servers.length ? `${servers.length} MCP servers from Grok` : "Managed in Grok's configuration"}</small></button>
 										{!!session.allowedFolders?.length && <div className="menu-label">Added folders</div>}
 										{session.allowedFolders?.map((folder) => <div className="item" key={folder}>{folder}</div>)}
+									</div>
+								)}
+								{menu === "context" && (
+									<div className="pop up" role="menu" aria-label="Earlier chats">
+										{chatChoices.length === 0 && <div className="item">No other chats yet.</div>}
+										{chatChoices.map((item) => {
+											const added = chosenChats.some((pick) => pick.id === item.id);
+											return (
+												<button key={item.id} type="button" className="item" disabled={added || chosenChats.length >= CONTEXT_PICK_LIMIT} onClick={() => { setContextPicks((current) => ({ ...current, [session.id]: addContextPick(current[session.id] ?? [], item) })); setMenu(null); }}>
+													{item.title}
+													{item.archived && <small>Archived</small>}
+													{added && <small>Added</small>}
+												</button>
+											);
+										})}
+										{chosenChats.length >= CONTEXT_PICK_LIMIT && <div className="item">Three chats is the limit.</div>}
 									</div>
 								)}
 								{menu === "env" && (
@@ -2721,7 +3192,7 @@ export function App() {
 												void api.pickFolder().then((picked) => {
 													if (!picked) { return; }
 													const name = shortPath(picked);
-													const update = (item: Session) => (item.id === sessionId ? { ...item, folder: picked, project: name, worktree: name, agentSessionId: undefined, allowedFolders: undefined } : item);
+													const update = (item: Session) => (item.id === sessionId ? { ...item, folder: picked, project: name, worktree: name, agentSessionId: undefined, allowedFolders: undefined, prWatch: undefined } : item);
 													setSessions((current) => current.map(update));
 													setPending((item) => (item ? update(item) : item));
 													// The side chat's Grok conversation keeps the old folder's approvals, so it starts over with the main chat.
@@ -2881,8 +3352,9 @@ export function App() {
 					</div>
 				</div>
 			)}
+			{promptLibrary && <SavedPromptPicker prompts={settings.savedPrompts} draft={promptLibrary.text} mode={promptLibrary.mode} onSave={savePrompt} onInsert={insertPrompt} onClose={closePromptLibrary} />}
 			{settingsOpen && <SettingsPage settings={settings} onChange={changeSettings} onClose={() => setSettingsOpen(null)} onCheckSetup={() => { setSettingsOpen(null); checkSetup(); }} servers={servers} folder={session.folder} onRun={(text) => void runFromSettings(text)} initialTab={settingsOpen} />}
-			{setup.open && <Setup result={setup.result} checking={setup.checking} installing={setup.installing} onInstallGrok={() => void runInstall("grok")} onInstallGit={() => void runInstall("git")} onCheck={() => checkSetup()} onCopy={(text) => void copyText(text)} onClose={() => setSetup((current) => ({ ...current, open: false }))} />}
+			{setup.open && <Setup result={setup.result} checking={setup.checking} installing={setup.installing} onInstallGrok={() => void runInstall("grok")} onInstallGit={() => void runInstall("git")} onUpdateGrok={() => void runInstall("update")} onCheck={() => checkSetup()} onCopy={(text) => void copyText(text)} onClose={() => setSetup((current) => ({ ...current, open: false }))} />}
 			{confirms[0] && (
 				<div key={confirms[0].id} className="overlay confirm-overlay">
 					<div className="sheet" role="alertdialog" aria-modal="true" aria-label={confirms[0].title}>

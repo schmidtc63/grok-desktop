@@ -1,7 +1,10 @@
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Terminal, type ITheme } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import "@xterm/xterm/css/xterm.css";
 import { PLATFORM } from "./data";
 
-export interface TerminalTab { id: string; title: string; cwd: string; running: boolean; output: string }
+export interface TerminalTab { id: string; title: string; cwd: string; running: boolean; output: string; backend?: "pty" | "pipe"; received?: number }
 
 export interface TerminalPaneProps {
 	tabs: TerminalTab[];
@@ -11,6 +14,7 @@ export interface TerminalPaneProps {
 	onNew: () => void;
 	onCloseTab: (id: string) => void;
 	onInput: (id: string, text: string) => void;
+	onResize: (id: string, cols: number, rows: number) => void;
 	onInterrupt: (tabId: string) => void;
 	onClose: () => void;
 }
@@ -40,16 +44,88 @@ export function historyStep(history: string[], index: number, direction: -1 | 1)
 	return { index: next, value: next === history.length ? "" : history[next] };
 }
 
-export function TerminalPane({ tabs, activeId, error, onActivate, onNew, onCloseTab, onInput, onInterrupt, onClose }: TerminalPaneProps) {
+function terminalTheme(element: HTMLElement): ITheme {
+	const style = window.getComputedStyle(element);
+	const color = (name: string) => style.getPropertyValue(name).trim();
+	return {
+		background: color("--code"), foreground: color("--code-text"), cursor: color("--code-text"), cursorAccent: color("--code"),
+		selectionBackground: color("--line-strong"),
+		black: color("--code"), red: color("--red"), green: color("--green"), yellow: color("--amber"), blue: color("--blue"), magenta: color("--accent"), cyan: color("--blue"), white: color("--code-text"),
+		brightBlack: color("--muted"), brightRed: color("--red"), brightGreen: color("--green"), brightYellow: color("--amber"), brightBlue: color("--blue"), brightMagenta: color("--accent"), brightCyan: color("--blue"), brightWhite: color("--code-text"),
+	};
+}
+
+function NativeTerminal({ tab, onInput, onResize }: { tab: TerminalTab; onInput: TerminalPaneProps["onInput"]; onResize: TerminalPaneProps["onResize"] }) {
+	const container = useRef<HTMLDivElement>(null);
+	const terminal = useRef<Terminal | null>(null);
+	const written = useRef(0);
+	const latest = useRef({ tab, onInput, onResize });
+	useLayoutEffect(() => { latest.current = { tab, onInput, onResize }; });
+	useLayoutEffect(() => {
+		const element = container.current;
+		if (!element) { return; }
+		const term = new Terminal({ scrollback: 5000, fontFamily: 'Consolas, "Cascadia Mono", ui-monospace, Menlo, monospace', fontSize: 12.5, lineHeight: 1.45, theme: terminalTheme(element), disableStdin: !latest.current.tab.running });
+		const fit = new FitAddon();
+		term.loadAddon(fit);
+		term.open(element);
+		terminal.current = term;
+		const initial = latest.current.tab;
+		written.current = initial.received ?? initial.output.length;
+		if (initial.output) { term.write(initial.output); }
+		const input = term.onData((text) => { if (latest.current.tab.running) { latest.current.onInput(tab.id, text); } });
+		let cols = 0;
+		let rows = 0;
+		const refit = () => {
+			if (element.clientWidth === 0 || element.clientHeight === 0) { return; }
+			fit.fit();
+			if (term.cols !== cols || term.rows !== rows) {
+				cols = term.cols;
+				rows = term.rows;
+				latest.current.onResize(tab.id, cols, rows);
+			}
+		};
+		const resize = new ResizeObserver(refit);
+		resize.observe(element);
+		const theme = () => { term.options.theme = terminalTheme(element); };
+		const appearance = new MutationObserver(theme);
+		appearance.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme", "class", "style"] });
+		const scheme = window.matchMedia("(prefers-color-scheme: dark)");
+		scheme.addEventListener("change", theme);
+		refit();
+		term.focus();
+		return () => {
+			resize.disconnect();
+			appearance.disconnect();
+			scheme.removeEventListener("change", theme);
+			input.dispose();
+			term.dispose();
+			terminal.current = null;
+		};
+	}, [tab.id]);
+	useLayoutEffect(() => {
+		const term = terminal.current;
+		if (!term) { return; }
+		term.options.disableStdin = !tab.running;
+		const received = tab.received ?? tab.output.length;
+		const added = received - written.current;
+		if (added > 0) { term.write(tab.output.slice(-Math.min(added, tab.output.length))); }
+		if (added < 0) { term.reset(); term.write(tab.output); }
+		written.current = received;
+	}, [tab.output, tab.received, tab.running]);
+	return <div className="tp-native" ref={container} aria-label="Interactive terminal" onKeyDown={(event) => event.stopPropagation()} />;
+}
+
+export function TerminalPane({ tabs, activeId, error, onActivate, onNew, onCloseTab, onInput, onResize, onInterrupt, onClose }: TerminalPaneProps) {
 	const [lines, setLines] = useState<Record<string, LineState>>({});
 	const outRef = useRef<HTMLPreElement>(null);
 	const inputRef = useRef<HTMLInputElement>(null);
 	const stick = useRef(true);
 	const shownId = useRef(activeId);
 	const active = tabs.find((tab) => tab.id === activeId);
+	const native = active?.backend === "pty";
 	const output = active?.output ?? "";
 	// ponytail: re-strips the whole buffer per chunk; cap output in the orchestrator if it grows past a few MB.
-	const text = useMemo(() => stripAnsi(output), [output]);
+	const text = useMemo(() => native ? "" : stripAnsi(output), [native, output]);
 	const line = lines[activeId] ?? FRESH_LINE;
 
 	useLayoutEffect(() => {
@@ -105,7 +181,7 @@ export function TerminalPane({ tabs, activeId, error, onActivate, onNew, onClose
 			)}
 			{active && (
 				<>
-					<pre
+					{native ? <NativeTerminal key={active.id} tab={active} onInput={onInput} onResize={onResize} /> : <pre
 						className="tp-out"
 						ref={outRef}
 						onScroll={(event) => {
@@ -114,14 +190,15 @@ export function TerminalPane({ tabs, activeId, error, onActivate, onNew, onClose
 						}}
 					>
 						{text}
-					</pre>
-					{(error || !active.running) && (
+					</pre>}
+					{(error || !active.running || !native) && (
 						<div className="tp-notes">
+							{!native && <p className="note">Basic terminal fallback: interactive programs and terminal resizing are unavailable.</p>}
 							{error && <p className="note">{error}</p>}
 							{!active.running && <p className="note">This terminal has exited.</p>}
 						</div>
 					)}
-					<form
+					{!native && <form
 						className="tp-row"
 						onSubmit={(event) => {
 							event.preventDefault();
@@ -162,7 +239,7 @@ export function TerminalPane({ tabs, activeId, error, onActivate, onNew, onClose
 								setLine({ history: line.history, index: step.index, draft: step.index === line.history.length ? saved : step.value, saved });
 							}}
 						/>
-					</form>
+					</form>}
 				</>
 			)}
 		</section>

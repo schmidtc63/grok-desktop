@@ -7,6 +7,9 @@ const { folderProblem, killTree, OWN_GROUP } = require("./agent.cjs");
 const MAX_TABS = 12;
 const MAX_WRITE = 20000;
 const MAX_HISTORY = 200000;
+let pty;
+try { pty = require("node-pty"); } catch { /* A missing native module keeps the pipe terminal available. */ }
+const PIPE_WARNING = "Interactive terminal unavailable. Using the basic pipe terminal.";
 // `-Command -` keeps state, but it reads stdin with the console code page
 // (OEM 437) fixed at startup, so non-ASCII input is mangled. Interactive mode
 // after this command reads stdin, writes output and pipes to native commands
@@ -59,14 +62,21 @@ class TerminalHost {
 		const windows = process.platform === "win32";
 		let child;
 		try {
-			child = windows
+			child = pty ? pty.spawn(shell, windows ? ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "RemoteSigned", "-NoExit", "-Command", INIT] : ["--noprofile", "--norc", "-i"], {
+				name: "xterm-256color", cols: 80, rows: 24, cwd, env: { ...process.env, ...BASH_SETTINGS, TERM: "xterm-256color" },
+			}) : windows
 				? spawn(shell, ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "RemoteSigned", "-NoExit", "-Command", INIT], { cwd, windowsHide: true, stdio: "pipe" })
 				: spawn(shell, BASH_ARGS, { ...OWN_GROUP, cwd, env: { ...process.env, ...BASH_SETTINGS }, stdio: "pipe" });
 		} catch {
 			return { ok: false, error: `${windows ? "PowerShell" : "bash"} could not start.` };
 		}
-		const tab = { id: randomUUID(), cwd, child, history: "", done: false };
+		const tab = { id: randomUUID(), cwd, child, backend: pty ? "pty" : "pipe", history: "", done: false, input: "" };
 		this.tabs.set(tab.id, tab);
+		if (pty) {
+			tab.listeners = [child.onData((data) => this.output(tab, data)), child.onExit(({ exitCode }) => this.finish(tab, exitCode))];
+			child.on?.("error", () => this.finish(tab, null));
+			return { ok: true, id: tab.id, backend: "pty" };
+		}
 		const out = new StringDecoder("utf8");
 		const err = new StringDecoder("utf8");
 		child.stdout.on("data", (buf) => this.output(tab, windows ? out.write(buf) : out.write(buf).replace(NO_TERMINAL, "")));
@@ -77,7 +87,7 @@ class TerminalHost {
 			this.output(tab, out.end() + err.end());
 			this.finish(tab, code);
 		});
-		return { ok: true, id: tab.id };
+		return { ok: true, id: tab.id, backend: "pipe", warning: PIPE_WARNING };
 	}
 
 	output(tab, data) {
@@ -101,6 +111,10 @@ class TerminalHost {
 		this.flushOutput(tab);
 		tab.done = true;
 		this.tabs.delete(tab.id);
+		if (tab.backend === "pty") {
+			try { tab.child.kill(); } catch { /* An exited PTY still needs its native cleanup attempted. */ }
+			for (const listener of tab.listeners ?? []) { listener.dispose(); }
+		}
 		this.emit({ type: "terminal-exit", id: tab.id, code });
 	}
 
@@ -109,6 +123,9 @@ class TerminalHost {
 		if (!tab) { return { ok: false, error: "That terminal is closed." }; }
 		if (typeof text !== "string" || text.includes("\0")) { return { ok: false, error: "That text cannot be sent to the terminal." }; }
 		if (text.length > MAX_WRITE) { return { ok: false, error: "That command is too long." }; }
+		if (tab.backend === "pty") {
+			try { tab.child.write(`${text.replace(/\r\n|\n/g, "\r").replace(/\r+$/, "")}\r`); return { ok: true }; } catch { return { ok: false, error: "That terminal is closed." }; }
+		}
 		if (process.platform !== "win32") {
 			// bash runs a multiline command once its last line is complete, so it needs no blank line after it.
 			const line = `${text.replace(/\n+$/, "")}\n`;
@@ -120,8 +137,38 @@ class TerminalHost {
 		return { ok: true };
 	}
 
+	input(id, data) {
+		const tab = this.tabs.get(id);
+		if (!tab) { return { ok: false, error: "That terminal is closed." }; }
+		if (typeof data !== "string" || data.length > MAX_WRITE) { return { ok: false, error: "That terminal input is too long or invalid." }; }
+		if (tab.backend === "pty") {
+			try { tab.child.write(data); return { ok: true }; } catch { return { ok: false, error: "That terminal is closed." }; }
+		}
+		for (const character of data.replace(/\r\n/g, "\r")) {
+			if (character === "\r" || character === "\n") {
+				const result = this.write(id, tab.input);
+				tab.input = "";
+				if (!result.ok) { return result; }
+			} else if (character === "\b" || character === "\x7f") {
+				tab.input = Array.from(tab.input).slice(0, -1).join("");
+			} else if (character >= " " || character === "\t") {
+				if (tab.input.length + character.length > MAX_WRITE) { return { ok: false, error: "That command is too long." }; }
+				tab.input += character;
+			}
+		}
+		return { ok: true };
+	}
+
+	resize(id, cols, rows) {
+		const tab = this.tabs.get(id);
+		if (!tab) { return { ok: false, error: "That terminal is closed." }; }
+		if (!Number.isInteger(cols) || cols < 2 || cols > 500 || !Number.isInteger(rows) || rows < 1 || rows > 300) { return { ok: false, error: "That terminal size is invalid." }; }
+		try { if (tab.backend === "pty") { tab.child.resize(cols, rows); } return { ok: true }; } catch { return { ok: false, error: "That terminal could not be resized." }; }
+	}
+
 	interrupt(id) {
 		const tab = this.tabs.get(id);
+		if (tab?.backend === "pty") { const result = this.input(id, "\x03"); return Promise.resolve(result.ok ? { ok: true, stopped: 1 } : result); }
 		if (!tab || tab.child.pid === undefined || tab.child.exitCode !== null) { return Promise.resolve({ ok: false, error: "That terminal is closed." }); }
 		const pid = tab.child.pid;
 		const failed = { ok: false, error: "The running command could not be stopped." };
@@ -167,7 +214,7 @@ class TerminalHost {
 	close(id) {
 		const tab = this.tabs.get(id);
 		if (tab) {
-			endTree(tab.child);
+			if (tab.backend !== "pty") { endTree(tab.child); }
 			this.finish(tab, null);
 		}
 		return { ok: true };
@@ -175,10 +222,11 @@ class TerminalHost {
 
 	closeAll() {
 		const tabs = Array.from(this.tabs.values());
-		const pids = tabs.filter((tab) => tab.child.pid !== undefined).flatMap((tab) => ["/PID", String(tab.child.pid)]);
+		const pipes = tabs.filter((tab) => tab.backend !== "pty");
+		const pids = pipes.filter((tab) => tab.child.pid !== undefined).flatMap((tab) => ["/PID", String(tab.child.pid)]);
 		// Synchronous: this runs at app quit, and an async taskkill would die with the app.
 		if (process.platform !== "win32") {
-			killTree(tabs.map((tab) => tab.child), true);
+			killTree(pipes.map((tab) => tab.child), true);
 		} else if (pids.length) {
 			spawnSync("taskkill", [...pids, "/T", "/F"], { windowsHide: true, stdio: "ignore", timeout: 10000 });
 		}
@@ -188,7 +236,7 @@ class TerminalHost {
 	}
 
 	list() {
-		return Array.from(this.tabs.values(), (tab) => ({ id: tab.id, cwd: tab.cwd, running: tab.child.exitCode === null }));
+		return Array.from(this.tabs.values(), (tab) => ({ id: tab.id, cwd: tab.cwd, running: !tab.done, backend: tab.backend }));
 	}
 
 	history(id) {

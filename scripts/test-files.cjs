@@ -5,7 +5,7 @@ const path = require("path");
 const childProcess = require("child_process");
 const { execFileSync } = childProcess;
 const { createHash } = require("crypto");
-const { listFiles, readText, writeText, runCommand } = require("../electron/files.cjs");
+const { listFiles, readText, readImage, writeText, runCommand } = require("../electron/files.cjs");
 const { readDiff, parseUnified, revertFile } = require("../electron/diff.cjs");
 
 // macOS puts the temp folder behind the /var symlink and the GitHub Windows runner names it with a short 8.3 name (RUNNER~1),
@@ -62,6 +62,7 @@ async function checkRepoFiles() {
 	put("deleted.txt");
 	put("tracked-image.PNG");
 	put("tracked-sheet.xlsx");
+	put("tool.exe");
 	put("vector.svg");
 	const deep = "nested/one/two/three/four/five/six/seven/deep.txt";
 	put(deep);
@@ -72,21 +73,21 @@ async function checkRepoFiles() {
 	const listed = await listFiles(folder);
 	assert.equal(listed.ok, true);
 	assert.equal(listed.truncated, false);
-	assert.deepEqual(listed.files, [".gitignore", "tracked.txt", deep, "untracked.txt", "space name.txt", "café.txt", "vector.svg"].sort());
+	assert.deepEqual(listed.files, [".gitignore", "tracked.txt", deep, "untracked.txt", "space name.txt", "café.txt", "vector.svg", "tracked-image.PNG", "tracked-sheet.xlsx", "untracked-image.png", "untracked-sheet.XLSX"].sort());
 	assert.deepEqual((await listFiles(path.join(folder, "nested"))).files, [deep.slice("nested/".length)], "subfolder paths are relative to the chosen folder");
 	assert.deepEqual((await listFiles(path.join(folder, "ignored-folder"))).files, ["visible.txt"], "an empty ignored git listing falls back to the walk");
 	const plain = path.join(depthRoot, "codex-plain");
 	fs.mkdirSync(plain);
 	fs.writeFileSync(path.join(plain, "plain.txt"), "plain\n");
-	for (const name of ["image.PNG", "sheet.xlsx", "vector.svg"]) { fs.writeFileSync(path.join(plain, name), "file\n"); }
-	assert.deepEqual((await listFiles(plain)).files, ["plain.txt", "vector.svg"], "the walk skips binary extensions case-insensitively and keeps SVG");
+	for (const name of ["image.PNG", "sheet.xlsx", "vector.svg", "tool.exe"]) { fs.writeFileSync(path.join(plain, name), "file\n"); }
+	assert.deepEqual((await listFiles(plain)).files, ["image.PNG", "plain.txt", "sheet.xlsx", "vector.svg"], "the walk includes previewable binaries case-insensitively and still skips executables");
 	const outside = path.join(depthRoot, "codex-outside");
 	fs.mkdirSync(outside);
 	fs.writeFileSync(path.join(outside, "outside.txt"), "outside\n");
 	fs.symlinkSync(outside, path.join(plain, "linked-outside"), process.platform === "win32" ? "junction" : "dir");
 	const linked = path.join(depthRoot, "codex-linked-plain");
 	fs.symlinkSync(plain, linked, process.platform === "win32" ? "junction" : "dir");
-	assert.deepEqual((await listFiles(linked)).files, ["plain.txt", "vector.svg"], "a linked root is listed without following a junction outside that root");
+	assert.deepEqual((await listFiles(linked)).files, ["image.PNG", "plain.txt", "sheet.xlsx", "vector.svg"], "a linked root is listed without following a junction outside that root");
 	const timed = await listFiles(plain, 0);
 	assert.equal(timed.ok, true);
 	assert.equal(timed.truncated, true, "a zero walk budget stops without throwing");
@@ -112,6 +113,40 @@ async function checkRepoFiles() {
 }
 
 async function main() {
+	const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1ZkAAAAASUVORK5CYII=", "base64");
+	write("preview.PNG", png);
+	assert.deepEqual(readImage(root, "preview.PNG"), { ok: true, dataUrl: `data:image/png;base64,${png.toString("base64")}`, bytes: png.length });
+	write("preview.ico", Buffer.from([0, 0, 1, 0]));
+	assert.ok(readImage(root, "preview.ico").dataUrl.startsWith("data:image/x-icon;base64,"));
+	write("preview.txt", "not an image");
+	assert.equal(readImage(root, "preview.txt").error, "That file is not an image.");
+	write("large-image.png", "");
+	fs.truncateSync(path.join(root, "large-image.png"), 300 * 1024);
+	const firstImage = readText(root, "large-image.png");
+	assert.equal(firstImage.ok, true);
+	assert.equal(firstImage.binary, true, "image metadata bypasses the editor's 200 KiB text limit");
+	assert.equal(typeof firstImage.version, "string");
+	fs.truncateSync(path.join(root, "large-image.png"), 20 * 1024 * 1024 + 1);
+	assert.notEqual(readText(root, "large-image.png").version, firstImage.version);
+	assert.equal(readImage(root, "large-image.png").error, "That image is too large to show here.");
+	fs.unlinkSync(path.join(root, "large-image.png"));
+	const outsideImage = path.join(depthRoot, "outside.png");
+	fs.writeFileSync(outsideImage, png);
+	assert.equal(readImage(root, path.relative(root, outsideImage)).error, "That file is not in this folder.");
+	let linkedImage = false;
+	try {
+		fs.symlinkSync(outsideImage, path.join(root, "outside-link.png"), "file");
+		linkedImage = true;
+	} catch (error) {
+		if (error.code !== "EPERM" && error.code !== "EACCES") { throw error; }
+		console.log("SKIP file symlink image check: platform permission unavailable");
+	}
+	if (linkedImage) {
+		assert.equal(readImage(root, "outside-link.png").error, "That file is not in this folder.");
+		fs.unlinkSync(path.join(root, "outside-link.png"));
+	}
+	console.log("PASS image reads: real PNG, ICO MIME, extension and size limits, binary metadata, outside paths and symlinks");
+
 	git(["init", "--quiet"]);
 	git(["config", "core.autocrlf", "false"]);
 	write("report[1].txt", "selected original\n");

@@ -29,8 +29,12 @@ export interface FilesPaneProps {
 }
 
 type Spot = { top: number; left: number };
+type ImagePreview = { key: string; dataUrl?: string; bytes?: number; width?: number; height?: number; error?: string };
 
 const AUTO_SAVE_MS = 800;
+const IMAGE_FILE = /\.(png|jpe?g|gif|webp|bmp|ico|avif)$/i;
+const DEFAULT_APP_FILE = /\.(pdf|docx?|xlsx?|pptx?|odt|ods|odp|rtf|mp3|wav|mp4|mov|webm)$/i;
+const HTML_CSP = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:">`;
 
 export function shouldAutoSave(state: { autoSave: boolean; dirty: boolean; conflict: boolean; readOnly: boolean; saving: boolean }): boolean {
 	return state.autoSave && state.dirty && !state.conflict && !state.readOnly && !state.saving;
@@ -49,7 +53,9 @@ export function FilesPane(props: FilesPaneProps) {
 	const { files, file, docKey, fileTypes, onSelectFile, line, lineTick, open, draft, readOnly, autoSave, onAutoSave, onEdit, onSave, onCancel, conflict, onOverride, onDiscard, onClearRecovery, onFileMenu, onLink, onClose } = props;
 	const [menu, setMenu] = useState<Spot | null>(null);
 	const [filter, setFilter] = useState(``);
-	const [preview, setPreview] = useState(true);
+	const [previewChoice, setPreview] = useState<{ key: string; on: boolean } | null>(null);
+	const [image, setImage] = useState<ImagePreview | null>(null);
+	const [openError, setOpenError] = useState<{ key: string; error: string } | null>(null);
 	const [picked, setPicked] = useState<Record<string, string>>({});
 	const [expanded, setExpanded] = useState(false);
 	const paneRef = useRef<HTMLElement>(null);
@@ -63,7 +69,25 @@ export function FilesPane(props: FilesPaneProps) {
 	const saving = !!draft?.saving;
 	const ready = open?.status === `ready` && !open.binary;
 	const markdown = /\.(md|markdown)$/i.test(file);
-	const showPreview = markdown && preview && ready;
+	const svg = /\.svg$/i.test(file);
+	const html = /\.html?$/i.test(file);
+	const previewable = markdown || svg || html;
+	const previewKey = JSON.stringify([docKey, file, lineTick]);
+	const preview = previewChoice?.key === previewKey ? previewChoice.on : !line && !html;
+	const showPreview = previewable && preview && ready;
+	const binary = open?.status === `ready` && !!open.binary;
+	const raster = binary && IMAGE_FILE.test(file);
+	const defaultApp = binary && DEFAULT_APP_FILE.test(file);
+	const imageKey = JSON.stringify([docKey, file, open?.version]);
+	const shownImage = image?.key === imageKey ? image : null;
+	const cwd = useMemo(() => {
+		try {
+			const key = JSON.parse(docKey);
+			return Array.isArray(key) && typeof key[1] === `string` ? key[1] : ``;
+		} catch {
+			return ``;
+		}
+	}, [docKey]);
 	const editable = ready && !!draft;
 	const showEditor = ready || dirty;
 	const text = draft?.text ?? open?.text ?? ``;
@@ -88,8 +112,24 @@ export function FilesPane(props: FilesPaneProps) {
 	}, [draft?.text, draft?.baseText, autoSave, dirty, conflict, readOnly]);
 
 	useEffect(() => {
-		setPreview(!line);
-	}, [lineTick]);
+		if (!raster) { return; }
+		let cancelled = false;
+		setImage({ key: imageKey });
+		const api = window.grokCode;
+		if (!api?.readImage || !cwd) {
+			setImage({ key: imageKey, error: `Reopen this window to preview images.` });
+			return;
+		}
+		void api.readImage(cwd, file).then((result) => {
+			if (cancelled) { return; }
+			setImage(result.ok && result.dataUrl
+				? { key: imageKey, dataUrl: result.dataUrl, bytes: result.bytes }
+				: { key: imageKey, error: result.error || `That image could not be shown.` });
+		}).catch(() => {
+			if (!cancelled) { setImage({ key: imageKey, error: `That image could not be read.` }); }
+		});
+		return () => { cancelled = true; };
+	}, [raster, cwd, file, imageKey]);
 
 	useEffect(() => {
 		if (expanded) { paneRef.current?.focus(); }
@@ -107,6 +147,16 @@ export function FilesPane(props: FilesPaneProps) {
 			flush();
 		}
 		onSelectFile(name);
+	}
+
+	async function openDefaultApp() {
+		setOpenError(null);
+		try {
+			const result = await window.grokCode?.openIn({ target: `explorer`, cwd, file });
+			if (!result?.ok) { setOpenError({ key: docKey, error: result?.error || `That file could not be opened.` }); }
+		} catch {
+			setOpenError({ key: docKey, error: `That file could not be opened.` });
+		}
 	}
 
 	return (
@@ -139,7 +189,7 @@ export function FilesPane(props: FilesPaneProps) {
 				{file && <span className="fp-name" title={file}>{file}</span>}
 				<span className="spacer" />
 				{autoSave && saving && <span className="meta">Saving…</span>}
-				{markdown && ready && <button className={`texty`} aria-pressed={!preview} onClick={() => setPreview((value) => !value)}>{preview ? `Edit` : `Preview`}</button>}
+				{previewable && ready && <button className={`texty`} aria-pressed={!preview} onClick={() => setPreview({ key: previewKey, on: !preview })}>{preview ? `Edit` : `Preview`}</button>}
 				{!autoSave && (
 					<>
 						<button className="texty" disabled={!dirty || saving || readOnly || conflict} onClick={onSave}>{saving ? `Saving` : `Save`}</button>
@@ -199,12 +249,34 @@ export function FilesPane(props: FilesPaneProps) {
 				{readOnly && file && <p className="note">This file is view-only here.</p>}
 				{files?.status !== `error` && open?.status === `loading` && <p className="meta">Reading {file}…</p>}
 				{files?.status !== `error` && open?.status === `error` && <p className="note">{open.error}</p>}
-				{open?.binary && <p className="note">This file is binary.</p>}
+				{binary && !raster && <p className="note">{defaultApp ? `This file can't be shown here.` : `This file is binary.`}</p>}
+				{defaultApp && <button className="texty" onClick={() => { void openDefaultApp(); }}>Open in default app</button>}
+				{openError && openError.key === docKey && <p className="note">{openError.error}</p>}
+				{raster && !shownImage?.dataUrl && !shownImage?.error && <p className="meta">Reading image…</p>}
+				{raster && shownImage?.error && <p className="note">{shownImage.error}</p>}
+				{raster && shownImage?.dataUrl && !shownImage.error && (
+					<>
+						<div className="fp-image">
+							<img key={imageKey} src={shownImage.dataUrl} alt={file} onLoad={(event) => {
+								const { naturalWidth: width, naturalHeight: height } = event.currentTarget;
+								setImage((current) => current?.key === imageKey ? { ...current, width, height } : current);
+							}} onError={() => setImage((current) => current?.key === imageKey ? { ...current, error: `That image could not be shown.` } : current)} />
+						</div>
+						<p className="meta">{shownImage.width && shownImage.height ? `${shownImage.width} × ${shownImage.height} · ` : ``}{shownImage.bytes?.toLocaleString()} bytes</p>
+					</>
+				)}
 				{draft?.note && <p className="note">{draft.note}</p>}
-				{showPreview && (
+				{showPreview && markdown && (
 					<div className={`fp-preview`}>
 						<Markdown text={text} onLink={(href, event) => { if (!href.startsWith(`#`)) { onLink(fromFile(file, href), event); } }} />
 					</div>
+				)}
+				{showPreview && svg && <div className="fp-image"><img src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(text)}`} alt={file} /></div>}
+				{showPreview && html && (
+					<>
+						<iframe className="fp-html" title={file} sandbox="" srcDoc={HTML_CSP + text} />
+						<p className="meta">Scripts are off, and the page loads nothing from the network or from other files.</p>
+					</>
 				)}
 				{showEditor && !showPreview && (
 					<div className="fp-editor">

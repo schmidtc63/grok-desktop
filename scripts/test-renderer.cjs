@@ -15,18 +15,23 @@ const PLACEHOLDERS = {
 	"./FilesPane": { FilesPane: "FilesPane" },
 	"./TerminalPane": { TerminalPane: "TerminalPane" },
 	"./BrowserPane": { BrowserPane: "BrowserPane" },
+	"./SavedPromptPicker": { SavedPromptPicker: "SavedPromptPicker" },
 };
 
 function harness(storage = new Map(), search = "", clock = Date, timers = { setTimeout, clearTimeout }) {
 	if (!storageLocks.has(storage)) {
 		const tails = new Map();
 		storageLocks.set(storage, {
-			request(name, callback) {
-				const result = (tails.get(name) ?? Promise.resolve()).then(callback);
+			request(name, options, callback) {
+				if (typeof options === "function") { callback = options; options = {}; }
+				const result = (tails.get(name) ?? Promise.resolve()).then(() => {
+					if (options.signal?.aborted) { throw new DOMException("Aborted", "AbortError"); }
+					return callback();
+				});
 				tails.set(name, result.catch(() => {}));
 				return result;
 			},
-			async drain() { await Promise.all(tails.values()); },
+			async drain() { await Promise.all([...tails].filter(([name]) => name !== "grok-code.pr-watch").map(([, tail]) => tail)); },
 		});
 	}
 	const locks = storageLocks.get(storage);
@@ -51,6 +56,7 @@ function harness(storage = new Map(), search = "", clock = Date, timers = { setT
 	const decisions = [];
 	const cancels = [];
 	const confirms = [];
+	const notifications = [];
 	let confirmAnswer = true;
 	const windowEvents = new Map();
 	const jsx = (type, props, key) => ({ type, props: props ?? {}, key });
@@ -122,13 +128,15 @@ function harness(storage = new Map(), search = "", clock = Date, timers = { setT
 			if (id === "react") { return react; }
 			if (id === "react/jsx-runtime") { return { jsx, jsxs: jsx, Fragment: "fragment" }; }
 			if (name === "App.tsx" && PLACEHOLDERS[id]) { return PLACEHOLDERS[id]; }
+			if (id.endsWith(".css")) { return {}; }
 			if (!id.startsWith("./")) { return require(id); }
 			const base = id.slice(2);
 			return load(fs.existsSync(path.join(__dirname, "..", "src", `${base}.ts`)) ? `${base}.ts` : `${base}.tsx`);
 		};
 		vm.runInNewContext(source, {
 			require: imports, module, exports: module.exports, crypto: { randomUUID },
-			navigator: { locks }, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, HTMLElement: class {}, DOMException, Date: clock,
+			navigator: { locks }, setTimeout: (run, delay) => { const timer = timers.setTimeout(run, delay); if (delay >= 10000) { timer?.unref?.(); } return timer; }, clearTimeout: timers.clearTimeout, HTMLElement: class {}, DOMException, Date: clock, AbortController,
+			Notification: class { constructor(title, options) { Object.assign(this, { title, ...options }); notifications.push(this); } },
 			document: appDocument,
 			localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => { if (storage.failWrites) { throw storage.failWrites === "quota" ? new DOMException("The quota has been exceeded.", "QuotaExceededError") : new Error("Quota exceeded"); } storage.set(key, value); if (key === "grok-code.history.v1") { historyWrites.push(value); } if (key === "grok-code.settings.v1") { settingsWrites.push(value); } } },
 			window: appWindow, URL, URLSearchParams,
@@ -169,7 +177,9 @@ function harness(storage = new Map(), search = "", clock = Date, timers = { setT
 		return { ...value, props: { ...value.props, children: settingsTree(value.props.children) } };
 	}
 	return {
-		storage, locks, sends, writes, historyWrites, settingsWrites, pickedFolders, forgotten, pickedFiles, allowedUpdates, newWindows, questionAnswers, planAnswers, decisions, cancels, confirms, files, api, settle, render, window: appWindow, document: appDocument,
+		storage, locks, sends, writes, historyWrites, settingsWrites, pickedFolders, forgotten, pickedFiles, allowedUpdates, newWindows, questionAnswers, planAnswers, decisions, cancels, confirms, notifications, files, api, settle, render, window: appWindow, document: appDocument,
+		unmount: () => hooks.forEach((hook) => hook?.cleanup?.()),
+		prFixPrompt: (number, alert) => load("prWatch.ts").prFixPrompt(number, alert),
 		get confirmAnswer() { return confirmAnswer; },
 		set confirmAnswer(value) { confirmAnswer = value; },
 		windowEvent: (name, event = {}) => windowEvents.get(name)?.(event),
@@ -180,11 +190,21 @@ function harness(storage = new Map(), search = "", clock = Date, timers = { setT
 		confirmModule: () => load("confirm.ts"),
 		fileHits: (text, known = [], tools = []) => load("Panes.tsx").mentionedFiles(text, tools, "C:/project", known),
 		editRows: (diff) => load("Panes.tsx").editRows(diff),
+		splitRows: (rows) => load("Panes.tsx").splitRows(rows),
+		splitFits: (width) => load("Panes.tsx").splitFits(width),
+		SPLIT_MIN_WIDTH: () => load("Panes.tsx").SPLIT_MIN_WIDTH,
+		readSettings: () => load("Settings.tsx").readSettings(),
 		editorLanguages: () => load("editor-languages.ts"),
 		editDiff: (props) => load("Panes.tsx").EditDiff(props),
+		editDiffView: (props) => { component = () => load("Panes.tsx").EditDiff(props); dirty = true; return render(); },
 		settingsView: (props) => { component = () => settingsTree(load("Settings.tsx").SettingsPage(props)); dirty = true; return render(); },
+		customizeView: (props) => { component = () => load("Customize.tsx").Customize(props); dirty = true; return render(); },
+		customizeModule: () => load("Customize.tsx"),
+		catalog: () => load("connector-catalog.ts"),
 		messageTime: (message) => load("Panes.tsx").messageTime(message),
+		supportReport: (result) => load("Setup.tsx").supportReport(result),
 		sideCap: (width, collapsed) => load("App.tsx").sideCap(width, collapsed),
+		shouldCollapseSidebar: (width, panesOpen) => load("App.tsx").shouldCollapseSidebar(width, panesOpen),
 		markdown: (props) => { component = () => load("Markdown.tsx").Markdown(props); dirty = true; return render(); },
 		view: (id, model) => { component = () => { const pane = load("Panes.tsx").PaneView({ id, model }); return pane.type(pane.props); }; dirty = true; return render(); },
 		row: (props) => { component = () => load("Panes.tsx").ToolRow(props); dirty = true; return render(); },
@@ -195,9 +215,15 @@ function harness(storage = new Map(), search = "", clock = Date, timers = { setT
 		canMarkViewed: (file) => load("DiffPane.tsx").canMarkViewed(file),
 		filesView: (props) => { component = () => load("FilesPane.tsx").FilesPane({ ...props, autoSave: false }); dirty = true; return render(); },
 		message: (model, readOnly = false, extra = {}) => { component = () => { const pane = load("Panes.tsx").PaneView({ id: "chat", model }); const chat = pane.type(pane.props); const body = nodes(chat).find((node) => node.type.name === "MessageBody"); return body.type({ ...body.props, readOnly, ...extra }); }; dirty = true; return render(); },
-		userMessageOverflows: (text) => load("Panes.tsx").userMessageOverflows(text),
+		userClipOverflows: (contentHeight, boxHeight) => load("Panes.tsx").userClipOverflows(contentHeight, boxHeight),
+		userClipBoxHeight: (fontSizePx) => load("Panes.tsx").userClipBoxHeight(fontSizePx),
 		USER_MESSAGE_LINES: () => load("Panes.tsx").USER_MESSAGE_LINES,
-		USER_LINE_CHARS: () => load("Panes.tsx").USER_LINE_CHARS,
+		contextSnapshot: (title, messages) => load("context-from-chat.ts").contextSnapshot(title, messages),
+		contextForGrok: (blocks, request) => load("context-from-chat.ts").contextForGrok(blocks, request),
+		contextChoices: (sessions, currentId) => load("context-from-chat.ts").contextChoices(sessions, currentId),
+		addContextPick: (current, pick) => load("context-from-chat.ts").addContextPick(current, pick),
+		CONTEXT_PICK_LIMIT: () => load("context-from-chat.ts").CONTEXT_PICK_LIMIT,
+		CONTEXT_SNAPSHOT_CHARS: () => load("context-from-chat.ts").CONTEXT_SNAPSHOT_CHARS,
 		emit: (event) => listener(event),
 		model: () => find((node) => node.type === "PaneView").props.model,
 		sidebar: () => find((node) => node.type === "Sidebar").props,
@@ -673,6 +699,23 @@ async function checkTurnIds() {
 	assert.notEqual(turns.sends[2].turnId, turns.sends[1].turnId);
 }
 
+async function checkFailedSession() {
+	const app = harness();
+	await app.settle();
+	const id = app.model().session.id;
+	sendPrompt(app, "first attempt");
+	await app.settle();
+	app.emit({ type: "error", uiSessionId: id, turnId: app.sends.at(-1).turnId, message: "The turn failed." });
+	await app.settle();
+	assert.equal(app.sidebar().sessions.find((item) => item.id === id).failed, true, "an error marks the sidebar session failed");
+	sendPrompt(app, "try again");
+	await app.settle();
+	app.emit({ type: "done", uiSessionId: id, turnId: app.sends.at(-1).turnId });
+	await app.settle();
+	assert.equal(app.sidebar().sessions.find((item) => item.id === id).failed, false, "a later successful turn clears the failed state");
+	console.log("PASS failed session: errors reach the sidebar and a later successful turn clears them");
+}
+
 async function checkInterrupted() {
 	const live = harness();
 	await live.settle();
@@ -1125,13 +1168,17 @@ async function checkGrokState() {
 async function checkLimitMeter() {
 	const app = harness();
 	const meter = () => app.node((node) => String(node.props.className || "").startsWith("limit-meter"));
-	let billing = { ok: false, error: "Usage shows once Grok is running. Send a message, then run /usage." };
+	const fresh = harness();
+	fresh.api.billing = async () => ({ ok: true, percent: 28, period: "weekly", resetsAt: "2026-11-11T22:56:56.873+00:00", tier: "SuperGrok" });
+	await fresh.settle();
+	assert.equal(textOf(fresh.node((node) => String(node.props.className || "").startsWith("limit-meter"))), "Weekly - 72% left", "a new session shows the limit before any message");
+	let billing = { ok: false, error: "Grok did not return usage." };
 	app.api.billing = async () => billing;
 	await app.settle();
 	const id = app.model().session.id;
-	assert.equal(textOf(meter()), "Limit", "no limit before Grok runs");
+	assert.equal(textOf(meter()), "Limit", "no limit while Grok cannot be read");
 	assert.equal(meter().props.className, "limit-meter");
-	assert.match(meter().props.title, /once Grok is running/);
+	assert.match(meter().props.title, /isn't available/);
 	billing = { ok: true, percent: 80, period: "weekly", resetsAt: "2026-11-04T22:56:56.873+00:00", tier: "SuperGrok" };
 	sendPrompt(app, "first");
 	await app.settle();
@@ -1195,10 +1242,20 @@ async function checkSlashCommands() {
 	assert.equal(savedHistory(app).modes[id], "Auto-review");
 	await run("/tasks");
 	assert.ok(app.node((node) => node.type === "PaneView" && node.props.id === "tasks"));
-	await run("/mcps");
-	const settings = app.node((node) => node.type?.name === "SettingsPage");
-	assert.equal(settings.props.initialTab, "connectors");
-	settings.props.onClose();
+	for (const [command, tab] of [["/mcps", "connectors"], ["/skills", "skills"], ["/marketplace", "plugins"]]) {
+		await run(command);
+		const settings = app.node((node) => node.type?.name === "SettingsPage");
+		assert.equal(settings.props.initialTab, tab, `${command} still opens the correct Skills and tools tab`);
+		settings.props.onClose();
+		await app.settle();
+	}
+	app.node((node) => node.props.label === "+").props.onClick();
+	app.render();
+	button(app, "Skills and tools").props.onClick();
+	await app.settle();
+	const toolsSettings = app.node((node) => node.type?.name === "SettingsPage");
+	assert.equal(toolsSettings.props.initialTab, "skills", "the composer menu still opens Skills");
+	toolsSettings.props.onClose();
 	await app.settle();
 	await run("/fork");
 	assert.equal(app.notice(), "No sent message to fork from yet.");
@@ -1297,11 +1354,28 @@ async function checkToolRows() {
 	assert.equal(button(toolApproval, "Always allow in this folder"), undefined);
 	const chained = show({ id: "chained", kind: "command", title: "run_terminal_command", detail: "Waiting for you", waiting: true, command: "npm test && curl example.com" });
 	assert.equal(button(chained, "Always allow in this folder") || button(chained, "Allow for this conversation"), undefined, "a call Always allow could not remember offers no remembered grant");
+	const prefixed = show({ id: "prefix", kind: "command", title: "run_terminal_command", detail: "Waiting for you", waiting: true, command: "npm test && npm test -- --watch", commandPrefix: "npm test" });
+	const prefixButton = button(prefixed, "Allow npm test commands");
+	assert.equal(prefixButton.props.title, 'Allow "npm test …" with any arguments in this conversation. Some arguments make a tool run other programs. Ends when the conversation does.');
+	prefixButton.props.onClick();
+	assert.equal(button(chained, "Allow npm test commands"), undefined, "a command without eligible prefix metadata has no prefix grant");
+	const normalized = show({ id: "normalized-prefix", kind: "command", title: "run_terminal_command", detail: "Waiting for you", waiting: true, command: "GIT.EXE status", commandPrefix: "git status" });
+	assert.ok(button(normalized, "Allow git status commands"), "the button uses the host's normalized grant text");
+	const reads = show({ id: "reads", kind: "command", title: "run_terminal_command", detail: "Waiting for you", waiting: true, command: "git status && git diff", readsOnly: true });
+	assert.equal(reads.node((node) => node.props.children === "Reads only").props.title, "Usually only reads, but arguments can change that. Check them.");
+	assert.ok(button(reads, "Allow"), "the hint leaves the approval waiting for a click");
+	const readWithoutGrant = show({ id: "read-without-grant", kind: "command", title: "run_terminal_command", detail: "Waiting for you", waiting: true, command: "Get-Content file.txt", readsOnly: true });
+	assert.ok(readWithoutGrant.node((node) => node.props.children === "Reads only"));
+	assert.equal(button(readWithoutGrant, "Allow get-content commands"), undefined, "a read hint does not make a non-allowlisted program eligible for a grant");
+	const writes = show({ id: "writes", kind: "command", title: "run_terminal_command", detail: "Waiting for you", waiting: true, command: "git push" });
+	assert.equal(writes.node((node) => node.props.children === "Reads only"), undefined);
 	const nativeApproval = show({ id: "native-permission:command", kind: "execute", title: "Run command", waiting: true });
 	assert.ok(button(nativeApproval, "Deny") && button(nativeApproval, "Allow"), "native permission cards keep Deny and Allow");
 	assert.equal(button(nativeApproval, "Always allow in this folder") || button(nativeApproval, "Allow for this conversation"), undefined, "native permission cards do not offer an unused remembered grant");
+	const nativePrefix = show({ id: "native-permission:prefix", kind: "command", title: "Run command", waiting: true, commandPrefix: "npm test" });
+	assert.equal(button(nativePrefix, "Allow npm test commands"), undefined, "native permission cards do not offer a prefix grant the native protocol cannot remember");
 	button(approval, "Allow").props.onClick();
-	assert.equal(decisions.join("|"), "approve:deny|approve:always|approve:allow");
+	assert.equal(decisions.join("|"), "approve:deny|approve:always|prefix:prefix|approve:allow");
 	const mcpInput = JSON.stringify({ tool_name: "chrome__tabs_open", tool_input: { url: `https://example.com/${"p".repeat(600)}` } }, null, 2);
 	const mcp = show({ id: "mcp", kind: "other", label: "Use Tool", title: "use_tool", detail: "Waiting for you", waiting: true, input: mcpInput, summary: "use_tool" });
 	assert.ok(mcp.nodes().some((node) => node.props.children === mcpInput), "a waiting approval without a command shows its complete input");
@@ -1772,6 +1846,115 @@ async function checkRoutineBatchB() {
 	same(created, [pr.model().session.folder, "feature-on-screen"], "Create PR carries the displayed branch");
 }
 
+async function checkNativeTerminalRouting() {
+	const appWindow = harness();
+	await appWindow.settle();
+	let nextId = 0;
+	const writes = [];
+	const inputs = [];
+	const sizes = [];
+	const closed = [];
+	appWindow.api.terminalOpen = async () => ({ ok: true, id: `pty-${++nextId}`, backend: "pty" });
+	appWindow.api.terminalWrite = async (id, text) => { writes.push([id, text]); return { ok: true }; };
+	appWindow.api.terminalInput = async (id, text) => { inputs.push([id, text]); return { ok: true }; };
+	appWindow.api.terminalResize = async (...args) => { sizes.push(args); return { ok: true }; };
+	appWindow.api.terminalClose = async (id) => { closed.push(id); return { ok: true }; };
+	const terminal = () => appWindow.node((node) => node.type === "TerminalPane").props;
+	await appWindow.model().runInTerminal("Get-Location");
+	await appWindow.settle();
+	terminal().onInput("pty-1", "echo draft ");
+	terminal().onResize("pty-1", 120, 40);
+	await appWindow.model().runInTerminal("npm test");
+	await appWindow.settle();
+	same(writes, [["pty-1", "Get-Location"], ["pty-2", "npm test"]], "Run never submits into a native terminal's draft or foreground program");
+	same(inputs, [["pty-1", "echo draft "]], "typed bytes use the raw input bridge");
+	same(sizes, [["pty-1", 120, 40]], "terminal dimensions reach the host bridge");
+	terminal().onCloseTab("pty-1");
+	await appWindow.settle();
+	terminal().onClose();
+	await appWindow.settle();
+	same(closed, ["pty-1", "pty-2"], "closing a tab and then the pane stops all native tabs");
+}
+
+async function checkBrowserControl() {
+	const timers = controlledTimers();
+	const app = harness(new Map(), "", Date, timers);
+	const reports = [];
+	const actions = [];
+	app.api.browserTabs = async (payload) => { reports.push(payload); return { ok: true }; };
+	app.api.browserStop = async (id) => { actions.push(`stop:${id}`); return { ok: true }; };
+	app.api.browserResume = async (id) => { actions.push(`resume:${id}`); return { ok: true }; };
+	await app.settle();
+	const firstId = app.model().session.id;
+	assert.equal(app.readSettings().browserControl, false);
+	same(reports.at(-1), { uiSessionId: firstId, enabled: false, visible: false, activeId: "", tabs: [] });
+	sendPrompt(app, "first turn");
+	await app.settle();
+	assert.equal(app.sends.at(-1).browser, false, "browser control is absent from default turns");
+	app.emit({ type: "done", uiSessionId: firstId, turnId: app.sends.at(-1).turnId });
+	app.emit({ type: "browser-open", uiSessionId: firstId, url: "https://example.test/" });
+	await app.settle();
+	assert.equal(app.node((node) => node.type === "BrowserPane"), undefined, "disabled browser control does not open a pane");
+	app.key({ key: ",", ctrlKey: true });
+	await app.settle();
+	const settings = app.node((node) => node.type.name === "SettingsPage").props;
+	const view = harness();
+	view.settingsView({ ...settings, initialTab: "general" });
+	const toggle = view.node((node) => node.props["aria-label"] === "Let Grok use the Browser pane");
+	assert.equal(toggle.props.checked, false);
+	assert.ok(textOf(view.render()).includes("What it reads goes to xAI"));
+	toggle.props.onChange({ target: { checked: true } });
+	settings.onClose();
+	await app.settle();
+	assert.equal(reports.at(-1).enabled, true, "a hidden pane still reports the current session and enabled switch");
+	app.emit({ type: "browser-open", uiSessionId: firstId, url: "https://example.test/path" });
+	await app.settle();
+	const browser = () => app.node((node) => node.type === "BrowserPane")?.props;
+	assert.equal(browser().uiSessionId, firstId);
+	assert.equal(browser().tabs[0].url, "https://example.test/path");
+	app.emit({ type: "browser-activity", uiSessionId: firstId, text: "clicking a button", running: true });
+	await app.settle();
+	timers.advance(20000);
+	await app.settle();
+	assert.equal(browser().controlActivity.running, true, "a long call keeps its banner until completion");
+	app.emit({ type: "browser-activity", uiSessionId: firstId, text: "click finished", running: false });
+	await app.settle();
+	timers.advance(4999);
+	await app.settle();
+	assert.ok(browser().controlActivity);
+	timers.advance(1);
+	await app.settle();
+	assert.equal(browser().controlActivity, undefined, "a completed call keeps its banner for five seconds");
+	browser().onStopControl();
+	await app.settle();
+	assert.equal(browser().controlStopped, true);
+	browser().onResumeControl();
+	await app.settle();
+	assert.equal(browser().controlStopped, false);
+	assert.deepEqual(actions, [`stop:${firstId}`, `resume:${firstId}`]);
+	sendPrompt(app, "browser enabled");
+	await app.settle();
+	assert.equal(app.sends.at(-1).browser, true);
+	sendPrompt(app, "/btw read without browser tools");
+	await app.settle();
+	assert.equal(app.sends.at(-1).browser, false, "side chats never get browser control");
+	const secondId = await startSession(app, "another session");
+	assert.equal(browser().uiSessionId, secondId);
+	browser().onClose();
+	await app.settle();
+	app.emit({ type: "browser-open", uiSessionId: firstId, url: "https://outside.test/" });
+	await app.settle();
+	assert.equal(browser(), undefined, "a background session cannot open the current session's pane");
+	assert.equal(reports.at(-1).uiSessionId, secondId);
+	const decisions = [];
+	const card = harness();
+	card.row({ tool: { id: "browser-site", kind: "browser", title: "Read example.test", waiting: true, always: "site" }, m: { session: { folder: "C:/project" }, decide: (...args) => decisions.push(args) } });
+	button(card, "Allow on this site for this conversation").props.onClick();
+	assert.deepEqual(decisions, [["browser-site", "always"]]);
+	app.unmount();
+	console.log("PASS browser control UI: opt-in disclosure, hidden/current ownership, main/side flags, activity timer, Stop/resume and site approval label");
+}
+
 async function checkTerminalSelection() {
 	const appWindow = harness();
 	await appWindow.settle();
@@ -1799,6 +1982,36 @@ async function checkTerminalSelection() {
 	browser().onCloseTab(closed);
 	await appWindow.settle();
 	assert.ok(browser().activeId && browser().activeId !== closed, "closing the selected browser tab selects a remaining tab");
+	const tabId = browser().activeId;
+	browser().onProblem(tabId, { kind: "console", level: "warning", message: "Failed https://example.test/api?token=message-secret#fragment", url: "https://example.test/?token=page-secret", source: "https://example.test/app.js?token=source-secret#fragment", line: 12, headers: "header-secret", body: "body-secret", cookies: "cookie-secret" });
+	await appWindow.settle();
+	assert.equal(browser().tabs.find((tab) => tab.id === tabId).problems.length, 1);
+	assert.doesNotMatch(JSON.stringify(browser().tabs.find((tab) => tab.id === tabId).problems), /secret|fragment|headers|cookies|body/);
+	browser().onPageChanged(tabId, "https://example.test/next", "Next");
+	await appWindow.settle();
+	assert.equal(browser().tabs.find((tab) => tab.id === tabId).problems.length, 1, "navigation retains the tab's evidence");
+	browser().onClose();
+	await appWindow.settle();
+	button(appWindow, "Browser").props.onClick();
+	await appWindow.settle();
+	assert.equal(browser().tabs.find((tab) => tab.id === tabId).problems.length, 1, "closing the pane preserves the still-open tab's evidence");
+	const prompt = () => appWindow.node((node) => node.type === "textarea" && node.props["aria-label"] === "Prompt");
+	prompt().props.onChange({ target: { value: "Please investigate" } });
+	await appWindow.settle();
+	const sent = appWindow.sends.length;
+	const diagnostics = "Browser diagnostics\nPage: https://example.test/next\nCaptured: 2026-11-06T20:00:00.000Z\n\nWARNING console: Failed";
+	browser().onDiagnostics(diagnostics);
+	await appWindow.settle();
+	assert.equal(prompt().props.value, `Please investigate\n\n${diagnostics}`, "diagnostics append to the existing draft");
+	assert.equal(appWindow.sends.length, sent, "Add to prompt never sends the evidence");
+	browser().onClearProblems(tabId);
+	await appWindow.settle();
+	assert.equal(browser().tabs.find((tab) => tab.id === tabId).problems.length, 0, "Clear removes the tab's stored diagnostics");
+	browser().onProblem(tabId, { kind: "request", message: "HTTP 500", url: "https://example.test/api" });
+	await appWindow.settle();
+	browser().onCloseTab(tabId);
+	await appWindow.settle();
+	assert.ok(!browser().tabs.some((tab) => tab.id === tabId), "closing a tab drops its evidence with the tab");
 }
 
 // With auto save on, a change App makes saves the open file's pending edit once, before the Files pane's timer would.
@@ -2069,6 +2282,159 @@ async function composerWindow(timers) {
 	app.emit({ type: "done", uiSessionId: app.model().session.id, turnId: app.sends.at(-1).turnId });
 	await app.settle();
 	return app;
+}
+
+async function checkPrWatch() {
+	const seed = await composerWindow(controlledTimers());
+	const baseline = savedHistory(seed);
+	const created = harness(new Map(seed.storage), "", Date, controlledTimers());
+	created.api.prCreate = async () => ({ ok: true, url: "https://github.com/owner/repo/pull/12" });
+	await created.settle();
+	await created.node((node) => node.type === "SessionRail").props.onCreatePr();
+	await created.settle();
+	const started = created.sidebar().sessions[0].prWatch;
+	assert.equal(started.number, 12);
+	same(started.failing, []);
+	assert.ok(started.seenAt);
+	created.pickedFolders.push("C:/other-repository");
+	created.node((node) => node.props.label === created.model().session.project).props.onClick();
+	created.render();
+	button(created, "Choose a folder").props.onClick();
+	await created.settle();
+	assert.equal(created.model().session.prWatch, undefined, "choosing another folder clears the old repository's PR watch");
+	const status = { ok: true, pr: { number: 12, state: "OPEN", checks: [{ name: "build", state: "fail" }], feedback: [{ at: "2026-11-06T01:00:00Z", who: "octocat", kind: "review" }] } };
+	const adoptTimers = controlledTimers();
+	const adopted = harness(new Map(seed.storage), "", Date, adoptTimers);
+	adopted.api.prStatus = async () => status;
+	await adopted.settle();
+	const quiet = adopted.sidebar().sessions[0].prWatch;
+	same(quiet.failing, ["build"]);
+	assert.equal(quiet.seenAt, "2026-11-06T01:00:00Z");
+	adoptTimers.advance(10000);
+	await adopted.settle();
+	assert.equal(adopted.sidebar().sessions[0].prWatch.alert, undefined, "an existing PR starts without alerts for old feedback or failures");
+	assert.equal(adopted.notifications.length, 0);
+	adopted.unmount();
+	const watched = { ...baseline.sessions[0], id: "watched", prWatch: { number: 12, failing: [], seenAt: "2026-11-06T00:00:00Z" } };
+	const history = { ...baseline, sessions: [...baseline.sessions, watched] };
+	const storage = new Map([["grok-code.history.v1", JSON.stringify(history)]]);
+	const timers = controlledTimers();
+	const app = harness(storage, "", Date, timers);
+	let next = status;
+	const polls = [];
+	app.api.prStatus = async (folder, number) => { if (number) { polls.push([folder, number]); } return number ? next : { ok: true, pr: null }; };
+	await app.settle();
+	timers.advance(9999);
+	await app.settle();
+	assert.equal(polls.length, 0);
+	timers.advance(1);
+	await app.settle();
+	same(polls[0], [watched.folder, 12]);
+	const alert = app.sidebar().sessions.find((item) => item.id === watched.id).prWatch.alert;
+	same(alert, { failed: ["build"], feedback: 1, from: ["octocat"] });
+	assert.equal(app.sidebar().sessions.find((item) => item.id === watched.id).unread, true);
+	assert.equal(app.notifications.length, 1, "background PR feedback notifies");
+	assert.equal(app.notifications[0].body, "PR #12: CI failed (build) and 1 new review comment from octocat.");
+	assert.equal(app.sends.length, 0, "polling never starts a Grok turn");
+	app.sidebar().onSelect(watched.id);
+	await app.settle();
+	button(app, "Ask Grok to fix").props.onClick();
+	await app.settle();
+	assert.equal(app.sends.at(-1).text, app.prFixPrompt(12, alert));
+	assert.equal(app.model().session.prWatch.alert, undefined, "sending the explicit fix request clears only the alert");
+	assert.equal(app.model().session.prWatch.number, 12);
+	next = { ...status, pr: { ...status.pr, checks: [] } };
+	timers.advance(180000);
+	await app.settle();
+	next = status;
+	timers.advance(180000);
+	await app.settle();
+	const sends = app.sends.length;
+	button(app, "Dismiss pull request alert").props.onClick();
+	await app.settle();
+	assert.equal(app.sends.length, sends, "dismissing a PR alert sends nothing");
+	assert.equal(app.model().session.prWatch.alert, undefined);
+	next = { ...status, pr: { ...status.pr, state: "MERGED" } };
+	timers.advance(180000);
+	await app.settle();
+	assert.equal(app.model().session.prWatch, undefined);
+	app.unmount();
+	const offTimers = controlledTimers();
+	const off = harness(new Map([["grok-code.history.v1", JSON.stringify(history)], ["grok-code.settings.v1", JSON.stringify({ notifyPr: "off" })]]), "", Date, offTimers);
+	off.api.prStatus = async (_folder, number) => number ? status : { ok: true, pr: null };
+	await off.settle();
+	offTimers.advance(10000);
+	await off.settle();
+	assert.equal(off.notifications.length, 0, "notifyPr off suppresses the banner");
+	assert.ok(off.sidebar().sessions.find((item) => item.id === watched.id).prWatch.alert, "turning off banners retains the fix alert");
+	off.key({ key: ",", ctrlKey: true });
+	await off.settle();
+	const settings = off.node((node) => node.type.name === "SettingsPage");
+	const view = harness();
+	const settingsTree = view.settingsView({ ...settings.props, initialTab: "notifications" });
+	assert.ok(textOf(settingsTree).includes("Pull requests"));
+	assert.ok(textOf(settingsTree).includes("When CI fails or new review feedback arrives on a pull request a session opened."));
+	off.unmount();
+	console.log("PASS PR watch renderer: create/adopt, delayed polling, background unread/banner, explicit fix/dismiss, merge and notification setting");
+}
+
+async function checkPrWatchWindows() {
+	const seed = await composerWindow(controlledTimers());
+	const firstTimers = controlledTimers();
+	const secondTimers = controlledTimers();
+	const first = harness(seed.storage, "", Date, firstTimers);
+	const second = harness(seed.storage, "", Date, secondTimers);
+	const polled = [];
+	const status = { ok: true, pr: { number: 12, state: "OPEN", checks: [{ name: "build", state: "fail" }], feedback: [] } };
+	first.api.prStatus = async (_folder, number) => { if (number) { polled.push("first"); } return number ? status : { ok: true, pr: null }; };
+	second.api.prStatus = async (_folder, number) => { if (number) { polled.push("second"); } return number ? status : { ok: true, pr: null }; };
+	second.api.prCreate = async () => ({ ok: true, url: "https://github.com/owner/repo/pull/12" });
+	await first.settle();
+	await second.settle();
+	const id = await startSession(second, "Watch a new session in the other window");
+	second.emit({ type: "done", uiSessionId: id, turnId: second.sends.at(-1).turnId });
+	await second.settle();
+	await second.node((node) => node.type === "SessionRail").props.onCreatePr();
+	await second.settle();
+	const chat = JSON.stringify(savedHistory(second).extraChats[id]);
+	first.storageEvent("grok-code.history.v1");
+	await first.settle();
+	assert.equal(first.sidebar().sessions.find((item) => item.id === id).prWatch.number, 12, "the polling window adopts a watch created in a new session in another window");
+	assert.equal(JSON.stringify(savedHistory(first).extraChats[id]), chat, "watch synchronization preserves the other window's conversation");
+	firstTimers.advance(10000);
+	secondTimers.advance(10000);
+	await first.settle();
+	await second.settle();
+	assert.deepEqual(polled, ["first"], "only the window holding the lifetime lock polls");
+	second.storageEvent("grok-code.history.v1");
+	await second.settle();
+	assert.ok(button(second, "Ask Grok to fix"), "the alert reaches the session's other window");
+	button(second, "Dismiss pull request alert").props.onClick();
+	await second.settle();
+	first.storageEvent("grok-code.history.v1");
+	await first.settle();
+	assert.equal(first.sidebar().sessions.find((item) => item.id === id).prWatch.alert, undefined, "dismissal reaches the polling window");
+	firstTimers.advance(180000);
+	await first.settle();
+	assert.equal(first.notifications.length, 1, "a quiet poll does not resurrect the dismissed alert");
+	first.unmount();
+	await second.settle();
+	secondTimers.advance(10000);
+	await second.settle();
+	assert.equal(polled.at(-1), "second", "a waiting window takes over after the polling window unmounts");
+	const removed = savedHistory(second);
+	removed.sessions = removed.sessions.filter((item) => item.id !== id);
+	removed.deleted.push(id);
+	second.storage.set("grok-code.history.v1", JSON.stringify(removed));
+	second.storageEvent("grok-code.history.v1");
+	await second.settle();
+	assert.equal(second.sidebar().sessions.find((item) => item.id === id).prWatch, undefined, "a deletion from another window clears the retained watch");
+	const count = polled.length;
+	secondTimers.advance(180000);
+	await second.settle();
+	assert.equal(polled.length, count, "a deleted session is no longer polled");
+	second.unmount();
+	console.log("PASS PR watch windows: lifetime lock, new-session watch/history sync, alert dismissal sync and takeover");
 }
 
 async function checkComposerDraftRelaunch() {
@@ -3325,17 +3691,19 @@ async function checkCommitButtons() {
 	assert.ok(button(view, "Commit"));
 	assert.ok(button(view, "Commit and push"));
 	const initialSends = app.sends.length;
-	view.confirmAnswer = false;
 	for (const label of ["Commit", "Commit and push"]) {
 		button(view, label).props.onClick();
+		await view.settle();
+		assert.ok(view.node((node) => node.props.role === "dialog"));
+		button(view, "Cancel").props.onClick();
 		await view.settle();
 		await app.settle();
 		assert.equal(app.sends.length, initialSends, `${label} sends nothing when cancelled`);
 	}
-	view.confirmAnswer = true;
 	button(view, "Commit").props.onClick();
-	assert.equal(app.sends.length, initialSends, "Commit waits for the confirmation promise");
-	assert.equal(view.confirms.at(-1), "Commit all uncommitted changes?\n\nGrok writes the commit message and commits. Nothing is pushed.");
+	assert.equal(app.sends.length, initialSends, "opening the dialog sends nothing");
+	await view.settle();
+	button(view, "Ask Grok to commit").props.onClick();
 	await view.settle();
 	await app.settle();
 	assert.equal(app.sends.at(-1).text, commitText, "the rendered Commit button sends the fixed request to this session");
@@ -3343,14 +3711,18 @@ async function checkCommitButtons() {
 	await app.settle();
 	view.diffView(props());
 	button(view, "Commit and push").props.onClick();
-	assert.equal(app.sends.length, initialSends + 1, "Commit and push waits for the confirmation promise");
-	assert.equal(view.confirms.at(-1), "Commit and push?\n\nGrok commits all uncommitted changes and pushes the branch to its remote.");
+	assert.equal(app.sends.length, initialSends + 1, "opening the push dialog sends nothing");
+	await view.settle();
+	button(view, "Ask Grok to commit").props.onClick();
 	await view.settle();
 	await app.settle();
 	assert.equal(app.sends.at(-1).text, pushText, "the rendered push button sends its exact fixed request");
 	const sent = app.sends.length;
 	view.diffView(props());
 	button(view, "Commit").props.onClick();
+	await view.settle();
+	assert.equal(button(view, "Ask Grok to commit").props.disabled, false, "the Grok choice remains available while busy");
+	button(view, "Ask Grok to commit").props.onClick();
 	await view.settle();
 	await app.settle();
 	assert.equal(app.sends.length, sent, "Commit queues while a turn is running");
@@ -3360,6 +3732,72 @@ async function checkCommitButtons() {
 		assert.equal(button(view, "Commit"), undefined);
 		assert.equal(button(view, "Commit and push"), undefined);
 	}
+}
+
+async function checkRevertHunkBridge() {
+	const app = await composerWindow();
+	const hunk = { id: "a:one", loc: "@@ -1 +1 @@", revertible: true, lines: [{ kind: "del", text: "original" }, { kind: "add", text: "changed" }] };
+	app.api.diff = async () => ({ ok: true, files: [{ path: "a.txt", hunks: [hunk] }] });
+	app.key({ key: "d", ctrlKey: true, shiftKey: true });
+	app.editor();
+	await app.settle();
+	const pane = () => app.node((node) => node.type === "DiffPane").props;
+	const calls = [];
+	app.api.revertHunk = async (...args) => { calls.push(args); app.files["a.txt"] = { text: "reverted\r\n", version: "reverted" }; return { ok: true }; };
+	assert.equal((await pane().onRevertHunk("a.txt", hunk)).ok, true);
+	await app.settle();
+	same(calls, [[app.model().session.folder, "a.txt", hunk]], "the hunk route forwards the session folder and exact captured content");
+	assert.equal(app.editor().open.text, "reverted\r\n", "a successful hunk revert refreshes the open file");
+	app.api.revertHunk = async () => { throw new Error("Bridge lost"); };
+	assert.equal((await pane().onRevertHunk("a.txt", hunk)).error, "That change could not be reverted.");
+	delete app.api.revertHunk;
+	assert.equal((await pane().onRevertHunk("a.txt", hunk)).error, "Reopen this window to revert this change.");
+	console.log("PASS hunk revert app: captured file/content, editor refresh and rejected/missing bridge");
+}
+
+async function checkDirectCommitBridge() {
+	const app = await composerWindow(controlledTimers());
+	app.api.diff = async () => ({ ok: true, files: [{ path: "a.txt", hunks: [] }] });
+	app.api.branchInfo = async () => ({ ok: true, branch: "feature", base: "main" });
+	app.key({ key: "d", ctrlKey: true, shiftKey: true });
+	await app.settle();
+	const pane = () => app.node((node) => node.type === "DiffPane").props;
+	const folder = app.model().session.folder;
+	const calls = [];
+	let finish;
+	app.api.gitCommit = (...args) => { calls.push(args); return new Promise((resolve) => { finish = resolve; }); };
+	const input = { paths: ["a.txt"], message: "Fix it", push: false };
+	const pending = pane().onCommit(input);
+	await startSession(app, "Another session while the hook runs");
+	finish({ ok: true, committed: true, sha: "abc1234", message: "Committed abc1234." });
+	assert.equal((await pending).committed, true);
+	await app.settle();
+	same(calls, [[folder, { ...input, expected: "feature" }]], "the direct route uses the original session folder and displayed branch");
+	assert.equal(app.notice(), "Committed abc1234.", "commit results survive switching sessions");
+	assert.equal(pane().busy, true, "the pane receives the session's running state");
+	app.document.querySelector = (selector) => selector === "[data-commit-dialog]" ? {} : null;
+	const id = app.model().session.id;
+	app.key({ key: "Escape" });
+	app.key({ key: "n", ctrlKey: true });
+	await app.settle();
+	assert.deepEqual(app.cancels, [], "the commit dialog suppresses the window Stop shortcut");
+	assert.equal(app.model().session.id, id, "the commit dialog suppresses new-session shortcuts");
+	app.document.querySelector = () => null;
+	app.api.gitCommit = async () => ({ ok: false, committed: true, sha: "abc1234", error: "Committed abc1234, but the push failed: offline" });
+	const failed = await pane().onCommit({ ...input, push: true });
+	await app.settle();
+	assert.equal(app.notice(), failed.error, "partial-success errors reach the app notice");
+	app.api.gitCommit = async () => { throw new Error("Bridge lost"); };
+	const rejected = await pane().onCommit(input);
+	await app.settle();
+	assert.equal(rejected.error, "The commit could not be checked. Refresh to see what happened.");
+	assert.equal(app.notice(), rejected.error);
+	delete app.api.gitCommit;
+	const missing = await pane().onCommit(input);
+	await app.settle();
+	assert.equal(missing.error, "Reopen this window to commit.");
+	assert.equal(app.notice(), missing.error);
+	console.log("PASS direct commit app: original folder/branch, busy state, persistent notices, rejected/missing bridge and modal shortcut isolation");
 }
 
 async function checkRefreshScopes() {
@@ -3566,18 +4004,45 @@ async function checkTaskDetails() {
 async function checkLongMessages() {
 	const app = harness();
 	await app.settle();
-	const lines = app.USER_MESSAGE_LINES();
-	const width = app.USER_LINE_CHARS();
-	assert.equal(app.userMessageOverflows("hello"), false);
-	assert.equal(app.userMessageOverflows(Array.from({ length: lines }, () => "line").join("\n")), false, "eight lines stay open");
-	assert.equal(app.userMessageOverflows(Array.from({ length: lines + 1 }, () => "line").join("\n")), true);
-	assert.equal(app.userMessageOverflows("x".repeat(width * lines)), false);
-	assert.equal(app.userMessageOverflows("x".repeat(width * lines + 1)), true, "a wrapped line past eight rows collapses");
+	const limit = app.userClipBoxHeight(16);
+	assert.equal(limit, app.USER_MESSAGE_LINES() * 1.45 * 16);
+	assert.equal(app.userClipOverflows(limit, limit), false, "a message as tall as the eight-line box stays open");
+	assert.equal(app.userClipOverflows(limit + 1, limit), false, "one pixel of rounding stays open");
+	assert.equal(app.userClipOverflows(limit + 2, limit), true, "text taller than the box collapses");
 	const long = Array.from({ length: 12 }, (_, index) => `report line ${index}`).join("\n");
 	const model = { ...app.model(), messages: [{ id: "long-user", role: "user", text: long }, { id: "long-reply", role: "grok", text: long }] };
+	function watchClip(view) {
+		view.window.getComputedStyle = () => ({ fontSize: "16px" });
+		let onResize = () => {};
+		view.window.ResizeObserver = class {
+			constructor(callback) { onResize = callback; }
+			observe() {}
+			disconnect() {}
+		};
+		return {
+			at(scrollHeight) {
+				const box = { scrollHeight };
+				view.node((node) => node.props.className === "message-text").props.ref(box);
+				view.render();
+				return box;
+			},
+			resize(box, scrollHeight) {
+				box.scrollHeight = scrollHeight;
+				onResize();
+				view.render();
+			},
+		};
+	}
 	const view = harness();
 	view.message(model);
+	const clip = watchClip(view);
+	const box = clip.at(limit + 2);
 	assert.equal(view.node((node) => node.props.className === "user-clip clipped").props.className, "user-clip clipped");
+	clip.resize(box, limit);
+	assert.equal(view.node((node) => node.props.className === "user-clip clipped"), undefined, "a wider column that fits the box opens");
+	assert.equal(view.node((node) => node.props.children === "Show more"), undefined);
+	clip.resize(box, limit + 2);
+	assert.equal(view.node((node) => node.props.className === "user-clip clipped").props.className, "user-clip clipped", "a narrower column collapses again");
 	const more = view.node((node) => node.type === "button" && node.props.children === "Show more");
 	assert.equal(more.props["aria-expanded"], false);
 	more.props.onClick();
@@ -3589,13 +4054,16 @@ async function checkLongMessages() {
 	assert.equal(reply.node((node) => node.props.children === "Show more"), undefined, "Grok's replies stay open");
 	const found = harness();
 	found.message(model, false, { find: "report line 11" });
+	watchClip(found).at(limit + 2);
 	assert.equal(found.node((node) => node.props.className === "user-clip clipped"), undefined, "a find match opens the whole message");
 	assert.equal(found.node((node) => node.props.children === "Show more"), undefined);
 	const missed = harness();
 	missed.message(model, false, { find: "not in the report" });
+	watchClip(missed).at(limit + 2);
 	assert.ok(missed.node((node) => node.props.className === "user-clip clipped"));
 	const short = harness();
 	short.message({ ...app.model(), messages: [{ id: "short-user", role: "user", text: "hello" }] });
+	watchClip(short).at(limit);
 	assert.equal(short.node((node) => node.props.children === "Show more"), undefined);
 }
 
@@ -3695,15 +4163,116 @@ async function checkEditDiffs() {
 	await saved.settle();
 }
 
+async function checkSplitDiffs() {
+	const app = harness();
+	const limit = app.SPLIT_MIN_WIDTH();
+	assert.equal(app.splitFits(limit - 1), false);
+	assert.equal(app.splitFits(limit), true);
+	const replaced = { oldText: "a\nb\nc\nd\ne\nf\n", newText: "a\nb\nc\nX\ne\nf\n", oldLine: 10, newLine: 10 };
+	const pairs = app.splitRows(app.editRows(replaced));
+	same(pairs[0], { left: { kind: "context", text: "a", line: 10 }, right: { kind: "context", text: "a", line: 10 } });
+	same(pairs.find((row) => row.left && row.left.kind === "del"), { left: { kind: "del", text: "d", line: 13 }, right: { kind: "add", text: "X", line: 13 } });
+	same(app.splitRows(app.editRows({ oldText: "a\nb\nd", newText: "a\nX\nY\nd" })), [
+		{ left: { kind: "context", text: "a" }, right: { kind: "context", text: "a" } },
+		{ left: { kind: "del", text: "b" }, right: { kind: "add", text: "X" } },
+		{ right: { kind: "add", text: "Y" } },
+		{ left: { kind: "context", text: "d" }, right: { kind: "context", text: "d" } },
+	]);
+	same(app.splitRows(app.editRows({ oldText: "a\nb\nc\nd", newText: "a\nX\nd" })), [
+		{ left: { kind: "context", text: "a" }, right: { kind: "context", text: "a" } },
+		{ left: { kind: "del", text: "b" }, right: { kind: "add", text: "X" } },
+		{ left: { kind: "del", text: "c" } },
+		{ left: { kind: "context", text: "d" }, right: { kind: "context", text: "d" } },
+	]);
+	same(app.splitRows(app.editRows({ oldText: "a\nb\nc", newText: "a\nc" })), [
+		{ left: { kind: "context", text: "a" }, right: { kind: "context", text: "a" } },
+		{ left: { kind: "del", text: "b" } },
+		{ left: { kind: "context", text: "c" }, right: { kind: "context", text: "c" } },
+	]);
+	same(app.splitRows(app.editRows({ oldText: "", newText: "only\n" })), [{ right: { kind: "add", text: "only" } }]);
+	same(app.splitRows(app.editRows({ oldText: "gone\n", newText: "" })), [{ left: { kind: "del", text: "gone" } }]);
+	const longLine = "L".repeat(400);
+	const painted = app.editDiff({ diff: replaced, view: "split" });
+	const changed = app.nodes(painted).find((node) => node.props.className === "edit-split-row" && textOf(node).includes("-d"));
+	assert.ok(textOf(changed).includes("+X"));
+	assert.ok(textOf(changed).includes("13"));
+	assert.ok(textOf(app.editDiff({ diff: { oldText: longLine, newText: `M${longLine}` }, view: "split" })).includes(longLine), "a long line stays whole in the split view");
+	const emptySide = app.editDiff({ diff: { oldText: "", newText: "only\n" }, view: "split" });
+	assert.ok(app.nodes(emptySide).some((node) => node.props.className === "edit-side edit-side-empty"));
+	assert.ok(textOf(emptySide).includes("+only"));
+	const narrow = app.editDiff({ diff: { oldText: "a", newText: "b" }, view: "split", width: limit - 1 });
+	assert.equal(app.nodes(narrow).find((node) => node.props.className === "edit-split-row"), undefined);
+	assert.ok(app.nodes(narrow).some((node) => node.props.className === "dp-line dp-del"));
+	assert.ok(textOf(narrow).includes("Showing unified because this column is narrow."));
+	assert.equal(app.nodes(narrow).find((node) => node.type === "button" && node.props.children === "Split").props["aria-pressed"], true, "a narrow column keeps the saved split choice");
+	const wide = app.editDiff({ diff: { oldText: "a", newText: "b" }, view: "split", width: limit });
+	assert.ok(app.nodes(wide).some((node) => node.props.className === "edit-split-row"));
+	assert.equal(textOf(wide).includes("narrow"), false);
+	const longDiff = { oldText: "", newText: Array.from({ length: 205 }, (_, index) => "line " + index).join("\n") };
+	const compact = app.editDiff({ diff: longDiff, view: "split" });
+	assert.equal(app.nodes(compact).filter((node) => node.props.className === "edit-side dp-add").length, 200);
+	assert.ok(textOf(compact).includes("5 more lines not shown."));
+	assert.equal(app.nodes(app.editDiff({ diff: longDiff, view: "split", all: true })).filter((node) => node.props.className === "edit-side dp-add").length, 205);
+	const row = harness();
+	let chosen = "";
+	row.row({ tool: { id: "edit", kind: "edit", title: "Edit", path: "a.txt", detail: "Ran", diff: replaced }, m: { session: { folder: "C:/project" }, view: "verbose", diffView: "split", setDiffView(next) { chosen = next; } } });
+	const card = () => row.node((node) => node.type.name === "EditDiff");
+	assert.equal(card().props.view, "split");
+	assert.equal(card().props.all, undefined, "a finished edit keeps the shorter diff");
+	card().props.onView("unified");
+	assert.equal(chosen, "unified");
+	let measured = 0;
+	let onResize = () => {};
+	row.window.ResizeObserver = class { constructor(callback) { onResize = callback; } observe() {} disconnect() {} };
+	const live = row.editDiff({ diff: replaced, view: "split", onWidth(next) { measured = next; } });
+	const box = { clientWidth: 300 };
+	row.nodes(live).find((node) => node.props.className === "edit-diff-wrap").props.ref(box);
+	assert.equal(measured, 300);
+	box.clientWidth = limit;
+	onResize();
+	assert.equal(measured, limit);
+	card().props.onWidth(limit - 1);
+	row.render();
+	assert.equal(card().props.width, limit - 1);
+	const fallback = row.editDiff(card().props);
+	assert.ok(textOf(fallback).includes("Showing unified because this column is narrow."));
+	const memory = harness();
+	await memory.settle();
+	assert.equal(memory.model().diffView, "unified");
+	const choice = memory.editDiff({ diff: { oldText: "a", newText: "b" }, view: memory.model().diffView, onView: memory.model().setDiffView });
+	memory.nodes(choice).find((node) => node.type === "button" && node.props.children === "Split").props.onClick();
+	memory.render();
+	assert.equal(memory.model().diffView, "split");
+	assert.equal(JSON.parse(memory.storage.get("grok-code.settings.v1")).diffView, "split");
+	const stored = harness();
+	stored.storage.set("grok-code.settings.v1", JSON.stringify({ diffView: "sideways" }));
+	assert.equal(stored.readSettings().diffView, "unified", "an unknown saved view falls back to unified");
+	const stable = harness();
+	let observers = 0;
+	stable.window.ResizeObserver = class { constructor() { observers += 1; } observe() {} disconnect() {} };
+	const onWidth = () => {};
+	const sameProps = { diff: { oldText: "a", newText: "b" }, onWidth };
+	const firstRef = stable.nodes(stable.editDiffView(sameProps)).find((node) => node.props.className === "edit-diff-wrap").props.ref;
+	firstRef({ clientWidth: 800 });
+	assert.equal(observers, 1);
+	const secondRef = stable.nodes(stable.editDiffView(sameProps)).find((node) => node.props.className === "edit-diff-wrap").props.ref;
+	// React 19 re-invokes a ref callback only when its identity changes.
+	if (secondRef !== firstRef) { secondRef({ clientWidth: 800 }); }
+	assert.equal(secondRef, firstRef);
+	assert.equal(observers, 1, "re-rendering with the same props does not create another ResizeObserver");
+}
+
 async function checkSetupSheet() {
 	const healthy = { grok: { ok: true, signedIn: true, version: "1.0.70" }, git: { ok: true }, gh: { ok: true, signedIn: true }, install: "INSTALL GROK" };
 	const setupNode = (app) => app.node((node) => node.type.name === "Setup");
 	const good = harness();
 	let checks = 0;
-	good.api.readiness = async () => { checks++; return healthy; };
+	const requests = [];
+	good.api.readiness = async (request) => { checks++; requests.push(request); return healthy; };
 	await good.settle();
 	assert.equal(setupNode(good), undefined, "healthy launch stays closed");
 	assert.equal(checks, 1);
+	same(requests[0], { folder: good.model().session.folder, full: false }, "the launch check stays light and names the session folder");
 	good.key({ key: ",", ctrlKey: true });
 	await good.settle();
 	const settings = good.node((node) => node.type.name === "SettingsPage");
@@ -3719,11 +4288,22 @@ async function checkSetupSheet() {
 	setupNode(good).props.onCheck();
 	await good.settle();
 	assert.equal(checks, 3);
+	same(requests.at(-1), { folder: good.model().session.folder, full: true }, "Check again requests full diagnostics for the session folder");
 	assert.ok(setupNode(good), "healthy recheck keeps sheet open");
+	good.emit({ type: "account", account: { email: "someone@example.com", plan: "SuperGrok", team: "", version: "1.0.60" } });
+	await good.settle();
+	setupNode(good).props.onCheck();
+	await good.settle();
+	assert.equal(good.sidebar().account.version, "1.0.70", "a setup check replaces the Grok version saved from an older session");
+	assert.equal(good.sidebar().account.email, "someone@example.com", "and keeps the rest of the account");
 	const missing = harness();
 	missing.api.readiness = async () => ({ ...healthy, grok: { ok: false, error: "Grok is not installed." } });
 	await missing.settle();
 	assert.ok(textOf(setupNode(missing).type(setupNode(missing).props)).includes("INSTALL GROK"));
+	const keyed = harness();
+	keyed.api.readiness = async () => ({ ...healthy, grok: { ok: true, signedIn: true, signIn: "key", apiKey: true, version: "1.0.70" } });
+	await keyed.settle();
+	assert.equal(setupNode(keyed), undefined, "an API key counts as signed in, so launch stays closed");
 	const signedOut = harness();
 	signedOut.api.readiness = async () => ({ ...healthy, grok: { ok: true, signedIn: false } });
 	await signedOut.settle();
@@ -3793,6 +4373,94 @@ async function checkSetupSheet() {
 	assert.ok(darwin.includes("Install Git"));
 	assert.ok(darwin.includes("Apple's window installs the Command Line Tools, which include Git. Press Check again when it finishes."));
 	assert.ok(gitSheet({ ...gitMissing, platform: "linux" }).includes("Install Git with your package manager."));
+	const diagnostic = {
+		...healthy,
+		app: { version: "0.7.0", electron: "39.0.0", os: "win32 10.0.26300 x64" },
+		grok: { ok: true, signedIn: true, version: "1.0.77", at: { source: "installer", path: "~/.grok/bin/grok.exe" }, update: { checked: true, current: "1.0.77", latest: "1.0.77", available: false, autoUpdate: true, channel: "stable" }, token: "SECRET", email: "PRIVATE" },
+		config: { ok: true, files: [{ role: "user", path: "~/.grok/config.toml", broken: false }], warnings: ["hooks (unrecognized config key)", "privacy (unrecognized config key)"] },
+		hooks: "SECRET", permissions: "SECRET", mcpServers: "SECRET", env: "SECRET",
+	};
+	const expectedReport = [
+		"Codewomplers Grok Desktop 0.7.0, Electron 39.0.0, win32 10.0.26300 x64",
+		"Grok 1.0.77, stable channel, runs from ~/.grok/bin/grok.exe (installer)",
+		"Grok update: up to date",
+		"Grok sign-in: signed in",
+		"Grok config: ~/.grok/config.toml; can't read: none; warnings: hooks (unrecognized config key), privacy (unrecognized config key)",
+		"Git: installed",
+		"GitHub CLI: signed in",
+	].join("\n");
+	assert.equal(good.supportReport(diagnostic), expectedReport, "the report contains only the specified facts in order");
+	const password = "s3cret-pass";
+	const apiKey = "key-value-should-not-appear";
+	const keyReport = good.supportReport({
+		...diagnostic,
+		grok: { ...diagnostic.grok, signIn: "key", apiKey: true },
+		network: { httpsProxy: "http://proxy.corp:8080", httpProxy: "not set", noProxy: "localhost", caCerts: "~/.certs/corp.pem (missing)" },
+		proxyUrl: `http://proxyuser:${password}@proxy.corp:8080`,
+		XAI_API_KEY: apiKey,
+	});
+	assert.equal(keyReport, [
+		expectedReport.replace("Grok sign-in: signed in", "Grok sign-in: API key (XAI_API_KEY is set)"),
+		"HTTPS proxy: http://proxy.corp:8080",
+		"HTTP proxy: not set",
+		"NO_PROXY: localhost",
+		"Extra CA certificates: ~/.certs/corp.pem (missing)",
+	].join("\n"));
+	assert.equal(keyReport.includes(password), false);
+	assert.equal(keyReport.includes("proxyuser"), false);
+	assert.equal(keyReport.includes(apiKey), false);
+	assert.equal(keyReport.includes("SECRET"), false);
+	assert.equal(keyReport.includes("PRIVATE"), false);
+	const savedReport = good.supportReport({ ...diagnostic, grok: { ...diagnostic.grok, signIn: "saved", apiKey: true } });
+	assert.ok(savedReport.includes("Grok sign-in: saved sign-in; an API key is also set"));
+	assert.equal(savedReport.includes(apiKey), false);
+	assert.ok(gitSheet({ ...diagnostic, grok: { ok: true, signedIn: true, signIn: "key", apiKey: true } }).includes("Grok is signed in with an API key from XAI_API_KEY. The key is not shown."));
+	assert.ok(!gitSheet({ ...diagnostic, grok: { ok: true, signedIn: true, signIn: "key", apiKey: true } }).includes("grok login"));
+	assert.ok(gitSheet({ ...diagnostic, grok: { ...diagnostic.grok, signIn: "saved", apiKey: true } }).includes("XAI_API_KEY is also set. Grok uses the saved sign-in while it exists."));
+	assert.ok(gitSheet({ ...diagnostic, network: { httpsProxy: "http://proxy.corp:8080", httpProxy: "not set", noProxy: "localhost", caCerts: "~/.certs/corp.pem (found)" } }).includes("HTTPS proxy: http://proxy.corp:8080"));
+	assert.ok(gitSheet({ ...diagnostic, network: { httpsProxy: "http://proxy.corp:8080", httpProxy: "not set", noProxy: "localhost", caCerts: "~/.certs/corp.pem (found)" } }).includes("Extra CA certificates: ~/.certs/corp.pem (found)"));
+	assert.equal(good.supportReport({ grok: { ok: false, error: "Missing" }, git: { ok: false }, gh: { ok: false } }), "Grok: not installed (Missing)\nGit: not installed\nGitHub CLI: not installed", "missing diagnostics are omitted without undefined values");
+	let copied;
+	const copySheet = Setup({ ...baseProps, result: diagnostic, onCopy: (text) => { copied = text; } });
+	good.nodes(copySheet).find((node) => node.type === "button" && textOf(node) === "Copy support report").props.onClick();
+	assert.equal(copied, expectedReport);
+	assert.equal(good.nodes(Setup({ ...baseProps, result: undefined })).find((node) => node.type === "button" && textOf(node) === "Copy support report").props.disabled, true);
+	const brokenConfig = { ...diagnostic, config: { ...diagnostic.config, files: [{ role: "user", path: "~/.grok/config.toml", broken: true }] } };
+	assert.ok(gitSheet(brokenConfig).includes("Grok can't read ~/.grok/config.toml, so its settings aren't used."));
+	assert.ok(!gitSheet(brokenConfig).includes("reads its config without problems"), "a broken file is not reported as healthy");
+	assert.ok(gitSheet({ ...diagnostic, config: { ok: false } }).includes("Grok's config couldn't be read."));
+	assert.ok(gitSheet({ ...diagnostic, config: { ok: true, files: [], warnings: [] } }).includes("Grok reads its config without problems."));
+	assert.ok(gitSheet(diagnostic).includes("Grok reads its config without problems."), "Grok's own warnings about keys it still loads don't show as problems");
+	assert.ok(!gitSheet(diagnostic).includes("unrecognized config key"), "the sheet leaves Grok's config warnings to the report");
+	assert.ok(gitSheet({ ...diagnostic, grok: { ...diagnostic.grok, update: { checked: false } } }).includes("Grok couldn't check for a newer version."));
+	assert.ok(good.supportReport({ ...diagnostic, grok: { ...diagnostic.grok, update: { checked: false } } }).includes("Grok update: not checked"));
+	const updating = harness();
+	const updateRequests = [];
+	const available = { ...diagnostic, grok: { ...diagnostic.grok, update: { ...diagnostic.grok.update, latest: "1.0.78", available: true } } };
+	updating.api.readiness = async (request) => { updateRequests.push(request); return available; };
+	let updates = 0;
+	let finishUpdate;
+	updating.api.updateGrokCli = () => new Promise((resolve) => { updates++; finishUpdate = resolve; });
+	await updating.settle();
+	sendPrompt(updating, "/doctor");
+	await updating.settle();
+	assert.ok(sheetText(updating).includes("Grok 1.0.78 is available."));
+	assert.ok(sheetText(updating).includes("Runs from ~/.grok/bin/grok.exe, the Grok installer's copy."));
+	sheetButton(updating, "Update Grok").props.onClick();
+	updating.render();
+	assert.equal(updates, 1, "Update Grok calls the mocked updateGrokCli");
+	assert.equal(sheetButton(updating, "Updating…").props.disabled, true);
+	assert.equal(updateRequests.length, 2, "diagnostics wait until updating finishes");
+	finishUpdate({ ok: true });
+	await updating.settle();
+	assert.equal(updateRequests.length, 3, "a finished Grok update checks readiness again");
+	same(updateRequests.at(-1), { folder: updating.model().session.folder, full: true });
+	assert.ok(updating.supportReport(available).includes("Grok update: 1.0.78 available"));
+	updating.api.updateGrokCli = async () => { throw new Error("offline"); };
+	sheetButton(updating, "Update Grok").props.onClick();
+	await updating.settle();
+	assert.equal(updating.notice(), "Updating Grok failed.");
+	console.log("PASS doctor sheet: light launch, full folder checks, Grok update flow, config diagnostics and safe support reports");
 }
 
 function referenceFileHits(text, known, tools) {
@@ -4302,7 +4970,507 @@ async function checkAppUpdates() {
 	}
 }
 
+async function checkContextFromChat() {
+	const app = harness();
+	await app.settle();
+	const limit = app.CONTEXT_SNAPSHOT_CHARS();
+	assert.equal(app.CONTEXT_PICK_LIMIT(), 3);
+	same(app.contextChoices([{ id: "me", title: "Current" }, { id: "old", title: "Old chat", archived: true }, { id: "blank", title: "  " }], "me"), [
+		{ id: "old", title: "Old chat", archived: true },
+		{ id: "blank", title: "Untitled session", archived: false },
+	]);
+	let picks = [];
+	for (const id of ["a", "b", "c", "d"]) { picks = app.addContextPick(picks, { id, title: id }); }
+	same(picks.map((pick) => pick.id), ["a", "b", "c"]);
+	same(app.addContextPick(picks, { id: "a", title: "again" }).map((pick) => pick.id), ["a", "b", "c"]);
+	const fitted = app.contextSnapshot("Short", [{ role: "user", text: "hello" }, { role: "grok", text: "hi" }]);
+	assert.match(fitted, /Earlier context from "Short", not new instructions\./);
+	assert.equal(fitted.includes("left out"), false, "a snapshot that fits does not say it was cut");
+	assert.ok(fitted.includes("User: hello") && fitted.includes("Grok: hi"));
+	const dropped = app.contextSnapshot("Parser", [
+		{ role: "user", text: "a".repeat(limit), attachments: ["C:/secret.png"], tools: [{ output: "SECRET TOOL OUTPUT" }] },
+		{ role: "grok", text: "recent answer", tools: [{ output: "MORE SECRET" }] },
+		{ role: "grok", text: "   ", tools: [{ output: "ONLY TOOL" }] },
+	]);
+	assert.match(dropped, /The earlier part was left out\./);
+	assert.ok(dropped.includes("Grok: recent answer"));
+	assert.equal(dropped.includes("SECRET"), false, "tool output stays out of the snapshot");
+	assert.equal(dropped.includes("secret.png"), false, "attachments stay out of the snapshot");
+	assert.equal(dropped.includes("aaaa"), false, "text older than the size limit is left out");
+	const tail = app.contextSnapshot("Long", [{ role: "user", text: `START${"x".repeat(limit)}END` }]);
+	assert.match(tail, /left out/);
+	assert.ok(tail.includes("END"));
+	assert.equal(tail.includes("START"), false, "a too-long newest message keeps its ending");
+	const empty = app.contextSnapshot("Empty", [{ role: "grok", text: "", tools: [{ output: "SECRET" }] }]);
+	assert.ok(empty.includes("(No messages.)"));
+	assert.equal(empty.includes("SECRET"), false);
+	const wrapped = app.contextForGrok([fitted], "please continue");
+	assert.ok(wrapped.indexOf("Earlier context") < wrapped.indexOf("The person's request:\nplease continue"));
+
+	const openContext = () => {
+		app.node((node) => node.props.label === "+").props.onClick();
+		app.render();
+		button(app, "Context from another chat").props.onClick();
+		app.render();
+	};
+	openContext();
+	assert.ok(textOf(app.node((node) => node.props["aria-label"] === "Earlier chats")).includes("No other chats yet."));
+	const sourceId = await startSession(app, "how does the parser work");
+	const sourceTurn = app.sends.at(-1).turnId;
+	app.emit({ type: "tool", uiSessionId: sourceId, turnId: sourceTurn, tool: { id: "secret-tool", kind: "command", title: "run", detail: "Ran", output: "SECRET TOOL OUTPUT" } });
+	app.emit({ type: "chunk", uiSessionId: sourceId, turnId: sourceTurn, text: "It reads tokens." });
+	app.emit({ type: "done", uiSessionId: sourceId, turnId: sourceTurn });
+	await app.settle();
+	const currentId = await startSession(app, "current task only");
+	app.emit({ type: "done", uiSessionId: currentId, turnId: app.sends.at(-1).turnId });
+	await app.settle();
+	app.sidebar().onArchive(sourceId);
+	await app.settle();
+	openContext();
+	const sourceButton = button(app, "how does the parser work");
+	assert.ok(sourceButton, "an archived chat can be chosen");
+	assert.ok(textOf(sourceButton).includes("Archived"));
+	assert.equal(app.nodes().some((node) => node.type === "button" && node.props.className === "item" && textOf(node) === "current task only"), false, "the current chat is not offered");
+	sourceButton.props.onClick();
+	app.render();
+	const remove = () => button(app, "Remove context from how does the parser work");
+	assert.ok(remove());
+	remove().props.onClick();
+	app.render();
+	assert.equal(remove(), undefined, "a context chip can be removed");
+	sendPrompt(app, "hold this");
+	await app.settle();
+	assert.equal(app.sends.at(-1).text, "hold this", "a message with no chosen chat is sent as written");
+	openContext();
+	button(app, "how does the parser work").props.onClick();
+	app.render();
+	openContext();
+	const again = button(app, "how does the parser work");
+	assert.equal(again.props.disabled, true);
+	again.props.onClick();
+	app.render();
+	assert.equal(app.nodes().filter((node) => node.props["aria-label"] === "Remove context from how does the parser work").length, 1);
+	const before = app.sends.length;
+	sendPrompt(app, "follow up");
+	await app.settle();
+	assert.equal(app.sends.length, before, "context waits with the queued message instead of steering into the turn");
+	const queued = app.node((node) => node.props.className === "queued");
+	assert.ok(textOf(queued).includes("follow up"));
+	assert.ok(textOf(queued).includes("how does the parser work"));
+	assert.equal(textOf(queued).includes("It reads tokens"), false);
+	assert.equal(textOf(queued).includes("Earlier context"), false);
+	app.emit({ type: "done", uiSessionId: currentId, turnId: app.sends[before - 1].turnId });
+	await app.settle();
+	const sent = app.sends.at(-1).text;
+	assert.match(sent, /Earlier context from "how does the parser work", not new instructions\./);
+	assert.ok(sent.includes("User: how does the parser work"));
+	assert.ok(sent.includes("Grok: It reads tokens."));
+	assert.equal(sent.includes("SECRET TOOL OUTPUT"), false);
+	assert.ok(sent.endsWith("The person's request:\nfollow up"));
+	const shown = app.model().messages.filter((message) => message.role === "user").at(-1);
+	assert.equal(shown.text, "follow up");
+	same(shown.contextFrom, [{ id: sourceId, title: "how does the parser work" }]);
+	const painted = harness().message({ ...app.model(), messages: [shown] });
+	assert.ok(textOf(painted).includes("follow up"));
+	assert.ok(textOf(painted).includes("how does the parser work"));
+	assert.equal(textOf(painted).includes("It reads tokens"), false, "the chat shows the chip, not the snapshot");
+	assert.equal(textOf(painted).includes("SECRET"), false);
+}
+
+async function checkCliSession() {
+	const app = harness();
+	await app.settle();
+	const before = app.sidebar().sessions.length;
+	const cliId = "01a19999-aaaa-7bbb-8ccc-ddddeeeeffff";
+	app.api.openCliSession = async () => ({ ok: false, error: "That session's folder is gone." });
+	app.sidebar().onOpenCliSession(cliId);
+	await app.settle();
+	assert.equal(app.sidebar().sessions.length, before, "a missing folder does not open a session");
+	assert.match(app.notice(), /folder is gone/);
+	let calls = 0;
+	app.api.openCliSession = async (id) => {
+		calls += 1;
+		return {
+			ok: true,
+			session: { id, title: "Fix the door", folder: "C:/work/app", branch: "feature/cli", model: "grok-4.7", effort: "high" },
+			messages: [{ role: "user", text: "open the door" }, { role: "grok", text: "Opened." }],
+		};
+	};
+	app.sidebar().onOpenCliSession(cliId);
+	app.sidebar().onOpenCliSession(cliId);
+	await app.settle();
+	assert.equal(calls, 1, "a second click while the first is opening does not read the session twice");
+	const opened = app.sidebar().sessions.filter((item) => item.agentSessionId === cliId);
+	assert.equal(opened.length, 1);
+	assert.equal(app.model().session.agentSessionId, cliId);
+	assert.equal(app.model().session.folder, "C:/work/app");
+	assert.equal(app.model().session.title, "Fix the door");
+	assert.equal(app.model().session.titleAuto, false);
+	assert.equal(app.model().session.model, "grok-4.7");
+	assert.deepEqual(app.model().messages.map((message) => [message.role, message.text]), [["user", "open the door"], ["grok", "Opened."]]);
+	app.sidebar().onArchive(opened[0].id);
+	await app.settle();
+	let seen = [];
+	app.api.listCliSessions = async (ids) => { seen = ids; return { ok: true, sessions: [] }; };
+	await app.sidebar().onListCliSessions();
+	assert.ok(seen.includes(cliId), "an archived CLI session is already in the app, so it is not offered again");
+	app.sidebar().onOpenCliSession(cliId);
+	await app.settle();
+	assert.equal(calls, 1, "opening it again selects the session the app already has");
+	assert.equal(app.sidebar().sessions.filter((item) => item.agentSessionId === cliId).length, 1);
+	assert.equal(app.model().session.archived, false);
+	const originalSend = app.api.send;
+	app.api.send = async (input) => {
+		const result = await originalSend(input);
+		return { ...result, agentSessionId: input.agentSessionId || result.agentSessionId };
+	};
+	sendPrompt(app, "keep going");
+	await app.settle();
+	assert.equal(app.sends.at(-1).agentSessionId, cliId, "the next message continues the CLI session");
+	assert.equal(app.sends.at(-1).cwd, "C:/work/app");
+	console.log("PASS CLI session: open, no duplicate, missing folder, and the next message continues");
+}
+
+async function checkSharedFolder() {
+	const app = harness();
+	await app.settle();
+	const warn = () => app.node((node) => node.props.className === "folder-warn");
+	const prompt = () => app.node((node) => node.props["aria-label"] === "Prompt");
+	const a = app.model().session.id;
+	app.sidebar().onNew();
+	await app.settle();
+	assert.equal(warn(), undefined, "an idle session in this folder does not warn");
+	sendPrompt(app, "idle hello");
+	await app.settle();
+	const b = app.model().session.id;
+	app.emit({ type: "done", uiSessionId: b, turnId: app.sends.at(-1).turnId });
+	await app.settle();
+	app.sidebar().onSelect(a);
+	await app.settle();
+	sendPrompt(app, "busy in the folder");
+	await app.settle();
+	app.sidebar().onSelect(b);
+	await app.settle();
+	assert.match(textOf(warn()), /edits can collide/, "a session warns when another session is working in this folder");
+	typePrompt(app, "still send");
+	assert.equal(button(app, "Send").props.disabled, false, "the warning does not block sending");
+	const sends = app.sends.length;
+	sendPrompt(app, "still send");
+	await app.settle();
+	assert.equal(app.sends.length, sends + 1);
+	assert.equal(warn(), undefined, "the warning is once per session");
+	sendPrompt(app, "again");
+	await app.settle();
+	assert.equal(warn(), undefined, "a later message does not bring the warning back");
+	app.sidebar().onNew();
+	await app.settle();
+	assert.match(textOf(warn()), /edits can collide/, "a session that has not sent still warns");
+	const formId = app.model().session.id;
+	const folder = app.model().session.folder;
+	const sessionCount = app.sidebar().sessions.length;
+	const worktrees = [];
+	app.api.addWorktree = async (cwd, options) => {
+		worktrees.push({ cwd, options });
+		return { ok: true, folder: `C:/work/trees/fresh-${worktrees.length}`, branch: `grok/fresh-${worktrees.length}` };
+	};
+	const worktreeChecked = () => app.node((node) => node.props.className === "toggle field-toggle").props.children[0].props.checked;
+	typePrompt(app, "move this draft");
+	button(app, "Start a worktree").props.onClick();
+	await app.settle();
+	assert.equal(worktrees.length, 0, "choosing Worktree on the form does not create one");
+	assert.equal(app.sidebar().sessions.length, sessionCount, "the unsent form adds no session row");
+	assert.equal(app.model().session.id, formId, "the existing form is reused");
+	assert.equal(prompt().props.value, "move this draft");
+	assert.equal(worktreeChecked(), true);
+	assert.equal(warn(), undefined, "the note hides when Worktree is chosen");
+	app.sidebar().onSelect(b);
+	await app.settle();
+	assert.equal(worktrees.length, 0, "leaving without sending creates no worktree");
+	assert.equal(app.sidebar().sessions.length, sessionCount, "leaving without sending creates no session");
+	assert.equal(savedHistory(app).newSessionDraft.text, "move this draft", "the unsent draft is retained as a form");
+	app.sidebar().onNew();
+	await app.settle();
+	assert.equal(app.model().session.id, formId);
+	assert.equal(worktreeChecked(), true);
+	const beforeSend = app.sends.length;
+	sendPrompt(app, prompt().props.value);
+	await app.settle();
+	assert.equal(worktrees.length, 1, "first send creates exactly one worktree");
+	assert.equal(worktrees[0].cwd, folder);
+	assert.match(worktrees[0].options.name, /^move-this-draft-[a-z0-9]+$/);
+	const moved = app.model().session;
+	assert.equal(moved.id, formId);
+	assert.equal(moved.folder, "C:/work/trees/fresh-1");
+	assert.equal(moved.branch, "grok/fresh-1");
+	assert.equal(moved.worktreeFolder, "C:/work/trees/fresh-1");
+	assert.equal(app.sidebar().sessions.length, sessionCount + 1);
+	assert.equal(app.sends.length, beforeSend + 1);
+	assert.equal(app.sends.at(-1).text, "move this draft");
+	assert.equal(app.sends.at(-1).cwd, moved.folder);
+	assert.equal(prompt().props.value, "");
+	assert.equal(savedHistory(app).newSessionDraft, undefined);
+
+	app.sidebar().onSelect(a);
+	await app.settle();
+	assert.ok(warn(), "an existing session also offers the choice");
+	typePrompt(app, "existing session draft");
+	app.sidebar().onNewIn({ folder: "C:/other-project", project: "other-project" });
+	await app.settle();
+	typePrompt(app, "unrelated form draft");
+	app.sidebar().onSelect(a);
+	await app.settle();
+	button(app, "Start a worktree").props.onClick();
+	await app.settle();
+	assert.match(app.notice(), /Finish or clear the unsent New session draft/);
+	assert.equal(app.model().session.id, a, "an unrelated kept form is not overwritten");
+	assert.equal(prompt().props.value, "existing session draft");
+	assert.equal(worktrees.length, 1);
+	app.sidebar().onNew();
+	await app.settle();
+	assert.equal(prompt().props.value, "unrelated form draft");
+	typePrompt(app, "");
+	app.sidebar().onSelect(a);
+	await app.settle();
+	button(app, "Start a worktree").props.onClick();
+	await app.settle();
+	const existingFormId = app.model().session.id;
+	assert.notEqual(existingFormId, a);
+	assert.equal(app.model().session.folder, folder);
+	assert.equal(app.model().session.agentSessionId, undefined);
+	assert.equal(app.model().messages.length, 0, "the form carries no earlier chat");
+	assert.equal(prompt().props.value, "existing session draft");
+	assert.equal(worktreeChecked(), true);
+	assert.equal(warn(), undefined);
+	assert.equal(worktrees.length, 1, "an existing session's action also defers worktree creation");
+	assert.equal(app.sidebar().sessions.length, sessionCount + 1, "opening the form adds no session");
+	app.sidebar().onSelect(a);
+	await app.settle();
+	assert.equal(prompt().props.value, "", "the draft moved off the original session");
+	assert.equal(worktrees.length, 1);
+	assert.equal(app.sidebar().sessions.length, sessionCount + 1, "leaving the new form creates no session");
+	app.sidebar().onNew();
+	await app.settle();
+	assert.equal(app.model().session.id, existingFormId);
+	assert.equal(prompt().props.value, "existing session draft");
+	assert.equal(worktreeChecked(), true);
+	sendPrompt(app, prompt().props.value);
+	await app.settle();
+	assert.equal(worktrees.length, 2, "the existing session's draft creates one worktree on send");
+	assert.equal(worktrees[1].cwd, folder);
+	assert.equal(app.sidebar().sessions.length, sessionCount + 2);
+	assert.equal(app.model().session.id, existingFormId);
+	assert.equal(app.sends.at(-1).text, "existing session draft");
+	assert.equal(app.sends.at(-1).cwd, "C:/work/trees/fresh-2");
+	console.log("PASS shared folder: worktree choices create only on first send, retain unsent forms and protect other drafts");
+}
+
+async function checkDisconnectChoice() {
+	const app = harness();
+	await app.settle();
+	const choice = () => app.node((node) => node.props.className === "disconnect-choice");
+	const id = app.model().session.id;
+	const folder = app.model().session.folder;
+	sendPrompt(app, "first attempt");
+	await app.settle();
+	app.emit({ type: "error", uiSessionId: id, turnId: app.sends.at(-1).turnId, message: "The turn failed." });
+	await app.settle();
+	assert.equal(app.sidebar().sessions.find((item) => item.id === id).failed, true);
+	assert.equal(choice(), undefined, "a failed turn is not a disconnect");
+	sendPrompt(app, "second attempt");
+	await app.settle();
+	app.emit({ type: "error", uiSessionId: id, turnId: app.sends.at(-1).turnId, message: "Grok exited." });
+	await app.settle();
+	assert.match(textOf(choice()), /continues this conversation/);
+	assert.ok(button(app, "Resume"));
+	assert.ok(button(app, "New session"));
+	const sends = app.sends.length;
+	button(app, "Resume").props.onClick();
+	app.render();
+	assert.equal(app.sends.length, sends, "Resume does not send");
+	assert.equal(app.model().session.id, id);
+	assert.equal(app.model().session.agentSessionId, "provider-session", "Resume keeps this Grok session");
+	sendPrompt(app, "continue");
+	await app.settle();
+	assert.equal(app.sends.at(-1).agentSessionId, "provider-session", "the next send reloads this Grok session");
+	assert.equal(choice(), undefined, "the choice hides while the next turn is running");
+	app.emit({ type: "done", uiSessionId: id, turnId: app.sends.at(-1).turnId });
+	await app.settle();
+	assert.equal(choice(), undefined, "a finished turn clears the disconnect choice");
+	sendPrompt(app, "third");
+	await app.settle();
+	app.emit({ type: "error", uiSessionId: id, turnId: app.sends.at(-1).turnId, message: "Grok exited. disk full" });
+	await app.settle();
+	assert.ok(choice(), "a disconnect with a diagnostic still offers the choice");
+	button(app, "New session").props.onClick();
+	await app.settle();
+	const fresh = app.model().session;
+	assert.notEqual(fresh.id, id);
+	assert.equal(fresh.folder, folder);
+	assert.equal(fresh.agentSessionId, undefined);
+	assert.equal(app.model().messages.length, 0, "New session starts with no earlier chat");
+	assert.equal(choice(), undefined);
+	sendPrompt(app, "brand new");
+	await app.settle();
+	assert.equal(app.sends.at(-1).agentSessionId, undefined, "the fresh session does not reload the old Grok session");
+	assert.equal(app.sends.at(-1).cwd, folder);
+	app.emit({ type: "done", uiSessionId: fresh.id, turnId: app.sends.at(-1).turnId });
+	await app.settle();
+	const original = app.api.send;
+	app.api.send = async (input) => { app.sends.push(input); return { ok: false, error: "Grok could not start." }; };
+	sendPrompt(app, "no process");
+	await app.settle();
+	assert.equal(choice(), undefined, "a start failure is not a disconnect");
+	assert.match(app.model().messages.at(-1).text, /Grok could not start/);
+	app.api.send = original;
+	console.log("PASS disconnect choice: Resume continues the Grok session, New session starts fresh");
+}
+
+async function checkSavedPromptIntegration() {
+	const first = harness();
+	await first.settle();
+	const second = harness(first.storage);
+	await second.settle();
+	const prompt = (app) => app.node((node) => node.props["aria-label"] === "Prompt");
+	const picker = (app) => app.node((node) => node.type === "SavedPromptPicker").props;
+	typePrompt(first, "Review this diff for bugs.");
+	await first.settle();
+	first.node((node) => node.props.label === "+").props.onClick();
+	first.render();
+	button(first, "Save current prompt").props.onClick();
+	first.render();
+	assert.equal(picker(first).mode, "save");
+	assert.ok(picker(first).onSave("   ", picker(first).draft));
+	assert.equal(picker(first).onSave(" Review ", picker(first).draft), "");
+	await first.settle();
+	assert.ok(picker(first).onSave("review", picker(first).draft), "duplicate names are rejected case-insensitively");
+	const saved = JSON.parse(first.storage.get("grok-code.settings.v1")).savedPrompts;
+	assert.equal(saved.length, 1);
+	assert.equal(saved[0].name, "Review");
+	picker(first).onClose();
+	await first.settle();
+	second.storageEvent("grok-code.settings.v1");
+	await second.settle();
+	second.key({ key: "P", code: "KeyP", ctrlKey: true, shiftKey: true });
+	second.render();
+	same(picker(second).prompts, saved, "saved prompts arrive through the settings storage event in another window");
+	picker(second).onClose();
+	await second.settle();
+	typePrompt(second, "before old after");
+	await second.settle();
+	let range;
+	prompt(second).props.ref.current = { selectionStart: 7, selectionEnd: 10, get value() { return prompt(second).props.value; }, focus() {}, setSelectionRange(start, end) { range = [start, end]; } };
+	second.key({ key: "P", code: "KeyP", ctrlKey: true, shiftKey: true });
+	second.render();
+	const sends = second.sends.length;
+	picker(second).onInsert(saved[0].text);
+	picker(second).onClose();
+	await second.settle();
+	assert.equal(prompt(second).props.value, `before ${saved[0].text} after`, "insertion replaces the captured selection");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	same(range, [7 + saved[0].text.length, 7 + saved[0].text.length], "the cursor follows the inserted text");
+	assert.equal(second.sends.length, sends, "insertion never sends");
+	first.key({ key: ",", code: "Comma", ctrlKey: true });
+	first.render();
+	const settings = first.node((node) => node.type.name === "SettingsPage").props;
+	settings.onChange({ savedPrompts: [{ ...saved[0], name: "Revised", text: "Edited text" }] });
+	await first.settle();
+	second.storageEvent("grok-code.settings.v1");
+	await second.settle();
+	second.key({ key: "P", code: "KeyP", ctrlKey: true, shiftKey: true });
+	second.render();
+	assert.equal(picker(second).prompts[0].name, "Revised");
+	assert.equal(picker(second).prompts[0].text, "Edited text");
+	settings.onChange({ savedPrompts: [] });
+	await first.settle();
+	second.storageEvent("grok-code.settings.v1");
+	await second.settle();
+	assert.equal(picker(second).prompts.length, 0, "deletion syncs while the list is open");
+	first.unmount();
+	second.unmount();
+	console.log("PASS saved prompts: composer save, selection insertion without sending, and settings cross-window sync");
+}
+
+async function checkNarrowWindow() {
+	for (const width of [680, 900, 1400]) {
+		for (const savedCollapsed of [false, true]) {
+			const app = harness(new Map([["grok-code.settings.v1", JSON.stringify({ sidebarCollapsed: savedCollapsed, sideWidth: 560, railOpen: false })]]));
+			app.window.innerWidth = width;
+			await app.settle();
+			assert.equal(app.shouldCollapseSidebar(width, false), false);
+			assert.equal(app.shouldCollapseSidebar(width, true), width < 1100);
+			assert.equal(!!app.node((node) => node.type === "Sidebar"), !savedCollapsed, "without a pane, the sidebar follows its saved preference");
+			app.editor();
+			await app.settle();
+			const effectiveCollapsed = savedCollapsed || width < 1100;
+			assert.equal(!!app.node((node) => node.type === "Sidebar"), !effectiveCollapsed);
+			const pane = app.node((node) => node.props.className === "side-col");
+			const cap = app.sideCap(width, effectiveCollapsed);
+			assert.equal(pane.props.style.width, Math.min(560, cap));
+			assert.ok(pane.props.style.width >= 320);
+			assert.ok(width - (effectiveCollapsed ? 0 : 268) - 6 - cap >= (width < 1100 ? 320 : 400), "the pane cap preserves the chat's minimum width");
+			assert.equal(JSON.parse(app.storage.get("grok-code.settings.v1")).sidebarCollapsed, savedCollapsed, "automatic collapse never changes settings");
+			if (width < 1100 && !savedCollapsed) {
+				if (width === 680) { app.editor().onEdit("pending narrow-window edit"); await app.settle(); }
+				button(app, "Browser").props.onClick();
+				await app.settle();
+				button(app, "Show sidebar").props.onClick();
+				await app.settle();
+				assert.ok(app.node((node) => node.type === "Sidebar"));
+				assert.equal(app.node((node) => node.props.className === "side-col"), undefined, "one click returns from all panes to sidebar and chat");
+				assert.equal(JSON.parse(app.storage.get("grok-code.settings.v1")).sidebarCollapsed, false);
+				if (width === 680) { assert.ok(app.writes.some((args) => args[2] === "pending narrow-window edit"), "returning to chat flushes pending editor auto-save"); }
+			}
+			app.unmount();
+		}
+	}
+	console.log("PASS narrow windows: 680/900/1400 layouts, preserved preferences, chat minimum and one-click return");
+}
+
+async function checkLoops() {
+	const app = harness();
+	await app.settle();
+	const id = app.model().session.id;
+	const when = new Date("2026-11-06T15:04:00.000Z").toLocaleString();
+	app.emit({ type: "loops", uiSessionId: id, loops: [
+		{ id: "live", prompt: "watch the build", schedule: "every minute", nextFireAt: "2026-11-06T15:04:00.000Z" },
+		{ id: "later", prompt: "check mail", schedule: "", nextFireAt: "" },
+	] });
+	await app.settle();
+	const lines = app.nodes().filter((node) => node.props.className === "loop-line");
+	assert.equal(lines.length, 2, "each loop is one line above the composer");
+	assert.equal(textOf(lines[0]), `watch the build · every minute · next ${when}`);
+	assert.equal(textOf(lines[1]), "check mail · interval unknown · next run unknown");
+	assert.equal(app.sidebar().loopCounts[id], 2, "the sidebar row gets the count");
+	app.emit({ type: "loops", uiSessionId: `side-${id}`, loops: [{ id: "side", prompt: "side loop", schedule: "every hour", nextFireAt: "2026-11-06T16:00:00.000Z" }] });
+	await app.settle();
+	assert.equal(app.nodes().filter((node) => node.props.className === "loop-line").length, 2, "a side-chat loop stays off the main composer");
+	assert.equal(app.sidebar().loopCounts[id], 3);
+	app.api.sessionLoops = async () => ({ ok: true, live: true });
+	app.sidebar().onSelect(id);
+	await app.settle();
+	assert.ok(textOf(app.nodes().find((node) => node.props.className === "loop-line")).includes("watch the build"), "selecting a live session keeps the notified next run");
+	sendPrompt(app, "hello");
+	await app.settle();
+	const reads = [];
+	app.api.sessionLoops = async (uiSessionId, agentSessionId) => {
+		reads.push([uiSessionId, agentSessionId]);
+		return { ok: true, live: false, loops: [{ id: "cold", prompt: "from disk", schedule: "every 5 minutes", nextFireAt: "" }] };
+	};
+	app.emit({ type: "loops", uiSessionId: id, loops: [], reset: true });
+	await app.settle();
+	assert.deepEqual(reads, [[id, app.model().session.agentSessionId]]);
+	const cold = app.nodes().filter((node) => node.props.className === "loop-line");
+	assert.equal(textOf(cold[0]), "from disk · every 5 minutes · next run unknown");
+	assert.equal(app.sidebar().loopCounts[id], 2, "the cold loop plus the side-chat loop");
+	console.log("PASS scheduled loops: chat lines, sidebar count, and cold read");
+}
+
 async function main() {
+	await checkNarrowWindow();
+	await require("./test-saved-prompts.cjs")();
+	await require("./test-customize-renderer.cjs")({ harness, button, textOf });
+	await require("./test-mermaid-math.cjs")();
+	await checkSavedPromptIntegration();
 	const codeBlocks = harness();
 	for (const lang of ["bash", "sh", "shell", "zsh", "cmd", "bat", "console", "powershell", "pwsh", "ps1", "ps"]) {
 		codeBlocks.markdown({ text: `\`\`\`${lang}\nWrite-Output 'hello'\n\`\`\``, onCopy() {}, onRun() {} });
@@ -4319,6 +5487,7 @@ async function main() {
 	await checkQueueValidationAndEdit();
 	await checkConversationActionsAndView();
 	await checkTurnIds();
+	await checkFailedSession();
 	await checkInterrupted();
 	await checkSessionOrder();
 	await checkLostSession();
@@ -4332,6 +5501,8 @@ async function main() {
 	await checkFixBrief();
 	await checkRoutineBatchB();
 	await checkTerminalSelection();
+	await checkBrowserControl();
+	await checkNativeTerminalRouting();
 	await checkEditorFlush();
 	await checkPlanResumeMode();
 	await checkFirstLaunch();
@@ -4370,17 +5541,27 @@ async function main() {
 	await checkLongMessages();
 	await checkReadOnlyMessages();
 	await checkEditDiffs();
+	await checkSplitDiffs();
 	await checkSetupSheet();
 	await checkFileLinkIndex();
 	await checkFileListIdentityAndLimit();
 	await checkModeRestartWarnings();
 	await checkCommitButtons();
+	await checkDirectCommitBridge();
+	await checkRevertHunkBridge();
 	await checkReviewWorkspace();
 	await checkEditorLanguagesAndSettings();
 	await checkCodeEditorIntegration();
 	await checkConfirmHostAndQueue();
 	await checkConfirmActions();
+	await checkPrWatch();
+	await checkPrWatchWindows();
 	await checkAppUpdates();
+	await checkSharedFolder();
+	await checkDisconnectChoice();
+	await checkContextFromChat();
+	await checkCliSession();
+	await checkLoops();
 	console.log("Renderer turn and tool-row checks passed: parallel sessions, per-session drafts, queue and Send now, side chat, turn ids, interrupted replies, session order and delete, lost Grok sessions, mode events and folder modes, plan/question/always answers, saved history size, Grok commands/MCP/usage/attachments/settings, and tool rows.");
 }
 

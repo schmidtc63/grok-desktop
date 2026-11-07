@@ -23,10 +23,15 @@ const react = {
 	useMemo(fn) { return fn(); },
 	useEffect(run, dependencies) {
 		if (!hooks) { return; }
-		const index = hooks.cursor++;
-		const previous = hooks.values[index];
-		if (!previous || !dependencies || dependencies.some((value, offset) => value !== previous[offset])) { hooks.effects.push(run); }
-		hooks.values[index] = dependencies;
+		const current = hooks;
+		const index = current.cursor++;
+		const previous = current.values[index];
+		if (!previous || !dependencies || dependencies.some((value, offset) => value !== previous.dependencies[offset])) {
+			current.effects.push(() => {
+				previous?.cleanup?.();
+				current.values[index] = { dependencies, cleanup: run() };
+			});
+		}
 	},
 };
 const jsx = (type, props) => ({ type, props: props ?? {} });
@@ -179,7 +184,7 @@ const diffProps = {
 	viewed: {}, onViewed() {},
 	snapshot: { ok: true, files: [{ path: "src/a.ts", additions: 2, deletions: 1, hunks: [hunk] }] },
 	scope: "branch", onScope: noop, commits: [{ sha: "abc123", short: "abc123", subject: "Fix" }],
-	selectedFile: "src/a.ts", onSelectFile: noop, onRefresh: noop, onRevert: asyncOk,
+	selectedFile: "src/a.ts", onSelectFile: noop, onRefresh: noop, onRevert: asyncOk, onRevertHunk: asyncOk, onCommit: asyncOk, busy: false,
 	comments: [{ id: "c1", file: "src/a.ts", line: 11, side: "new", text: "Why?" }],
 	onAddComment: noop, onRemoveComment: noop, onSendComments: noop,
 	branch: { branch: "feature", base: "main", ahead: 2 }, pr: null,
@@ -208,6 +213,21 @@ check("Revert is available only in Uncommitted changes", () => {
 		const item = render().elements.find((node) => node.props.role === "menuitem" && node.props.children === "Revert file…");
 		assert.equal(item.props.disabled, scope !== "uncommitted");
 		assert.equal(item.props.title, scope !== "uncommitted" ? "Switch to Uncommitted changes to revert a file" : undefined);
+	}
+});
+
+check("Hunk revert appears only for eligible working-tree changes in Uncommitted scope", () => {
+	const hunks = [
+		{ ...hunk, revertible: true },
+		{ ...hunk, id: "staged", loc: `Staged ${hunk.loc}`, revertible: false },
+		{ ...hunk, id: "new", loc: "New file", revertible: false },
+		{ ...hunk, id: "binary", loc: "Binary file", revertible: false },
+		{ ...hunk, id: "submodule", loc: "Submodule", revertible: false },
+		{ ...hunk, id: "legacy" },
+	];
+	for (const scope of ["uncommitted", "branch", "abc123"]) {
+		const tree = flatten(DiffPane({ ...diffProps, scope, snapshot: { ok: true, files: [{ path: "src/a.ts", hunks }] } }));
+		assert.equal(tree.elements.filter((el) => el.type === "button" && el.props.children === "Revert this change").length, scope === "uncommitted" ? 1 : 0);
 	}
 });
 
@@ -246,25 +266,82 @@ const pickProps = { ...diffProps, scope: "uncommitted", comments: [], snapshot: 
 const pickBoxes = (tree) => tree.elements.filter((el) => /^Include .+ in the commit$/.test(el.props["aria-label"] ?? ""));
 const pickBox = (tree, file) => pickBoxes(tree).find((el) => el.props["aria-label"] === `Include ${file} in the commit`);
 const commitButton = (tree, label) => tree.elements.find((el) => el.type === "button" && el.props.children === label);
+const commitModal = (tree) => tree.elements.find((el) => el.props.role === "dialog");
+const modalTree = (tree) => flatten(commitModal(tree));
+const modalButton = (tree, label) => commitButton(modalTree(tree), label);
 
-// Renders the Changes pane over props, answers every confirm question yes, and records the questions and the requests sent to Grok.
 function commitRig(props) {
-	const confirms = load("confirm.ts");
 	const asks = [];
 	const requests = [];
-	confirms.setConfirmHost((pending) => { asks.push(JSON.parse(JSON.stringify(pending))); pending.resolve(true); });
-	const shown = { ...props, onAskGrok: (text) => requests.push(text) };
-	const render = renderer(load("DiffPane.tsx", {}, confirms).DiffPane, shown);
+	const commits = [];
+	let refreshes = 0;
+	const shown = { ...props, onAskGrok: (text) => requests.push(text), onCommit: (input) => { commits.push(JSON.parse(JSON.stringify(input))); return props.onCommit(input); }, onRefresh: () => { refreshes++; props.onRefresh(); } };
+	const render = renderer(DiffPane, shown);
+	const open = (label) => {
+		commitButton(render(), label).props.onClick();
+		asks.push({ title: commitModal(render()).props["aria-label"] });
+	};
 	return {
-		props: shown, render, asks, requests,
+		props: shown, render, asks, requests, commits, open,
+		refreshes: () => refreshes,
+		message: (text) => modalTree(render()).elements.find((el) => el.props["aria-label"] === "Commit message").props.onChange({ target: { value: text } }),
 		toggle: (file) => pickBox(render(), file).props.onChange(),
 		async press(label) {
-			commitButton(render(), label).props.onClick();
+			open(label);
+			modalButton(render(), "Ask Grok to commit").props.onClick();
 			await new Promise((resolve) => setImmediate(resolve));
 			return { ask: asks.at(-1), request: requests.at(-1) };
 		},
 	};
 }
+
+function hunkRig(change, reply = asyncOk) {
+	const confirms = load("confirm.ts");
+	const asks = [];
+	const calls = [];
+	let refreshes = 0;
+	confirms.setConfirmHost((pending) => asks.push(pending));
+	const props = {
+		...diffProps, scope: "uncommitted", comments: [],
+		snapshot: { ok: true, files: [{ path: "src/a.ts", hunks: [change] }] },
+		onRevertHunk: (file, selected) => { calls.push([file, selected]); return reply(); },
+		onRefresh: () => { refreshes++; },
+	};
+	const render = renderer(load("DiffPane.tsx", {}, confirms).DiffPane, props);
+	return { props, render, asks, calls, refreshes: () => refreshes, press: () => commitButton(render(), "Revert this change").props.onClick() };
+}
+
+check("Commit dialog names the count, focuses the message and keeps Ask Grok available while busy", () => {
+	const rig = commitRig(pickProps);
+	for (const label of ["Commit", "Commit and push"]) {
+		rig.open(label);
+		const tree = rig.render();
+		const modal = commitModal(tree);
+		assert.equal(modal.props["aria-modal"], "true");
+		assert.equal(modal.props["aria-label"], `Commit 3 files${label === "Commit and push" ? " and push" : ""}?`);
+		assert.ok(modalTree(tree).text.join("").includes("Only the checked files listed in the pane will be committed. Other changes stay uncommitted."));
+		const field = modalTree(tree).elements.find((el) => el.props["aria-label"] === "Commit message");
+		assert.equal(field.type, "textarea");
+		assert.equal(field.props.value, "");
+		assert.equal(field.props.autoFocus, true);
+		assert.equal(modalButton(tree, label).props.disabled, true);
+		assert.equal(modalButton(tree, label).props.className.includes("danger"), label === "Commit and push");
+		assert.deepEqual(modalTree(tree).elements.filter((el) => el.type === "button").map((el) => el.props.children), ["Cancel", "Ask Grok to commit", label]);
+		rig.message(" \n\t ");
+		assert.equal(modalButton(rig.render(), label).props.disabled, true);
+		rig.message("Use the direct route");
+		assert.equal(modalButton(rig.render(), label).props.disabled, false);
+		rig.props.busy = true;
+		assert.equal(modalButton(rig.render(), label).props.disabled, true);
+		assert.equal(modalButton(rig.render(), "Ask Grok to commit").props.disabled, false);
+		assert.ok(modalTree(rig.render()).text.join("").includes("Grok is still working. Wait for the turn to end, or ask Grok to commit."));
+		modalButton(rig.render(), "Ask Grok to commit").props.onClick();
+		assert.equal(commitModal(rig.render()), undefined);
+		rig.props.busy = false;
+	}
+	assert.equal(rig.requests.length, 2);
+	assert.deepEqual(rig.commits, []);
+});
 
 check("File checkboxes appear only where the commit buttons appear, all checked", () => {
 	const tree = flatten(DiffPane(pickProps));
@@ -441,7 +518,132 @@ check("FilesPane previews Markdown drafts and switches to Source for edits and l
 	assert.ok(!tree.elements.some((node) => node.type === "markdown"));
 });
 
+function previewProps(file) {
+	return {
+		files: { status: "ready", files: [file] }, file, docKey: JSON.stringify(["session", "C:/repo", file]), fileTypes: {}, onSelectFile: noop, lineTick: 0,
+		open: { status: "ready", text: "on disk", version: "v1" },
+		draft: undefined, readOnly: false, autoSave: false, onAutoSave: noop, onEdit: noop, onSave: noop, onCancel: noop,
+		conflict: false, onOverride: noop, onDiscard: noop, onClearRecovery: noop, onFileMenu: noop, onLink: noop, onClose: noop,
+	};
+}
+
+check("FilesPane previews the current SVG draft as an image and offers Edit", () => {
+	const props = previewProps("drawing.svg");
+	props.draft = { text: '<svg xmlns="http://www.w3.org/2000/svg"><text>draft & text</text></svg>', baseText: "on disk", version: "v1" };
+	const render = renderer(FilesPane, props);
+	let tree = render();
+	const img = tree.elements.find((node) => node.type === "img");
+	assert.equal(img.props.src, `data:image/svg+xml;charset=utf-8,${encodeURIComponent(props.draft.text)}`);
+	assert.equal(img.props.alt, props.file);
+	tree.elements.find((node) => node.props.children === "Edit").props.onClick();
+	tree = render();
+	assert.equal(tree.elements.find((node) => node.type === "code-editor").props.value, props.draft.text);
+	assert.ok(!tree.elements.some((node) => node.type === "img"));
+});
+
+check("FilesPane opens HTML in the editor and previews its draft in a restricted iframe", () => {
+	for (const file of ["index.html", "index.htm"]) {
+		const props = previewProps(file);
+		props.draft = { text: '<html><script>alert(1)</script><p>draft</p></html>', baseText: "on disk", version: "v1" };
+		const render = renderer(FilesPane, props);
+		let tree = render();
+		assert.ok(tree.elements.some((node) => node.type === "code-editor"));
+		assert.ok(!tree.elements.some((node) => node.type === "iframe"));
+		tree.elements.find((node) => node.props.children === "Preview").props.onClick();
+		tree = render();
+		const iframe = tree.elements.find((node) => node.type === "iframe");
+		assert.equal(iframe.props.title, file);
+		assert.equal(iframe.props.sandbox, "");
+		assert.equal(iframe.props.srcDoc, `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:">${props.draft.text}`);
+		assert.ok(tree.text.join("").includes("Scripts are off, and the page loads nothing from the network or from other files."));
+		Object.assign(props, previewProps("other.html"));
+		assert.ok(!render().elements.some((node) => node.type === "iframe"), "another HTML file starts in the editor immediately");
+	}
+});
+
+check("FilesPane offers default apps only for allowlisted binary documents and media", () => {
+	for (const extension of ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "mp3", "wav", "mp4", "mov", "webm", "exe", "bat", "cmd", "ps1", "vbs", "js", "lnk"]) {
+		const props = previewProps(`file.${extension}`);
+		props.open = { status: "ready", binary: true };
+		const tree = flatten(FilesPane(props));
+		const allowed = !["exe", "bat", "cmd", "ps1", "vbs", "js", "lnk"].includes(extension);
+		assert.equal(tree.elements.some((node) => node.props.children === "Open in default app"), allowed, extension);
+	}
+});
+
 async function main() {
+	await checkAsync("FilesPane loads images, shows dimensions and bytes, and reloads a changed version", async () => {
+		const calls = [];
+		const dataUrl = "data:image/png;base64,cG5n";
+		const { FilesPane: ImagePane } = load("FilesPane.tsx", { window: { grokCode: { readImage: async (...args) => { calls.push(args); return { ok: true, dataUrl, bytes: 68 }; } } } });
+		const props = previewProps("picture.PNG");
+		props.open = { status: "ready", binary: true, version: "v1" };
+		const render = renderer(ImagePane, props);
+		render();
+		await Promise.resolve();
+		let tree = render();
+		assert.deepEqual(calls, [["C:/repo", "picture.PNG"]]);
+		const img = tree.elements.find((node) => node.type === "img");
+		assert.equal(img.props.src, dataUrl);
+		img.props.onLoad({ currentTarget: { naturalWidth: 1200, naturalHeight: 800 } });
+		assert.ok(render().text.join("").includes("1200 × 800 · 68 bytes"));
+		props.open = { ...props.open, version: "v2" };
+		tree = render();
+		assert.ok(!tree.elements.some((node) => node.type === "img"), "the old image is hidden while the changed version loads");
+		await Promise.resolve();
+		assert.equal(render().elements.find((node) => node.type === "img").props.src, dataUrl);
+		assert.equal(calls.length, 2);
+	});
+
+	await checkAsync("FilesPane ignores an image result after another file is selected", async () => {
+		const pending = new Map();
+		const { FilesPane: ImagePane } = load("FilesPane.tsx", { window: { grokCode: { readImage: (_cwd, file) => new Promise((resolve) => pending.set(file, resolve)) } } });
+		const props = previewProps("first.png");
+		props.open = { status: "ready", binary: true, version: "v1" };
+		const render = renderer(ImagePane, props);
+		render();
+		Object.assign(props, previewProps("second.png"), { open: { status: "ready", binary: true, version: "v1" } });
+		render();
+		pending.get("second.png")({ ok: true, dataUrl: "data:image/png;base64,c2Vjb25k", bytes: 6 });
+		await Promise.resolve();
+		assert.equal(render().elements.find((node) => node.type === "img").props.src, "data:image/png;base64,c2Vjb25k");
+		pending.get("first.png")({ ok: true, dataUrl: "data:image/png;base64,Zmlyc3Q=", bytes: 5 });
+		await Promise.resolve();
+		assert.equal(render().elements.find((node) => node.type === "img").props.src, "data:image/png;base64,c2Vjb25k");
+	});
+
+	await checkAsync("FilesPane shows image read and decode errors in a note", async () => {
+		let result = { ok: false, error: "That image is too large to show here." };
+		const { FilesPane: ImagePane } = load("FilesPane.tsx", { window: { grokCode: { readImage: async () => result } } });
+		const props = previewProps("broken.png");
+		props.open = { status: "ready", binary: true, version: "v1" };
+		const render = renderer(ImagePane, props);
+		render();
+		await Promise.resolve();
+		assert.ok(render().text.join("").includes(result.error));
+		result = { ok: true, dataUrl: "data:image/png;base64,aW52YWxpZA==", bytes: 7 };
+		props.open.version = "v2";
+		render();
+		await Promise.resolve();
+		render().elements.find((node) => node.type === "img").props.onError();
+		assert.ok(render().text.join("").includes("That image could not be shown."));
+	});
+
+	await checkAsync("FilesPane opens an allowlisted file in its session folder and reports host errors", async () => {
+		const calls = [];
+		const { FilesPane: DocumentPane } = load("FilesPane.tsx", { window: { grokCode: { openIn: async (payload) => { calls.push(payload); return { ok: false, error: "No default app is available." }; } } } });
+		const props = previewProps("report.pdf");
+		props.open = { status: "ready", binary: true };
+		const render = renderer(DocumentPane, props);
+		render().elements.find((node) => node.props.children === "Open in default app").props.onClick();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0].target, "explorer");
+		assert.equal(calls[0].cwd, "C:/repo");
+		assert.equal(calls[0].file, "report.pdf");
+		assert.ok(render().text.join("").includes("No default app is available."));
+	});
+
 	await checkAsync("Revert asks for the captured file and restores it only on yes", async () => {
 		for (const yes of [false, true]) {
 			const questions = [];
@@ -464,10 +666,57 @@ async function main() {
 			assert.equal(render().text.join("").includes("Restored src/a.ts to the last commit."), yes);
 		}
 	});
+	await checkAsync("Hunk revert confirms the exact range and captures the file and hunk until the reply", async () => {
+		const change = { ...hunk, revertible: true };
+		let finish;
+		const rig = hunkRig(change, () => new Promise((resolve) => { finish = resolve; }));
+		rig.press();
+		const ask = rig.asks[0];
+		assert.equal(ask.title, "Revert this change?");
+		assert.equal(ask.body, "Lines 10-13 of src/a.ts go back to how they are in the index. The app can't undo this.");
+		assert.equal(ask.ok, "Revert");
+		assert.equal(ask.danger, true);
+		assert.deepEqual(rig.calls, []);
+		ask.resolve(false);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(rig.calls, [], "Cancel leaves the file alone");
+		assert.equal(rig.refreshes(), 0);
+		rig.press();
+		rig.props.selectedFile = "src/b.ts";
+		rig.props.snapshot = { ok: true, files: [{ path: "src/b.ts", hunks: [{ ...change, id: "later", loc: "@@ -1 +1 @@" }] }] };
+		rig.asks[1].resolve(true);
+		await Promise.resolve();
+		assert.equal(rig.calls.length, 1);
+		assert.equal(rig.calls[0][0], "src/a.ts");
+		assert.equal(rig.calls[0][1], change, "the confirmation sends the original hunk content");
+		assert.equal(commitButton(rig.render(), "Revert this change").props.disabled, true);
+		assert.equal(rig.refreshes(), 0, "refresh waits for the host reply");
+		finish({ ok: true });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(rig.refreshes(), 1);
+		assert.ok(rig.render().text.join("").includes("Restored this change in src/a.ts to its indexed version."));
+	});
+	await checkAsync("Hunk revert reports failures and refreshes, and deletion-only ranges name their insertion anchor", async () => {
+		for (const result of [{ ok: false, error: "This change is no longer in the file. Refresh, then try again." }, null]) {
+			const rig = hunkRig({ ...hunk, revertible: true }, async () => { if (!result) { throw new Error("Bridge closed"); } return result; });
+			rig.press();
+			rig.asks[0].resolve(true);
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.equal(rig.refreshes(), 1);
+			assert.ok(rig.render().text.join("").includes(result?.error ?? "That change could not be restored."));
+			assert.equal(commitButton(rig.render(), "Revert this change").props.disabled, false);
+		}
+		for (const start of [0, 10]) {
+			const rig = hunkRig({ ...hunk, revertible: true, loc: `@@ -${start + 1},2 +${start},0 @@`, lines: [{ kind: "del", text: "removed" }] });
+			rig.press();
+			assert.equal(rig.asks[0].body, `Lines ${start}-${start} of src/a.ts go back to how they are in the index. The app can't undo this. The deleted lines are restored ${start === 0 ? "before the first line" : "after line 10"}.`);
+			rig.asks[0].resolve(false);
+		}
+	});
 	await checkAsync("Commit and Commit and push name only the checked files, and all checked keeps the fixed requests", async () => {
 		const fixed = [
-			{ title: "Commit all uncommitted changes?", body: "Grok writes the commit message and commits. Nothing is pushed.", ok: "Commit" },
-			{ title: "Commit and push?", body: "Grok commits all uncommitted changes and pushes the branch to its remote.", ok: "Commit and push", danger: true },
+			{ title: "Commit 3 files?" },
+			{ title: "Commit 3 files and push?" },
 		];
 		const fixedRequests = [
 			"Commit the current uncommitted changes in this repository with a clear commit message. Don't push.",
@@ -486,8 +735,8 @@ async function main() {
 		rig.toggle("src/b.ts");
 		await rig.press("Commit and push");
 		assert.deepEqual(rig.asks.slice(2), [
-			{ title: "Commit 2 of 3 files?", body: "Grok writes the commit message and commits only the checked files. Nothing is pushed.", ok: "Commit" },
-			{ title: "Commit 2 of 3 files and push?", body: "Grok commits only the checked files and pushes the branch to its remote.", ok: "Commit and push", danger: true },
+			{ title: "Commit 2 files?" },
+			{ title: "Commit 2 files and push?" },
 		]);
 		assert.deepEqual(rig.requests.slice(2), [
 			"Commit only these files in this repository with a clear commit message, and leave the other changes uncommitted: `src/a.ts`, `src/c.ts`. Don't push.",
@@ -496,7 +745,7 @@ async function main() {
 
 		rig.toggle("src/a.ts");
 		rig.toggle("src/b.ts");
-		assert.equal((await rig.press("Commit")).ask.title, "Commit 1 of 3 files?");
+		assert.equal((await rig.press("Commit")).ask.title, "Commit 1 file?");
 		assert.ok(rig.requests.at(-1).includes(": `src/c.ts`. Don't push."));
 
 		const before = rig.asks.length;
@@ -511,11 +760,11 @@ async function main() {
 		rig.props.snapshot = { ok: true, files: [...pickFiles, { path: "src/d.ts", additions: 1, deletions: 0, hunks: [hunk] }] };
 		assert.equal(pickBox(rig.render(), "src/d.ts").props.checked, true);
 		const added = await rig.press("Commit");
-		assert.equal(added.ask.title, "Commit 3 of 4 files?");
+		assert.equal(added.ask.title, "Commit 3 files?");
 		assert.ok(added.request.includes(": `src/a.ts`, `src/c.ts`, `src/d.ts`. Don't push."));
 		rig.props.snapshot = { ok: true, files: [pickFiles[0], pickFiles[2]] };
 		const gone = await rig.press("Commit and push");
-		assert.equal(gone.ask.title, "Commit and push?");
+		assert.equal(gone.ask.title, "Commit 2 files and push?");
 		assert.equal(gone.request, "Commit the current uncommitted changes in this repository with a clear commit message, then push the branch.");
 	});
 	await checkAsync("A renamed file is named by its old and new path", async () => {
@@ -524,8 +773,85 @@ async function main() {
 		rig.toggle("src/b.ts");
 		assert.ok(pickBox(rig.render(), "src/new.ts"), "the row is labelled with the new path");
 		const asked = await rig.press("Commit");
-		assert.equal(asked.ask.title, "Commit 3 of 4 files?");
+		assert.equal(asked.ask.title, "Commit 3 files?");
 		assert.equal(asked.request, "Commit only these files in this repository with a clear commit message, and leave the other changes uncommitted: `src/old.ts`, `src/new.ts`, `src/a.ts`, `src/c.ts`. Don't push.");
+	});
+	await checkAsync("Direct commit captures checked rename paths, trims the message and locks the dialog until it refreshes", async () => {
+		const renamed = { path: "src/new.ts", from: "src/old.ts", hunks: [hunk] };
+		for (const push of [false, true]) {
+			let finish;
+			const rig = commitRig({ ...pickProps, snapshot: { ok: true, files: [renamed, ...pickFiles] }, onCommit: () => new Promise((resolve) => { finish = resolve; }) });
+			rig.toggle("src/b.ts");
+			const label = push ? "Commit and push" : "Commit";
+			rig.open(label);
+			rig.props.snapshot = { ok: true, files: [...pickFiles, { path: "later.ts", hunks: [] }] };
+			rig.toggle("src/a.ts");
+			rig.message("  Summary\n\nDetails  ");
+			modalButton(rig.render(), label).props.onClick();
+			assert.deepEqual(rig.commits, [{ paths: ["src/old.ts", "src/new.ts", "src/a.ts", "src/c.ts"], message: "Summary\n\nDetails", push }]);
+			let tree = rig.render();
+			assert.ok(modalButton(tree, push ? "Pushing…" : "Committing…"));
+			assert.ok(modalTree(tree).elements.filter((el) => el.type === "button").every((el) => el.props.disabled));
+			assert.equal(modalTree(tree).elements.find((el) => el.type === "textarea").props.disabled, true);
+			let stopped = false;
+			tree.elements.find((el) => el.props["data-commit-dialog"]).props.onKeyDown({ key: "Escape", nativeEvent: {}, preventDefault() {}, stopPropagation() { stopped = true; } });
+			assert.equal(stopped, true);
+			assert.ok(commitModal(rig.render()), "Escape cannot close an in-flight commit");
+			assert.equal(rig.refreshes(), 0);
+			finish({ ok: true, committed: true, message: "Host commit result." });
+			await new Promise((resolve) => setImmediate(resolve));
+			tree = rig.render();
+			assert.equal(commitModal(tree), undefined);
+			assert.equal(rig.refreshes(), 1);
+			assert.ok(pickBoxes(tree).every((el) => el.props.checked), "a landed commit clears exclusions");
+			assert.ok(!tree.text.join("").includes("Host commit result."), "the pane leaves commit result notices to App");
+		}
+	});
+	await checkAsync("Commit failure and rejection preserve exclusions, while a landed push failure clears them", async () => {
+		for (const outcome of [{ ok: false, error: "Hook refused." }, { ok: false, committed: true, error: "Push refused." }, null]) {
+			const rig = commitRig({ ...pickProps, onCommit: async () => { if (!outcome) { throw new Error("Bridge closed."); } return outcome; } });
+			rig.toggle("src/b.ts");
+			rig.open("Commit and push");
+			rig.message("Summary");
+			modalButton(rig.render(), "Commit and push").props.onClick();
+			await new Promise((resolve) => setImmediate(resolve));
+			const tree = rig.render();
+			assert.equal(commitModal(tree), undefined);
+			assert.equal(pickBox(tree, "src/b.ts").props.checked, outcome?.committed === true);
+			assert.equal(rig.refreshes(), 1, "every host result or rejection refreshes the pane");
+			assert.ok(!tree.text.join("").includes(outcome?.error ?? "Bridge closed."), "commit errors are not stored in a pane note");
+		}
+	});
+	await checkAsync("Commit dialog keys stay isolated from review, comment-send and window shortcuts", async () => {
+		let sentComments = 0;
+		let windowKeys = 0;
+		const rig = commitRig({ ...pickProps, busy: true, comments: diffProps.comments, onSendComments: () => { sentComments++; } });
+		rig.render().elements.find((el) => el.props["aria-label"] === "Review in a large view").props.onClick();
+		const key = (value, ctrlKey = false) => {
+			const tree = rig.render();
+			let stopped = false;
+			const event = { key: value, ctrlKey, nativeEvent: {}, target: { tagName: "TEXTAREA" }, preventDefault() {}, stopPropagation() { stopped = true; } };
+			tree.elements.find((el) => el.props["data-commit-dialog"]).props.onKeyDown(event);
+			if (!stopped) { tree.elements.find((el) => el.type === "section").props.onKeyDown(event); }
+			if (!stopped) { windowKeys++; }
+			assert.equal(stopped, true);
+		};
+		rig.open("Commit");
+		key("x");
+		key("Enter", true);
+		assert.equal(sentComments, 0);
+		assert.deepEqual(rig.commits, []);
+		key("Escape");
+		assert.equal(commitModal(rig.render()), undefined);
+		assert.ok(rig.render().elements.some((el) => el.props.className === "pane fp-expanded dp-review"), "Escape closes the dialog and leaves review mode open");
+		rig.props.busy = false;
+		rig.open("Commit");
+		rig.message("Keyboard commit");
+		key("Enter", true);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(rig.commits.length, 1);
+		assert.equal(sentComments, 0);
+		assert.equal(windowKeys, 0);
 	});
 	if (failures > 0) {
 		console.log(`${failures} check(s) failed`);

@@ -6,8 +6,8 @@ const vm = require("vm");
 const { createRequire } = require("module");
 const { EventEmitter } = require("events");
 const { execFileSync, spawn } = require("child_process");
-const { readDiff, FILTER_NOT_OFF } = require("../electron/diff.cjs");
-const { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, bundledGitDir } = require("../electron/git.cjs");
+const { readDiff, revertHunk, FILTER_NOT_OFF } = require("../electron/diff.cjs");
+const { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, commitFiles, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, bundledGitDir } = require("../electron/git.cjs");
 
 // Never let gh resolve a real GitHub repository from the environment; the temp origin is a local bare repo.
 delete process.env.GH_REPO;
@@ -211,7 +211,342 @@ function checkBundledGitDir() {
 	console.log("PASS bundledGitDir: newest folder that has git.exe; a missing root and an empty localAppData are blank");
 }
 
+async function checkDirectCommits() {
+	const create = (name, files = { "a.txt": "base\n" }, born = true) => {
+		const folder = path.join(root, name);
+		git(["init", "--quiet", "-b", "main", folder], root);
+		for (const [key, value] of [["user.name", "GrokCode test"], ["user.email", "test@example.invalid"], ["core.autocrlf", "false"], ["commit.gpgsign", "false"], ["core.hooksPath", path.join(folder, ".git", "hooks")]]) { git(["config", key, value], folder); }
+		for (const [file, content] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(folder, file)), { recursive: true }); write(file, content, folder); }
+		if (born) { git(["add", "--all"], folder); git(["commit", "--quiet", "-m", "Base"], folder); }
+		return folder;
+	};
+	const hook = (folder, name, body) => fs.writeFileSync(path.join(folder, ".git", "hooks", name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+	const head = (folder) => git(["rev-parse", "HEAD"], folder).trim();
+	const changed = (folder) => git(["show", "--pretty=format:", "--name-only", "HEAD"], folder).trim().split(/\r?\n/).sort();
+	const partial = create("commit-partial", { "a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n", "staged.txt": "staged\n" });
+	for (const file of ["a.txt", "b.txt", "c.txt", "staged.txt"]) { write(file, "changed\n", partial); }
+	git(["add", "staged.txt"], partial);
+	const selected = await commitFiles(partial, { paths: ["a.txt", "b.txt"], message: "Selected files\n\nDetails", expected: "main" });
+	assert.equal(selected.ok, true, JSON.stringify(selected));
+	assert.equal(selected.committed, true);
+	assert.deepEqual(changed(partial), ["a.txt", "b.txt"]);
+	assert.equal(git(["status", "--porcelain"], partial), " M c.txt\nM  staged.txt\n");
+	assert.match(selected.message, /2 other changed files are not in this commit\.$/);
+	console.log("PASS direct commit: selected working files only, other staged and unstaged changes preserved");
+
+	const renamed = create("commit-rename", { "old.ts": "rename\n", "gone.txt": "gone\n" });
+	git(["mv", "old.ts", "new.ts"], renamed);
+	fs.unlinkSync(path.join(renamed, "gone.txt"));
+	write("new.txt", "new\n", renamed);
+	const moved = await commitFiles(renamed, { paths: ["old.ts", "new.ts", "gone.txt", "new.txt"], message: "Rename, add and delete" });
+	assert.equal(moved.ok, true, JSON.stringify(moved));
+	assert.deepEqual(git(["ls-tree", "--name-only", "HEAD"], renamed).trim().split(/\r?\n/).sort(), ["new.ts", "new.txt"]);
+	assert.equal(git(["status", "--porcelain"], renamed), "");
+	const privacy = create("commit-privacy", { ".env": "SECRET=fixture\n", ".gitignore": "" });
+	write(".gitignore", ".env\n", privacy);
+	git(["rm", "--cached", ".env"], privacy);
+	const privacyHead = head(privacy);
+	const privacyStatus = git(["status", "--porcelain"], privacy);
+	const blocked = await commitFiles(privacy, { paths: [".env"], message: "Stop tracking secret" });
+	assert.equal(blocked.error, ".env is staged to be deleted but is still on disk, so committing it here would commit the file. Commit it from a terminal.");
+	assert.equal(head(privacy), privacyHead);
+	assert.equal(git(["status", "--porcelain"], privacy), privacyStatus);
+	const recreated = create("commit-recreated", { "old.ts": "old\n" });
+	git(["mv", "old.ts", "new.ts"], recreated);
+	write("old.ts", "recreated\n", recreated);
+	const recreatedHead = head(recreated);
+	const recreatedStatus = git(["status", "--porcelain"], recreated);
+	assert.match((await commitFiles(recreated, { paths: ["old.ts", "new.ts"], message: "Rename" })).error, /^old\.ts is staged to be deleted but is still on disk/);
+	assert.equal(head(recreated), recreatedHead);
+	assert.equal(git(["status", "--porcelain"], recreated), recreatedStatus);
+	console.log("PASS direct commit: untracked additions, renames and deletions; on-disk staged deletions refused without mutation");
+
+	const refused = create("commit-hook-refused");
+	write("new.txt", "new\n", refused);
+	hook(refused, "pre-commit", "echo 'lint refused'\nexit 1");
+	const refusedHead = head(refused);
+	const refusal = await commitFiles(refused, { paths: ["new.txt"], message: "Hook fails" });
+	assert.equal(refusal.error, "lint refused");
+	assert.equal(head(refused), refusedHead);
+	assert.equal(git(["status", "--porcelain"], refused), "?? new.txt\n", "intent-to-add is rolled back after a failed hook");
+	fs.unlinkSync(path.join(refused, ".git", "hooks", "pre-commit"));
+	assert.equal((await commitFiles(refused, { paths: ["new.txt"], message: "Retry" })).ok, true, "a hook failure releases the repository lock");
+	const silent = create("commit-hook-silent");
+	git(["config", "core.autocrlf", "true"], silent);
+	write("new.txt", "LF only\n", silent);
+	hook(silent, "pre-commit", "exit 1");
+	assert.equal((await commitFiles(silent, { paths: ["new.txt"], message: "Silent hook" })).error, "Git failed.", "CRLF warnings are not the failure reason");
+	const glob = create("commit-hook-glob", { "checked.js": "old\n" });
+	write("checked.js", "new\n", glob);
+	hook(glob, "pre-commit", "printf '%s' \"$GIT_LITERAL_PATHSPECS\" > .git/literal-seen\ngit diff --cached --name-only -- '*.js' > .git/js-seen");
+	assert.equal((await commitFiles(glob, { paths: ["checked.js"], message: "Hooks use their globs" })).ok, true);
+	assert.equal(fs.readFileSync(path.join(glob, ".git", "literal-seen"), "utf8"), "");
+	assert.equal(fs.readFileSync(path.join(glob, ".git", "js-seen"), "utf8"), "checked.js\n");
+	console.log("PASS direct commit hooks: failures roll back intent, silent CRLF warnings filtered, hook glob semantics preserved");
+
+	const literal = create("commit-literal", { "[ab].txt": "old\n", "-x.txt": "old\n", "a.txt": "old\n", "b.txt": "old\n" });
+	for (const file of ["[ab].txt", "-x.txt", "a.txt", "b.txt"]) { write(file, "changed\n", literal); }
+	assert.equal((await commitFiles(literal, { paths: ["[ab].txt", "-x.txt"], message: "Literal names" })).ok, true);
+	assert.deepEqual(changed(literal), ["-x.txt", "[ab].txt"]);
+	assert.equal(git(["diff", "--name-only"], literal), "a.txt\nb.txt\n");
+	const nested = create("commit-subfolder", { "nested/a.txt": "old\n", "outside.txt": "old\n" });
+	write("nested/a.txt", "changed\n", nested);
+	write("outside.txt", "changed\n", nested);
+	assert.equal((await commitFiles(path.join(nested, "nested"), { paths: ["./a.txt"], message: "Relative to session" })).ok, true);
+	assert.deepEqual(changed(nested), ["nested/a.txt"]);
+	assert.equal(git(["diff", "--name-only"], nested), "outside.txt\n");
+	console.log("PASS direct commit paths: bracket and leading-dash literals, normalized subfolder-relative paths");
+
+	const invalidFolder = create("commit-invalid");
+	const invalidHead = head(invalidFolder);
+	const file = path.resolve(__dirname, "../electron/git.cjs");
+	const localRequire = createRequire(file);
+	const loaded = { exports: {} };
+	let invalidSpawns = 0;
+	vm.runInNewContext(fs.readFileSync(file, "utf8"), { module: loaded, Object, process, require(name) {
+		if (name === "child_process") { return { spawn() { invalidSpawns++; throw new Error("Invalid input must not call git"); } }; }
+		return localRequire(name);
+	} });
+	const valid = { paths: ["a.txt"], message: "Message" };
+	for (const options of [null, [], "invalid", new Date(), { ...valid, paths: [] }, { ...valid, paths: ["../outside"] }, { ...valid, paths: [path.resolve(invalidFolder, "a.txt")] }, { ...valid, paths: ["bad\0name"] }, { ...valid, paths: ["bad\nname"] }, { ...valid, paths: ["bad\rname"] }, { ...valid, paths: [""] }, { ...valid, paths: [42] }, { ...valid, paths: Array(1001).fill("a.txt") }, { ...valid, message: "" }, { ...valid, message: " \n " }, { ...valid, message: "bad\0message" }, { ...valid, message: "x".repeat(10001) }, { ...valid, push: "yes" }]) {
+		assert.equal((await loaded.exports.commitFiles(invalidFolder, options)).ok, false);
+	}
+	assert.equal(invalidSpawns, 0, "pure invalid-input checks run before the git repository probe");
+	assert.equal(head(invalidFolder), invalidHead);
+	write("a.txt", "changed\n", invalidFolder);
+	assert.equal((await commitFiles(invalidFolder, { ...valid, expected: "feature" })).error, "The checkout changed to main. Refresh, then commit again.");
+	assert.equal(head(invalidFolder), invalidHead);
+	git(["checkout", "--quiet", "--detach"], invalidFolder);
+	assert.equal((await commitFiles(invalidFolder, { ...valid, push: true })).error, "Switch to a branch before pushing.");
+	assert.equal(head(invalidFolder), invalidHead);
+	console.log("PASS direct commit validation: invalid options/paths/messages without git calls, stale branch and detached push refusals");
+
+	const merging = create("commit-merge");
+	git(["checkout", "--quiet", "-b", "other"], merging);
+	write("a.txt", "other\n", merging);
+	git(["add", "a.txt"], merging); git(["commit", "--quiet", "-m", "Other"], merging);
+	git(["checkout", "--quiet", "main"], merging);
+	write("a.txt", "main\n", merging);
+	git(["add", "a.txt"], merging); git(["commit", "--quiet", "-m", "Main"], merging);
+	assert.throws(() => git(["merge", "other"], merging));
+	write("a.txt", "resolved\n", merging);
+	git(["add", "a.txt"], merging);
+	const mergingHead = head(merging);
+	const mergingStatus = git(["status", "--porcelain"], merging);
+	assert.match((await commitFiles(merging, { paths: ["a.txt"], message: "Partial merge" })).error, /cannot do a partial commit during a merge\./);
+	assert.equal(head(merging), mergingHead);
+	assert.equal(git(["status", "--porcelain"], merging), mergingStatus);
+	console.log("PASS direct commit merge: resolved merge refuses a partial commit without changing HEAD or index");
+
+	const remote = path.join(root, "commit-origin.git");
+	git(["init", "--quiet", "--bare", remote], root);
+	const pushing = create("commit-push");
+	git(["remote", "add", "origin", remote], pushing);
+	hook(pushing, "pre-push", "printf ran >> .git/push-seen");
+	for (const version of ["first", "second"]) {
+		write("a.txt", `${version}\n`, pushing);
+		const pushed = await commitFiles(pushing, { paths: ["a.txt"], message: version, push: true });
+		assert.equal(pushed.ok, true, JSON.stringify(pushed));
+		assert.equal(git(["rev-parse", "refs/heads/main"], remote).trim(), head(pushing));
+		assert.equal(pushed.message, `Committed ${pushed.sha} and pushed main.`);
+	}
+	assert.equal(fs.readFileSync(path.join(pushing, ".git", "push-seen"), "utf8"), "ranran", "both push forms run the real pre-push hook");
+	const pushFailure = create("commit-push-failed");
+	git(["remote", "add", "origin", path.join(root, "missing-origin.git")], pushFailure);
+	write("a.txt", "changed\n", pushFailure);
+	const notPushed = await commitFiles(pushFailure, { paths: ["a.txt"], message: "Kept locally", push: true });
+	assert.equal(notPushed.ok, false);
+	assert.equal(notPushed.committed, true);
+	assert.ok(head(pushFailure).startsWith(notPushed.sha));
+	assert.match(notPushed.error, /^Committed .+, but the push failed:/);
+	assert.equal(git(["log", "-1", "--format=%s"], pushFailure).trim(), "Kept locally");
+	console.log("PASS direct commit push: local bare origin with/without upstream, pre-push hooks and preserved commit on offline failure");
+
+	const timeoutRepo = create("commit-timeout");
+	git(["remote", "add", "origin", remote], timeoutRepo);
+	const node = process.execPath.replace(/\\/g, "/");
+	hook(timeoutRepo, "post-commit", `"${node}" -e 'setTimeout(() => {}, 5000)' &`);
+	hook(timeoutRepo, "pre-push", "printf ran > .git/push-seen");
+	write("a.txt", "changed\n", timeoutRepo);
+	const landed = await commitFiles(timeoutRepo, { paths: ["a.txt"], message: "Landed before timeout", push: true }, { timeout: 1200 });
+	assert.equal(landed.ok, false, JSON.stringify(landed));
+	assert.equal(landed.committed, true, JSON.stringify(landed));
+	assert.ok(head(timeoutRepo).startsWith(landed.sha));
+	assert.match(landed.error, /but git did not finish cleanly: Git timed out\./);
+	assert.match(landed.error, /Git was stopped\./);
+	assert.equal(git(["log", "-1", "--format=%s"], timeoutRepo).trim(), "Landed before timeout");
+	assert.equal(fs.existsSync(path.join(timeoutRepo, ".git", "push-seen")), false, "a timed-out commit never starts its optional push");
+	console.log("PASS direct commit timeout: post-commit background stdout reports landed HEAD honestly and never pushes");
+
+	const locked = create("commit-lock", { "a.txt": "base\n", "nested/b.txt": "base\n" });
+	hook(locked, "pre-commit", `printf started > .git/commit-started\n"${node}" -e 'setTimeout(() => {}, 1000)'`);
+	write("a.txt", "changed\n", locked);
+	const running = commitFiles(locked, { paths: ["a.txt"], message: "First" });
+	const marker = path.join(locked, ".git", "commit-started");
+	for (let attempt = 0; !fs.existsSync(marker) && attempt < 100; attempt++) { await new Promise((resolve) => setTimeout(resolve, 20)); }
+	assert.equal(fs.existsSync(marker), true, "the first commit reached its hook");
+	assert.equal((await commitFiles(path.join(locked, "nested"), { paths: ["b.txt"], message: "Second" })).error, "A commit is already running in this repository.");
+	assert.equal((await running).ok, true);
+	fs.unlinkSync(path.join(locked, ".git", "hooks", "pre-commit"));
+	write("a.txt", "again\n", locked);
+	assert.equal((await commitFiles(locked, { paths: ["a.txt"], message: "After release" })).ok, true);
+	console.log("PASS direct commit lock: concurrent subfolder commit refused, successful completion releases the repository");
+
+	const unborn = create("commit-unborn", { "new.txt": "new\n" }, false);
+	hook(unborn, "pre-commit", "echo 'first refused' >&2\nexit 1");
+	assert.equal((await commitFiles(unborn, { paths: ["new.txt"], message: "First" })).error, "first refused");
+	assert.equal(git(["status", "--porcelain"], unborn), "?? new.txt\n", "rollback also works before the first HEAD exists");
+	fs.unlinkSync(path.join(unborn, ".git", "hooks", "pre-commit"));
+	assert.equal((await commitFiles(unborn, { paths: ["new.txt"], message: "First" })).ok, true);
+	const long = create("commit-long");
+	const longPaths = Array.from({ length: 1000 }, (_, index) => `long-${String(index).padStart(4, "0")}-${"x".repeat(76)}.txt`);
+	for (const file of longPaths) { write(file, "new\n", long); }
+	const longCommit = await commitFiles(long, { paths: longPaths, message: "1000 long paths" });
+	assert.equal(longCommit.ok, true, JSON.stringify(longCommit));
+	assert.equal(git(["ls-tree", "--name-only", "HEAD"], long).trim().split(/\r?\n/).length, 1001);
+	assert.equal(git(["status", "--porcelain"], long), "");
+	console.log("PASS direct commit scale: unborn branch rollback/commit and 1000 long file paths");
+}
+
+async function checkHunkReverts() {
+	const create = (name, files, autocrlf = "false") => {
+		const folder = path.join(root, name);
+		git(["init", "--quiet", "-b", "main", folder], root);
+		for (const [key, value] of [["user.name", "GrokCode test"], ["user.email", "test@example.invalid"], ["core.autocrlf", autocrlf], ["commit.gpgsign", "false"], ["core.hooksPath", os.devNull]]) { git(["config", key, value], folder); }
+		for (const [file, content] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(folder, file)), { recursive: true }); write(file, content, folder); }
+		git(["add", "--all"], folder);
+		git(["commit", "--quiet", "-m", "Hunk fixtures"], folder);
+		return folder;
+	};
+	const lines = Array.from({ length: 30 }, (_, index) => `line ${String(index + 1).padStart(2, "0")}`);
+	const base = `${lines.join("\n")}\n`;
+	const both = base.replace("line 04", "first edit").replace("line 25", "second edit");
+	const hunks = async (folder, file = "sample.txt") => (await readDiff(folder)).files.find((entry) => entry.path === file).hunks;
+	const choice = create("hunk-choice", { "sample.txt": base });
+	write("sample.txt", both, choice);
+	let shown = await hunks(choice);
+	assert.equal(shown.length, 2);
+	assert.ok(shown.every((hunk) => hunk.revertible === true));
+	const indexBefore = fs.readFileSync(path.join(choice, ".git", "index"));
+	assert.equal((await revertHunk(choice, "sample.txt", shown[1])).ok, true);
+	assert.equal(fs.readFileSync(path.join(choice, "sample.txt"), "utf8"), base.replace("line 04", "first edit"));
+	assert.deepEqual(fs.readFileSync(path.join(choice, ".git", "index")), indexBefore, "the raw index bytes are untouched");
+	write("sample.txt", both, choice);
+	shown = await hunks(choice);
+	assert.equal((await revertHunk(choice, "sample.txt", shown[0])).ok, true);
+	assert.equal(fs.readFileSync(path.join(choice, "sample.txt"), "utf8"), base.replace("line 25", "second edit"));
+	console.log("PASS hunk revert selection: either of two hunks restores alone and index bytes stay unchanged");
+
+	const crlfBase = base.replace(/\n/g, "\r\n");
+	const crlf = create("hunk-crlf", { "sample.txt": crlfBase }, "true");
+	assert.equal(git(["show", ":sample.txt"], crlf).includes("\r"), false, "autocrlf stores LF in the index");
+	write("sample.txt", crlfBase.replace("line 04", "first edit").replace("line 25", "second edit"), crlf);
+	assert.equal((await revertHunk(crlf, "sample.txt", (await hunks(crlf))[1])).ok, true);
+	assert.deepEqual(fs.readFileSync(path.join(crlf, "sample.txt")), Buffer.from(crlfBase.replace("line 04", "first edit")), "every retained byte including each CRLF is preserved");
+	const mixedBase = lines.map((line, index) => `${line}${index % 2 ? "\n" : "\r\n"}`).join("");
+	const mixed = create("hunk-mixed", { "sample.txt": mixedBase });
+	write("sample.txt", mixedBase.replace("line 04", "first edit").replace("line 25", "second edit"), mixed);
+	assert.equal((await revertHunk(mixed, "sample.txt", (await hunks(mixed))[1])).ok, true);
+	assert.deepEqual(fs.readFileSync(path.join(mixed, "sample.txt")), Buffer.from(mixedBase.replace("line 04", "first edit")), "mixed endings outside the selected edit are byte-for-byte unchanged");
+	const noEndBase = lines.join("\n");
+	const noEnd = create("hunk-no-ending", { "sample.txt": noEndBase });
+	write("sample.txt", noEndBase.replace("line 04", "first edit").replace("line 30", "last edit"), noEnd);
+	assert.equal((await revertHunk(noEnd, "sample.txt", (await hunks(noEnd)).at(-1))).ok, true);
+	assert.deepEqual(fs.readFileSync(path.join(noEnd, "sample.txt")), Buffer.from(noEndBase.replace("line 04", "first edit")), "restoring the final line keeps its absent EOF newline");
+	console.log("PASS hunk revert bytes: autocrlf CRLF, mixed line endings and no newline at EOF");
+	const legacy = create("hunk-legacy-index", { "sample.txt": Buffer.from(base.replace("line 25", "caf\xe9"), "latin1") });
+	const converted = Buffer.from(base.replace("line 25", "caf\u00e9 updated"), "utf8");
+	write("sample.txt", converted, legacy);
+	const legacyHunk = (await hunks(legacy))[0];
+	assert.equal((await revertHunk(legacy, "sample.txt", legacyHunk)).ok, false, "legacy index bytes must never be decoded into replacement characters and saved");
+	assert.deepEqual(fs.readFileSync(path.join(legacy, "sample.txt")), converted);
+	console.log("PASS hunk revert encoding: a legacy-encoded index refuses without rewriting the UTF-8 working file");
+
+	const nested = create("hunk-subfolder", { "nested/sample.txt": base, "outside.txt": "keep\n" });
+	write("nested/sample.txt", both, nested);
+	const sessionFolder = path.join(nested, "nested");
+	assert.equal((await revertHunk(sessionFolder, "sample.txt", (await hunks(sessionFolder))[1])).ok, true);
+	assert.equal(fs.readFileSync(path.join(nested, "nested/sample.txt"), "utf8"), base.replace("line 04", "first edit"));
+	assert.equal(fs.readFileSync(path.join(nested, "outside.txt"), "utf8"), "keep\n");
+	const stale = create("hunk-stale", { "sample.txt": base });
+	write("sample.txt", both, stale);
+	const old = (await hunks(stale))[1];
+	const changedText = both.replace("second edit", "later edit");
+	write("sample.txt", changedText, stale);
+	assert.equal((await revertHunk(stale, "sample.txt", old)).error, "This change is no longer in the file. Refresh, then try again.");
+	assert.equal(fs.readFileSync(path.join(stale, "sample.txt"), "utf8"), changedText);
+	const current = (await hunks(stale))[1];
+	assert.equal((await revertHunk(stale, "sample.txt", { ...current, lines: current.lines.map((line) => ({ ...line, text: "forged" })) })).ok, false, "the host checks line content as well as id and location");
+	assert.equal(fs.readFileSync(path.join(stale, "sample.txt"), "utf8"), changedText);
+	console.log("PASS hunk revert freshness: subfolder paths resolve correctly, stale or forged content never writes");
+
+	const staged = create("hunk-staged", { "sample.txt": base });
+	const stagedText = base.replace("line 04", "staged edit");
+	write("sample.txt", stagedText, staged);
+	git(["add", "sample.txt"], staged);
+	write("sample.txt", stagedText.replace("line 25", "working edit"), staged);
+	const stagedHunks = await hunks(staged);
+	const stagedOnly = stagedHunks.find((hunk) => hunk.loc.startsWith("Staged "));
+	const workingOnly = stagedHunks.find((hunk) => hunk.revertible === true);
+	assert.equal(stagedOnly.revertible, undefined);
+	assert.ok(workingOnly);
+	const stagedIndex = fs.readFileSync(path.join(staged, ".git", "index"));
+	const stagedPatch = git(["diff", "--cached"], staged);
+	assert.equal((await revertHunk(staged, "sample.txt", { ...stagedOnly, revertible: true })).ok, false, "renderer metadata cannot authorize a staged hunk");
+	assert.equal((await revertHunk(staged, "sample.txt", workingOnly)).ok, true);
+	assert.equal(fs.readFileSync(path.join(staged, "sample.txt"), "utf8"), stagedText);
+	assert.deepEqual(fs.readFileSync(path.join(staged, ".git", "index")), stagedIndex);
+	assert.equal(git(["diff", "--cached"], staged), stagedPatch);
+	console.log("PASS hunk revert staging: working changes return to index content while staged hunks and index bytes remain intact");
+
+	const filtered = create("hunk-filtered", { "sample.txt": base });
+	write("sample.txt", both, filtered);
+	write(".gitattributes", "sample.txt filter=unsafe\n", filtered);
+	const marker = path.join(root, "hunk-filter-ran");
+	const driver = path.join(root, "hunk-filter.cjs");
+	fs.writeFileSync(driver, `require("fs").appendFileSync(${JSON.stringify(marker)}, "ran"); process.stdin.pipe(process.stdout);`);
+	git(["config", "filter.unsafe.clean", `node "${driver.replace(/\\/g, "/")}"`], filtered);
+	const filteredHunks = await hunks(filtered);
+	assert.ok(filteredHunks.every((hunk) => hunk.revertible !== true));
+	assert.equal((await revertHunk(filtered, "sample.txt", { ...filteredHunks[0], revertible: true })).error, "This file uses a Git filter. Revert it from a terminal.");
+	assert.equal(fs.existsSync(marker), false, "neither the diff nor the refusal runs the local filter");
+	assert.equal(fs.readFileSync(path.join(filtered, "sample.txt"), "utf8"), both);
+	const outside = path.join(root, "hunk-outside");
+	fs.mkdirSync(outside);
+	write("outside.txt", "outside\n", outside);
+	const link = path.join(choice, "outside-link");
+	fs.symlinkSync(outside, link, process.platform === "win32" ? "junction" : "dir");
+	assert.equal((await revertHunk(choice, "outside-link/outside.txt", shown[0])).ok, false);
+	assert.equal((await revertHunk(choice, "../hunk-outside/outside.txt", shown[0])).ok, false);
+	assert.equal((await revertHunk(path.join(root, "no-folder"), "sample.txt", shown[0])).ok, false);
+	assert.equal(fs.readFileSync(path.join(outside, "outside.txt"), "utf8"), "outside\n");
+	console.log("PASS hunk revert refusals: effective filters never execute, escaped symlinks and outside/missing folders cannot write");
+
+	const unsupported = create("hunk-unsupported", { "sample.txt": base, "binary.bin": Buffer.from([0, 1, 2]) });
+	write("new.txt", "untracked\n", unsupported);
+	write("binary.bin", Buffer.from([0, 3, 4]), unsupported);
+	write("sample.txt", `${"new line\n".repeat(900)}`, unsupported);
+	const unsupportedDiff = await readDiff(unsupported);
+	assert.ok(unsupportedDiff.files.every((file) => file.hunks.every((hunk) => hunk.revertible !== true)), "untracked, binary and incomplete hunks expose no action");
+	for (const file of unsupportedDiff.files) { assert.equal((await revertHunk(unsupported, file.path, { ...file.hunks[0], revertible: true })).ok, false); }
+	const superFolder = create("hunk-super", { "base.txt": "base\n" });
+	const subFolder = create("hunk-super/sub", { "sub.txt": "old\n" });
+	const oldCommit = git(["rev-parse", "HEAD"], subFolder).trim();
+	git(["update-index", "--add", "--cacheinfo", `160000,${oldCommit},sub`], superFolder);
+	git(["commit", "--quiet", "-m", "Submodule link"], superFolder);
+	write("sub.txt", "new\n", subFolder);
+	git(["add", "sub.txt"], subFolder);
+	git(["commit", "--quiet", "-m", "Submodule change"], subFolder);
+	const subDiff = (await readDiff(superFolder)).files.find((file) => file.path === "sub");
+	assert.ok(subDiff);
+	assert.ok(subDiff.hunks.every((hunk) => hunk.revertible !== true));
+	assert.equal((await revertHunk(superFolder, "sub", subDiff.hunks[0])).ok, false);
+	console.log("PASS hunk revert eligibility: staged, untracked, binary, truncated and submodule hunks cannot opt themselves in");
+}
+
 async function main() {
+	await checkHunkReverts();
+	await checkDirectCommits();
 	checkBundledGitDir();
 	await checkTruncatedRepoFiles();
 	await checkTruncatedDiffCounts();
@@ -346,6 +681,37 @@ async function main() {
 	write("node_modules/cache", "regenerable\n", ignoredTree.folder);
 	assert.deepEqual(await removeWorktree(repo, ignoredTree.folder), { ok: true, dirty: false });
 	console.log("PASS ignored archive files: .env blocks removal and is named; node_modules alone is removed");
+
+	const prAnswer = {
+		number: 42, title: "A pull request", url: "https://example.invalid/pull/42", state: "OPEN", author: { login: "owner" },
+		statusCheckRollup: [{ name: "build", status: "COMPLETED", conclusion: "FAILURE" }],
+		comments: [
+			{ author: { login: "owner" }, createdAt: "2026-11-06T10:00:00Z", body: "private own reply" },
+			{ author: { login: "hidden" }, createdAt: "2026-11-06T10:01:00Z", isMinimized: true, body: "private minimized comment" },
+			{ author: { login: "octocat" }, createdAt: "2026-11-06T10:02:00Z", isMinimized: false, body: "private comment" },
+		],
+		reviews: [
+			{ author: { login: "owner" }, submittedAt: "2026-11-06T10:03:00Z", state: "COMMENTED", body: "private own review" },
+			...["APPROVED", "DISMISSED", "PENDING"].map((state) => ({ author: { login: "reviewer" }, submittedAt: "2026-11-06T10:04:00Z", state, body: "private excluded review" })),
+			{ author: { login: "reviewer" }, submittedAt: "2026-11-06T10:05:00Z", state: "COMMENTED", body: "" },
+			{ author: { login: "octocat" }, submittedAt: "2026-11-06T10:06:00Z", state: "CHANGES_REQUESTED", body: "private requested change" },
+		],
+	};
+	const statusStub = stubGitHub(() => ({ out: JSON.stringify(prAnswer) }));
+	const status = await statusStub.api.prStatus(repo, 42);
+	const fields = "number,title,url,state,isDraft,mergeable,autoMergeRequest,statusCheckRollup,author,comments,reviews";
+	const jq = ".comments |= map({author, createdAt, isMinimized}) | .reviews |= map({author, submittedAt, state})";
+	assert.deepEqual(JSON.parse(JSON.stringify(statusStub.calls)), [["pr", "view", "42", "--json", fields, "--jq", jq]], "the watch reads the selected PR and requests feedback metadata without bodies");
+	assert.deepEqual(JSON.parse(JSON.stringify(status.pr.feedback)), [
+		{ at: "2026-11-06T10:02:00Z", who: "octocat", kind: "comment" },
+		{ at: "2026-11-06T10:05:00Z", who: "reviewer", kind: "review" },
+		{ at: "2026-11-06T10:06:00Z", who: "octocat", kind: "review" },
+	], "own replies, minimized comments and excluded review states stay out; empty COMMENTED reviews count");
+	assert.equal(status.pr.checks[0].state, "fail", "check rollups keep their existing shape");
+	assert.equal(JSON.stringify(status).includes("private"), false, "comment and review bodies never leave the main process");
+	await statusStub.api.prStatus(repo, 0);
+	assert.deepEqual([...statusStub.calls.at(-1)], ["pr", "view", "--json", fields, "--jq", jq], "an invalid PR number keeps the current-branch behavior");
+	console.log("PASS prStatus feedback: selected number, JSON fields, filtered author and review metadata without bodies");
 
 	const staleHead = stubGitHub(() => { throw new Error("gh must not run for a stale displayed branch"); });
 	assert.equal((await staleHead.api.prCreate(repo, { title: "Test", expected: "other" })).error, "The checkout changed to feature. Refresh, then create the pull request again.");

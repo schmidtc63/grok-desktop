@@ -1,4 +1,4 @@
-const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Notification, powerMonitor, powerSaveBlocker, screen, session, shell } = require("electron");
+const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Notification, powerMonitor, powerSaveBlocker, screen, session, shell, webContents } = require("electron");
 const { spawn, spawnSync } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -29,15 +29,18 @@ app.setPath("userData", path.join(app.getPath("appData"), "grok-code"));
 app.setName("Codewomplers Grok Desktop");
 if (process.platform === "win32") app.setAppUserModelId("Grok.Code");
 const appIcon = nativeImage.createFromPath(path.join(__dirname, "..", "assets", "codewomplers-grok-desktop.png"));
-const { AgentHost } = require("./agent.cjs");
-const { readDiff, revertFile } = require("./diff.cjs");
+const { AgentHost, grokHome } = require("./agent.cjs");
+const { createBrowserAgent } = require("./browser-agent.cjs");
+const loops = require("./loops.cjs");
+const { readDiff, revertFile, revertHunk } = require("./diff.cjs");
 const git = require("./git.cjs");
 if (process.platform === "win32") { git.useBundledGit(); }
 const { TerminalHost } = require("./terminal.cjs");
 const { createInbound, candidatesFor, askInOrder } = require("./inbound.cjs");
-const { listFiles, readText, writeText, runCommand, locateFile } = require("./files.cjs");
+const { listFiles, readText, readImage, writeText, runCommand, locateFile, DEFAULT_APP_EXT } = require("./files.cjs");
 const usage = require("./usage.cjs");
 const customize = require("./customize.cjs");
+const { chooseExport } = require("./export.cjs");
 const updates = require("./updates.cjs");
 const updateHelper = require("../scripts/update-helper.cjs");
 let pendingUpdate = null;
@@ -45,6 +48,7 @@ let startingUpdate = false;
 
 const owners = new Map();
 const terminalOwners = new Map();
+let browserAgent;
 const host = new AgentHost((event) => {
 	// A turn Grok starts for a late steer belongs to the window that steered; with that window gone, it stops.
 	if (event.type === "turn-start") {
@@ -58,7 +62,12 @@ const host = new AgentHost((event) => {
 		return;
 	}
 	broadcast(event);
-}, { rulesFile: () => path.join(app.getPath("userData"), "always-allow.json") });
+}, { rulesFile: () => path.join(app.getPath("userData"), "always-allow.json"), browserServer: (id) => browserAgent.server(id) });
+
+const blockedBrowserPorts = new Set();
+const debugBrowserPort = Number(process.env.GROK_CODE_DEBUG_PORT);
+if (Number.isInteger(debugBrowserPort) && debugBrowserPort > 0 && debugBrowserPort <= 65535) { blockedBrowserPorts.add(debugBrowserPort); }
+browserAgent = createBrowserAgent({ host, owners, blockedPorts: blockedBrowserPorts, webContents });
 
 const inbound = createInbound({ registryFile: path.join(app.getPath("userData"), "inbound.json"), deliver: deliverInbound });
 const inboundWindows = new Set();
@@ -82,8 +91,9 @@ async function deliverInbound({ agentSessionId, text }) {
 }
 
 const terminals = new TerminalHost((event) => {
+	const owner = terminalOwners.get(event.id);
 	if (event.type === "terminal-exit") { terminalOwners.delete(event.id); }
-	broadcast(event);
+	if (owner && !owner.isDestroyed()) { owner.send("grok:event", event); }
 });
 
 function broadcast(event) {
@@ -136,9 +146,9 @@ function windowPlacement(first) {
 	let saved;
 	try {
 		const value = JSON.parse(fs.readFileSync(windowStateFile, "utf8"));
-		if (value && Number.isFinite(value.width) && Number.isFinite(value.height) && value.width >= 1100 && value.height >= 560 && ((value.x === undefined && value.y === undefined) || (Number.isFinite(value.x) && Number.isFinite(value.y)))) { saved = value; }
+		if (value && Number.isFinite(value.width) && Number.isFinite(value.height) && value.width >= 680 && value.height >= 560 && ((value.x === undefined && value.y === undefined) || (Number.isFinite(value.x) && Number.isFinite(value.y)))) { saved = value; }
 	} catch {}
-	const fit = (area) => ({ width: Math.max(1100, Math.min(saved?.width ?? 1440, area.width)), height: Math.max(560, Math.min(saved?.height ?? 920, area.height)) });
+	const fit = (area) => ({ width: Math.max(680, Math.min(saved?.width ?? 1440, area.width)), height: Math.max(560, Math.min(saved?.height ?? 920, area.height)) });
 	if (first && saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
 		const area = screen.getDisplayMatching(saved).workArea;
 		const size = fit(area);
@@ -155,7 +165,7 @@ function createWindow(uiSessionId) {
 	const placement = windowPlacement(BrowserWindow.getAllWindows().length === 0);
   const win = new BrowserWindow({
 		...placement.bounds,
-    minWidth: 1100,
+    minWidth: 680,
 		minHeight: 560,
     show: false,
     backgroundColor: "#161513",
@@ -229,6 +239,12 @@ function createWindow(uiSessionId) {
 	win.webContents.on("did-start-navigation", (details) => {
 		if (details.isMainFrame && !details.isSameDocument) {
 			stopOwnedTurn();
+		}
+	});
+	win.webContents.on("will-frame-navigate", (details) => {
+		const source = details.frame?.url ?? "";
+		if (!details.isMainFrame && (source === "about:srcdoc" || source.startsWith("about:srcdoc#")) && details.url !== "about:srcdoc") {
+			details.preventDefault();
 		}
 	});
 
@@ -349,9 +365,12 @@ ipcMain.handle("grok:files", (_event, cwd) => listFiles(cwd));
 
 ipcMain.handle("grok:read", (_event, cwd, file) => readText(cwd, file));
 
+ipcMain.handle("grok:read-image", (_event, cwd, file) => readImage(cwd, file));
+
 ipcMain.handle("grok:write", (_event, cwd, file, text, expectedVersion) => writeText(cwd, file, text, expectedVersion));
 
 ipcMain.handle("grok:revert", (_event, cwd, file) => revertFile(cwd, file));
+ipcMain.handle("grok:revert-hunk", (_event, cwd, file, hunk) => revertHunk(cwd, file, hunk));
 
 ipcMain.handle("grok:run", (_event, payload) => {
   const cwd = payload && payload.cwd;
@@ -396,6 +415,23 @@ ipcMain.handle("grok:copy", (_event, text) => {
   return { ok: true };
 });
 
+ipcMain.handle("grok:export-markdown", async (event, payload) => {
+  const parent = BrowserWindow.fromWebContents(event.sender);
+  return chooseExport({
+    sessionId: payload && payload.agentSessionId,
+    title: payload && payload.title,
+    choose: async (name) => {
+      const options = {
+        title: "Export as Markdown",
+        defaultPath: path.join(app.getPath("documents"), name),
+        filters: [{ name: "Markdown", extensions: ["md"] }],
+      };
+      const picked = await (parent ? dialog.showSaveDialog(parent, options) : dialog.showSaveDialog(options));
+      return picked.canceled || !picked.filePath ? "" : picked.filePath;
+    },
+  });
+});
+
 ipcMain.handle("grok:reveal", (_event, cwd, file) => {
 	const located = locateFile(cwd, file);
 	if (!located.ok) { return { ok: false, error: located.error }; }
@@ -408,16 +444,19 @@ ipcMain.handle("grok:terminal-open", (event, payload) => {
 	if (result.ok) { terminalOwners.set(result.id, event.sender); }
 	return result;
 });
-ipcMain.handle("grok:terminal-write", (_event, id, text) => terminals.write(id, text));
-ipcMain.handle("grok:terminal-close", (_event, id) => terminals.close(id));
-ipcMain.handle("grok:terminal-history", (_event, id) => terminals.history(id));
+ipcMain.handle("grok:terminal-write", (event, id, text) => (terminalOwners.get(id) === event.sender ? terminals.write(id, text) : { ok: false, error: "That terminal is closed." }));
+ipcMain.handle("grok:terminal-input", (event, id, data) => (terminalOwners.get(id) === event.sender ? terminals.input(id, data) : { ok: false, error: "That terminal is closed." }));
+ipcMain.handle("grok:terminal-resize", (event, id, cols, rows) => (terminalOwners.get(id) === event.sender ? terminals.resize(id, cols, rows) : { ok: false, error: "That terminal is closed." }));
+ipcMain.handle("grok:terminal-close", (event, id) => (terminalOwners.get(id) === event.sender ? terminals.close(id) : { ok: false, error: "That terminal is closed." }));
+ipcMain.handle("grok:terminal-history", (event, id) => (terminalOwners.get(id) === event.sender ? terminals.history(id) : ""));
 ipcMain.handle("grok:terminal-interrupt", (event, id) => (terminalOwners.get(id) === event.sender ? terminals.interrupt(id) : { ok: false, error: "That terminal is closed." }));
 
 ipcMain.handle("grok:branch-info", (_event, cwd) => git.branchInfo(cwd));
 ipcMain.handle("grok:scoped-diff", (_event, cwd, scope) => git.readScopedDiff(cwd, scope));
 ipcMain.handle("grok:list-commits", (_event, cwd) => git.listCommits(cwd));
-ipcMain.handle("grok:pr-status", (_event, cwd) => git.prStatus(cwd));
+ipcMain.handle("grok:pr-status", (_event, cwd, number) => git.prStatus(cwd, Number.isInteger(number) && number > 0 ? number : undefined));
 ipcMain.handle("grok:pr-create", (_event, cwd, expected) => git.prCreate(cwd, { expected: typeof expected === "string" ? expected : undefined }));
+ipcMain.handle("grok:git-commit", (_event, cwd, options) => git.commitFiles(cwd, options));
 ipcMain.handle("grok:pr-merge", (_event, cwd, number) => git.prMergeWhenReady(cwd, number));
 ipcMain.handle("grok:add-worktree", (_event, cwd, payload) => git.addWorktree(cwd, { name: payload && payload.name, prefix: payload && payload.prefix }));
 ipcMain.handle("grok:restore-worktree", (_event, folder, branch) => git.restoreWorktree(folder, branch));
@@ -455,10 +494,13 @@ ipcMain.handle("grok:open-in", (_event, payload) => {
 		const located = locateFile(cwd, file);
 		if (!located.ok) { return { ok: false, error: located.error }; }
 		absolute = located.target;
-	} else if (typeof cwd !== "string" || !fs.existsSync(cwd)) {
+	} else if (typeof cwd !== "string" || !fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) {
 		return { ok: false, error: "That folder is not on this computer." };
 	}
 	if (target === "explorer") {
+		if (file && (!DEFAULT_APP_EXT.has(path.extname(file).toLowerCase()) || !DEFAULT_APP_EXT.has(path.extname(absolute).toLowerCase()))) {
+			return { ok: false, error: "That kind of file doesn't open from here." };
+		}
 		return shell.openPath(absolute).then((error) => (error ? { ok: false, error } : { ok: true }));
 	}
 	if (target === "vscode") {
@@ -471,6 +513,10 @@ ipcMain.handle("grok:open-in", (_event, payload) => {
 	}
 	return { ok: false, error: "Choose where to open it." };
 });
+
+ipcMain.handle("grok:browser-tabs", (event, payload) => browserAgent.setTabs(event.sender, payload));
+ipcMain.handle("grok:browser-stop", (event, id) => (owners.get(id)?.contents === event.sender ? browserAgent.stop(id) : { ok: false, error: "That browser belongs to another window." }));
+ipcMain.handle("grok:browser-resume", (event, id) => (owners.get(id)?.contents === event.sender ? browserAgent.resume(id) : { ok: false, error: "That browser belongs to another window." }));
 
 ipcMain.handle("grok:clear-browsing-data", async (_event, partition) => {
 	if (partition !== "persist:grok-code" && !/^temp:grok-[A-Za-z0-9-]+$/.test(String(partition))) { return { ok: false, error: "Unknown browser storage." }; }
@@ -490,6 +536,13 @@ ipcMain.handle("grok:attention", (event) => {
 	return { ok: true };
 });
 
+const taskbarStates = new Map();
+function applyDockBadge() {
+	if (process.platform === "darwin") {
+		const anyNeedsYou = [...taskbarStates.values()].some((state) => state === "needs-you");
+		app.dock.setBadge(anyNeedsYou ? "•" : "");
+	}
+}
 let badge = null;
 function badgeImage() {
 	if (badge) { return badge; }
@@ -508,6 +561,15 @@ function badgeImage() {
 ipcMain.handle("grok:taskbar", (event, state) => {
 	const win = BrowserWindow.fromWebContents(event.sender);
 	if (!win || win.isDestroyed() || !["idle", "running", "needs-you"].includes(state)) { return { ok: false }; }
+	const windowId = win.id;
+	if (!taskbarStates.has(windowId)) {
+		win.once("closed", () => {
+			taskbarStates.delete(windowId);
+			applyDockBadge();
+		});
+	}
+	taskbarStates.set(windowId, state);
+	applyDockBadge();
 	win.setProgressBar(state === "running" ? 2 : -1, state === "running" ? { mode: "indeterminate" } : undefined);
 	win.setOverlayIcon(state === "needs-you" ? badgeImage() : null, state === "needs-you" ? "Grok needs you" : "");
 	return { ok: true };
@@ -603,14 +665,25 @@ ipcMain.handle("grok:context-breakdown", (_event, agentSessionId) => usage.conte
 ipcMain.handle("grok:task-output", (_event, file) => usage.taskOutput(String(file || "")));
 ipcMain.handle("grok:subagent-transcript", (_event, id) => usage.subagentTranscript(String(id || "")));
 ipcMain.handle("grok:recent-spend", () => usage.recentSpend());
-ipcMain.handle("grok:readiness", () => customize.readiness());
+ipcMain.handle("grok:list-cli-sessions", (_event, knownIds) => usage.listCliSessions(knownIds));
+ipcMain.handle("grok:session-loops", (_event, uiSessionId, agentSessionId) => {
+	if (host.procs.has(String(uiSessionId || ""))) { return { ok: true, live: true }; }
+	return loops.readSessionLoops(String(agentSessionId || ""), path.join(grokHome(), "sessions"));
+});
+ipcMain.handle("grok:open-cli-session", (_event, agentSessionId) => usage.openCliSession(String(agentSessionId || "")));
+ipcMain.handle("grok:readiness", async (_event, request) => {
+	const result = await customize.readiness(request && typeof request.folder === "string" ? request.folder : "", !!request && request.full === true);
+	return { ...result, app: { version: app.getVersion(), electron: process.versions.electron, os: `${process.platform} ${os.release()} ${process.arch}` } };
+});
 ipcMain.handle("grok:install-grok", async () => {
 	const result = await customize.installGrok();
 	if (process.platform === "win32") { git.useBundledGit(); }
 	return result;
 });
+ipcMain.handle("grok:update-grok-cli", () => customize.updateGrok());
 ipcMain.handle("grok:install-git", () => customize.installGit());
 ipcMain.handle("grok:customize", (_event, cwd) => customize.inventory(cwd));
+ipcMain.handle("grok:skill-excerpt", (_event, cwd, skillPath) => customize.skillExcerpt(cwd, skillPath));
 ipcMain.handle("grok:customize-change", (_event, cwd, input) => customize.change(cwd, input));
 // Undefined until Grok first starts in this app; null after signing out.
 ipcMain.handle("grok:account", () => host.account);
@@ -690,6 +763,40 @@ Menu.setApplicationMenu(Menu.buildFromTemplate([
 ]));
 
 const GUEST_PERMISSIONS = new Set(["fullscreen", "clipboard-sanitized-write"]);
+const browserDiagnosticSessions = new WeakMap();
+
+function watchBrowserGuest(guest) {
+	let guests = browserDiagnosticSessions.get(guest.session);
+	if (!guests) {
+		guests = new Map();
+		browserDiagnosticSessions.set(guest.session, guests);
+		const report = (details, message) => {
+			const owner = guests.get(details.webContentsId);
+			if (!owner || owner.isDestroyed() || !owner.hostWebContents || owner.hostWebContents.isDestroyed()) { return; }
+			let url;
+			try {
+				const parsed = new URL(details.url);
+				if (!["http:", "https:", "ws:", "wss:"].includes(parsed.protocol)) { return; }
+				parsed.username = "";
+				parsed.password = "";
+				parsed.search = "";
+				parsed.hash = "";
+				url = parsed.href;
+			} catch { return; }
+			owner.hostWebContents.send("grok:browser-problem", { webContentsId: owner.id, url, message: message.slice(0, 500), at: Date.now() });
+		};
+		guest.session.webRequest.onErrorOccurred({ urls: ["<all_urls>"] }, (details) => {
+			if (details.error === "net::ERR_ABORTED" || details.error === "ERR_ABORTED") { return; }
+			const code = typeof details.error === "string" && /^(?:net::)?ERR_[A-Z0-9_]+$/.test(details.error) ? details.error : "Network request failed.";
+			report(details, code);
+		});
+		guest.session.webRequest.onCompleted({ urls: ["<all_urls>"] }, (details) => {
+			if (Number.isInteger(details.statusCode) && details.statusCode >= 400) { report(details, `HTTP ${details.statusCode}`); }
+		});
+	}
+	guests.set(guest.id, guest);
+	guest.once("destroyed", () => { if (guests.get(guest.id) === guest) { guests.delete(guest.id); } });
+}
 
 function httpUrl(value) {
   try {
@@ -733,6 +840,7 @@ function contextMenuItems(contents, params) {
 }
 
 app.on("web-contents-created", (_event, contents) => {
+	const allowedGuestSessions = new WeakSet();
   contents.setWindowOpenHandler(() => ({ action: "deny" }));
 	contents.on("context-menu", (_menuEvent, params) => {
 		const items = contextMenuItems(contents, params);
@@ -754,10 +862,13 @@ app.on("web-contents-created", (_event, contents) => {
 		}
 		// Pages in the Browser pane get no device, notification or external-app access.
 		const guestSession = session.fromPartition(partition);
+		browserAgent.guestSession(guestSession);
+		if (BrowserWindow.fromWebContents(contents)?.webContents === contents) { allowedGuestSessions.add(guestSession); }
 		guestSession.setPermissionRequestHandler((_contents, permission, callback) => callback(GUEST_PERMISSIONS.has(permission)));
 		guestSession.setPermissionCheckHandler((_contents, permission) => GUEST_PERMISSIONS.has(permission));
   });
   contents.on("did-attach-webview", (_attach, guest) => {
+		if (guest.hostWebContents === contents && allowedGuestSessions.has(guest.session)) { watchBrowserGuest(guest); browserAgent.guestSession(guest.session, guest); }
     guest.setWindowOpenHandler(() => ({ action: "deny" }));
     const block = (event, url) => {
       if (!httpUrl(url)) event.preventDefault();
@@ -819,6 +930,7 @@ if (startupMarker) {
 // After every window has closed, so a quit that a window's unsaved-text question cancels leaves Grok running.
 app.on("will-quit", () => {
 	terminals.closeAll();
+	void browserAgent.close();
 	inbound.close();
 	host.kill();
 	repairShortcuts();

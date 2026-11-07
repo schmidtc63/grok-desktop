@@ -41,6 +41,7 @@ export const SHORTCUTS: [string, string][] = [
 	["Ctrl+\\", "Close the focused pane"],
 	["Ctrl+;", "Open side chat"],
 	["Ctrl+O", "Cycle transcript views"],
+	["Ctrl+Shift+P", "Search saved prompts"],
 	["Ctrl+F", "Find in the conversation"],
 	["Ctrl+F", "Find and replace in the Files editor"],
 	["Ctrl+C", "Stop the running command, in the Terminal input"],

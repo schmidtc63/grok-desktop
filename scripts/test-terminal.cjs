@@ -3,11 +3,9 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const vm = require("vm");
-const { randomUUID } = require("crypto");
-const { TerminalHost } = require("../electron/terminal.cjs");
-
-const events = [];
-const host = new TerminalHost((event) => { events.push(event); }, { flushMs: 0 });
+const { EventEmitter } = require("events");
+const { folderProblem } = require("../electron/agent.cjs");
+const source = fs.readFileSync(path.join(__dirname, "../electron/terminal.cjs"), "utf8");
 
 function checkTerminalShell() {
 	const source = fs.readFileSync(path.join(__dirname, "../electron/terminal.cjs"), "utf8");
@@ -21,8 +19,9 @@ function checkTerminalShell() {
 		let probes = 0;
 		const sandbox = {
 			module: { exports: {} },
-			process,
+			process: { ...process, platform: "win32" },
 			require: (name) => {
+				if (name === "node-pty") { throw new Error("Unavailable in this test"); }
 				if (name === "./agent.cjs") { return { folderProblem: () => "" }; }
 				if (name === "child_process") {
 					return { spawnSync: (command, args, options) => {
@@ -50,7 +49,7 @@ function checkOutputBatching() {
 	const batched = [];
 	const sandbox = {
 		module: { exports: {} },
-		require: (name) => name === "./agent.cjs" ? { folderProblem: () => "" } : require(name),
+		require: (name) => { if (name === "node-pty") { throw new Error("Unavailable in this test"); } return name === "./agent.cjs" ? { folderProblem: () => "" } : require(name); },
 		setTimeout: (callback, ms) => { const timer = {}; timers.set(timer, { callback, ms }); return timer; },
 		clearTimeout: (timer) => timers.delete(timer),
 	};
@@ -82,217 +81,237 @@ function checkOutputBatching() {
 	console.log("PASS terminal output batches, flushes before exit, and schedules later output");
 }
 
-function output(id) {
-	return events.filter((event) => event.type === "terminal-data" && event.id === id).map((event) => event.data).join("");
+function plain(value) {
+	return JSON.parse(JSON.stringify(value));
 }
 
-function hasLine(id, line) {
-	return output(id).split(/\r?\n/).includes(line);
+function loadTerminal({ platform = "win32", ptyAvailable = true, spawnFails = false, flushMs = 0 } = {}) {
+	const events = [];
+	const ptys = [];
+	const children = [];
+	const spawns = [];
+	const syncSpawns = [];
+	const kills = [];
+	const timers = new Map();
+	const preferred = path.join(os.tmpdir(), "PowerShell", "pwsh.exe");
+	const fakePty = {
+		spawn(shell, args, options) {
+			if (spawnFails) { throw new Error("PTY failed"); }
+			let data;
+			let exited;
+			const child = Object.assign(new EventEmitter(), {
+				pid: 700 + ptys.length, shell, args: Array.from(args), options: plain(options), writes: [], sizes: [], killCalls: 0, disposed: 0,
+				onData(callback) { data = callback; return { dispose() { child.disposed++; } }; },
+				onExit(callback) { exited = callback; return { dispose() { child.disposed++; } }; },
+				write(text) { if (child.writeFails) { throw new Error("closed"); } child.writes.push(text); },
+				resize(cols, rows) { if (child.resizeFails) { throw new Error("closed"); } child.sizes.push([cols, rows]); },
+				kill() { child.killCalls++; if (child.exitOnKill) { exited({ exitCode: 0 }); } },
+				data(text) { data(text); },
+				exit(code) { exited({ exitCode: code }); },
+			});
+			ptys.push(child);
+			return child;
+		},
+	};
+	const loaded = { exports: {} };
+	vm.runInNewContext(source, {
+		module: loaded,
+		process: { platform, env: { SystemRoot: process.env.SystemRoot || "C:/Windows" }, kill: (...args) => kills.push(args) },
+		setTimeout: (callback, ms) => { const timer = {}; timers.set(timer, { callback, ms }); return timer; },
+		clearTimeout: (timer) => timers.delete(timer),
+		require(name) {
+			if (name === "node-pty") { if (!ptyAvailable) { throw new Error("native module unavailable"); } return fakePty; }
+			if (name === "./agent.cjs") { return { folderProblem, OWN_GROUP: platform === "win32" ? {} : { detached: true }, killTree: (...args) => { kills.push(args); return true; } }; }
+			if (name === "child_process") {
+				return {
+					spawnSync(command, args, options) { syncSpawns.push({ command, args: Array.from(args), options }); return command === "where.exe" ? { status: 0, stdout: preferred } : { status: 0 }; },
+					spawn(command, args, options) {
+						const child = Object.assign(new EventEmitter(), { pid: 800 + children.length, exitCode: null, writes: [] });
+						child.stdout = new EventEmitter();
+						child.stderr = new EventEmitter();
+						child.stdin = Object.assign(new EventEmitter(), { write: (text) => child.writes.push(text) });
+						children.push(child);
+						spawns.push({ command, args: Array.from(args), options, child });
+						return child;
+					},
+				};
+			}
+			return require(name);
+		},
+	}, { filename: "terminal.cjs" });
+	return { host: new loaded.exports.TerminalHost((event) => events.push(event), { flushMs }), events, ptys, children, spawns, syncSpawns, kills, timers, preferred };
 }
 
-// A line sent while a command still runs is echoed at once, so on bash its output follows the next prompt, as in a terminal.
-function printed(id, text) {
-	return output(id).split(/\r?\n/).some((line) => line === text || line.endsWith(` $ ${text}`));
-}
-
-function exits(id) {
-	return events.filter((event) => event.type === "terminal-exit" && event.id === id);
-}
-
-function pause(ms) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function waitFor(check, label, ms = 20000) {
-	const end = Date.now() + ms;
-	while (!check()) {
-		if (Date.now() > end) { throw new Error(`Timed out waiting for ${label}`); }
-		await pause(100);
+function checkPty() {
+	for (const platform of ["win32", "linux", "darwin"]) {
+		const run = loadTerminal({ platform, flushMs: 30 });
+		const cwd = os.tmpdir();
+		const opened = run.host.open({ cwd, shell: "untrusted", env: { INJECTED: "bad" } });
+		assert.equal(opened.ok, true);
+		assert.equal(opened.backend, "pty");
+		assert.equal(run.spawns.length, 0, "PTY tabs do not start pipe shells");
+		const child = run.ptys[0];
+		assert.equal(child.shell, platform === "win32" ? run.preferred : "bash");
+		assert.equal(child.options.cwd, cwd);
+		assert.equal(child.options.name, "xterm-256color");
+		assert.equal(child.options.cols, 80);
+		assert.equal(child.options.rows, 24);
+		assert.equal(child.options.env.TERM, "xterm-256color");
+		assert.equal(child.options.env.INJECTED, undefined, "the renderer does not choose a shell or environment");
+		if (platform === "win32") {
+			assert.equal(child.args[child.args.indexOf("-ExecutionPolicy") + 1], "RemoteSigned");
+		} else {
+			assert.deepEqual(child.args, ["--noprofile", "--norc", "-i"], "a real terminal retains interactive line editing and job control");
+		}
+		assert.equal(run.host.input(opened.id, "vi file\r\x1b[A\x03\x00").ok, true);
+		assert.deepEqual(child.writes, ["vi file\r\x1b[A\x03\x00"], "raw control bytes, including Ctrl+Space, are not changed or submitted twice");
+		assert.equal(run.host.write(opened.id, "one\r\ntwo\n").ok, true);
+		assert.equal(child.writes.at(-1), "one\rtwo\r", "Run-button commands finish with Enter");
+		assert.equal(run.host.write(opened.id, "x".repeat(20000)).ok, true);
+		assert.equal(child.writes.at(-1).length, 20001, "the command limit excludes its added Enter");
+		assert.equal(run.host.resize(opened.id, 120, 40).ok, true);
+		assert.deepEqual(child.sizes, [[120, 40]]);
+		child.data("\x1b[31mone");
+		child.data("two\x1b[0m");
+		assert.deepEqual(run.events, []);
+		assert.equal(run.host.history(opened.id), "\x1b[31monetwo\x1b[0m", "ANSI sequences stay in the history");
+		const timer = [...run.timers.values()][0];
+		assert.equal(timer.ms, 30);
+		timer.callback();
+		assert.equal(run.events.length, 1, "PTY output is batched before IPC");
+		assert.equal(run.events[0].data, "\x1b[31monetwo\x1b[0m");
+		child.data("last");
+		child.exitOnKill = true;
+		child.exit(3);
+		assert.equal(child.killCalls, 1, "natural exit still releases native PTY helpers explicitly");
+		assert.equal(child.disposed, 2);
+		assert.deepEqual(run.events.slice(-2).map((event) => event.type), ["terminal-data", "terminal-exit"]);
+		assert.equal(run.events.at(-1).code, 3);
+		assert.deepEqual(plain(run.host.list()), []);
+		child.data("ignored after exit");
+		run.host.close(opened.id);
+		assert.equal(run.events.filter((event) => event.type === "terminal-exit").length, 1);
+		assert.equal(child.killCalls, 1, "cleanup is idempotent");
 	}
+	console.log("PASS PTY spawn, raw input, command submission, resize, ANSI batching and explicit natural-exit cleanup");
 }
 
-function alive(pid) {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return error.code === "EPERM";
+async function checkPtyLifecycle() {
+	const run = loadTerminal();
+	const first = run.host.open({ cwd: os.tmpdir() });
+	const child = run.ptys[0];
+	assert.deepEqual(plain(await run.host.interrupt(first.id)), { ok: true, stopped: 1 });
+	assert.equal(child.writes.at(-1), "\x03", "interrupt reaches the foreground program as Ctrl+C");
+	assert.equal(child.killCalls, 0, "interrupt does not close the terminal");
+	run.host.output(run.host.tabs.get(first.id), "x".repeat(450000));
+	assert.equal(run.host.history(first.id).length, 200000, "scrollback stays bounded");
+	run.host.close(first.id);
+	assert.equal(child.killCalls, 1);
+	assert.equal(run.host.list().length, 0);
+	const tabs = [];
+	for (let i = 0; i < 12; i++) { tabs.push(run.host.open({ cwd: os.tmpdir() })); }
+	assert.equal(run.host.open({ cwd: os.tmpdir() }).ok, false, "the thirteenth tab is refused");
+	run.host.closeAll();
+	assert.equal(run.host.list().length, 0);
+	assert.equal(run.ptys.every((pty) => pty.killCalls === 1), true, "closeAll explicitly kills every native tab");
+	assert.equal(run.events.filter((event) => event.type === "terminal-exit").length, 13);
+	assert.equal(run.spawns.length, 0, "PTY cleanup does not leave taskkill helper processes");
+	assert.equal((await run.host.interrupt("missing")).ok, false);
+	const failed = loadTerminal();
+	failed.host.open({ cwd: os.tmpdir() });
+	failed.ptys[0].emit("error", new Error("native stream error"));
+	assert.equal(failed.ptys[0].killCalls, 1, "a native stream error also releases its PTY");
+	assert.equal(failed.host.list().length, 0);
+	console.log("PASS PTY interrupt, bounded history, Close/closeAll, tab limit and idempotent native cleanup");
+}
+
+function checkBounds() {
+	const run = loadTerminal();
+	for (const cwd of ["", null, undefined, __filename, path.join(os.tmpdir(), "missing-terminal-folder")]) { assert.equal(run.host.open({ cwd }).ok, false); }
+	assert.equal(run.ptys.length, 0, "invalid folders never spawn");
+	const opened = run.host.open({ cwd: os.tmpdir() });
+	for (const value of [42, null, undefined, "x".repeat(20001)]) { assert.equal(run.host.input(opened.id, value).ok, false); }
+	for (const value of [42, null, "x\0y", "x".repeat(20001)]) { assert.equal(run.host.write(opened.id, value).ok, false); }
+	for (const [cols, rows] of [[1, 24], [501, 24], [80, 0], [80, 301], [80.5, 24], [80, NaN], ["80", 24], [Infinity, 24]]) {
+		assert.equal(run.host.resize(opened.id, cols, rows).ok, false);
 	}
+	assert.equal(run.host.resize(opened.id, 2, 1).ok, true);
+	assert.equal(run.host.resize(opened.id, 500, 300).ok, true);
+	assert.equal(run.host.input("missing", "x").ok, false);
+	assert.equal(run.host.write("missing", "x").ok, false);
+	assert.equal(run.host.resize("missing", 80, 24).ok, false);
+	run.ptys[0].writeFails = true;
+	assert.equal(run.host.input(opened.id, "x").ok, false);
+	assert.equal(run.host.write(opened.id, "x").ok, false);
+	run.ptys[0].resizeFails = true;
+	assert.equal(run.host.resize(opened.id, 80, 24).ok, false);
+	run.host.closeAll();
+	assert.equal(loadTerminal({ spawnFails: true }).host.open({ cwd: os.tmpdir() }).ok, false);
+	console.log("PASS terminal folder, raw-input/command caps, dimension bounds and native operation failures");
 }
 
-function pidOf(id, name) {
-	const match = output(id).match(new RegExp(`${name}=(\\d+)\\r?\\n`));
-	return match ? Number(match[1]) : 0;
-}
-
-// macOS and Linux: bash -i over pipes prints a prompt naming the folder, and the host echoes each line.
-async function posixShell(id, tmp) {
-	const real = fs.realpathSync(tmp);
-	await waitFor(() => output(id).includes(" $ "), "bash prompt");
-	assert.equal(/no job control|cannot set terminal process group/.test(output(id)), false, "the job-control warnings are dropped");
-	console.log("PASS bash shows its prompt and no job-control warning");
-	host.write(id, "for i in 1 2; do\n  echo \"n$i\"\ndone");
-	await waitFor(() => output(id).includes("n1\n") && output(id).includes("n2\n"), "multiline for output");
-	console.log("PASS multiline command completes without another write");
-	assert.equal(host.write(id, "x=41").ok, true);
-	assert.equal(host.write(id, "echo $((x + 1))\n").ok, true);
-	await waitFor(() => output(id).includes("42\n"), "42");
-	// Both lines were sent before bash printed its next prompt, so they echo together, as typed-ahead lines do in a terminal.
-	assert.ok(output(id).includes(" $ x=41\necho $((x + 1))\n"), "input lines are echoed after the prompt");
-	assert.equal(output(id).split("echo $((x + 1))").length, 2, "an input line is echoed once");
-	assert.ok(output(id).indexOf("echo $((x + 1))") < output(id).indexOf("42\n"), "the echo comes before the output");
-	assert.ok(output(id).includes(" $ for i in 1 2; do\n  echo \"n$i\"\ndone\nn1\nn2\n"), "a multiline command is echoed whole, with no continuation prompts");
-	assert.equal(output(id).split("\n").some((line) => line.split(" $ ").length > 2), false, "no empty prompt from a blank line");
-	console.log("PASS variables persist between writes (x=41, echo $((x + 1)) printed 42) and input is echoed");
-	host.write(id, "cd ..");
-	host.write(id, "pwd");
-	await waitFor(() => output(id).includes(`${path.dirname(real)}\n`), "parent of tmpdir");
-	await waitFor(() => output(id).includes(`${path.dirname(real)} $ `), "prompt naming the new folder");
-	console.log("PASS location persists between writes (cd .. then pwd) and the prompt shows it");
-	host.write(id, "echo \"héllo\"");
-	await waitFor(() => output(id).includes("héllo\n"), "UTF-8 output");
-	console.log("PASS UTF-8 round trip (héllo intact)");
-	host.write(id, "echo \"shell=$$\"");
-}
-
-async function windowsShell(id, tmp) {
-	host.write(id, "Import-Module \"$PSHOME/Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1\"; Get-ExecutionPolicy");
-	await waitFor(() => hasLine(id, "RemoteSigned"), "RemoteSigned execution policy");
-	console.log("PASS terminal execution policy is RemoteSigned");
-	host.write(id, "foreach ($i in 1..2) {\n  \"n$i\"\n}");
-	await waitFor(() => hasLine(id, "n1") && hasLine(id, "n2"), "multiline foreach output");
-	console.log("PASS multiline command completes without another write");
-	assert.equal(host.write(id, "$x = 41").ok, true);
-	assert.equal(host.write(id, "$x + 1\n").ok, true);
-	await waitFor(() => hasLine(id, "42"), "42");
-	console.log("PASS variables persist between writes ($x = 41, $x + 1 printed 42)");
-
-	host.write(id, "Set-Location ..");
-	host.write(id, "(Get-Location).Path");
-	await waitFor(() => hasLine(id, path.dirname(tmp)), "parent of tmpdir");
-	console.log("PASS location persists between writes (Set-Location .. then Get-Location)");
-
-	host.write(id, "Write-Output \"héllo\"");
-	host.write(id, "\"héllo\".Length");
-	await waitFor(() => hasLine(id, "héllo") && hasLine(id, "5"), "UTF-8 output");
-	console.log("PASS UTF-8 round trip (héllo intact, length 5 so stdin was decoded as UTF-8)");
-	host.write(id, "\"shell=$PID\"");
+async function checkPipeFallback() {
+	for (const platform of ["win32", "linux", "darwin"]) {
+		const run = loadTerminal({ platform, ptyAvailable: false });
+		const opened = run.host.open({ cwd: os.tmpdir() });
+		assert.equal(opened.backend, "pipe");
+		assert.match(opened.warning, /basic pipe terminal/);
+		const child = run.children[0];
+		assert.equal(run.host.input(opened.id, "ab").ok, true);
+		assert.deepEqual(child.writes, [], "fallback raw input is buffered until Enter");
+		run.host.input(opened.id, "\x7fc\r\n");
+		assert.deepEqual(child.writes, ["ac\n"], "backspace edits the pending line and CRLF submits once");
+		run.host.write(opened.id, "one\ntwo");
+		assert.equal(child.writes.at(-1), platform === "win32" ? "one\ntwo\n\n" : "one\ntwo\n");
+		assert.equal(run.host.resize(opened.id, 80, 24).ok, true);
+		const bytes = Buffer.from("héllo");
+		child.stdout.emit("data", bytes.subarray(0, 2));
+		child.stdout.emit("data", bytes.subarray(2));
+		assert.ok(run.host.history(opened.id).includes("héllo"), "pipe fallback keeps UTF-8 decoding");
+		if (platform !== "win32") {
+			assert.equal(run.spawns[0].options.detached, true);
+			child.stdout.emit("data", Buffer.from("bash: no job control in this shell\n"));
+			assert.equal(run.host.history(opened.id).includes("no job control"), false);
+			const pending = run.host.interrupt(opened.id);
+			const query = run.spawns.at(-1);
+			assert.equal(query.command, "pgrep");
+			query.child.stdout.emit("data", Buffer.from(String(child.pid) + "\n901\n"));
+			query.child.emit("close", 0);
+			assert.equal((await pending).stopped, 1);
+			assert.deepEqual(run.kills.at(-1), [901, "SIGKILL"]);
+		} else {
+			const pending = run.host.interrupt(opened.id);
+			const query = run.spawns.at(-1);
+			assert.ok(query.args.includes("-NonInteractive"));
+			query.child.stdout.emit("data", Buffer.from("901\n"));
+			query.child.emit("close", 0);
+			const killer = run.spawns.at(-1);
+			assert.equal(killer.command, "taskkill");
+			killer.child.emit("close", 0);
+			assert.equal((await pending).stopped, 1);
+		}
+		assert.equal(child.exitCode, null, "the fallback shell stays available after interrupt");
+		run.host.write(opened.id, "echo after");
+		run.host.close(opened.id);
+		child.emit("close", 0);
+		assert.equal(run.events.filter((event) => event.type === "terminal-exit").length, 1);
+		const extra = run.host.open({ cwd: os.tmpdir() });
+		run.host.closeAll();
+		assert.equal(run.host.list().length, 0);
+		assert.equal(run.events.some((event) => event.type === "terminal-exit" && event.id === extra.id), true);
+		if (platform === "win32") { assert.equal(run.syncSpawns.at(-1).command, "taskkill"); }
+		else { assert.equal(run.kills.at(-1)[1], true, "app quit keeps synchronous pipe process-tree cleanup"); }
+	}
+	console.log("PASS missing-native fallback warning, buffered pipe input, UTF-8, shell state/interrupt and process-tree cleanup");
 }
 
 async function main() {
-	const windows = process.platform === "win32";
-	if (windows) { checkTerminalShell(); }
+	checkTerminalShell();
 	checkOutputBatching();
-	// The GitHub Windows runner's temp folder sits under a short 8.3 name (RUNNER~1), which PowerShell prints in full.
-	const tmp = fs.realpathSync.native(os.tmpdir());
-	const opened = host.open({ cwd: tmp });
-	assert.equal(opened.ok, true, opened.error);
-	const id = opened.id;
-	assert.deepEqual(host.list(), [{ id, cwd: tmp, running: true }]);
-	await (windows ? windowsShell(id, tmp) : posixShell(id, tmp));
-	await waitFor(() => pidOf(id, "shell") > 0, "shell pid");
-	const firstShell = pidOf(id, "shell");
-	assert.equal(host.history(id), output(id));
-	assert.match(host.history(id), /42\r?\n/);
-	assert.equal(host.history("no-such-tab"), "");
-	console.log("PASS history(id) returns earlier output");
-
-	assert.equal(host.open({ cwd: path.join(tmp, `no-such-folder-${randomUUID()}`) }).ok, false);
-	assert.equal(host.open({ cwd: "" }).ok, false);
-	assert.equal(host.open({}).ok, false);
-	assert.equal(host.open(null).ok, false);
-	assert.equal(host.open({ cwd: __filename }).ok, false);
-	console.log("PASS invalid cwd rejected (missing, empty, absent, null, file)");
-
-	assert.equal(host.write(id, "x".repeat(20001)).ok, false);
-	assert.equal(host.write(id, "a\0b").ok, false);
-	assert.equal(host.write(id, 42).ok, false);
-	assert.equal(host.write("no-such-tab", "dir").ok, false);
-	console.log("PASS over-long, NUL, non-string and unknown-tab writes rejected");
-
-	const sleeper = host.open({ cwd: tmp });
-	assert.equal(sleeper.ok, true, sleeper.error);
-	host.write(sleeper.id, windows
-		? "\"shell=$PID\"; $child = Start-Process ping.exe -ArgumentList '-n','60','127.0.0.1' -WindowStyle Hidden -PassThru; \"grandchild=$($child.Id)\"; Start-Sleep 60"
-		: "echo \"shell=$$\"; sleep 60 & echo \"grandchild=$!\"; sleep 60");
-	await waitFor(() => pidOf(sleeper.id, "grandchild") > 0, "grandchild pid");
-	const shellPid = pidOf(sleeper.id, "shell");
-	const grandPid = pidOf(sleeper.id, "grandchild");
-	await pause(500);
-	assert.equal(alive(shellPid) && alive(grandPid), true);
-	assert.equal(host.close(sleeper.id).ok, true);
-	assert.equal(exits(sleeper.id).length, 1);
-	assert.equal(host.list().some((tab) => tab.id === sleeper.id), false);
-	await waitFor(() => !alive(shellPid) && !alive(grandPid), "process tree to stop", 10000);
-	await pause(1500);
-	assert.equal(exits(sleeper.id).length, 1);
-	console.log("PASS close() stops a 60-second sleep and its child process tree, emits terminal-exit once, removes the tab");
-
-	const stopper = host.open({ cwd: tmp });
-	assert.equal(stopper.ok, true, stopper.error);
-	host.write(stopper.id, windows
-		? "\"shell=$PID\"; $ping = Start-Process ping.exe -ArgumentList '-n','60','127.0.0.1' -NoNewWindow -PassThru; \"ping=$($ping.Id)\"; $ping.WaitForExit()"
-		: "echo \"shell=$$\"; sleep 60 & echo \"ping=$!\"; wait");
-	await waitFor(() => pidOf(stopper.id, "ping") > 0, "ping pid");
-	const stopperShell = pidOf(stopper.id, "shell");
-	const pingPid = pidOf(stopper.id, "ping");
-	assert.equal(alive(stopperShell) && alive(pingPid), true);
-	const stopped = await host.interrupt(stopper.id);
-	assert.equal(stopped.ok, true, stopped.error);
-	assert.ok(stopped.stopped >= 1, `stopped ${stopped.stopped} processes`);
-	await waitFor(() => !alive(pingPid), "ping to stop", 5000);
-	assert.equal(alive(stopperShell), true, "the shell survives the interrupt");
-	assert.deepEqual(host.list().find((tab) => tab.id === stopper.id), { id: stopper.id, cwd: tmp, running: true });
-	host.write(stopper.id, "echo after");
-	await waitFor(() => printed(stopper.id, "after"), "echo after the interrupt");
-	if (!windows) {
-		host.write(stopper.id, "sleep 60");
-		await pause(500);
-		assert.equal((await host.interrupt(stopper.id)).stopped, 1, "Stop ends a foreground command");
-		await waitFor(() => output(stopper.id).endsWith(" $ "), "the prompt after Stop");
-		// Stopping a foreground command makes bash print a tcsetattr notice. This prints the macOS wording on every system.
-		const notice = "bash: [12329: 3] tcsetattr: Operation not supported on socket";
-		host.write(stopper.id, `echo "${notice}"; echo back`);
-		await waitFor(() => hasLine(stopper.id, "back"), "echo after stopping a foreground command");
-		assert.equal(output(stopper.id).split(/\r?\n/).includes(notice), false, "the macOS tcsetattr notice is hidden");
-	}
-	assert.deepEqual(await host.interrupt(stopper.id), { ok: true, stopped: 0 });
-	assert.deepEqual(await host.interrupt("no-such-tab"), { ok: false, error: "That terminal is closed." });
-	assert.equal(exits(stopper.id).length, 0);
-	host.close(stopper.id);
-	console.log(`PASS interrupt() stops the running child (${stopped.stopped} stopped) and keeps the shell, which then runs echo after; an idle shell stops 0; an unknown tab is closed`);
-
-	const quitter = host.open({ cwd: tmp });
-	assert.equal(quitter.ok, true, quitter.error);
-	host.write(quitter.id, "exit 3");
-	await waitFor(() => exits(quitter.id).length > 0, "self exit");
-	await pause(1000);
-	assert.deepEqual(exits(quitter.id).map((event) => event.code), [3]);
-	assert.equal(host.list().some((tab) => tab.id === quitter.id), false);
-	console.log("PASS a shell that exits by itself emits terminal-exit once (code 3) and is removed");
-
-	const extra = [];
-	while (host.list().length < 12) {
-		const tab = host.open({ cwd: tmp });
-		assert.equal(tab.ok, true, tab.error);
-		extra.push(tab.id);
-	}
-	assert.deepEqual(host.open({ cwd: tmp }), { ok: false, error: "Close a terminal tab first." });
-	for (const extraId of extra) {
-		host.close(extraId);
-	}
-	console.log("PASS 13th tab rejected with \"Close a terminal tab first.\"");
-
-	host.closeAll();
-	assert.deepEqual(host.list(), []);
-	assert.equal(exits(id).length, 1);
-	await waitFor(() => !alive(firstShell), "closeAll to stop the shell", 10000);
-	console.log("PASS closeAll() stops every shell and empties list()");
+	checkPty();
+	await checkPtyLifecycle();
+	checkBounds();
+	await checkPipeFallback();
 }
 
-main().catch((error) => {
-	console.error(error);
-	process.exitCode = 1;
-}).finally(() => {
-	host.closeAll();
-});
+main().catch((error) => { console.error(error); process.exitCode = 1; });

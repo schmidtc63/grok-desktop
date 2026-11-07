@@ -24,6 +24,15 @@ interface GrokBgTask {
 	exitCode: number | null;
 }
 
+interface GrokLoop {
+	id: string;
+	prompt: string;
+	schedule: string;
+	nextFireAt: string;
+	durable?: boolean;
+	expiresAt?: string;
+}
+
 interface GrokSubagent {
 	id: string;
 	label: string;
@@ -86,11 +95,23 @@ interface GrokMcpServer {
 }
 
 interface GrokReadiness {
-	grok: { ok: boolean; version?: string; signedIn?: boolean; error?: string };
+	grok: {
+		ok: boolean;
+		version?: string;
+		signedIn?: boolean;
+		signIn?: "saved" | "key" | "none";
+		apiKey?: boolean;
+		error?: string;
+		at?: { source: "GROK_PATH" | "installer" | "PATH"; path: string };
+		update?: { checked: boolean; current?: string; latest?: string; available?: boolean; autoUpdate?: boolean; channel?: string };
+	};
 	git: { ok: boolean };
 	gh: { ok: boolean; signedIn?: boolean };
 	install: string;
 	platform: string;
+	config?: { ok: boolean; files?: { role: string; path: string; broken: boolean }[]; warnings?: string[] };
+	network?: { httpsProxy: string; httpProxy: string; noProxy: string; caCerts: string };
+	app?: { version: string; electron: string; os: string };
 }
 
 // What `grok inspect`, `grok mcp list` and `grok plugin list` report for one folder.
@@ -99,7 +120,7 @@ interface GrokInventory {
 	error?: string;
 	trusted?: boolean;
 	skills?: { name: string; command: string; description: string; source: string; path: string; disabled: boolean }[];
-	servers?: { name: string; detail: string; source: string; enabled: boolean; removable: boolean }[];
+	servers?: { name: string; detail: string; source: string; enabled: boolean; removable: boolean; transport?: string; target?: string; command?: string; args?: string[]; env?: { name: string; value: string }[]; headers?: { name: string; value: string }[]; configPath?: string }[];
 	plugins?: { name: string; version: string; description: string; marketplace: string; installed: boolean; enabled: boolean }[];
 	otherPlugins?: { name: string; detail: string }[];
 	marketplaces?: { name: string; source: string }[];
@@ -131,7 +152,9 @@ interface GrokToolEvent {
 	plan?: string;
 	todos?: GrokTodo[];
 	// What Always allow would remember for this approval: the exact command in this folder, or the tool for this conversation.
-	always?: "folder" | "conversation";
+	always?: "folder" | "conversation" | "site";
+	commandPrefix?: string;
+	readsOnly?: boolean;
 }
 
 interface GrokAlwaysRules {
@@ -149,13 +172,17 @@ interface GrokAccount {
 type InboundResult = { accepted: true; status: "sent" | "queued" | "held" } | { accepted: false; stale?: true };
 
 interface GrokEvent {
-	type: "chunk" | "thought" | "tool" | "done" | "error" | "mode" | "usage" | "context" | "commands" | "models" | "mcp" | "mcp-status" | "terminal-data" | "terminal-exit" | "account" | "bg-tasks" | "subagent" | "title" | "steer" | "turn-start" | "update-open" | "inbound";
+	type: "chunk" | "thought" | "tool" | "done" | "error" | "mode" | "usage" | "context" | "commands" | "models" | "mcp" | "mcp-status" | "terminal-data" | "terminal-exit" | "account" | "bg-tasks" | "subagent" | "title" | "steer" | "turn-start" | "update-open" | "inbound" | "loops" | "browser-open" | "browser-activity";
+	url?: string;
+	running?: boolean;
+	stopped?: boolean;
 	requestId?: string;
 	agentSessionId?: string;
 	current?: string;
 	latest?: string;
 	tag?: string;
 	tasks?: GrokBgTask[];
+	loops?: GrokLoop[];
 	reset?: boolean;
 	subagent?: GrokSubagent;
 	title?: string;
@@ -189,7 +216,7 @@ interface PrCheck {
 interface PrStatus {
 	ok: boolean;
 	error?: string;
-	pr?: null | { number: number; title: string; url: string; state: string; isDraft: boolean; mergeable?: string; autoMerge: boolean; checks: PrCheck[] };
+	pr?: null | { number: number; title: string; url: string; state: string; isDraft: boolean; mergeable?: string; autoMerge: boolean; checks: PrCheck[]; feedback: { at: string; who: string; kind: "comment" | "review" }[] };
 }
 
 interface BranchInfo {
@@ -222,6 +249,7 @@ interface DiffLine {
 }
 
 interface DiffHunk {
+	revertible?: boolean;
   id: string;
   loc: string;
   lines: DiffLine[];
@@ -276,6 +304,13 @@ interface WriteResult {
 	message?: string;
 }
 
+interface BrowserNetworkProblem {
+	webContentsId: number;
+	url: string;
+	message: string;
+	at: number;
+}
+
 interface GrokCodeApi {
   send: (payload: {
     uiSessionId: string;
@@ -288,11 +323,12 @@ interface GrokCodeApi {
     effort: string;
     mode: string;
 		attachments?: string[];
+		browser?: boolean;
   }) => Promise<GrokSendResult>;
   cancel: (uiSessionId: string) => Promise<void>;
 	stopSession?: (uiSessionId: string) => Promise<void>;
 	forgetSession?: (uiSessionId: string) => Promise<void>;
-  decide: (payload: { uiSessionId: string; toolId: string; decision: "allow" | "deny" | "always" }) => Promise<GrokSendResult>;
+  decide: (payload: { uiSessionId: string; toolId: string; decision: "allow" | "deny" | "always" | "prefix" }) => Promise<GrokSendResult>;
 	answerQuestion: (payload: { uiSessionId: string; toolId: string; answers: Record<string, string> | null }) => Promise<GrokSendResult>;
 	answerPlan: (payload: { uiSessionId: string; toolId: string; outcome: "approved" | "feedback" | "abandoned"; feedback?: string; mode?: "Normal" | "Auto-review" | "Always-approve" }) => Promise<GrokSendResult>;
 	setAllowedFolders: (payload: { uiSessionId: string; allowedFolders: string[] }) => Promise<GrokSendResult>;
@@ -300,14 +336,24 @@ interface GrokCodeApi {
   diff: (cwd: string) => Promise<DiffSnapshot>;
   files: (cwd: string) => Promise<FolderList>;
   readFile: (cwd: string, file: string) => Promise<FileText>;
+	readImage?: (cwd: string, file: string) => Promise<{ ok: boolean; error?: string; dataUrl?: string; bytes?: number }>;
 	writeFile: (cwd: string, file: string, text: string, expectedVersion: string) => Promise<WriteResult>;
   revertFile: (cwd: string, file: string) => Promise<WriteResult>;
+	revertHunk?: (cwd: string, file: string, hunk: DiffHunk) => Promise<WriteResult>;
   pickFiles: () => Promise<string[]>;
 	newWindow: (uiSessionId?: string) => Promise<WriteResult>;
   copyText: (text: string) => Promise<WriteResult>;
+  exportMarkdown?: (payload: { agentSessionId: string; title?: string }) => Promise<{ ok: boolean; cancelled?: boolean; error?: string; path?: string }>;
+  listCliSessions?: (knownIds: string[]) => Promise<{ ok: boolean; error?: string; sessions?: { id: string; title: string; folder: string; lastActive: number }[] }>;
+  sessionLoops?: (uiSessionId: string, agentSessionId: string) => Promise<{ ok: boolean; live?: boolean; loops?: GrokLoop[] }>;
+  openCliSession?: (agentSessionId: string) => Promise<{ ok: boolean; error?: string; truncated?: boolean; session?: { id: string; title: string; folder: string; branch?: string; model?: string; effort?: string; lastActive?: number }; messages?: { role: "user" | "grok"; text: string }[] }>;
   reveal: (cwd: string, file: string) => Promise<WriteResult>;
   run: (payload: { cwd: string; command: string }) => Promise<CommandResult>;
   onEvent: (callback: (event: GrokEvent) => void) => () => void;
+	onBrowserProblem?: (callback: (problem: BrowserNetworkProblem) => void) => () => void;
+	browserTabs?: (payload: { uiSessionId: string; enabled: boolean; visible: boolean; activeId: string; tabs: { id: string; webContentsId: number; url: string; problems: string }[] }) => Promise<WriteResult>;
+	browserStop?: (uiSessionId: string) => Promise<WriteResult>;
+	browserResume?: (uiSessionId: string) => Promise<WriteResult>;
 	pathForFile: (file: File) => string;
 	openExternal: (url: string) => Promise<WriteResult>;
 	openIn: (payload: { target: "explorer" | "vscode"; cwd: string; file?: string; line?: number }) => Promise<WriteResult>;
@@ -335,17 +381,21 @@ interface GrokCodeApi {
 	recentSpend?: () => Promise<{ ok: boolean; error?: string; usd?: number }>;
 	homeDir?: string;
 	platform?: string;
-	readiness?: () => Promise<GrokReadiness>;
+	readiness?: (request?: { folder?: string; full?: boolean }) => Promise<GrokReadiness>;
 	installGrok?: () => Promise<{ ok: boolean; error?: string }>;
+	updateGrokCli?: () => Promise<{ ok: boolean; error?: string }>;
 	installGit?: () => Promise<{ ok: boolean; error?: string }>;
 	customize?: (cwd: string) => Promise<GrokInventory>;
+	skillExcerpt?: (cwd: string, skillPath: string) => Promise<{ ok: boolean; text?: string; folder?: string; error?: string }>;
 	customizeChange?: (cwd: string, input: GrokCustomizeChange) => Promise<{ ok: boolean; error?: string; message?: string }>;
 	account?: () => Promise<GrokAccount | null | undefined>;
 	billing?: () => Promise<{ ok: true; percent: number | null; period: string; resetsAt: string; tier: string } | { ok: false; error: string }>;
 	signOut?: () => Promise<WriteResult>;
 	devScripts: (cwd: string) => Promise<{ ok: boolean; scripts?: { script: string; command: string }[] }>;
-	terminalOpen?: (payload: { cwd: string }) => Promise<WriteResult & { id?: string }>;
+	terminalOpen?: (payload: { cwd: string }) => Promise<WriteResult & { id?: string; backend?: "pty" | "pipe"; warning?: string }>;
 	terminalWrite?: (id: string, text: string) => Promise<WriteResult>;
+	terminalInput?: (id: string, data: string) => Promise<WriteResult>;
+	terminalResize?: (id: string, cols: number, rows: number) => Promise<WriteResult>;
 	terminalClose?: (id: string) => Promise<WriteResult>;
 	terminalHistory?: (id: string) => Promise<string>;
 	terminalInterrupt?: (id: string) => Promise<{ ok: boolean; error?: string; stopped?: number }>;
@@ -354,8 +404,9 @@ interface GrokCodeApi {
 	branchInfo?: (cwd: string) => Promise<BranchInfo>;
 	scopedDiff?: (cwd: string, scope: string) => Promise<DiffSnapshot>;
 	listCommits?: (cwd: string) => Promise<{ ok: boolean; error?: string; commits?: { sha: string; short: string; subject: string; when: string }[] }>;
-	prStatus?: (cwd: string) => Promise<PrStatus>;
+	prStatus?: (cwd: string, number?: number) => Promise<PrStatus>;
 	prCreate?: (cwd: string, expected?: string) => Promise<WriteResult & { url?: string; message?: string }>;
+	gitCommit?: (cwd: string, options: { paths: string[]; message: string; push: boolean; expected?: string }) => Promise<WriteResult & { message?: string; committed?: boolean; sha?: string }>;
 	prMergeWhenReady?: (cwd: string, number: number) => Promise<WriteResult>;
 	addWorktree?: (cwd: string, payload: { name: string; prefix: string }) => Promise<WriteResult & { folder?: string; branch?: string }>;
 	restoreWorktree?: (folder: string, branch: string) => Promise<WriteResult & { folder?: string; branch?: string }>;

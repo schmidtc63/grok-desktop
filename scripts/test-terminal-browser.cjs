@@ -5,16 +5,39 @@ const vm = require("node:vm");
 const { transformSync } = require("esbuild");
 
 const jsx = (type, props) => ({ type, props: props ?? {} });
+let hooks;
 const react = {
 	createElement: (type, props) => ({ type, props: props ?? {} }),
-	useEffect() {},
-	useLayoutEffect() {},
+	useEffect(run, dependencies) {
+		if (!hooks) { return; }
+		const state = hooks;
+		const index = state.cursor++;
+		const previous = state.values[index];
+		if (!previous || !dependencies || dependencies.some((value, offset) => value !== previous.dependencies[offset])) {
+			state.effects.push(() => {
+				previous?.cleanup?.();
+				state.values[index] = { dependencies, cleanup: run() };
+			});
+		}
+	},
 	useMemo: (fn) => fn(),
-	useRef: (current) => ({ current }),
-	useState: (initial) => [initial, () => {}],
+	useRef(current) {
+		if (!hooks) { return { current }; }
+		const index = hooks.cursor++;
+		if (!(index in hooks.values)) { hooks.values[index] = { current }; }
+		return hooks.values[index];
+	},
+	useState(initial) {
+		if (!hooks) { return [typeof initial === "function" ? initial() : initial, () => {}]; }
+		const state = hooks;
+		const index = state.cursor++;
+		if (!(index in state.values)) { state.values[index] = typeof initial === "function" ? initial() : initial; }
+		return [state.values[index], (next) => { state.values[index] = typeof next === "function" ? next(state.values[index]) : next; }];
+	},
 };
+react.useLayoutEffect = react.useEffect;
 
-function load(name) {
+function load(name, globals = {}) {
 	const file = path.join(__dirname, "..", "src", name);
 	const source = transformSync(fs.readFileSync(file, "utf8"), { loader: "tsx", format: "cjs", jsx: "automatic" }).code;
 	const module = { exports: {} };
@@ -25,12 +48,18 @@ function load(name) {
 		if (id === "react/jsx-runtime") {
 			return { jsx, jsxs: jsx, Fragment: "fragment" };
 		}
+		if (id === "@xterm/xterm") { return globals.xterm || { Terminal: class {} }; }
+		if (id === "@xterm/addon-fit") { return globals.fitAddon || { FitAddon: class {} }; }
+		if (id === "@xterm/xterm/css/xterm.css") { return {}; }
 		if (id === "./data") {
-			return load("data.ts");
+			return load("data.ts", globals);
+		}
+		if (id === "./browserDiagnostics") {
+			return load("browserDiagnostics.ts", globals);
 		}
 		throw new Error(`Unexpected import ${id}`);
 	};
-	vm.runInNewContext(source, { require: imports, module, exports: module.exports, URL }, { filename: file });
+	vm.runInNewContext(source, { require: imports, module, exports: module.exports, URL, ...globals }, { filename: file });
 	return module.exports;
 }
 
@@ -145,6 +174,89 @@ function ctrlC(selectionStart, selectionEnd) {
 	return Object.assign(fakeEvent(null, "c"), { ctrlKey: true, shiftKey: false, altKey: false, currentTarget: { selectionStart, selectionEnd } });
 }
 
+function findNodes(node, match, output = []) {
+	if (Array.isArray(node)) {
+		for (const child of node) { findNodes(child, match, output); }
+	} else if (node && typeof node === "object") {
+		if (match(node)) { output.push(node); }
+		findNodes(node.props.children, match, output);
+	}
+	return output;
+}
+
+function textOf(node) {
+	if (Array.isArray(node)) { return node.map(textOf).join(""); }
+	if (typeof node === "string" || typeof node === "number") { return String(node); }
+	return node && typeof node === "object" ? textOf(node.props.children) : "";
+}
+
+function browserHarness() {
+	const diagnostics = load("browserDiagnostics.ts");
+	const appended = [];
+	const reports = [];
+	let stops = 0;
+	let resumes = 0;
+	let networkListener;
+	let unsubscribed = 0;
+	const { BrowserPane } = load("BrowserPane.tsx", {
+		window: { grokCode: { browserTabs: async (payload) => { reports.push(JSON.parse(JSON.stringify(payload))); return { ok: true }; }, onBrowserProblem(listener) { networkListener = listener; return () => { unsubscribed++; networkListener = undefined; }; } } },
+		document: { activeElement: null, addEventListener() {}, removeEventListener() {} },
+	});
+	const state = { cursor: 0, values: [], effects: [] };
+	const props = {
+		uiSessionId: "session-one", controlEnabled: true, controlStopped: false,
+		onStopControl() { stops++; props.controlStopped = true; }, onResumeControl() { resumes++; props.controlStopped = false; },
+		tabs: [{ id: "one", url: "https://one.test/page?session=secret#private", title: "One" }, { id: "two", url: "https://two.test/", title: "Two" }],
+		activeId: "one", keepCookies: true, linksInBuiltIn: true, devServers: [], selectTick: 0,
+		onActivate(id) { props.activeId = id; }, onNewTab() {},
+		onCloseTab(id) { props.tabs = props.tabs.filter((tab) => tab.id !== id); },
+		onNavigate() {},
+		onPageChanged(id, url, title) { props.tabs = props.tabs.map((tab) => tab.id === id ? { ...tab, url, title } : tab); },
+		onKeepCookies() {}, onClearData() {}, onLinksInBuiltIn() {}, onStartServer() {}, onStopServer() {}, onStopAll() {}, onPicked() {}, onClose() {},
+		onProblem(id, entry) { props.tabs = props.tabs.map((tab) => tab.id === id ? { ...tab, problems: diagnostics.addProblem(tab.problems ?? [], entry) } : tab); },
+		onClearProblems(id) { props.tabs = props.tabs.map((tab) => tab.id === id ? { ...tab, problems: [] } : tab); },
+		onDiagnostics(text) { appended.push(text); },
+	};
+	function render() {
+		hooks = state;
+		state.cursor = 0;
+		state.effects = [];
+		try {
+			const tree = BrowserPane(props);
+			for (const effect of state.effects) { effect(); }
+			return tree;
+		} finally {
+			hooks = undefined;
+		}
+	}
+	const views = new Map();
+	const cleanups = [];
+	for (const [offset, node] of findNodes(render(), (item) => item.type === "webview").entries()) {
+		const listeners = new Map();
+		const view = {
+			url: props.tabs[offset].url,
+			getURL() { return this.url; }, getTitle() { return props.tabs[offset]?.title ?? ""; }, getWebContentsId() { return 10 + offset; },
+			getAttribute(name) { return name === "src" ? this.url : undefined; }, setAttribute(name, value) { if (name === "src") { this.url = value; } },
+			addEventListener(name, listener) { listeners.set(name, listener); },
+			removeEventListener(name, listener) { if (listeners.get(name) === listener) { listeners.delete(name); } },
+			emit(type, details = {}) { Object.defineProperty(details, "type", { value: type, configurable: true }); listeners.get(type)?.(details); },
+			listeners,
+		};
+		cleanups.push(node.props.ref(view));
+		views.set(props.tabs[offset].id, view);
+	}
+	return {
+		props, views, render, appended, reports, stops: () => stops, resumes: () => resumes,
+		network(entry) { networkListener?.(entry); },
+		problems(id) { return props.tabs.find((tab) => tab.id === id)?.problems ?? []; },
+		unmount() {
+			for (const cleanup of cleanups) { cleanup?.(); }
+			for (const value of state.values) { value?.cleanup?.(); }
+		},
+		unsubscribed: () => unsubscribed,
+	};
+}
+
 (async () => {
 	await check("stripAnsi removes SGR colors", () => {
 		assert.equal(stripAnsi("\x1b[31mred\x1b[0m and \x1b[1;32mbold green\x1b[m"), "red and bold green");
@@ -242,6 +354,277 @@ function ctrlC(selectionStart, selectionEnd) {
 		page.__grokPickerStop();
 		assert.equal(await newer, null);
 		assert.equal(listeners.size, 0);
+	});
+	await check("native terminal forwards raw input, fits, appends capped output, follows theme and disposes", () => {
+		const instances = [];
+		const resizes = [];
+		const inputs = [];
+		const resizeObservers = [];
+		const appearanceObservers = [];
+		const schemeListeners = new Map();
+		let background = "#100f0d";
+		let foreground = "#e7e1d6";
+		class FakeTerminal {
+			constructor(options) { this.options = options; this.writes = []; this.cols = 80; this.rows = 24; instances.push(this); }
+			loadAddon(addon) { addon.term = this; }
+			open(element) { this.element = element; }
+			write(text) { this.writes.push(text); }
+			onData(listener) { this.input = listener; return { dispose: () => { this.input = undefined; this.inputDisposed = true; } }; }
+			focus() { this.focused = true; }
+			reset() { this.resets = (this.resets ?? 0) + 1; }
+			dispose() { this.disposed = true; }
+		}
+		class FakeFitAddon {
+			fit() { this.term.cols = Math.floor(this.term.element.clientWidth / 10); this.term.rows = Math.floor(this.term.element.clientHeight / 20); }
+		}
+		class FakeResizeObserver {
+			constructor(callback) { this.callback = callback; resizeObservers.push(this); }
+			observe(target) { this.target = target; }
+			disconnect() { this.disconnected = true; }
+		}
+		class FakeMutationObserver {
+			constructor(callback) { this.callback = callback; appearanceObservers.push(this); }
+			observe(target) { this.target = target; }
+			disconnect() { this.disconnected = true; }
+		}
+		const { TerminalPane } = load("TerminalPane.tsx", {
+			xterm: { Terminal: FakeTerminal }, fitAddon: { FitAddon: FakeFitAddon },
+			ResizeObserver: FakeResizeObserver, MutationObserver: FakeMutationObserver,
+			document: { documentElement: {} },
+			window: {
+				getComputedStyle: () => ({ getPropertyValue: (name) => name === "--code" ? background : foreground }),
+				matchMedia: () => ({ addEventListener: (name, callback) => schemeListeners.set(name, callback), removeEventListener: (name, callback) => { if (schemeListeners.get(name) === callback) { schemeListeners.delete(name); } } }),
+			},
+		});
+		const pane = TerminalPane({ tabs: [{ id: "native", title: "Shell", cwd: "C:/project", running: true, backend: "pty", output: "ABCDEF", received: 6 }], activeId: "native", onInput: (...args) => inputs.push(args), onResize: (...args) => resizes.push(args), onActivate() {}, onNew() {}, onCloseTab() {}, onInterrupt() {}, onClose() {} });
+		assert.equal(findNode(pane, (node) => node.type === "form"), null, "native tabs have no line-input form");
+		const native = findNode(pane, (node) => typeof node.type === "function" && node.type.name === "NativeTerminal");
+		assert.ok(native);
+		const props = { ...native.props };
+		const element = { clientWidth: 1000, clientHeight: 600 };
+		const state = { cursor: 0, values: [], effects: [] };
+		const render = () => {
+			hooks = state;
+			state.cursor = 0;
+			state.effects = [];
+			try {
+				const tree = native.type(props);
+				tree.props.ref.current = element;
+				for (const effect of state.effects) { effect(); }
+				return tree;
+			} finally { hooks = undefined; }
+		};
+		render();
+		const term = instances[0];
+		assert.equal(term.options.scrollback, 5000);
+		assert.equal(term.focused, true);
+		assert.deepEqual(resizes, [["native", 100, 30]]);
+		assert.deepEqual(term.writes, ["ABCDEF"], "initial output is replayed once");
+		term.input("\x1b[A\x03");
+		assert.deepEqual(inputs, [["native", "\x1b[A\x03"]], "arrow keys and Ctrl+C stay raw");
+		props.tab = { ...props.tab, output: "CDEFGH", received: 8 };
+		props.onInput = (...args) => inputs.push(["updated", ...args]);
+		props.onResize = (...args) => resizes.push(["updated", ...args]);
+		render();
+		render();
+		assert.equal(instances.length, 1, "output and callback changes do not recreate xterm");
+		assert.deepEqual(term.writes, ["ABCDEF", "GH"], "received preserves new suffixes when the stored buffer is capped");
+		term.input("x");
+		assert.deepEqual(inputs.at(-1), ["updated", "native", "x"]);
+		element.clientWidth = 800;
+		element.clientHeight = 400;
+		resizeObservers[0].callback();
+		assert.deepEqual(resizes.at(-1), ["updated", "native", 80, 20]);
+		background = "#f3f1ea";
+		foreground = "#2b2722";
+		appearanceObservers[0].callback();
+		assert.equal(term.options.theme.background, background);
+		assert.equal(term.options.theme.foreground, foreground);
+		assert.equal(term.options.theme.cursor, foreground);
+		assert.equal(schemeListeners.has("change"), true);
+		for (const value of state.values) { value?.cleanup?.(); }
+		assert.equal(resizeObservers[0].disconnected, true);
+		assert.equal(appearanceObservers[0].disconnected, true);
+		assert.equal(schemeListeners.size, 0);
+		assert.equal(term.inputDisposed, true);
+		assert.equal(term.disposed, true);
+	});
+	await check("browser control reports real guests, sanitized evidence, active tab and unmount; Stop and resume stay explicit", () => {
+		const browser = browserHarness();
+		assert.equal(browser.reports.at(-1).uiSessionId, "session-one");
+		assert.deepEqual(browser.reports.at(-1).tabs.map((tab) => [tab.id, tab.webContentsId, tab.url]), [["one", 10, "https://one.test/page"], ["two", 11, "https://two.test/"]]);
+		assert.ok(browser.reports.at(-1).tabs.every((tab) => tab.problems.startsWith("Browser diagnostics\nPage: ")));
+		assert.ok(!JSON.stringify(browser.reports).includes("secret"));
+		browser.props.onActivate("two");
+		browser.render();
+		assert.equal(browser.reports.at(-1).activeId, "two");
+		browser.views.get("two").url = "https://two.test/next?token=secret#private";
+		browser.views.get("two").emit("dom-ready");
+		assert.equal(browser.reports.at(-1).tabs[1].url, "https://two.test/next");
+		browser.props.controlActivity = { text: "clicking a button", running: true };
+		let tree = browser.render();
+		const banner = findNode(tree, (node) => node.props.className === "bp-control");
+		assert.ok(textOf(banner).includes("An already-sent action may still finish."));
+		findNode(banner, (node) => node.type === "button" && node.props.children === "Stop").props.onClick();
+		assert.equal(browser.stops(), 1);
+		tree = browser.render();
+		findNode(tree, (node) => node.props["aria-label"] === "Browser menu").props.onClick();
+		tree = browser.render();
+		findNode(tree, (node) => node.type === "button" && node.props.children === "Let Grok use this browser").props.onClick();
+		assert.equal(browser.resumes(), 1);
+		browser.props.controlEnabled = false;
+		browser.render();
+		assert.equal(browser.reports.at(-1).enabled, false);
+		browser.unmount();
+		assert.equal(browser.reports.at(-1).visible, false);
+		assert.deepEqual(browser.reports.at(-1).tabs, []);
+	});
+	await check("browser agent Problems contain only the current live origin while the UI keeps earlier history", () => {
+		const browser = browserHarness();
+		const view = browser.views.get("one");
+		view.url = "https://unapproved.test/account";
+		view.emit("console-message", { level: 3, message: "Prior remote account private-value", sourceId: "https://unapproved.test/app.js" });
+		view.url = "http://localhost:5173/";
+		view.emit("console-message", { level: 3, message: "Current development failure", sourceId: "http://localhost:5173/app.js" });
+		browser.props.onProblem("one", { kind: "console", message: "Same-origin source only", source: "http://localhost:5173/source.js" });
+		browser.props.onProblem("one", { kind: "console", message: "Unknown origin private-value" });
+		browser.props.onProblem("one", { kind: "console", message: "Other source private-value", source: "https://unapproved.test/source.js" });
+		browser.render();
+		const reported = () => browser.reports.at(-1).tabs.find((tab) => tab.id === "one").problems;
+		assert.ok(reported().includes("Current development failure"));
+		assert.ok(reported().includes("Same-origin source only"));
+		assert.ok(!reported().includes("private-value"), "earlier, other-origin and unidentifiable evidence does not cross a site grant");
+		assert.ok(browser.problems("one").some((entry) => entry.message.includes("Prior remote account private-value")), "the UI history is unchanged");
+		view.getURL = () => { throw new Error("Guest not ready"); };
+		view.emit("dom-ready");
+		assert.ok(!reported().includes("Current development failure"), "a stale tab URL cannot establish the live consent origin");
+		browser.unmount();
+	});
+	await check("browser diagnostics bound real console events to 100 entries and 500 message characters", () => {
+		const browser = browserHarness();
+		for (let index = 0; index < 105; index++) {
+			browser.views.get("one").emit("console-message", { level: 3, message: `Problem ${index}: ${"x".repeat(700)}`, sourceId: "https://one.test/app.js", line: 9 });
+		}
+		const entries = browser.problems("one");
+		assert.equal(entries.length, 100);
+		assert.ok(entries[0].message.startsWith("Problem 5:"), "the oldest five entries are discarded");
+		assert.ok(entries.at(-1).message.startsWith("Problem 104:"));
+		assert.ok(entries.every((entry) => entry.message.length <= 500));
+		browser.unmount();
+	});
+	await check("browser diagnostics count duplicate warnings and ignore informational messages and cancelled loads", () => {
+		const browser = browserHarness();
+		const view = browser.views.get("one");
+		for (const level of [0, 1, "info", "debug"]) {
+			view.emit("console-message", { level, message: "Informational output" });
+		}
+		view.emit("did-fail-load", { errorCode: -3, errorDescription: "ERR_ABORTED", validatedURL: "https://one.test/aborted?secret=yes#private" });
+		assert.equal(browser.problems("one").length, 0);
+		for (let index = 0; index < 3; index++) {
+			view.emit("console-message", { level: 2, message: "A warning", sourceId: "https://one.test/app.js", line: 42 });
+		}
+		assert.equal(browser.problems("one").length, 1);
+		assert.equal(browser.problems("one")[0].count, 3);
+		assert.equal(browser.problems("one")[0].level, "warning");
+		assert.equal(browser.problems("one")[0].line, 42);
+		view.emit("console-message", { level: "error", message: "A modern error", sourceId: "https://one.test/modern.js", lineNumber: 12 });
+		assert.equal(browser.problems("one").length, 2);
+		assert.equal(browser.problems("one")[1].level, "error");
+		assert.equal(browser.problems("one")[1].line, 12);
+		const problemsButton = findNode(browser.render(), (node) => node.type === "button" && node.props["aria-label"] === "Problems for One");
+		assert.ok(problemsButton);
+		problemsButton.props.onClick();
+		const panel = findNode(browser.render(), (node) => node.props["aria-label"] === "Browser problems");
+		assert.ok(panel);
+		assert.ok(textOf(panel).includes("×3"), "the repeated warning displays its occurrence count");
+		assert.equal(findNodes(panel, (node) => node.type === "li").length, 2, "duplicates share one row");
+		browser.unmount();
+	});
+	await check("browser diagnostics strip URL secrets and omit body, header and cookie fields", () => {
+		const browser = browserHarness();
+		const event = {
+			level: 3, message: "Fetch failed at https://one.test/api?messageToken=secret#private", sourceId: "https://user:password@one.test/app.js?sourceToken=secret#private", line: 7,
+		};
+		for (const field of ["requestBody", "responseBody", "headers", "cookies"]) {
+			Object.defineProperty(event, field, { get() { throw new Error(`Read forbidden field ${field}`); }, enumerable: true });
+		}
+		browser.views.get("one").emit("console-message", event);
+		const entry = browser.problems("one")[0];
+		assert.equal(entry.source, "https://one.test/app.js");
+		assert.equal(entry.url, "https://one.test/page");
+		assert.ok(entry.message.includes("https://one.test/api"));
+		const stored = JSON.stringify(entry);
+		for (const secret of ["messageToken", "sourceToken", "session=", "private", "password", "requestBody", "responseBody", "headers", "cookies"]) {
+			assert.ok(!stored.includes(secret), `${secret} is absent from stored diagnostics`);
+		}
+		findNode(browser.render(), (node) => node.props["aria-label"] === "Problems for One").props.onClick();
+		findNode(browser.render(), (node) => node.type === "button" && node.props.children === "Add to prompt").props.onClick();
+		assert.equal(browser.appended.length, 1);
+		assert.ok(browser.appended[0].startsWith("Browser diagnostics\nPage: https://one.test/page\nCaptured: "));
+		assert.match(browser.appended[0], /Captured: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z\n\n/);
+		assert.ok(browser.appended[0].includes("https://one.test/app.js:7"));
+		for (const secret of ["messageToken", "sourceToken", "session=", "private", "password", "requestBody", "responseBody", "headers", "cookies"]) {
+			assert.ok(!browser.appended[0].includes(secret), `${secret} is absent from prompt text`);
+		}
+		browser.unmount();
+	});
+	await check("browser diagnostics strip bare endpoint, query-only and fragment-only secrets before storing or appending", () => {
+		const browser = browserHarness();
+		for (const target of ["api?access_token=example-secret#private", "?access_token=query-secret#query-fragment", "#fragment-secret", "https:\\/\\/one.test\\/api?escaped-secret#escaped-private"]) {
+			browser.views.get("one").emit("console-message", { level: 3, message: `Request failed: ${target}`, sourceId: "source.js?source-secret#source-private", line: 1 });
+		}
+		const stored = JSON.stringify(browser.problems("one"));
+		assert.ok(browser.problems("one").length > 0);
+		for (const secret of ["access_token", "example-secret", "query-secret", "query-fragment", "fragment-secret", "escaped-secret", "escaped-private", "source-secret", "source-private"]) {
+			assert.ok(!stored.includes(secret), `${secret} is absent from stored relative URL diagnostics`);
+		}
+		findNode(browser.render(), (node) => node.props["aria-label"] === "Problems for One").props.onClick();
+		findNode(browser.render(), (node) => node.type === "button" && node.props.children === "Add to prompt").props.onClick();
+		assert.equal(browser.appended.length, 1);
+		for (const secret of ["access_token", "example-secret", "query-secret", "query-fragment", "fragment-secret", "escaped-secret", "escaped-private", "source-secret", "source-private"]) {
+			assert.ok(!browser.appended[0].includes(secret), `${secret} is absent from the appended prompt`);
+		}
+		browser.unmount();
+	});
+	await check("browser diagnostics route network failures by guest id and retain earlier problems across navigation", () => {
+		const browser = browserHarness();
+		browser.network({ webContentsId: 999, url: "https://outside.test/", message: "Unrelated failure", at: 1711111111111 });
+		assert.equal(browser.problems("one").length + browser.problems("two").length, 0);
+		browser.network({ webContentsId: 11, url: "https://two.test/api?networkToken=secret#private", message: "HTTP 503", at: 1711111111111, headers: "header-secret", body: "body-secret", cookies: "cookie-secret" });
+		assert.equal(browser.problems("one").length, 0);
+		assert.equal(browser.problems("two").length, 1);
+		assert.equal(browser.problems("two")[0].url, "https://two.test/api");
+		assert.ok(!JSON.stringify(browser.problems("two")).includes("secret"));
+		browser.views.get("one").emit("did-fail-load", { errorCode: -105, errorDescription: "ERR_NAME_NOT_RESOLVED", validatedURL: "https://one.test/missing?loadToken=secret#private" });
+		assert.equal(browser.problems("one").length, 1);
+		assert.equal(browser.problems("one")[0].url, "https://one.test/missing");
+		browser.views.get("one").url = "https://one.test/next?navigationToken=secret#private";
+		browser.views.get("one").emit("did-navigate", { isMainFrame: true, url: browser.views.get("one").url });
+		const entries = browser.problems("one");
+		assert.equal(entries.length, 2);
+		assert.equal(entries[0].kind, "load");
+		assert.equal(entries[1].kind, "navigation");
+		assert.ok(entries[1].message.toLowerCase().includes("navigated to"));
+		assert.ok(!JSON.stringify(entries).includes("secret"));
+		assert.equal(browser.problems("two").length, 1, "another tab's log is retained independently");
+		browser.unmount();
+		assert.equal(browser.unsubscribed(), 1);
+		assert.ok([...browser.views.values()].every((view) => view.listeners.size === 0), "unmount removes webview diagnostics listeners");
+	});
+	await check("browser diagnostics Clear affects only its tab and Add to prompt uses that tab's evidence", () => {
+		const browser = browserHarness();
+		browser.views.get("one").emit("console-message", { level: 3, message: "First tab failure", sourceId: "https://one.test/a.js", line: 1 });
+		browser.views.get("two").emit("console-message", { level: 2, message: "Second tab warning", sourceId: "https://two.test/b.js", line: 2 });
+		findNode(browser.render(), (node) => node.props["aria-label"] === "Problems for Two").props.onClick();
+		findNode(browser.render(), (node) => node.type === "button" && node.props.children === "Add to prompt").props.onClick();
+		assert.equal(browser.appended.length, 1);
+		assert.ok(browser.appended[0].includes("Page: https://two.test/"));
+		assert.ok(browser.appended[0].includes("Second tab warning"));
+		assert.ok(!browser.appended[0].includes("First tab failure"));
+		findNode(browser.render(), (node) => node.type === "button" && node.props.children === "Clear").props.onClick();
+		assert.equal(browser.problems("two").length, 0);
+		assert.equal(browser.problems("one").length, 1);
+		browser.unmount();
 	});
 	if (failed > 0) {
 		console.log(`${failed} check(s) failed`);

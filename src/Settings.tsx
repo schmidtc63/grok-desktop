@@ -1,8 +1,10 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Customize } from "./Customize";
 import { keyLabel } from "./data";
 import { DEFAULT_FILE_TYPES, PLAIN_TEXT } from "./editor-defaults";
 import { mapMode, MODES, type PermissionMode, type TranscriptView } from "./types";
+import { SavedPromptsSettings } from "./SavedPromptsSettings";
+import { normalizeSavedPrompts, type SavedPrompt } from "./saved-prompts";
 
 const EditorSettings = lazy(() => import("./EditorSettings").then((module) => ({ default: module.EditorSettings })).catch(() => ({
 	default: () => <p className="note" role="alert">Editor file types could not load. Restart the app to try again.</p>,
@@ -13,12 +15,15 @@ export interface AppSettings {
 	autoSave: boolean;
 	editorFileTypes: Record<string, string>;
 	promptSuggestions: boolean;
+	savedPrompts: SavedPrompt[];
 	keepCookies: boolean;
 	linksInBuiltIn: boolean;
+	browserControl: boolean;
 	linkAsked: boolean;
 	notifyPermission: "banner" | "off";
 	notifyQuestion: "banner" | "off";
 	notifyDone: "banner" | "off";
+	notifyPr: "banner" | "off";
 	attention: boolean;
 	sound: "system" | "none";
 	keepAwake: boolean;
@@ -36,6 +41,7 @@ export interface AppSettings {
 	sideWidth: number;
 	sidebarCollapsed: boolean;
 	railOpen: boolean;
+	diffView: "unified" | "split";
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -43,12 +49,15 @@ export const DEFAULT_SETTINGS: AppSettings = {
 	autoSave: true,
 	editorFileTypes: DEFAULT_FILE_TYPES,
 	promptSuggestions: true,
+	savedPrompts: [],
 	keepCookies: true,
 	linksInBuiltIn: true,
+	browserControl: false,
 	linkAsked: false,
 	notifyPermission: "banner",
 	notifyQuestion: "banner",
 	notifyDone: "banner",
+	notifyPr: "banner",
 	attention: true,
 	sound: "system",
 	keepAwake: true,
@@ -65,6 +74,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
 	sideWidth: 560,
 	sidebarCollapsed: false,
 	railOpen: true,
+	diffView: "unified",
 };
 
 export const settingsKey = "grok-code.settings.v1";
@@ -77,6 +87,8 @@ export function readSettings(): AppSettings {
 		settings.editorFileTypes = fileTypes && typeof fileTypes === "object" && Object.getPrototypeOf(fileTypes) === Object.prototype && Object.values(fileTypes).every((value) => typeof value === "string") ? fileTypes : { ...DEFAULT_FILE_TYPES };
 		settings.defaultMode = mapMode(settings.defaultMode) ?? "Normal";
 		if (!["normal", "thinking", "verbose"].includes(settings.defaultView)) { settings.defaultView = "normal"; }
+		if (settings.diffView !== "split") { settings.diffView = "unified"; }
+		settings.savedPrompts = normalizeSavedPrompts(settings.savedPrompts);
 		return settings;
 	} catch {
 		return { ...DEFAULT_SETTINGS, editorFileTypes: { ...DEFAULT_FILE_TYPES } };
@@ -87,7 +99,7 @@ export function validPrefix(value: string) {
 	return /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(value) && !/^(main|master|staging|warm|prod-.*|release.*)$/i.test(value);
 }
 
-export type SettingsTab = "general" | "editor" | "notifications" | "sessions" | "skills" | "connectors" | "plugins" | "about";
+export type SettingsTab = "general" | "editor" | "notifications" | "sessions" | "prompts" | "skills" | "connectors" | "plugins" | "about";
 
 export function SettingsPage({ settings, onChange, onClose, onCheckSetup, servers, folder, onRun, initialTab = "general" }: {
 	settings: AppSettings;
@@ -100,6 +112,10 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 	initialTab?: SettingsTab;
 }) {
 	const [tab, setTab] = useState<SettingsTab>(initialTab);
+	const toolsOpen = tab === "skills" || tab === "connectors" || tab === "plugins";
+	const section = toolsOpen ? "skills" : tab;
+	const selectedButton = useRef<HTMLButtonElement | null>(null);
+	useEffect(() => { selectedButton.current?.focus(); }, [section]);
 	const [prefix, setPrefix] = useState(settings.branchPrefix);
 	const [extension, setExtension] = useState("");
 	const [newLanguage, setNewLanguage] = useState(PLAIN_TEXT);
@@ -140,13 +156,13 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 		<div className="settings-page" role="dialog" aria-label="Settings">
 			<nav className="settings-nav">
 				<h2>Settings</h2>
-				{([["general", "General"], ["editor", "Editor"], ["notifications", "Notifications"], ["sessions", "Sessions"], ["skills", "Skills"], ["connectors", "Connectors"], ["plugins", "Plugins"], ["about", "About"]] as [SettingsTab, string][]).map(([id, label]) => (
-					<button key={id} type="button" autoFocus={tab === id} className={tab === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>
+				{([["general", "General"], ["editor", "Editor"], ["notifications", "Notifications"], ["sessions", "Sessions"], ["prompts", "Saved prompts"], ["skills", "Skills and tools"], ["about", "About"]] as [SettingsTab, string][]).map(([id, label]) => (
+					<button key={id} type="button" ref={section === id ? selectedButton : undefined} aria-current={section === id ? "page" : undefined} className={section === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>
 				))}
 				<span className="spacer" />
 				<button type="button" className="texty" onClick={onClose}>Done</button>
 			</nav>
-			<div className="settings-body">
+			<div className={toolsOpen ? "settings-body customize" : "settings-body"}>
 				{tab === "general" && (
 					<>
 						<h3>General</h3>
@@ -158,6 +174,7 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 						<h3>Browser</h3>
 						{row("Keep cookies", "Sign-ins in the Browser pane survive restarts.", toggle("keepCookies", "Keep cookies"))}
 						{row("Open links in built-in browser", keyLabel("Links in the chat open in the Browser pane. Ctrl+click opens your default browser."), toggle("linksInBuiltIn", "Open links in built-in browser"))}
+						{row("Let Grok use the Browser pane", "Grok uses sites where you are signed in. What it reads goes to xAI as part of the conversation. Other sites ask for permission; Stop pauses browser access.", toggle("browserControl", "Let Grok use the Browser pane"))}
 					</>
 				)}
 				{tab === "editor" && (
@@ -165,12 +182,14 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 						<EditorSettings fileTypes={settings.editorFileTypes} onChange={(fileTypes) => onChange({ editorFileTypes: fileTypes })} extension={extension} setExtension={setExtension} newLanguage={newLanguage} setNewLanguage={setNewLanguage} />
 					</Suspense>
 				)}
+				{tab === "prompts" && <SavedPromptsSettings prompts={settings.savedPrompts} onChange={(savedPrompts) => onChange({ savedPrompts })} />}
 				{tab === "notifications" && (
 					<>
 						<h3>Notifications</h3>
 						{row("Permission requests", "When Grok needs approval and the window is in the background.", choose("notifyPermission", "Permission request notifications", [["banner", "Banners"], ["off", "Off"]]))}
 						{row("Questions", "When Grok asks you to choose.", choose("notifyQuestion", "Question notifications", [["banner", "Banners"], ["off", "Off"]]))}
 						{row("Task complete", "When a session finishes while you are not looking at it.", choose("notifyDone", "Task complete notifications", [["banner", "Banners"], ["off", "Off"]]))}
+						{row("Pull requests", "When CI fails or new review feedback arrives on a pull request a session opened.", choose("notifyPr", "Pull request notifications", [["banner", "Banners"], ["off", "Off"]]))}
 						{row("Draw attention", "Flash the taskbar button when Grok needs you.", toggle("attention", "Draw attention on notifications"))}
 						{row("Notification sound", "The sound banners play.", choose("sound", "Notification sound", [["system", "System sound"], ["none", "None"]]))}
 					</>
@@ -205,7 +224,7 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 						{rulesError && <p className="note" role="alert">{rulesError}</p>}
 					</>
 				)}
-				{(tab === "skills" || tab === "connectors" || tab === "plugins") && <Customize key={folder} view={tab} folder={folder} live={servers} onRun={onRun} />}
+				{(tab === "skills" || tab === "connectors" || tab === "plugins") && <Customize key={folder} view={tab} onViewChange={setTab} folder={folder} live={servers} onRun={onRun} />}
 				{tab === "about" && (
 					<>
 						<h3>About</h3>

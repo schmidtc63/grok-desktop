@@ -23,6 +23,9 @@ export interface DiffPaneProps {
 	onSelectFile: (file: string) => void;
 	onRefresh: () => void;
 	onRevert: (file: string) => Promise<{ ok: boolean; error?: string }>;
+	onRevertHunk: (file: string, hunk: DiffHunk) => Promise<WriteResult>;
+	onCommit: (input: { paths: string[]; message: string; push: boolean }) => Promise<{ ok: boolean; error?: string; message?: string; committed?: boolean; sha?: string }>;
+	busy: boolean;
 	comments: DiffComment[];
 	viewed: Record<string, string>;
 	onViewed: (file: string, fingerprint: string | null) => void;
@@ -182,6 +185,8 @@ export function DiffPane(props: DiffPaneProps) {
 	const [note, setNote] = useState(``);
 	const [reverting, setReverting] = useState(false);
 	const [compose, setCompose] = useState<Compose | null>(null);
+	const [commitDialog, setCommitDialog] = useState<{ paths: string[]; request: string; count: number; push: boolean; message: string } | null>(null);
+	const [committing, setCommitting] = useState(false);
 	const sendAfterAdd = useRef(false);
 	useEffect(() => {
 		if (sendAfterAdd.current) {
@@ -230,23 +235,29 @@ export function DiffPane(props: DiffPaneProps) {
 
 	function commit(push: boolean) {
 		const some = picked.length < files.length;
-		const count = `${picked.length} of ${files.length} files`;
 		// A renamed file also names its old path, or the commit would leave the old one behind.
-		const names = picked.flatMap((file) => file.from ? [file.from, file.path] : [file.path]).map((name) => `\`${name}\``).join(`, `);
+		const paths = picked.flatMap((file) => file.from ? [file.from, file.path] : [file.path]);
+		const names = paths.map((name) => `\`${name}\``).join(`, `);
 		const only = `Commit only these files in this repository with a clear commit message, and leave the other changes uncommitted: ${names}.`;
-		const ask = push
-			? { title: some ? `Commit ${count} and push?` : `Commit and push?`, body: some ? `Grok commits only the checked files and pushes the branch to its remote.` : `Grok commits all uncommitted changes and pushes the branch to its remote.`, ok: `Commit and push`, danger: true }
-			: { title: some ? `Commit ${count}?` : `Commit all uncommitted changes?`, body: some ? `Grok writes the commit message and commits only the checked files. Nothing is pushed.` : `Grok writes the commit message and commits. Nothing is pushed.`, ok: `Commit` };
 		const request = push
 			? (some ? `${only} Then push the branch.` : `Commit the current uncommitted changes in this repository with a clear commit message, then push the branch.`)
 			: (some ? `${only} Don't push.` : `Commit the current uncommitted changes in this repository with a clear commit message. Don't push.`);
-		// The files left out stay uncommitted, so they start checked for the next commit.
-		void askConfirm(ask).then((yes) => {
-			if (yes) {
-				onAskGrok(request);
-				setExcluded([]);
-			}
-		});
+		setMenu(null);
+		setCommitDialog({ paths, request, count: picked.length, push, message: `` });
+	}
+
+	async function runCommit() {
+		if (!commitDialog || committing || props.busy || !commitDialog.message.trim()) { return; }
+		setCommitting(true);
+		try {
+			const result = await props.onCommit({ paths: commitDialog.paths, message: commitDialog.message.trim(), push: commitDialog.push });
+			if (result.committed) { setExcluded([]); }
+		} catch {
+		} finally {
+			setCommitting(false);
+			setCommitDialog(null);
+			onRefresh();
+		}
 	}
 
 	function revert() {
@@ -262,6 +273,22 @@ export function DiffPane(props: DiffPaneProps) {
 			void onRevert(file).then((result) => {
 				setNote(result.ok ? `Restored ${file} to the last commit.` : (result.error || `That file could not be restored.`));
 			}, () => setNote(`That file could not be restored.`)).finally(() => setReverting(false));
+		});
+	}
+
+	function revertHunk(file: string, hunk: DiffHunk) {
+		const range = /\+(\d+)(?:,(\d+))? @@/.exec(hunk.loc);
+		if (!range) { return; }
+		const start = Number(range[1]);
+		const count = range[2] === undefined ? 1 : Number(range[2]);
+		const deletion = count === 0 ? (start === 0 ? ` The deleted lines are restored before the first line.` : ` The deleted lines are restored after line ${start}.`) : ``;
+		void askConfirm({ title: `Revert this change?`, body: `Lines ${start}-${Math.max(start, start + count - 1)} of ${file} go back to how they are in the index. The app can't undo this.${deletion}`, ok: `Revert`, danger: true }).then((yes) => {
+			if (!yes) { return; }
+			setReverting(true);
+			setNote(``);
+			void props.onRevertHunk(file, hunk).then((result) => {
+				setNote(result.ok ? `Restored this change in ${file} to its indexed version.` : (result.error || `That change could not be restored.`));
+			}, () => setNote(`That change could not be restored.`)).finally(() => { setReverting(false); onRefresh(); });
 		});
 	}
 
@@ -301,6 +328,7 @@ export function DiffPane(props: DiffPaneProps) {
 					{firstLine !== undefined && (
 						<button className="dp-goto" aria-label={`Open ${file} at line ${firstLine}`} onClick={() => onOpenFile(file, firstLine)}>Open</button>
 					)}
+					{scope === `uncommitted` && hunk.revertible === true && <button className="texty" disabled={reverting} onClick={() => revertHunk(file, hunk)}>Revert this change</button>}
 				</div>
 				{rows.map((row, index) => {
 					const side = row.kind === `del` ? `old` : `new`;
@@ -354,6 +382,7 @@ export function DiffPane(props: DiffPaneProps) {
 			aria-label="Changes"
 			tabIndex={-1}
 			onKeyDown={(event) => {
+				if (commitDialog) { event.stopPropagation(); return; }
 				if (event.key === `Escape` && menu) {
 					setMenu(null);
 					return;
@@ -456,6 +485,30 @@ export function DiffPane(props: DiffPaneProps) {
 				</div>
 			)}
 		</section>
+		{commitDialog && (
+			<div className="overlay confirm-overlay" data-commit-dialog onKeyDown={(event) => {
+				event.stopPropagation();
+				if (event.key === `Escape`) {
+					event.preventDefault();
+					if (!committing) { setCommitDialog(null); }
+				} else if (modKey(event) && event.key === `Enter` && !event.nativeEvent.isComposing) {
+					event.preventDefault();
+					void runCommit();
+				}
+			}}>
+				<div className="sheet" role="dialog" aria-modal="true" aria-label={`Commit ${commitDialog.count} file${commitDialog.count === 1 ? `` : `s`}${commitDialog.push ? ` and push` : ``}?`}>
+					<h2>{`Commit ${commitDialog.count} file${commitDialog.count === 1 ? `` : `s`}${commitDialog.push ? ` and push` : ``}?`}</h2>
+					<p className="confirm-body">Only the checked files listed in the pane will be committed. Other changes stay uncommitted.</p>
+					<label>Commit message<textarea className="tool-other" aria-label="Commit message" autoFocus rows={3} value={commitDialog.message} disabled={committing} placeholder="The first line is the summary." onChange={(event) => setCommitDialog({ ...commitDialog, message: event.target.value })} /></label>
+					{props.busy && <p className="note">Grok is still working. Wait for the turn to end, or ask Grok to commit.</p>}
+					<div className="actions" style={{ marginTop: 16 }}>
+						<button type="button" className="texty" disabled={committing} onClick={() => setCommitDialog(null)}>Cancel</button>
+						<button type="button" className="texty" disabled={committing} onClick={() => { onAskGrok(commitDialog.request); setExcluded([]); setCommitDialog(null); }}>Ask Grok to commit</button>
+						<button type="button" className={commitDialog.push ? `yes danger` : `yes`} disabled={committing || props.busy || !commitDialog.message.trim()} onClick={() => void runCommit()}>{committing ? (commitDialog.push ? `Pushing…` : `Committing…`) : commitDialog.push ? `Commit and push` : `Commit`}</button>
+					</div>
+				</div>
+			</div>
+		)}
 		</>
 	);
 }

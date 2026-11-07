@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { Markdown } from "./Markdown";
 import { type NumberedLine } from "./DiffPane";
 import { imageSrc, type ChatMessage, type Session, type ToolCard, type ToolDiff, type TranscriptView } from "./types";
@@ -51,7 +51,7 @@ export interface PaneModel {
 	taskOutput: NonNullable<GrokCodeApi["taskOutput"]>;
 	subagentTranscript: NonNullable<GrokCodeApi["subagentTranscript"]>;
 	busy: boolean;
-	decide: (toolId: string, decision: "allow" | "deny" | "always") => void;
+	decide: (toolId: string, decision: "allow" | "deny" | "always" | "prefix") => void;
 	answerQuestion: (toolId: string, answers: Record<string, string> | null) => Promise<GrokSendResult>;
 	answerPlan: (toolId: string, choice: { outcome: "approved" | "feedback" | "abandoned"; feedback?: string; mode?: "Normal" | "Auto-review" | "Always-approve" }) => Promise<GrokSendResult>;
 	resumeMode: "Normal" | "Auto-review" | "Always-approve";
@@ -66,6 +66,8 @@ export interface PaneModel {
 	openImage: (file: string) => void;
 	runInTerminal: (code: string) => void;
 	closePane: (id: "plan" | "tasks") => void;
+	diffView?: "unified" | "split";
+	setDiffView?: (view: "unified" | "split") => void;
 }
 
 interface FileHit {
@@ -267,15 +269,83 @@ export function editRows(diff: ToolDiff): NumberedLine[] {
 	return rows;
 }
 
-export function EditDiff({ diff, all = false }: { diff: ToolDiff; all?: boolean }) {
+export interface SplitCell { kind: "context" | "del" | "add"; text: string; line?: number }
+export interface SplitRow { left?: SplitCell; right?: SplitCell }
+
+// Two line-number columns plus about twenty characters of text on each side.
+export const SPLIT_MIN_WIDTH = 480;
+
+export function splitFits(width: number): boolean {
+	return Number.isFinite(width) && width >= SPLIT_MIN_WIDTH;
+}
+
+function splitCell(row: NumberedLine, side: "left" | "right"): SplitCell {
+	const line = side === "left" ? row.oldLine : row.newLine;
+	return { kind: row.kind === "add" ? "add" : row.kind === "del" ? "del" : "context", text: row.text, ...(line === undefined ? {} : { line }) };
+}
+
+// Deleted lines and the added lines that follow them share rows. Leftovers stay on one side.
+export function splitRows(rows: NumberedLine[]): SplitRow[] {
+	const pairs: SplitRow[] = [];
+	let index = 0;
+	while (index < rows.length) {
+		if (rows[index].kind === "context") {
+			pairs.push({ left: splitCell(rows[index], "left"), right: splitCell(rows[index], "right") });
+			index += 1;
+			continue;
+		}
+		const removed: NumberedLine[] = [];
+		const added: NumberedLine[] = [];
+		while (index < rows.length && rows[index].kind === "del") { removed.push(rows[index]); index += 1; }
+		while (index < rows.length && rows[index].kind === "add") { added.push(rows[index]); index += 1; }
+		const shared = Math.min(removed.length, added.length);
+		for (let pair = 0; pair < shared; pair += 1) { pairs.push({ left: splitCell(removed[pair], "left"), right: splitCell(added[pair], "right") }); }
+		for (let pair = shared; pair < removed.length; pair += 1) { pairs.push({ left: splitCell(removed[pair], "left") }); }
+		for (let pair = shared; pair < added.length; pair += 1) { pairs.push({ right: splitCell(added[pair], "right") }); }
+	}
+	return pairs;
+}
+
+function marked(cell: SplitCell) {
+	return `${cell.kind === "add" ? "+" : cell.kind === "del" ? "-" : " "}${cell.text}`;
+}
+
+export function EditDiff({ diff, all = false, view = "unified", onView, width = 0, onWidth }: { diff: ToolDiff; all?: boolean; view?: "unified" | "split"; onView?: (view: "unified" | "split") => void; width?: number; onWidth?: (width: number) => void }) {
 	const rows = editRows(diff);
+	const shown = all ? rows : rows.slice(0, 200);
+	const split = view === "split" && (width === 0 || splitFits(width));
+	// React 19 drops and recalls a ref callback when its identity changes. A new watcher on every streaming render would rebuild the observer and read clientWidth.
+	const watch = useCallback((node: HTMLDivElement | null) => {
+		if (!node || !onWidth || typeof node.clientWidth !== "number") { return; }
+		const read = () => onWidth(node.clientWidth);
+		read();
+		const Observer = window.ResizeObserver;
+		if (typeof Observer !== "function") { return; }
+		const observer = new Observer(read);
+		observer.observe(node);
+		return () => observer.disconnect();
+	}, [onWidth]);
 	return (
-		<>
+		<div className="edit-diff-wrap" ref={watch}>
+			<div className="edit-view" role="group" aria-label="Diff view">
+				<button type="button" aria-pressed={view !== "split"} onClick={() => onView?.("unified")}>Unified</button>
+				<button type="button" aria-pressed={view === "split"} onClick={() => onView?.("split")}>Split</button>
+			</div>
+			{view === "split" && !split && <p className="note">Showing unified because this column is narrow.</p>}
 			{diff.whole && <p className="note">Writes the whole file. If the file exists, all of its current text is replaced.</p>}
 			{diff.replaceAll && <p className="note">Replaces every match in the file, not only this one.</p>}
-			{rows.length > 0 && (
+			{shown.length > 0 && (
 				<div className="edit-diff">
-					{(all ? rows : rows.slice(0, 200)).map((row, index) => (
+					{split ? splitRows(shown).map((row, index) => (
+						<div className="edit-split-row" key={index}>
+							{[row.left, row.right].map((cell, side) => cell ? (
+								<div className={`edit-side dp-${cell.kind}`} key={side}>
+									<span className="dp-num">{cell.line ?? ""}</span>
+									<span className="dp-text">{marked(cell)}</span>
+								</div>
+							) : <div className="edit-side edit-side-empty" key={side}><span className="dp-num" /><span className="dp-text" /></div>)}
+						</div>
+					)) : shown.map((row, index) => (
 						<div className={`dp-line dp-${row.kind}`} key={index}>
 							<span className="dp-num">{row.oldLine ?? ""}</span>
 							<span className="dp-num">{row.newLine ?? ""}</span>
@@ -286,7 +356,7 @@ export function EditDiff({ diff, all = false }: { diff: ToolDiff; all?: boolean 
 			)}
 			{!all && rows.length > 200 && <p className="note">{rows.length - 200} more lines not shown.</p>}
 			{diff.clipped && <p className="note">Grok's edit was longer; this shows the start.</p>}
-		</>
+		</div>
 	);
 }
 
@@ -296,6 +366,7 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 	const [error, setError] = useState("");
 	const [picks, setPicks] = useState<Record<number, { picked: string[]; other: string; typed: boolean }>>({});
 	const [feedback, setFeedback] = useState<string | null>(null);
+	const [diffWidth, setDiffWidth] = useState(0);
 	useEffect(() => { setOpen(m.view === "verbose"); }, [m.view]);
 	const questions = tool.questions;
 	const plan = questions === undefined ? tool.plan : undefined;
@@ -420,13 +491,14 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 								{tool.diff.replaceAll && <p className="note">Replaces every match in the file, not only this one.</p>}
 								{approval && <pre className="tool-code">{approval}</pre>}
 							</>
-						) : <EditDiff diff={tool.diff} all />}
+						) : <EditDiff diff={tool.diff} all view={m.diffView === "split" ? "split" : "unified"} onView={m.setDiffView} width={diffWidth} onWidth={setDiffWidth} />}
 					</>
 				) : approval && <pre className="tool-code">{approval}</pre>}
 				{toolId && (
 					<div className="actions">
 						<button type="button" onClick={() => m.decide(toolId, "deny")}>Deny</button>
-						{!toolId.startsWith("native-permission:") && tool.always && <button type="button" title={tool.always === "folder" ? "Allow this exact command in this folder from now on, in every session. Settings lists the commands you allowed." : "Allow this tool for the rest of this conversation"} onClick={() => m.decide(toolId, "always")}>{tool.always === "folder" ? "Always allow in this folder" : "Allow for this conversation"}</button>}
+						{!toolId.startsWith("native-permission:") && tool.always && <button type="button" title={tool.always === "folder" ? "Allow this exact command in this folder from now on, in every session. Settings lists the commands you allowed." : tool.always === "site" ? "Allow browser access on this site for the rest of this conversation." : "Allow this tool for the rest of this conversation"} onClick={() => m.decide(toolId, "always")}>{tool.always === "folder" ? "Always allow in this folder" : tool.always === "site" ? "Allow on this site for this conversation" : "Allow for this conversation"}</button>}
+						{!toolId.startsWith("native-permission:") && kind === "command" && tool.commandPrefix && <button type="button" title={`Allow "${tool.commandPrefix} …" with any arguments in this conversation. Some arguments make a tool run other programs. Ends when the conversation does.`} onClick={() => m.decide(toolId, "prefix")}>{`Allow ${tool.commandPrefix} commands`}</button>}
 						<button type="button" className="yes" onClick={() => m.decide(toolId, "allow")}>Allow</button>
 					</div>
 				)}
@@ -440,7 +512,7 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 				{command && <pre className="tool-code">{command}</pre>}
 				{tool.output && <pre className="tool-code">{tool.output}</pre>}
 				{tool.path && <div className="tool-path">{tool.path}</div>}
-				{tool.diff && !failed && <EditDiff diff={tool.diff} />}
+				{tool.diff && !failed && <EditDiff diff={tool.diff} view={m.diffView === "split" ? "split" : "unified"} onView={m.setDiffView} width={diffWidth} onWidth={setDiffWidth} />}
 			</>
 		);
 	}
@@ -448,6 +520,7 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 		<>
 			<span className="tool-glyph" aria-hidden="true">{TOOL_GLYPHS[kind] ?? "•"}</span>
 			<span className="tool-label">{label}</span>
+			{kind === "command" && tool.readsOnly && <small className="meta" title="Usually only reads, but arguments can change that. Check them.">Reads only</small>}
 			{text && <span className="tool-text" title={text}>{text}</span>}
 			{(additions !== undefined || deletions !== undefined) && (
 				<span className="tool-count"><span className="add">{`+${additions ?? 0}`}</span> <span className="del">{`−${deletions ?? 0}`}</span></span>
@@ -520,21 +593,39 @@ function Thought({ text, view }: { text: string; view: TranscriptView }) {
 }
 
 // Eight lines, then a fade, matches how Claude Desktop shows a long message.
-// shortcut: 88 characters is one line of the user bubble at the chat column's max width; measure the bubble if that width changes.
+// The box is styles.css `.user-clip.clipped` max-height: calc(8 * 1.45em).
 export const USER_MESSAGE_LINES = 8;
-export const USER_LINE_CHARS = 88;
+const USER_LINE_EM = 1.45;
 
-export function userMessageOverflows(text: string): boolean {
-	let rows = 0;
-	for (const line of text.split("\n")) {
-		rows += Math.max(1, Math.ceil(line.length / USER_LINE_CHARS));
-		if (rows > USER_MESSAGE_LINES) { return true; }
-	}
-	return false;
+export function userClipBoxHeight(fontSizePx: number): number {
+	return USER_MESSAGE_LINES * USER_LINE_EM * fontSizePx;
+}
+
+// One pixel of slack: scrollHeight and the em max-height round apart, and a message that fills the box stays open.
+export function userClipOverflows(contentHeight: number, boxHeight: number): boolean {
+	return Number.isFinite(contentHeight) && Number.isFinite(boxHeight) && contentHeight > boxHeight + 1;
+}
+
+function readUserClipOverflow(node: HTMLElement): boolean {
+	if (typeof window.getComputedStyle !== "function") { return false; }
+	const fontSize = Number.parseFloat(window.getComputedStyle(node).fontSize);
+	return userClipOverflows(node.scrollHeight, userClipBoxHeight(fontSize));
 }
 
 function MessageBody({ message, m, readOnly = false, find = "" }: { message: ChatMessage; m: PaneModel; readOnly?: boolean; find?: string }) {
 	const [userOpen, setUserOpen] = useState(false);
+	const [overflows, setOverflows] = useState(false);
+	// message.text is a dependency so a longer message remeasures even when the column width stays put.
+	const attachText = useCallback((node: HTMLDivElement | null) => {
+		if (!node) { return; }
+		const measure = () => setOverflows(readUserClipOverflow(node));
+		measure();
+		const Observer = window.ResizeObserver;
+		if (typeof Observer !== "function") { return; }
+		const observer = new Observer(measure);
+		observer.observe(node);
+		return () => observer.disconnect();
+	}, [message.text]);
 	const known = m.folderFiles?.files;
 	const hits = useMemo(() => readOnly ? [] : mentionedFiles(message.text, message.tools, m.session.folder, known ?? []), [readOnly, message.text, message.tools, m.session.folder, known]);
 	const hitFiles = useMemo(() => hits.map((hit) => hit.file), [hits]);
@@ -559,7 +650,6 @@ function MessageBody({ message, m, readOnly = false, find = "" }: { message: Cha
 	if (message.role === "user") {
 		const files = message.attachments ?? [];
 		const others = files.filter((file) => !imageSrc(file));
-		const overflows = userMessageOverflows(message.text);
 		const found = find !== "" && message.text.toLowerCase().includes(find.toLowerCase());
 		const clipped = overflows && !userOpen && !found;
 		return (
@@ -570,8 +660,13 @@ function MessageBody({ message, m, readOnly = false, find = "" }: { message: Cha
 					</button>
 				))}
 				<div className="user-bubble">
+					{!!message.contextFrom?.length && (
+						<div className="attach-list">
+							{message.contextFrom.map((pick) => <span className="attach-chip" key={pick.id} title={`Earlier context from ${pick.title}`}>{pick.title}</span>)}
+						</div>
+					)}
 					<div className={clipped ? "user-clip clipped" : "user-clip"}>
-						<div className="message-text">{message.text}</div>
+						<div className="message-text" ref={attachText}>{message.text}</div>
 					</div>
 					{overflows && !found && (
 						<button type="button" className="show-more" aria-expanded={userOpen} onClick={() => setUserOpen((value) => !value)}>

@@ -177,4 +177,133 @@ function subagentTranscript(childSessionId, root = sessionsRoot()) {
 	}
 }
 
-module.exports = { contextBreakdown, recentSpend, autoCompactPercent, taskOutput, subagentTranscript };
+// shortcut: a transcript over 2 MiB or 400k characters keeps its newest part, raise the caps if a long CLI session opens incomplete.
+const CLI_FILE_LIMIT = 2 * 1024 * 1024;
+const CLI_MESSAGE_CAP = 20000;
+const CLI_TOTAL_CAP = 400000;
+const CLI_EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
+
+function decodeFolder(name) {
+	try { return decodeURIComponent(name); } catch { return name; }
+}
+
+function readSummary(folder) {
+	try { return JSON.parse(fs.readFileSync(path.join(folder, "summary.json"), "utf8")); } catch { return {}; }
+}
+
+function messageText(content) {
+	if (typeof content === "string") { return content; }
+	if (Array.isArray(content)) { return content.map((part) => (part && typeof part.text === "string" ? part.text : "")).join(""); }
+	return content && typeof content.text === "string" ? content.text : "";
+}
+
+// The first user entry also carries Grok's rules. The person's words are the user_query.
+function personText(entry) {
+	if (!entry || entry.synthetic_reason) { return ""; }
+	const text = messageText(entry.content);
+	const queries = [];
+	for (const match of text.matchAll(/<user_query>([\s\S]*?)<\/user_query>/gi)) {
+		const value = match[1].trim();
+		if (value) { queries.push(value); }
+	}
+	if (queries.length) { return queries.join("\n\n"); }
+	if (/<user_info>|<rules>|<user_rules>/.test(text)) { return ""; }
+	return text.trim();
+}
+
+function cliTitle(summary) {
+	const raw = typeof summary.generated_title === "string" && summary.generated_title.trim() ? summary.generated_title : (typeof summary.session_summary === "string" ? summary.session_summary : "");
+	return raw.replace(/[\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 80) || "CLI session";
+}
+
+function activeAt(summary, file) {
+	const parsed = Date.parse(String(summary.last_active_at || summary.updated_at || "").replace(/(\.\d{3})\d+/, "$1"));
+	if (parsed) { return parsed; }
+	try { return fs.statSync(file).mtimeMs; } catch { return 0; }
+}
+
+function cwdOf(sessionDir, summary) {
+	const named = summary.info && typeof summary.info.cwd === "string" ? summary.info.cwd : "";
+	return named || decodeFolder(path.basename(path.dirname(sessionDir)));
+}
+
+// Sessions the app already has, archived ones included, are left out. Newest first.
+function listCliSessions(knownIds = [], root = sessionsRoot()) {
+	const known = new Set((Array.isArray(knownIds) ? knownIds : []).map((id) => String(id).toLowerCase()));
+	const sessions = [];
+	const seen = new Set();
+	let entries;
+	try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return { ok: false, error: "Grok's sessions could not be read." }; }
+	for (const cwdEntry of entries) {
+		if (!cwdEntry.isDirectory()) { continue; }
+		let children;
+		try { children = fs.readdirSync(path.join(root, cwdEntry.name), { withFileTypes: true }); } catch { continue; }
+		for (const child of children) {
+			const id = child.name;
+			if (!child.isDirectory() || !SESSION_ID.test(id) || known.has(id.toLowerCase()) || seen.has(id.toLowerCase())) { continue; }
+			const folder = path.join(root, cwdEntry.name, id);
+			const history = path.join(folder, "chat_history.jsonl");
+			if (!fs.existsSync(history)) { continue; }
+			seen.add(id.toLowerCase());
+			const summary = readSummary(folder);
+			sessions.push({ id, title: cliTitle(summary), folder: cwdOf(folder, summary), lastActive: activeAt(summary, history) });
+		}
+	}
+	sessions.sort((a, b) => b.lastActive - a.lastActive || a.title.localeCompare(b.title));
+	return { ok: true, sessions };
+}
+
+function historyText(file, fileLimit) {
+	const size = fs.statSync(file).size;
+	if (size <= fileLimit) { return { text: fs.readFileSync(file, "utf8"), truncated: false }; }
+	const tail = readTail(file, fileLimit);
+	const skip = tail.text.indexOf("\n");
+	return { text: skip < 0 ? "" : tail.text.slice(skip + 1), truncated: true };
+}
+
+function openCliSession(agentSessionId, root = sessionsRoot(), limits = {}) {
+	const fileLimit = limits.fileLimit || CLI_FILE_LIMIT;
+	const messageCap = limits.messageCap || CLI_MESSAGE_CAP;
+	const totalCap = limits.totalCap || CLI_TOTAL_CAP;
+	let folder = "";
+	try { folder = sessionFolder(agentSessionId, root); } catch { return { ok: false, error: "Grok's sessions could not be read." }; }
+	if (!folder) { return { ok: false, error: "That Grok session is gone." }; }
+	const summary = readSummary(folder);
+	const cwd = cwdOf(folder, summary);
+	let directory = false;
+	try { directory = path.isAbsolute(cwd) && !cwd.includes("\0") && fs.statSync(cwd).isDirectory(); } catch { directory = false; }
+	if (!directory) { return { ok: false, error: "That session's folder is gone." }; }
+	let read;
+	try { read = historyText(path.join(folder, "chat_history.jsonl"), fileLimit); } catch { return { ok: false, error: "That Grok session could not be read." }; }
+	const messages = [];
+	let total = 0;
+	let truncated = read.truncated;
+	for (const line of read.text.split("\n")) {
+		if (!line.trim()) { continue; }
+		let entry;
+		try { entry = JSON.parse(line); } catch { continue; }
+		const role = entry.type === "user" ? "user" : entry.type === "assistant" ? "grok" : "";
+		if (!role) { continue; }
+		let text = role === "user" ? personText(entry) : messageText(entry.content).trim();
+		if (!text) { continue; }
+		if (text.length > messageCap) { text = `${text.slice(0, messageCap)}…`; truncated = true; }
+		messages.push({ role, text });
+		total += text.length;
+	}
+	while (messages.length > 1 && total > totalCap) {
+		total -= messages[0].text.length;
+		messages.shift();
+		truncated = true;
+	}
+	const branch = typeof summary.head_branch === "string" ? summary.head_branch.replace(/[\u0000-\u001f]/g, "").trim().slice(0, 80) : "";
+	const model = typeof summary.current_model_id === "string" && /^[A-Za-z0-9._-]{1,80}$/.test(summary.current_model_id) ? summary.current_model_id : "";
+	const effort = CLI_EFFORTS.has(summary.reasoning_effort) ? summary.reasoning_effort : "";
+	return {
+		ok: true,
+		truncated,
+		session: { id: String(agentSessionId), title: cliTitle(summary), folder: cwd, branch, model, effort, lastActive: activeAt(summary, path.join(folder, "chat_history.jsonl")) },
+		messages,
+	};
+}
+
+module.exports = { contextBreakdown, recentSpend, autoCompactPercent, taskOutput, subagentTranscript, listCliSessions, openCliSession };

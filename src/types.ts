@@ -9,7 +9,7 @@ export type PaneId =
 
 export type SidePaneId = Exclude<PaneId, "chat">;
 
-export type SessionStatus = "running" | "needs-you" | "idle" | "scheduled";
+export type SessionStatus = "running" | "needs-you" | "idle";
 
 export type Environment = "Local" | "SSH" | "Cloud";
 
@@ -59,6 +59,8 @@ export interface Session {
 	lastActivityAt?: number;
 	unread?: boolean;
 	completed?: boolean;
+	failed?: boolean;
+	prWatch?: { number: number; failing: string[]; seenAt: string; alert?: { failed: string[]; feedback: number; from: string[] } };
 	sectionId?: string;
 	worktreeFolder?: string;
 	usage?: GrokUsage;
@@ -84,7 +86,9 @@ export interface ToolCard {
 	questions?: GrokQuestion[];
 	plan?: string;
 	todos?: GrokTodo[];
-	always?: "folder" | "conversation";
+	always?: "folder" | "conversation" | "site";
+	commandPrefix?: string;
+	readsOnly?: boolean;
 }
 
 // The text an edit replaced and its replacement; Grok sends snippets, not whole files.
@@ -102,6 +106,7 @@ export interface ChatMessage {
   tools?: ToolCard[];
 	parts?: MessagePart[];
 	attachments?: string[];
+	contextFrom?: { id: string; title: string }[];
 	point?: { agentSessionId: string; index: number };
   live?: boolean;
   pending?: boolean;

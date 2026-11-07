@@ -22,6 +22,8 @@ $name = "Codewomplers Grok Desktop"
 	--ignore='^/(node_modules|src|out|\.github)(/|$)'
 if ($LASTEXITCODE -ne 0) { throw "electron-packager failed with exit code $LASTEXITCODE." }
 $app = Join-Path $root "out\$name-win32-x64"
+& node (Join-Path $PSScriptRoot "package-node-pty.cjs") (Join-Path $app "resources\app") win32 x64
+if ($LASTEXITCODE -ne 0) { throw "The Windows terminal runtime could not be packaged." }
 $exe = Join-Path $app "$name.exe"
 foreach ($rel in @("$name.exe", "resources\app\electron\main.cjs", "resources\app\dist\index.html")) {
 	if (-not (Test-Path -LiteralPath (Join-Path $app $rel))) { throw "The package is missing $rel." }

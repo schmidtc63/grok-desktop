@@ -10,7 +10,7 @@ process.exitCode = 1;
 const source = fs.readFileSync(path.join(__dirname, "../electron/agent.cjs"), "utf8");
 const input = { uiSessionId: "chat", cwd: path.resolve(__dirname, ".."), text: "Hello", model: "grok-4.7", effort: "high", mode: "Normal" };
 
-function makeHost(options, { tmpdir, platform = "win32", killErrors = {} } = {}) {
+function makeHost(options, { tmpdir, platform = "win32", killErrors = {}, env = {} } = {}) {
 	const timers = new Map();
 	const writes = [];
 	const spawns = [];
@@ -36,7 +36,7 @@ function makeHost(options, { tmpdir, platform = "win32", killErrors = {} } = {})
 			spawnSync: (...args) => { kills.push(args); return { status: 0 }; },
 		} : (name === "os" && tmpdir ? { ...os, tmpdir: () => tmpdir } : require(name)),
 		// `kill` records process-group kills; killErrors maps a pid to the error code its kill throws.
-		process: { platform, env: {}, kill: (pid, signal) => { kills.push(["kill", pid, signal]); if (killErrors[Math.abs(pid)]) { throw Object.assign(new Error("kill failed"), { code: killErrors[Math.abs(pid)] }); } } },
+		process: { platform, env, kill: (pid, signal) => { kills.push(["kill", pid, signal]); if (killErrors[Math.abs(pid)]) { throw Object.assign(new Error("kill failed"), { code: killErrors[Math.abs(pid)] }); } } },
 		setTimeout: (callback, ms) => { const timer = {}; timers.set(timer, { callback, ms }); return timer; },
 		clearTimeout: (timer) => timers.delete(timer),
 	};
@@ -67,7 +67,7 @@ function makeHost(options, { tmpdir, platform = "win32", killErrors = {} } = {})
 			}
 		}
 	}
-	return { host, timers, writes, spawns, kills, events, children, running, serve, probeGrok: sandbox.module.exports.probeGrok, killTree: sandbox.module.exports.killTree };
+	return { host, timers, writes, spawns, kills, events, children, running, serve, probeGrok: sandbox.module.exports.probeGrok, killTree: sandbox.module.exports.killTree, commandInfo: sandbox.module.exports.commandInfo };
 }
 
 // macOS and Linux: each Grok leads its own process group, and killTree ends the group instead of running taskkill.
@@ -90,9 +90,9 @@ function checkPosixProcessGroups() {
 async function checkProbeGrok() {
 	const failed = { ok: false, error: "Grok could not start." };
 	const cases = [
-		["cached token", { result: { authMethods: [{ id: "grok.com" }, { id: "cached_token" }], _meta: { agentVersion: "1.0.70" } } }, { ok: true, version: "1.0.70", signedIn: true }],
-		["signed out", { result: { authMethods: [{ id: "grok.com" }] } }, { ok: true, version: "", signedIn: false }],
-		["older Grok", { result: { _meta: { agentVersion: "x".repeat(60) } } }, { ok: true, version: "x".repeat(40), signedIn: true }],
+		["cached token", { result: { authMethods: [{ id: "grok.com" }, { id: "cached_token" }], _meta: { agentVersion: "1.0.70" } } }, { ok: true, version: "1.0.70", signedIn: true, signIn: "saved", apiKey: false }],
+		["signed out", { result: { authMethods: [{ id: "grok.com" }] } }, { ok: true, version: "", signedIn: false, signIn: "none", apiKey: false }],
+		["older Grok", { result: { _meta: { agentVersion: "x".repeat(60) } } }, { ok: true, version: "x".repeat(40), signedIn: true, signIn: "saved", apiKey: false }],
 		["error reply", { error: { message: "secret" } }, failed],
 		["missing result", {}, failed],
 		["null result", { result: null }, failed],
@@ -111,7 +111,7 @@ async function checkProbeGrok() {
 		assert.equal(run.spawns[0][2].cwd, os.homedir());
 		assert.equal(run.spawns[0][2].windowsHide, true);
 		assert.equal(run.writes.length, 1);
-		assert.deepEqual(run.writes[0], { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false }, clientInfo: { name: "grok-code", version: "0.1.0" } } });
+		assert.deepEqual(run.writes[0], { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false }, clientInfo: { name: "grok-code", version: require("../package.json").version } } });
 		assert.equal([...run.timers.values()][0].ms, 15000);
 		if (reply) {
 			child.stdout.emit("data", Buffer.from(`not JSON\n${JSON.stringify({ id: 9, result: {} })}\n`));
@@ -134,6 +134,22 @@ async function checkProbeGrok() {
 		child.emit("exit", 0);
 		assert.equal(taskkills(run.spawns).length, 1, "a later exit does not finish twice");
 	}
+	const signedOut = [{ id: "grok.com" }];
+	const saved = [{ id: "cached_token" }];
+	const key = "key-value-should-not-appear";
+	async function probeSignIn(env, methods) {
+		const run = makeHost({}, { env });
+		const pending = run.probeGrok();
+		run.children[0].stdout.emit("data", Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { authMethods: methods } })}\n`));
+		const result = plain(await pending);
+		assert.equal(JSON.stringify(result).includes(key), false, "the probe result never contains the API key");
+		assert.deepEqual(run.writes.map((message) => message.method), ["initialize"], "an API key probe still only initializes");
+		return result;
+	}
+	assert.deepEqual(await probeSignIn({ XAI_API_KEY: key }, signedOut), { ok: true, version: "", signedIn: true, signIn: "key", apiKey: true }, "a set API key counts as signed in");
+	assert.deepEqual(await probeSignIn({ XAI_API_KEY: "   " }, signedOut), { ok: true, version: "", signedIn: false, signIn: "none", apiKey: false }, "a blank API key does not count");
+	assert.deepEqual(await probeSignIn({ XAI_API_KEY: "" }, signedOut), { ok: true, version: "", signedIn: false, signIn: "none", apiKey: false });
+	assert.deepEqual(await probeSignIn({ XAI_API_KEY: key }, saved), { ok: true, version: "", signedIn: true, signIn: "saved", apiKey: true }, "a saved sign-in wins while it exists");
 }
 
 function checkEditDiffs() {
@@ -238,6 +254,7 @@ async function checkRestore() {
 	host.sessions.set("chat", { sessionId: "persisted", cwd: input.cwd, proc, model: "grok-4.7", effort: "high" });
 	host.loseProc(proc, "Exited");
 	assert.deepEqual(plain(events.shift()), { type: "bg-tasks", uiSessionId: "chat", tasks: [], reset: true });
+	assert.deepEqual(plain(events.shift()), { type: "loops", uiSessionId: "chat", loops: [], reset: true });
 	assert.equal(host.sessions.get("chat").proc, null);
 	assert.equal(host.sessions.get("chat").model, "");
 	const next = { uiSessionId: "chat", lost: false, parents: new Map() };
@@ -911,6 +928,231 @@ async function checkIdle() {
 	assert.deepEqual(gone.events.filter((event) => event.type === "done" || event.type === "error").map((event) => event.stopReason), ["cancelled", "cancelled"], "their turns end as cancelled, not as errors");
 }
 
+async function checkBrowserControl() {
+	const entry = { type: "http", name: "browser_pane", url: "http://127.0.0.1:12345/mcp", headers: [{ name: "Authorization", value: "Bearer test-token" }] };
+	const test = makeHost({ browserServer: async () => entry }, { env: { NO_PROXY: "example.test", no_proxy: "internal.test" } });
+	assert.equal(test.host.inputProblem({ ...input, browser: "yes" }), "Browser control must be on or off.");
+	assert.equal(test.host.inputProblem({ ...input, browser: true }), "");
+	const proc = test.host.start({ ...input, browser: true }, "ask");
+	proc.ready.catch(() => {});
+	assert.equal(proc.browser, true);
+	assert.equal(test.spawns[0][2].env.NO_PROXY, "example.test,127.0.0.1,localhost");
+	assert.equal(test.spawns[0][2].env.no_proxy, "internal.test,127.0.0.1,localhost");
+	const requests = [];
+	test.host.request = (_proc, method, params) => { requests.push({ method, params }); return { promise: Promise.resolve({ sessionId: "browser-session" }) }; };
+	await test.host.ensureSession(proc, { ...input, browser: true });
+	assert.equal(requests[0].method, "session/new");
+	assert.deepEqual(plain(requests[0].params.mcpServers), [entry]);
+	assert.equal(proc.browserReady, true);
+	const reloaded = { browser: true, lost: false };
+	await test.host.ensureSession(reloaded, { ...input, browser: true });
+	assert.equal(requests[1].method, "session/load");
+	assert.deepEqual(plain(requests[1].params.mcpServers), [entry]);
+	const side = test.host.start({ ...input, uiSessionId: "side-chat", browser: true }, "ask");
+	side.ready.catch(() => {});
+	assert.equal(side.browser, false, "side chats never get browser tools");
+	await test.host.ensureSession(side, { ...input, uiSessionId: "side-chat", browser: true });
+	assert.deepEqual(plain(requests.findLast((request) => request.method === "session/new").params.mcpServers), []);
+	const restarted = test.host.procFor({ ...input, browser: false }, { ...input, turnId: "restart" });
+	restarted.ready.catch(() => {});
+	assert.notEqual(restarted, proc);
+	assert.equal(restarted.browser, false);
+	assert.ok(test.events.some((event) => /Grok restarted to turn browser control off/.test(event.text || "")));
+	test.host.kill();
+	const failed = makeHost({ browserServer: async () => { throw new Error("private startup detail"); } });
+	const failedRequests = [];
+	failed.host.request = (_proc, method, params) => { failedRequests.push({ method, params }); return { promise: Promise.resolve({ sessionId: "without-browser" }) }; };
+	const failedProc = { browser: true, lost: false };
+	await failed.host.ensureSession(failedProc, input);
+	assert.deepEqual(plain(failedRequests[0].params.mcpServers), []);
+	assert.equal(failedProc.browserReady, false);
+	assert.equal(failed.events.filter((event) => /Browser control could not start/.test(event.text || "")).length, 1);
+	assert.equal(JSON.stringify(failed.events).includes("private startup detail"), false);
+
+	const hooks = makeHost();
+	const live = hooks.running({ uiSessionId: "chat", agentSessionId: "browser-session", mode: "Plan" });
+	live.browser = true;
+	live.browserReady = true;
+	for (const toolName of ["browser_pane__click", "use_tool"]) {
+		const id = `browser-hook-${toolName}`;
+		hooks.host.onHook(live, { id, params: { toolUseId: id, toolName, toolInput: { tool_name: "browser_pane__click", tool_input: { ref: "e1" } } } });
+		assert.equal(hooks.writes.at(-1).result.decision, "allow", "the browser module owns action-time approval even in Plan mode");
+		assert.equal(hooks.host.gates.has(id), false);
+	}
+	for (const [id, toolInput] of [["browser-file", { tool_name: "browser_pane__click", file: "calls.json" }], ["other-tool", { tool_name: "other__click" }]]) {
+		hooks.host.onHook(live, { id, params: { toolUseId: id, toolName: "use_tool", toolInput } });
+		assert.equal(hooks.host.gates.has(id), true, "file-backed and other MCP calls keep their normal cards");
+		hooks.host.decide({ uiSessionId: "chat", toolId: id, decision: "deny" });
+	}
+	live.browserReady = false;
+	hooks.host.onHook(live, { id: "browser-unavailable", params: { toolUseId: "browser-unavailable", toolName: "browser_pane__click", toolInput: {} } });
+	assert.equal(hooks.host.gates.has("browser-unavailable"), true);
+	hooks.host.decide({ uiSessionId: "chat", toolId: "browser-unavailable", decision: "deny" });
+
+	for (const decision of ["allow", "always", "deny"]) {
+		const pending = hooks.host.ask("chat", { title: "Browser site access", summary: "https://example.test", always: true });
+		const gate = [...hooks.host.gates.values()].find((item) => item.resolve);
+		assert.equal(gate.always, "site");
+		assert.equal(hooks.host.decide({ uiSessionId: "other", toolId: gate.toolId, decision }).ok, false);
+		assert.equal(hooks.host.decide({ uiSessionId: "chat", toolId: gate.toolId, decision }).ok, true);
+		assert.equal(await pending, decision);
+	}
+	assert.equal(hooks.host.always.size, 0, "browser grants never become normal tool or folder grants");
+	const sensitive = hooks.host.ask("chat", { title: "Sensitive browser field", summary: "12 characters, hidden" });
+	const sensitiveGate = [...hooks.host.gates.values()].find((item) => item.resolve);
+	assert.equal(sensitiveGate.always, "");
+	assert.equal(hooks.host.decide({ uiSessionId: "chat", toolId: sensitiveGate.toolId, decision: "always" }).ok, false);
+	assert.equal(hooks.host.decide({ uiSessionId: "chat", toolId: sensitiveGate.toolId, decision: "prefix" }).ok, false);
+	hooks.host.denyBrowser("chat");
+	assert.equal(await sensitive, "deny");
+	const timeout = hooks.host.ask("chat", { title: "Browser timeout" });
+	const timedGate = [...hooks.host.gates.values()].find((item) => item.resolve);
+	assert.equal(hooks.timers.get(timedGate.timer).ms, 8 * 60 * 1000);
+	hooks.timers.get(timedGate.timer).callback();
+	assert.equal(await timeout, "deny");
+	const cancelled = hooks.host.ask("chat", { title: "Browser cancelled" });
+	hooks.host.cancel("chat");
+	assert.equal(await cancelled, "deny");
+	assert.equal(await hooks.host.ask("chat", { title: "No live turn" }), "deny");
+	hooks.host.kill();
+	console.log("PASS browser ACP integration: flag/restart, side-chat exclusion, new/load MCP entries, loopback proxy, hook routing and approval outcomes");
+}
+
+function checkCommandPrefixes() {
+	const { host, writes, events, running, commandInfo } = makeHost();
+	for (const [command, prefix] of [
+		["npm test", "npm test"], ["npm test -- --watch", "npm test"], ["npm test && npm test", "npm test"],
+		["git status; git status", "git status"], ["cargo build --release", "cargo build"], ["make test", "make test"], ["tsc --noEmit", "tsc"],
+		["npm test || npm test -- --watch", "npm test"], ["GIT.EXE status --short", "git status"],
+		["npm run build", "npm run"], ["gh pr view 3", "gh pr"],
+	]) { assert.equal(commandInfo(command).prefix, prefix, command); }
+	for (const command of [
+		"git -c core.pager=x log", "./npm test", "C:\\tools\\npm test", 'node -e "x"', "npx foo", "NODE.EXE x",
+		"npm test | tee log", "npm test > out", "npm test && git push", 'echo "a && b"', "$(rm -rf /)", "`x`", "npm test\nmake", "npm test\rmake",
+		"npm test & make", "npm test < input", "make (x)", "echo 'x'", "npm test &&", ";npm test", "npm test;;npm test", "npm test &&& npm test", "npm test |||| npm test", "", "   ", "git", "npm --version",
+		"make", "make -j4", "git status @{value=Write-Output x}", "git status {x}", "git status [x]", "npm test #x",
+		"saps notepad", "icm x", "ii x", "python3.12.exe --version", "curl x", "npm install @types/x",
+		"npm exe x", "npm t", "npm i", "gh ext list", "gh extensions list", "gh repo delete x", "docker container ls", "docker ps", "kubectl get pods",
+		"make test:all", "make test.all", "make _test", "make 1test", "make Test", "make test/other", "make test=other",
+		"git rebase -i HEAD~2", "git log --oneline", "yarn run test",
+	]) { assert.equal(commandInfo(command).prefix, "", command); }
+	for (const character of ["@", "{", "}", "[", "]", "(", ")", "$", "%", "#", "!", "?", "'", '"', "`", "&", "|", "<", ">", "\t", "\n", "\r", "\r\n", "\u0000", "\u000b", "\u000c", "\u0085", "\u00a0", "\u2028", "\u2029"]) {
+		for (const command of [`${character}git status`, `git${character}status`, `git status${character}`]) {
+			assert.equal(commandInfo(command).prefix, "", JSON.stringify(command));
+			assert.equal(commandInfo(command).readsOnly, false, "invalid characters suppress display hints as well as grants");
+		}
+	}
+	for (const program of "node deno bun python python3 py ruby perl php java powershell pwsh cmd bash sh zsh fish wsl env sudo runas xargs eval iex invoke-expression start-process start npx pnpx bunx uvx osascript open rundll32 regsvr32 mshta wscript cscript".split(" ")) {
+		for (const variant of [program, program.toUpperCase(), `${program}.exe`, `${program.toUpperCase()}.EXE`]) {
+			assert.equal(commandInfo(`${variant} argument`).prefix, "", variant);
+		}
+	}
+	for (const [program, commands] of Object.entries({
+		git: "status diff show branch fetch pull add commit push checkout switch restore stash merge rm mv",
+		npm: "test run install ci ls outdated", pnpm: "test run install ls outdated", yarn: "test install",
+		cargo: "build test check run clippy fmt", go: "build test vet run fmt", dotnet: "build test run restore", gh: "pr issue run status",
+	})) {
+		for (const subcommand of commands.split(" ")) {
+			assert.equal(commandInfo(`${program} ${subcommand} argument`).prefix, `${program} ${subcommand}`);
+			assert.equal(commandInfo(`${program.toUpperCase()}.EXE ${subcommand} argument`).prefix, `${program} ${subcommand}`);
+			assert.equal(commandInfo(`${program} ${subcommand.toUpperCase()} argument`).prefix, "", "subcommands require exact names");
+		}
+		for (const command of [program, `${program} -option argument`, `${program} unknown argument`]) {
+			assert.equal(commandInfo(command).prefix, "", "managed programs never receive a broader program-only or unknown-subcommand grant");
+		}
+	}
+	for (const target of ["test", "build-all", "build_all", "a1"]) {
+		assert.equal(commandInfo(`make ${target} -j4`).prefix, `make ${target}`);
+		assert.equal(commandInfo(`MAKE.EXE ${target}`).prefix, `make ${target}`);
+	}
+	for (const program of "ls dir pwd cat type head tail wc rg grep findstr tree tsc eslint jest vitest pytest ruff".split(" ")) {
+		assert.equal(commandInfo(`${program.toUpperCase()}.EXE argument`).prefix, program, "program-only grants use canonical names");
+	}
+	for (const prefix of "npm exec|npm x|pnpm exec|pnpm dlx|yarn dlx|yarn exec|git config|docker run|docker exec|kubectl exec|gh api|gh extension".split("|")) {
+		assert.equal(commandInfo(`${prefix} argument`).prefix, "", prefix);
+		const [program, subcommand] = prefix.split(" ");
+		assert.equal(commandInfo(`${program.toUpperCase()}.EXE ${subcommand} argument`).prefix, "", "canonical spelling cannot bypass a forbidden subcommand");
+	}
+	for (const command of ["git status && git diff", "git log; git show", "git branch --delete topic", "ls", "dir", "pwd", "cat", "type", "head", "tail", "wc", "rg", "grep", "findstr", "Get-ChildItem", "Get-Content", "Get-Location", "Select-String", "get-content.exe file"]) {
+		assert.equal(commandInfo(command).readsOnly, true, command);
+	}
+	assert.equal(commandInfo("git log --oneline").readsOnly, true, "git log keeps its display hint without receiving a prefix grant");
+	for (const program of ["Get-ChildItem", "Get-Content", "Get-Location", "Select-String"]) {
+		const info = commandInfo(`${program} x`);
+		assert.equal(info.prefix, "", "display-only PowerShell cmdlets never receive a grant");
+		assert.deepEqual(plain(info.prefixes), []);
+		assert.equal(info.readsOnly, true);
+	}
+	assert.equal(commandInfo("git status && Get-Content x").readsOnly, true);
+	assert.deepEqual(plain(commandInfo("git status && Get-Content x").prefixes), [], "a hint-only segment cannot be hidden inside an otherwise grantable command");
+	for (const command of ["git push", "git status && npm test", "git status | cat", "npm test"]) { assert.equal(commandInfo(command).readsOnly, false, command); }
+
+	const proc = running({ uiSessionId: "chat", agentSessionId: "prefix-session" });
+	const hook = (id, command, extra = {}) => {
+		host.onHook(proc, { id, params: { toolUseId: id, toolName: "run_terminal_command", toolInput: { command }, ...extra } });
+		return writes.find((item) => item.id === id);
+	};
+	const decide = (id, decision, extra = {}) => host.decide({ uiSessionId: "chat", toolId: id, decision, ...extra });
+	const card = (id) => events.find((event) => event.tool?.id === id && event.tool.waiting)?.tool;
+	assert.equal(hook("prefix-first", "npm test && npm test -- --watch"), undefined);
+	assert.equal(card("prefix-first").commandPrefix, "npm test");
+	assert.equal(decide("prefix-first", "prefix", { prefix: "rm" }).ok, true);
+	assert.equal(writes.at(-1).result.decision, "allow");
+	assert.deepEqual([...host.always.values()].map((keys) => [...keys]), [["prefix:npm test"]], "the host derives the grant from its gate, never an injected prefix");
+	assert.deepEqual(plain(host.listRules()), [], "conversation prefixes never become folder rules");
+	assert.equal(hook("prefix-coverage", "npm test --coverage").result.decision, "allow");
+	assert.equal(host.gates.has("prefix-coverage"), false);
+	for (const command of ["npm run build", "npm test && rm -rf x", "npm test | make", 'npm test "argument"', "node anything"]) {
+		const id = `prefix-nonmatch-${command}`;
+		assert.equal(hook(id, command), undefined, command);
+		assert.equal(host.gates.has(id), true);
+		if (!commandInfo(command).prefix) {
+			assert.equal(decide(id, "prefix").ok, false, "an injected prefix decision cannot approve an ineligible command");
+			assert.equal(host.gates.has(id), true);
+		}
+		decide(id, "deny");
+	}
+	assert.equal(hook("prefix-read-only", "git status"), undefined, "Reads only is a hint and still asks");
+	assert.equal(card("prefix-read-only").readsOnly, true);
+	assert.equal(decide("prefix-read-only", "prefix").ok, true);
+	assert.equal(hook("prefix-canonical", "GIT.EXE status --short").result.decision, "allow", "later commands match canonical program spelling");
+	for (const command of ["git status @{value=Write-Output x}", "git status {x}", "git status [x]", "npm test #x", "git status\t", "\tnpm test", "git status && Get-Content x", "npm exec x", "npm exe x", "npm t", "npm i", "git config core.pager x", "docker run x", "gh ext list", "gh extensions list", "gh repo delete x", "docker container ls", "docker ps", "kubectl get pods"]) {
+		const id = `prefix-revision2-${command}`;
+		assert.equal(hook(id, command), undefined, "rejected syntax and subcommands never match an existing grant");
+		assert.equal(card(id).commandPrefix, undefined);
+		assert.equal(decide(id, "prefix").ok, false);
+		decide(id, "deny");
+	}
+	assert.equal(hook("prefix-mixed", "npm test --coverage && git status --short").result.decision, "allow", "each segment may match a separately granted prefix");
+	assert.equal(hook("prefix-read-mixed", "git status && git diff"), undefined);
+	assert.equal(card("prefix-read-mixed").readsOnly, true);
+	assert.equal(card("prefix-read-mixed").commandPrefix, undefined, "different prefixes do not offer one wider button");
+	decide("prefix-read-mixed", "deny");
+	host.turns.get("chat").mode = "Plan";
+	assert.equal(hook("prefix-plan", "npm test --coverage").result.decision, "allow", "Plan preserves the existing exact-command grant policy");
+	host.turns.get("chat").mode = "Auto-review";
+	assert.equal(hook("prefix-auto", "npm test --coverage", { permissionMode: "default" }).result.decision, "allow", "prefix grants use the same guard as exact grants in Auto-review");
+	host.turns.get("chat").mode = "Normal";
+	host.turns.get("chat").agentSessionId = "new-conversation";
+	assert.equal(hook("prefix-new-conversation", "npm test --coverage"), undefined, "a new conversation does not inherit a prefix");
+	decide("prefix-new-conversation", "deny");
+	host.turns.get("chat").agentSessionId = "prefix-session";
+	host.turns.get("chat").cwd = path.join(input.cwd, "scripts");
+	assert.equal(hook("prefix-other-folder", "npm test --coverage"), undefined, "prefix grants do not follow a conversation into another folder");
+	decide("prefix-other-folder", "deny");
+	host.turns.get("chat").cwd = input.cwd;
+	host.onHook(proc, { id: "prefix-edit", params: { toolUseId: "prefix-edit", toolName: "write", toolInput: { file_path: path.join(input.cwd, ".git", "config"), command: "npm test" } } });
+	assert.equal(decide("prefix-edit", "prefix").ok, false, "command text on an edit never creates a command grant");
+	decide("prefix-edit", "deny");
+	host.onPermission(proc, { id: "prefix-native", params: { toolCall: { toolCallId: "native-command", title: "run_terminal_command", kind: "command", rawInput: { command: "npm test" } }, options: [{ kind: "allow_once", optionId: "yes" }, { kind: "reject_once", optionId: "no" }] } });
+	assert.equal(decide("native-permission:chat:prefix-native", "prefix").ok, false, "native permission cards cannot accept injected prefix grants");
+	decide("native-permission:chat:prefix-native", "deny");
+	assert.equal(host.toolCard({ toolCallId: "read-hint", kind: "command", status: "completed", rawInput: { command: "git status && git diff" } }).readsOnly, true, "ordinary command updates carry the hint too");
+	assert.equal(host.toolCard({ toolCallId: "read-hint", rawInput: { command: "git push" } }).readsOnly, false, "a changed command clears the hint");
+	assert.equal(host.gates.size, 0);
+	console.log("PASS command prefix grants: strict splitting and allowlists, display hints, real-hook matching, scope and injected-decision checks");
+}
+
 async function checkParityFeatures() {
 	const { host, writes, events, running } = makeHost();
 	const cwd = path.resolve(__dirname, "..");
@@ -1187,12 +1429,56 @@ async function checkPermissionMeta() {
 	assert.equal(requests.length, before, "a session already open in this Grok is not opened again");
 }
 
+// With no Grok running, a one-shot Grok reads the limit: initialize, authenticate with the saved token, billing, then it is killed.
+async function checkBillingOnce() {
+	const resetsAt = "2026-11-11T22:56:56.873+00:00";
+	const answer = (child, id, body) => child.stdout.emit("data", Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", id, ...body })}\n`));
+	const saved = { result: { authMethods: [{ id: "cached_token" }] } };
+	const run = makeHost();
+	run.host.procs.set("lost", { lost: true });
+	const pending = run.host.billing();
+	const child = run.children[0];
+	assert.deepEqual(plain(run.spawns[0][1]), ["--permission-mode", "default", "agent", "--no-leader", "stdio"], "a lost process cannot serve billing, so a one-shot Grok starts");
+	assert.equal(run.spawns[0][2].cwd, os.homedir());
+	answer(child, 1, saved);
+	answer(child, 2, { result: { _meta: { email: "someone@example.com" } } });
+	answer(child, 3, { result: { config: { creditUsagePercent: 28, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: resetsAt } }, subscription_tier: "SuperGrok" } });
+	const shown = { ok: true, percent: 28, period: "weekly", resetsAt, tier: "SuperGrok" };
+	assert.deepEqual(plain(await pending), shown);
+	assert.deepEqual(run.writes.map((message) => message.method), ["initialize", "authenticate", "_x.ai/billing"]);
+	assert.deepEqual(plain(run.writes[1].params), { methodId: "cached_token" });
+	assert.deepEqual(taskkills(run.spawns), [String(child.pid)], "the one-shot Grok is always killed");
+	assert.equal(run.timers.size, 0);
+	assert.deepEqual(plain(await run.host.billing()), shown, "a second read within a minute reuses the answer");
+	assert.equal(run.children.length, 1, "and starts no second Grok");
+	run.host.limitProbe.at -= 61000;
+	const later = run.host.billing();
+	assert.equal(run.children.length, 2, "after a minute a new one-shot Grok starts");
+	answer(run.children[1], 1, { error: { message: "private failure" } });
+	assert.deepEqual(plain(await later), { ok: false, error: "Grok did not return usage." });
+	const failed = { ok: false, error: "Grok did not return usage." };
+	for (const [name, act] of [
+		["signed out", (item) => answer(item, 1, { result: { authMethods: [{ id: "grok.com" }] } })],
+		["authenticate error", (item) => { answer(item, 1, saved); answer(item, 2, { error: { message: "expired" } }); }],
+		["exit", (item) => item.emit("exit", 1)],
+		["spawn error", (item) => item.emit("error", Object.assign(new Error("secret"), { code: "ENOENT" }))],
+	]) {
+		const each = makeHost({}, { env: { XAI_API_KEY: "key" } });
+		const result = each.host.billing();
+		act(each.children[0]);
+		assert.deepEqual(plain(await result), failed, name);
+		if (name === "signed out") { assert.deepEqual(each.writes.map((message) => message.method), ["initialize"], "without a saved sign-in, authenticate is not tried"); }
+		assert.deepEqual(taskkills(each.spawns), [String(each.children[0].pid)], `${name}: the one-shot Grok is killed`);
+	}
+	const slow = makeHost();
+	const timedOut = slow.host.billing();
+	assert.equal([...slow.timers.values()][0].ms, 15000);
+	[...slow.timers.values()][0].callback();
+	assert.deepEqual(plain(await timedOut), failed, "a one-shot Grok that never answers times out");
+}
+
 async function checkBilling() {
 	const { host, writes, running } = makeHost();
-	const unavailable = { ok: false, error: "Usage shows once Grok is running. Send a message, then run /usage." };
-	assert.deepEqual(plain(await host.billing()), unavailable);
-	host.procs.set("lost", { lost: true });
-	assert.deepEqual(plain(await host.billing()), unavailable, "lost processes cannot serve billing");
 	const proc = running({ uiSessionId: "chat", agentSessionId: "sid-1" });
 	proc.ready = Promise.resolve();
 	async function reply(result, error) {
@@ -1329,7 +1615,7 @@ async function checkSessionEnhancements() {
 	assert.equal(events.length, before, "a replaced process never clears the current process's task rows");
 	const current = running({ uiSessionId: "a", agentSessionId: "sid-a", promptId: null });
 	host.loseProc(current, "Idle");
-	assert.deepEqual(plain(events.at(-1)), { type: "bg-tasks", uiSessionId: "a", tasks: [], reset: true });
+	assert.deepEqual(plain(events.filter((event) => event.type === "bg-tasks").at(-1)), { type: "bg-tasks", uiSessionId: "a", tasks: [], reset: true });
 }
 
 async function checkPromptIndexes() {
@@ -1476,6 +1762,9 @@ function checkSavedRules() {
 		assert.equal(ask(first, "c1", "chat", "npm test"), undefined);
 		assert.deepEqual(plain(first.host.decide({ uiSessionId: "chat", toolId: "c1", decision: "always" })), { ok: true });
 		assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { version: 1, folders: [{ folder, commands: ["npm test"] }] }, "the rule is written to the rules file");
+		assert.equal(ask(first, "prefix-persist", "chat", "npm run build"), undefined);
+		assert.equal(first.host.decide({ uiSessionId: "chat", toolId: "prefix-persist", decision: "prefix" }).ok, true);
+		assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { version: 1, folders: [{ folder, commands: ["npm test"] }] }, "prefix grants never alter the saved JSON rules");
 		const restarted = makeHost({ rulesFile: () => file });
 		assert.equal(ask(restarted, "c2", "later", "npm test").result.decision, "allow", "a saved command applies after a restart, in any session in its folder");
 		assert.deepEqual(plain(restarted.host.removeRule(folder.toUpperCase(), "npm test")), { ok: true }, "folders match as Windows does");
@@ -1648,6 +1937,101 @@ function checkChunkBatching() {
 	assert.equal(quitting.timers.size, 0);
 }
 
+async function checkLoops() {
+	const { readSessionLoops } = require("../electron/loops.cjs");
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "grok-loops-"));
+	try {
+		const id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+		const folder = path.join(root, "C%3A%5Cwork", id);
+		fs.mkdirSync(folder, { recursive: true });
+		fs.writeFileSync(path.join(folder, "chat_history.jsonl"), "{}\n");
+		const write = (state) => fs.writeFileSync(path.join(folder, "resources_state.json"), JSON.stringify({ state }));
+		write({ "grok_build.Scheduler": { tasks: { "loop-1": { intervalSecs: 300, durable: true, expiresAt: "2026-11-13T00:00:00.000Z", prompt: `  ${"p".repeat(210)}` } } } });
+		const dotted = readSessionLoops(id, root);
+		assert.equal(dotted.ok, true);
+		assert.equal(dotted.loops.length, 1);
+		assert.equal(dotted.loops[0].id, "loop-1");
+		assert.equal(dotted.loops[0].prompt.length, 200);
+		assert.equal(dotted.loops[0].schedule, "every 300s");
+		assert.equal(dotted.loops[0].nextFireAt, "", "the file has no next run, so it stays unknown");
+		assert.equal(dotted.loops[0].durable, true);
+		assert.equal(dotted.loops[0].expiresAt, "2026-11-13T00:00:00.000Z");
+		write({ grok_build: { Scheduler: { tasks: [{ id: "loop-2", humanSchedule: "every 5 minutes", prompt: "nested", nextFireAt: "2026-11-06T15:04:00.000Z" }] } } });
+		const nested = readSessionLoops(id, root);
+		assert.equal(nested.loops.length, 1);
+		assert.equal(nested.loops[0].id, "loop-2");
+		assert.equal(nested.loops[0].schedule, "every 5 minutes");
+		assert.equal(nested.loops[0].nextFireAt, "2026-11-06T15:04:00.000Z", "a next run is shown only when the file actually has one");
+		write({ "grok_build.Scheduler": { tasks: { bad: { prompt: 5 }, huge: { prompt: "x".repeat(9000) }, later: { prompt: "keep" } } } });
+		assert.deepEqual(readSessionLoops(id, root).loops.map((loop) => loop.id), ["later"], "a task with a bad prompt is skipped");
+		fs.writeFileSync(path.join(folder, "resources_state.json"), "{");
+		assert.deepEqual(readSessionLoops(id, root).loops, [], "a broken file shows no loops");
+		fs.rmSync(path.join(folder, "resources_state.json"));
+		assert.deepEqual(readSessionLoops(id, root).loops, [], "a missing file shows no loops");
+		assert.deepEqual(readSessionLoops("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", root).loops, []);
+		assert.deepEqual(readSessionLoops("not-an-id", root).loops, []);
+		fs.rmSync(path.join(folder, "chat_history.jsonl"));
+		write({ "grok_build.Scheduler": { tasks: { "loop-1": { prompt: "hidden" } } } });
+		assert.deepEqual(readSessionLoops(id, root).loops, [], "a folder without the session transcript is not that session");
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+
+	const { host, events, running } = makeHost();
+	const proc = running({ uiSessionId: "a", agentSessionId: "sid-a" });
+	const notify = (sessionId, update) => host.onMessage(proc, { method: "_x.ai/session_notification", params: { sessionId, update } });
+	const loops = () => events.filter((event) => event.type === "loops");
+	notify("sid-a", { sessionUpdate: "scheduled_task_created", task_id: "loop-1", prompt: "  watch the build  ", human_schedule: "every minute", next_fire_at: "2026-11-06T15:04:00.000Z" });
+	assert.deepEqual(plain(loops().at(-1)), { type: "loops", uiSessionId: "a", loops: [{ id: "loop-1", prompt: "watch the build", schedule: "every minute", nextFireAt: "2026-11-06T15:04:00.000Z" }] });
+	const before = events.length;
+	notify("sid-a", { sessionUpdate: "scheduled_task_created", prompt: "missing id" });
+	notify("sid-a", { sessionUpdate: "scheduled_task_created", task_id: "bad", human_schedule: 5, prompt: "bad schedule" });
+	notify("sid-a", { sessionUpdate: "scheduled_task_created", task_id: "bad", prompt: "bad time", next_fire_at: "tomorrow" });
+	notify("sid-a", { sessionUpdate: "scheduled_task_created", task_id: "bad", prompt: "x".repeat(9000) });
+	notify("sid-a", { sessionUpdate: "scheduled_task_fired", task_id: "missing", next_fire_at: "2026-11-06T16:00:00.000Z" });
+	assert.equal(events.length, before, "malformed loop updates are ignored");
+	notify("sid-a", { sessionUpdate: "scheduled_task_created", task_id: "long", prompt: "y".repeat(250), human_schedule: "every hour" });
+	assert.equal(loops().at(-1).loops.find((loop) => loop.id === "long").prompt.length, 200, "a long prompt is clipped");
+	notify("sid-a", { sessionUpdate: "scheduled_task_fired", task_id: "loop-1", next_fire_at: "2026-11-06T15:05:00.000Z" });
+	assert.equal(loops().at(-1).loops.find((loop) => loop.id === "loop-1").prompt, "watch the build", "a fire keeps the prompt");
+	assert.equal(loops().at(-1).loops.find((loop) => loop.id === "loop-1").nextFireAt, "2026-11-06T15:05:00.000Z");
+	host.onMessage(proc, { method: "x.ai/scheduled_task_created", params: { sessionId: "sid-a", update: { sessionUpdate: "scheduled_task_created", taskId: "loop-ext", prompt: "from the ext method", humanSchedule: "every 5 minutes", nextFireAt: "2026-11-06T15:10:00.000Z" } } });
+	assert.equal(loops().at(-1).loops.some((loop) => loop.id === "loop-ext" && loop.schedule === "every 5 minutes"), true, "the x.ai notification carries the same loop");
+	notify("sid-a", { sessionUpdate: "scheduled_task_deleted", task_id: "loop-ext", reason: "shutdown" });
+	assert.equal(loops().at(-1).loops.some((loop) => loop.id === "loop-ext"), true, "shutdown keeps the loop; it is still on disk");
+	notify("sid-a", { sessionUpdate: "subagent_spawned", child_session_id: "kid", parent_session_id: "sid-a" });
+	const held = loops().length;
+	notify("kid", { sessionUpdate: "scheduled_task_deleted", task_id: "loop-1", reason: "deleted" });
+	assert.equal(loops().length, held, "a child session does not change the parent's loops");
+	notify("sid-a", { sessionUpdate: "scheduled_task_deleted", task_id: "loop-1", reason: "deleted" });
+	assert.equal(loops().at(-1).loops.some((loop) => loop.id === "loop-1"), false);
+	host.loseProc(proc, "Stopped.");
+	assert.deepEqual(plain(loops().at(-1)), { type: "loops", uiSessionId: "a", loops: [], reset: true });
+
+	const idle = (made) => [...made.timers.values()].filter((timer) => timer.ms === 1234);
+	const note = (sessionId, update) => Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", method: "_x.ai/session_notification", params: { sessionId, update } })}\n`);
+	const made = makeHost({ idleMs: 1234 });
+	const side = made.running({ uiSessionId: "side-c", agentSessionId: "sid-c" });
+	side.child.stdout.emit("data", Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "sid-c", update: { sessionUpdate: "agent_message_chunk", content: { text: "working" } } } })}\n`));
+	assert.equal(idle(made).length, 1);
+	side.child.stdout.emit("data", note("sid-c", { sessionUpdate: "scheduled_task_created", task_id: "loop-1", prompt: "keep me up", human_schedule: "every minute", next_fire_at: "2026-11-06T15:04:00.000Z" }));
+	assert.equal(idle(made).length, 0, "a live loop has no idle clock");
+	made.host.finishPrompt(made.host.turns.get("side-c"), 2, { stopReason: "end_turn" }, "");
+	side.child.stdout.emit("data", note("sid-c", { sessionUpdate: "scheduled_task_fired", task_id: "loop-1", next_fire_at: "nope" }));
+	assert.equal(idle(made).length, 0, "a malformed fire does not release the loop");
+	side.child.stdout.emit("data", note("sid-c", { sessionUpdate: "scheduled_task_deleted", task_id: "loop-1", reason: "shutdown" }));
+	assert.equal(idle(made).length, 0, "shutdown does not release the idle hold");
+	side.child.stdout.emit("data", note("sid-c", { sessionUpdate: "subagent_spawned", child_session_id: "kid", parent_session_id: "sid-c" }));
+	side.child.stdout.emit("data", note("kid", { sessionUpdate: "scheduled_task_deleted", task_id: "loop-1", reason: "deleted" }));
+	assert.equal(idle(made).length, 0, "a child's delete does not release the parent's loop");
+	side.child.stdout.emit("data", note("sid-c", { sessionUpdate: "scheduled_task_deleted", task_id: "loop-1", reason: "deleted" }));
+	assert.equal(idle(made).length, 1, "deleting the loop starts the idle clock");
+	side.child.stdout.emit("data", note("sid-c", { sessionUpdate: "scheduled_task_created", task_id: "gone", prompt: "already over", expires_at: "2000-01-01T00:00:00.000Z" }));
+	assert.equal(idle(made).length, 1, "a loop that has already expired does not hold the clock");
+	assert.equal(made.events.filter((event) => event.type === "loops").at(-1).loops.length, 0);
+	console.log("PASS scheduled loops: notifications, malformed updates, cold read, and the idle hold");
+}
+
 (async () => {
 	checkPosixProcessGroups();
 	await checkProbeGrok();
@@ -1657,11 +2041,13 @@ function checkChunkBatching() {
 	await checkBranches();
 	await checkSteer();
 	await checkSessionEnhancements();
+	await checkBillingOnce();
 	await checkBilling();
 	await checkAccount();
 	await checkSessions();
 	await checkProcesses();
 	await checkIdle();
+	await checkLoops();
 	await checkPermissionMeta();
 	await checkCancellation();
 	await checkRestore();
@@ -1673,6 +2059,8 @@ function checkChunkBatching() {
 	await checkInteractions();
 	await checkModesAndCards();
 	await checkParityFeatures();
+	checkCommandPrefixes();
+	await checkBrowserControl();
 	checkSavedRules();
 	console.log("Agent regression checks passed: one Grok per session (own folder, permission at launch, mode-change restart and its notice, folder change, Stop and crash isolation, worktree release, quit cleanup, idle stop that keeps busy and background Groks), parallel sessions, cancellation, restoration, configuration, Auto-review fail-safe, edit-folder/home boundaries, process failure cleanup/diagnostics, stdin errors, tool policy, questions, plan approval, plan mode sync, tool rows, Always allow scope, Grok commands/models/MCP, todos, usage and attachments.");
 	process.exitCode = 0;
