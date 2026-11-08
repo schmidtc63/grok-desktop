@@ -62,17 +62,18 @@ assert.deepEqual(inventory.otherPlugins, [{ name: "foreign", detail: "2 skills, 
 assert.deepEqual(inventory.marketplaces, [{ name: "market", source: "https://example.com/market.git" }]);
 console.log("PASS shape: skills, servers, plugins and marketplaces from Grok's reports");
 
+const spacedCommand = path.resolve("/Program Files/node/node.exe");
 const connectorDetails = shape({
 	inspect: { mcpServers: [{ name: "imported", transport: "sse", target: "https://user:password@imported.example/mcp?api_key=private#secret", headers: { Authorization: "Bearer ${IMPORTED_TOKEN}", "X-Secret": "literal-header-secret" } }] },
 	servers: [
-		{ name: "local", command: "C:/Program Files/node/node.exe", args: ["-y", "@vendor/server", "--api-key=literal-argument-secret", "--token=${TOKEN}", "${ARG}", "literal-positional-secret"], env: { TOKEN: "literal-env-secret", REFERENCE: "${TOKEN}", FALLBACK: "${TOKEN:-literal-fallback-secret}" }, headers: { Authorization: "Bearer literal-bearer-secret" } },
+		{ name: "local", command: spacedCommand, args: ["-y", "@vendor/server", "--api-key=literal-argument-secret", "--token=${TOKEN}", "${ARG}", "literal-positional-secret"], env: { TOKEN: "literal-env-secret", REFERENCE: "${TOKEN}", FALLBACK: "${TOKEN:-literal-fallback-secret}" }, headers: { Authorization: "Bearer literal-bearer-secret" } },
 		{ name: "remote", transport: "http", url: "https://user:password@remote.example/mcp?api_key=private#secret", headers: { Authorization: "Bearer ${TOKEN}", "X-Key": "${HEADER_TOKEN}", Cookie: "literal-cookie-secret" } },
 		{ name: "inline", command: "node --token literal-command-secret" },
 	], plugins: [], marketplaces: [], config: "",
 });
 const localConnector = connectorDetails.servers.find((item) => item.name === "local");
 assert.equal(localConnector.transport, "stdio");
-assert.equal(localConnector.command, "C:/Program Files/node/node.exe");
+assert.equal(localConnector.command, spacedCommand);
 assert.deepEqual(localConnector.args, ["-y", "[hidden]", "--api-key=[hidden]", "--token=${TOKEN}", "${ARG}", "[hidden]"]);
 assert.deepEqual(localConnector.env, [{ name: "TOKEN", value: "[hidden]" }, { name: "REFERENCE", value: "${TOKEN}" }, { name: "FALLBACK", value: "[hidden]" }]);
 const remoteConnector = connectorDetails.servers.find((item) => item.name === "remote");
