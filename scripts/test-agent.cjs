@@ -4,11 +4,14 @@ const path = require("node:path");
 const os = require("node:os");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
+const { redactKeys, redactDeep, heldTail } = require("../electron/redact.cjs");
 
 // A check whose promise never settles ends the run without the success line, so that run fails.
 process.exitCode = 1;
 const source = fs.readFileSync(path.join(__dirname, "../electron/agent.cjs"), "utf8");
 const input = { uiSessionId: "chat", cwd: path.resolve(__dirname, ".."), text: "Hello", model: "grok-4.7", effort: "high", mode: "Normal" };
+const fakeKey = `xai-${"A".repeat(80)}`;
+const fakeEnvKey = `xai-${"B".repeat(80)}`;
 
 function makeHost(options, { tmpdir, platform = "win32", killErrors = {}, env = {} } = {}) {
 	const timers = new Map();
@@ -34,7 +37,7 @@ function makeHost(options, { tmpdir, platform = "win32", killErrors = {}, env = 
 		require: (name) => name === "child_process" ? {
 			spawn: (...args) => { spawns.push(args); return args[0] === "taskkill" ? new EventEmitter() : fakeChild(); },
 			spawnSync: (...args) => { kills.push(args); return { status: 0 }; },
-		} : (name === "os" && tmpdir ? { ...os, tmpdir: () => tmpdir } : require(name)),
+		} : (name === "./redact.cjs" ? { redactKeys, redactDeep, heldTail } : name === "os" && tmpdir ? { ...os, tmpdir: () => tmpdir } : require(name)),
 		// `kill` records process-group kills; killErrors maps a pid to the error code its kill throws.
 		process: { platform, env, kill: (pid, signal) => { kills.push(["kill", pid, signal]); if (killErrors[Math.abs(pid)]) { throw Object.assign(new Error("kill failed"), { code: killErrors[Math.abs(pid)] }); } } },
 		setTimeout: (callback, ms) => { const timer = {}; timers.set(timer, { callback, ms }); return timer; },
@@ -67,7 +70,8 @@ function makeHost(options, { tmpdir, platform = "win32", killErrors = {}, env = 
 			}
 		}
 	}
-	return { host, timers, writes, spawns, kills, events, children, running, serve, probeGrok: sandbox.module.exports.probeGrok, killTree: sandbox.module.exports.killTree, commandInfo: sandbox.module.exports.commandInfo };
+	const { probeGrok, killTree, commandInfo, setSignIn, signInStatus } = sandbox.module.exports;
+	return { host, timers, writes, spawns, kills, events, children, running, serve, probeGrok, killTree, commandInfo, setSignIn, signInStatus };
 }
 
 // macOS and Linux: each Grok leads its own process group, and killTree ends the group instead of running taskkill.
@@ -136,20 +140,188 @@ async function checkProbeGrok() {
 	}
 	const signedOut = [{ id: "grok.com" }];
 	const saved = [{ id: "cached_token" }];
-	const key = "key-value-should-not-appear";
-	async function probeSignIn(env, methods) {
+	const accepted = [{ id: "grok.com" }, { id: "xai.api_key" }];
+	async function probeSignIn(env, methods, status, version = "") {
 		const run = makeHost({}, { env });
+		if (status) { run.setSignIn({ status: () => status, grokEnv: () => status.keyReadable ? { XAI_API_KEY: fakeKey } : {} }); }
 		const pending = run.probeGrok();
-		run.children[0].stdout.emit("data", Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { authMethods: methods } })}\n`));
+		grokLine(run.children[0], { id: 1, result: { authMethods: methods, _meta: { agentVersion: version } } });
 		const result = plain(await pending);
-		assert.equal(JSON.stringify(result).includes(key), false, "the probe result never contains the API key");
+		assertNoKey(result, "the probe result never contains an API key");
 		assert.deepEqual(run.writes.map((message) => message.method), ["initialize"], "an API key probe still only initializes");
 		return result;
 	}
-	assert.deepEqual(await probeSignIn({ XAI_API_KEY: key }, signedOut), { ok: true, version: "", signedIn: true, signIn: "key", apiKey: true }, "a set API key counts as signed in");
+	const keyMode = { mode: "key", hasKey: true, keyReadable: true };
+	const unreadable = { ...keyMode, keyReadable: false };
+	const keyEnv = { XAI_API_KEY: fakeEnvKey };
+	assert.deepEqual(await probeSignIn(keyEnv, accepted), { ok: true, version: "", signedIn: true, signIn: "key", apiKey: true, keySource: "env" });
+	assert.deepEqual(await probeSignIn(keyEnv, signedOut), { ok: true, version: "", signedIn: false, signIn: "none", apiKey: true, keySource: "env", keyRejected: true });
+	assert.deepEqual(await probeSignIn(keyEnv, accepted, keyMode, fakeKey), { ok: true, version: "[redacted]", signedIn: true, signIn: "key", apiKey: true, keySource: "app" });
+	assert.deepEqual(await probeSignIn({}, signedOut, keyMode), { ok: true, version: "", signedIn: false, signIn: "none", apiKey: true, keySource: "app", keyRejected: true });
+	assert.deepEqual(await probeSignIn({}, saved, keyMode), { ok: true, version: "", signedIn: true, signIn: "saved", apiKey: true, keySource: "app", keyIgnored: true });
+	assert.deepEqual(await probeSignIn({}, signedOut, unreadable), { ok: true, version: "", signedIn: false, signIn: "none", apiKey: false, keyUnreadable: true });
+	assert.deepEqual(await probeSignIn(keyEnv, accepted, unreadable), { ok: true, version: "", signedIn: true, signIn: "key", apiKey: true, keySource: "env", keyUnreadable: true });
+	assert.deepEqual(await probeSignIn({}, null, keyMode), { ok: true, version: "", signedIn: true, signIn: "saved", apiKey: true }, "older Grok keeps the saved reading");
 	assert.deepEqual(await probeSignIn({ XAI_API_KEY: "   " }, signedOut), { ok: true, version: "", signedIn: false, signIn: "none", apiKey: false }, "a blank API key does not count");
 	assert.deepEqual(await probeSignIn({ XAI_API_KEY: "" }, signedOut), { ok: true, version: "", signedIn: false, signIn: "none", apiKey: false });
-	assert.deepEqual(await probeSignIn({ XAI_API_KEY: key }, saved), { ok: true, version: "", signedIn: true, signIn: "saved", apiKey: true }, "a saved sign-in wins while it exists");
+	assert.deepEqual(await probeSignIn(keyEnv, saved), { ok: true, version: "", signedIn: true, signIn: "saved", apiKey: true }, "a saved sign-in wins while it exists");
+}
+
+function grokLine(child, message) {
+	child.stdout.emit("data", Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`));
+}
+
+function assertNoKey(value, label) {
+	const text = JSON.stringify(value);
+	assert.ok(!text.includes(fakeKey) && !text.includes(fakeEnvKey) && !/xai-[A-Za-z0-9_-]{20,}/.test(text), label);
+}
+
+async function checkSignInSpawns() {
+	const oneShotArgs = ["--permission-mode", "default", "agent", "--no-leader", "stdio"];
+	const accepted = { authMethods: [{ id: "xai.api_key" }] };
+	const env = { XAI_API_KEY: fakeEnvKey, OTHER: "kept" };
+	const run = makeHost({}, { env });
+	let status = { mode: "key", hasKey: true, keyReadable: true };
+	run.setSignIn({ status: () => status, grokEnv: () => status.keyReadable ? { XAI_API_KEY: fakeKey } : {} });
+	assert.deepEqual(plain(run.signInStatus()), status);
+	for (const mode of ["key", "grok"]) {
+		if (mode === "grok") { status = { mode: "grok" }; }
+		const key = mode === "key" ? fakeKey : fakeEnvKey;
+		const spawnAt = run.spawns.length;
+		const childAt = run.children.length;
+		const probe = run.probeGrok();
+		const billing = run.host.billing();
+		const session = run.host.start(input, "ask");
+		const [probeChild, billChild, sessionChild] = run.children.slice(childAt);
+		const [probeSpawn, billSpawn, sessionSpawn] = run.spawns.slice(spawnAt);
+		for (const spawn of [probeSpawn, billSpawn, sessionSpawn]) {
+			assert.ok(spawn[2].env.XAI_API_KEY === key, `${mode} mode uses the expected key`);
+			assert.equal(spawn[2].env.OTHER, "kept");
+			assertNoKey(spawn[1], "argv never carries a key");
+		}
+		assert.ok(env.XAI_API_KEY === fakeEnvKey, "spawning leaves the inherited environment alone");
+		assert.deepEqual(plain(probeSpawn[1]), oneShotArgs);
+		assert.deepEqual(plain(billSpawn[1]), oneShotArgs);
+		assert.deepEqual(plain(sessionSpawn[1]), [...oneShotArgs.slice(0, -1), "--model", input.model, "--reasoning-effort", input.effort, "stdio"]);
+		grokLine(probeChild, { id: 1, result: accepted });
+		grokLine(billChild, { id: 1, result: accepted });
+		grokLine(sessionChild, { id: sessionChild.writes[0].id, result: accepted });
+		await ticks();
+		assert.deepEqual(sessionChild.writes.map(({ method }) => method), ["initialize", "authenticate"]);
+		assert.deepEqual(sessionChild.writes[1].params, { methodId: "cached_token" });
+		grokLine(sessionChild, { id: sessionChild.writes[1].id, result: { _meta: { email: fakeKey } } });
+		await session.ready;
+		assertNoKey(run.host.account, "account reads mask the key");
+		assertNoKey(await probe, "probe exposes only safe state");
+		assert.deepEqual(plain(await billing), { ok: false, error: "Grok did not return usage." });
+		assert.deepEqual(billChild.writes.map(({ method }) => method), ["initialize"]);
+		run.host.signInChanged();
+	}
+	const older = makeHost();
+	older.setSignIn({ status: () => ({ mode: "key", hasKey: true, keyReadable: true }), grokEnv: () => ({ XAI_API_KEY: fakeKey }) });
+	const legacy = older.host.start(input, "ask");
+	void legacy.ready.catch(() => {});
+	const legacyChild = older.children[0];
+	assert.ok(older.spawns[0][2].env.XAI_API_KEY === fakeKey, "the older Grok receives the selected key");
+	grokLine(legacyChild, { id: legacyChild.writes[0].id, result: {} });
+	await ticks();
+	assert.deepEqual(legacyChild.writes.map(({ method }) => method), ["initialize", "authenticate"], "missing authMethods still authenticates in key mode");
+	assert.deepEqual(legacyChild.writes[1].params, { methodId: "cached_token" });
+	grokLine(legacyChild, { id: legacyChild.writes[1].id, result: {} });
+	await legacy.ready;
+	older.host.signInChanged();
+	for (const [name, readable, detail] of [
+		["rejected", true, "Grok rejected the API key, or couldn't reach xAI to check it. Check the key in Settings."],
+		["unreadable", false, "The saved API key can't be read on this computer. Enter it again in Settings."],
+	]) {
+		const each = makeHost();
+		each.setSignIn({ status: () => ({ mode: "key", hasKey: true, keyReadable: readable }), grokEnv: () => readable ? { XAI_API_KEY: fakeKey } : {} });
+		const prompt = each.host.prompt(input);
+		const child = each.children[0];
+		grokLine(child, { id: child.writes[0].id, result: { authMethods: [{ id: "grok.com" }] } });
+		const result = await prompt;
+		assertNoKey(result, "startup errors never echo the key");
+		assert.deepEqual(plain(result), { ok: false, error: detail }, name);
+		assert.deepEqual(child.writes.map(({ method }) => method), ["initialize"], "the child stops before authenticate");
+		assert.deepEqual(taskkills(each.spawns), [String(child.pid)]);
+		assert.equal(each.host.procs.size, 0);
+	}
+	const background = run.host.start(input, "ask");
+	const scheduled = run.host.start({ ...input, uiSessionId: "scheduled" }, "ask");
+	background.ready.catch(() => {});
+	scheduled.ready.catch(() => {});
+	background.background = true;
+	scheduled.looping = true;
+	run.host.limitProbe = { at: Date.now(), promise: Promise.resolve({ ok: true }) };
+	const eventAt = run.events.length;
+	run.host.signInChanged();
+	assert.equal(run.host.limitProbe, null);
+	assert.equal(run.host.procs.size, 0);
+	assert.deepEqual(taskkills(run.spawns).slice(-2), [String(background.child.pid), String(scheduled.child.pid)]);
+	assert.deepEqual(plain(run.events[eventAt]), { type: "account", account: null });
+	assert.deepEqual(plain(run.events.at(-1)), { type: "sign-in-changed" });
+}
+
+function checkKeyMasking() {
+	const sourceValue = { [fakeKey]: { values: [fakeKey, "xai-grok-cli", "xai.api_key", null] } };
+	const copy = redactDeep(sourceValue);
+	assert.ok(Object.hasOwn(copy, fakeKey), "object keys stay unchanged");
+	assert.ok(sourceValue[fakeKey].values[0] === fakeKey, "redaction leaves the original event untouched");
+	assertNoKey(copy[fakeKey], "nested values are masked");
+	assert.deepEqual(copy[fakeKey].values, ["[redacted]", "xai-grok-cli", "xai.api_key", null]);
+	const serialized = redactKeys(JSON.stringify({ value: `before\n${fakeKey}` }));
+	assertNoKey(serialized, "an encoded newline does not prevent redaction");
+	assert.equal(JSON.parse(serialized).value, "before\n[redacted]");
+
+	const run = makeHost({ chunkMs: 30 });
+	const proc = run.running({ uiSessionId: "chat", agentSessionId: "sid-mask" });
+	const hook = (id, toolName, toolInput) => grokLine(proc.child, {
+		id,
+		method: "_x.ai/hooks/run",
+		params: { sessionId: "sid-mask", toolUseId: id, toolName, toolInput },
+	});
+	const commandHook = (id, command) => hook(id, "run_terminal_command", { command });
+	const choose = (toolId, decision) => run.host.decide({ uiSessionId: "chat", toolId, decision });
+	const update = (update) => grokLine(proc.child, { method: "session/update", params: { sessionId: "sid-mask", update } });
+	const command = `npm test -- ${fakeKey}`;
+	commandHook("key-command", command);
+	assert.ok(run.host.gates.get("key-command").command === command, "the hook retains the original command");
+	assertNoKey(run.events, "approval payload and formatted input mask the key");
+	assert.equal(run.events.at(-1).tool.noAlways, true);
+	assert.equal(run.events.at(-1).tool.command, "npm test -- [redacted]");
+	assert.equal(run.events.at(-1).tool.commandPrefix, "npm test", "a safe prefix remains available");
+	assert.equal(choose("key-command", "always").ok, true);
+	assert.equal(run.writes.at(-1).result.decision, "allow", "an injected Always is one-time only");
+	assert.equal(run.host.savedRules().size, 0);
+	assert.equal(run.host.always.size, 0);
+
+	commandHook("different-key", `npm test -- ${fakeEnvKey}`);
+	assert.equal(run.host.gates.has("different-key"), true, "another key does not inherit a rule from the masked command");
+	assert.equal(choose("different-key", "prefix").ok, true);
+	commandHook("allowed-prefix", command);
+	assert.equal(run.writes.at(-1).result.decision, "allow", "the existing safe prefix still applies to the raw command");
+	commandHook("sensitive-prefix", `make ${fakeKey.toLowerCase()}`);
+	assert.equal(run.events.at(-1).tool.commandPrefix, undefined);
+	assert.equal(choose("sensitive-prefix", "prefix").ok, false, "an injected prefix cannot grant a key");
+	choose("sensitive-prefix", "deny");
+
+	hook("key-tool", "use_tool", { tool_name: fakeKey });
+	assert.equal(run.events.at(-1).tool.noAlways, true, "the field used by an MCP tool rule is checked");
+	assert.equal(choose("key-tool", "always").ok, true);
+	hook("same-key-tool", "use_tool", { tool_name: fakeKey });
+	assert.equal(run.host.gates.has("same-key-tool"), true, "the MCP rule was never stored");
+	choose("same-key-tool", "deny");
+
+	update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `key:\n${fakeKey}` } });
+	run.host.flushText("chat");
+	assertNoKey(run.events, "buffered chat output passes through the masking boundary");
+	assert.equal(run.events.at(-1).text, "key:\n[redacted]");
+	update({ sessionUpdate: "tool_call", toolCallId: "key-output", kind: "execute", status: "completed", content: [{ type: "content", content: { type: "text", text: `xai-grok-cli ${fakeKey}` } }] });
+	assertNoKey(run.events, "tool output sent to the window is masked");
+	assert.equal(run.events.at(-1).tool.output, "xai-grok-cli [redacted]");
+	run.host.emit({ type: "error", uiSessionId: "chat", message: `Failure:\n${fakeKey}` });
+	assertNoKey(run.events, "the event wrapper masks errors sent to the window");
+	assert.equal(run.events.at(-1).message, "Failure:\n[redacted]");
 }
 
 function checkEditDiffs() {
@@ -690,18 +862,21 @@ async function checkProcessFailures() {
 
 	const privateFailure = makeHost();
 	const privateSent = privateFailure.host.prompt(input);
-	privateFailure.children[0].stderr.emit("data", Buffer.from('Authentication failed. Authorization: Basic dummy-credential\n{"api_key":"dummy-api-key"} token=another-dummy password=private-value xai-examplecredential\n'));
+	privateFailure.children[0].stderr.emit("data", Buffer.from(`Authentication failed. Authorization: Basic dummy-credential\n{"api_key":"dummy-api-key"} token=another-dummy password=private-value xai-grok-cli sk-examplecredential ${fakeKey}\n`));
 	privateFailure.children[0].emit("exit", 1);
 	const privateResult = await privateSent;
+	assertNoKey(privateResult, "stderr diagnostics mask xAI keys");
 	assert.match(privateResult.error, /Authentication failed/);
-	assert.equal(/dummy-credential|dummy-api-key|another-dummy|private-value|xai-examplecredential/.test(privateResult.error), false);
-	assert.match(privateResult.error, /\[redacted\]/);
+	assert.equal(/dummy-credential|dummy-api-key|another-dummy|private-value|sk-examplecredential/.test(privateResult.error), false);
+	assert.match(privateResult.error, /xai-grok-cli \[redacted\] \[redacted\]/);
 
 	const rpc = makeHost();
 	const rpcSent = rpc.host.prompt(input);
 	rpc.children[0].stderr.emit("data", Buffer.from("Unrelated stderr warning.\n"));
-	rpc.host.onMessage(rpc.host.procs.get("chat"), { id: rpc.writes[0].id, error: { message: "Authentication rejected by RPC." } });
-	assert.equal((await rpcSent).error, "Authentication rejected by RPC.");
+	grokLine(rpc.children[0], { id: rpc.writes[0].id, error: { message: `Authentication rejected by RPC.\n${fakeKey}` } });
+	const rpcResult = await rpcSent;
+	assertNoKey(rpcResult, "direct IPC errors mask Grok's RPC message");
+	assert.equal(rpcResult.error, "Authentication rejected by RPC.\n[redacted]");
 }
 
 async function checkSessions() {
@@ -1588,6 +1763,11 @@ async function checkSessionEnhancements() {
 	host.onMessage(proc, { id: pending.request.id, result: { suggestion: "  Yes,  start ", generation: pending.request.params.generation } });
 	assert.equal(await pending.promise, "Yes, start");
 	pending = requestSuggestion();
+	host.onMessage(proc, { id: pending.request.id, result: { suggestion: `  Use ${fakeKey} `, generation: pending.request.params.generation } });
+	const suggestion = await pending.promise;
+	assertNoKey(suggestion, "direct prompt suggestions mask keys");
+	assert.equal(suggestion, "Use [redacted]");
+	pending = requestSuggestion();
 	host.onMessage(proc, { id: pending.request.id, result: { suggestion: null, generation: pending.request.params.generation } });
 	assert.equal(await pending.promise, "");
 	pending = requestSuggestion();
@@ -1890,25 +2070,60 @@ function checkChunkBatching() {
 	assert.deepEqual(plain(chunks.events), [{ type: "chunk", text: "onetwothree", uiSessionId: "chat", turnId: "turn" }]);
 	assert.equal(chunks.timers.size, 0);
 
+	const split = makeHost({ chunkMs: 30 });
+	const splitAt = "xai-".length + 25;
+	split.host.emitTurn(turn(), { type: "chunk", text: `Key: ${fakeKey.slice(0, splitAt)}` });
+	flush(split);
+	assert.ok(split.events.length === 1 && split.events[0].text === "Key: ", "the first timed flush sends only the safe prefix");
+	assert.equal(split.timers.size, 0, "an idle candidate does not rearm the timer");
+	split.host.emitTurn(turn(), { type: "chunk", text: `${fakeKey.slice(splitAt)}\n` });
+	flush(split);
+	assert.ok(split.events.length === 2 && split.events[1].text === "[redacted]\n", "the second flush masks the whole key at once");
+	assert.equal(split.host.heldText.size, 0);
+
+	const candidate = makeHost({ chunkMs: 30 });
+	candidate.host.emitTurn(turn(), { type: "chunk", text: "x" });
+	flush(candidate);
+	assert.equal(candidate.events.length, 0);
+	assert.equal(candidate.timers.size, 0);
+	candidate.host.emitTurn(turn(), { type: "chunk", text: " " });
+	flush(candidate);
+	assert.equal(candidate.events[0].text, "x ", "a delimiter releases a bare candidate");
+
 	const tool = makeHost({ chunkMs: 30 });
-	tool.host.emitTurn(turn(), { type: "chunk", text: "before tool" });
+	tool.host.emitTurn(turn(), { type: "chunk", text: "x" });
+	flush(tool);
 	tool.host.emitTurn(turn(), { type: "tool", tool: { id: "read", kind: "read", detail: "Ran" } });
 	assert.deepEqual(tool.events.map((event) => event.type), ["chunk", "tool"], "tool updates flush text without waiting");
+	assert.equal(tool.events[0].text, "x");
 	assert.equal(tool.timers.size, 0);
 
 	const alternate = makeHost({ chunkMs: 30 });
-	alternate.host.emitTurn(turn(), { type: "chunk", text: "first" });
-	alternate.host.emitTurn(turn(), { type: "thought", text: "thinking" });
+	alternate.host.emitTurn(turn(), { type: "chunk", text: "x" });
+	flush(alternate);
+	alternate.host.emitTurn(turn(), { type: "thought", text: "xa" });
+	flush(alternate);
 	alternate.host.emitTurn(turn(), { type: "chunk", text: "last" });
 	flush(alternate);
-	assert.deepEqual(alternate.events.map((event) => [event.type, event.text]), [["chunk", "first"], ["thought", "thinking"], ["chunk", "last"]]);
+	assert.deepEqual(alternate.events.map((event) => [event.type, event.text]), [["chunk", "x"], ["thought", "xa"], ["chunk", "last"]], "a new stream kind forces the prior candidate out first");
+
+	const nextTurn = makeHost({ chunkMs: 30 });
+	nextTurn.host.emitTurn(turn(), { type: "chunk", text: "xai" });
+	flush(nextTurn);
+	nextTurn.host.emitTurn({ ...turn(), turnId: "next" }, { type: "chunk", text: "next reply" });
+	assert.deepEqual(nextTurn.events.map((event) => [event.turnId, event.text]), [["turn", "xai"]], "a new turn forces the previous turn's candidate out");
+	flush(nextTurn);
+	assert.deepEqual(nextTurn.events.map((event) => [event.turnId, event.text]), [["turn", "xai"], ["next", "next reply"]]);
 
 	const done = makeHost({ chunkMs: 30 });
 	const finishing = turn();
 	done.host.turns.set("chat", finishing);
-	done.host.emitTurn(finishing, { type: "chunk", text: "final reply" });
+	done.host.emitTurn(finishing, { type: "chunk", text: fakeKey });
+	flush(done);
+	assert.equal(done.events.length, 0);
 	done.host.finishPrompt(finishing, 2, { stopReason: "end_turn" }, "");
 	assert.deepEqual(done.events.map((event) => event.type), ["chunk", "done"], "completion flushes the final text before retiring the turn");
+	assert.ok(done.events[0].text === "[redacted]", "completion masks a key with no trailing delimiter");
 	assert.equal(done.timers.size, 0);
 
 	const approval = makeHost({ chunkMs: 30 });
@@ -1931,9 +2146,10 @@ function checkChunkBatching() {
 	assert.deepEqual(parallel.events.map((event) => [event.uiSessionId, event.turnId, event.text]), [["chat", "turn", "a1a2"], ["other", "other-turn", "b1"]]);
 
 	const quitting = makeHost({ chunkMs: 30 });
-	quitting.host.emitTurn(turn(), { type: "chunk", text: "saved before quit" });
+	quitting.host.emitTurn(turn(), { type: "chunk", text: "xai-" });
+	flush(quitting);
 	quitting.host.kill();
-	assert.equal(quitting.events[0].text, "saved before quit");
+	assert.equal(quitting.events[0].text, "xai-", "quitting flushes a held candidate");
 	assert.equal(quitting.timers.size, 0);
 }
 
@@ -2035,6 +2251,8 @@ async function checkLoops() {
 (async () => {
 	checkPosixProcessGroups();
 	await checkProbeGrok();
+	await checkSignInSpawns();
+	checkKeyMasking();
 	checkEditDiffs();
 	checkChunkBatching();
 	await checkPromptIndexes();

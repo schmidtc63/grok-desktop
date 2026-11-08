@@ -1,4 +1,6 @@
 import { useState, type ReactNode } from "react";
+import { Icon } from "./Icon";
+import { PopupMenu } from "./PopupMenu";
 import type { Session } from "./types";
 
 const CHECK_LABEL: Record<PrCheck["state"], string> = { pass: "passed", fail: "failed", run: "running", wait: "waiting", skip: "skipped" };
@@ -40,12 +42,14 @@ export function contextRows(usage: GrokUsage, breakdown: ContextBreakdown | unde
 
 export function SessionRail({
 	session,
+	folderMissing = false,
 	diff,
 	branch,
 	pr,
 	usage,
 	breakdown,
 	recentUsd,
+	subscription,
 	onOpenDiff,
 	onCompact,
 	onOpenUrl,
@@ -53,19 +57,21 @@ export function SessionRail({
 	onMergeWhenReady,
 }: {
 	session: Session;
+	folderMissing?: boolean;
 	diff: DiffSnapshot | undefined;
 	branch: BranchInfo | undefined;
 	pr: PrStatus | undefined;
 	usage: GrokUsage | undefined;
 	breakdown: ContextBreakdown | undefined;
 	recentUsd: number | null;
+	subscription?: { plan: string; percent: number | null; period: string; resets: string; stale: boolean };
 	onOpenDiff: (file?: string) => void;
 	onCompact: () => void;
 	onOpenUrl: (url: string) => void;
 	onCreatePr: () => Promise<{ ok: boolean; error?: string; message?: string }>;
 	onMergeWhenReady: () => Promise<{ ok: boolean; error?: string; message?: string }>;
 }) {
-	const [prMenu, setPrMenu] = useState(false);
+	const [prMenu, setPrMenu] = useState<HTMLButtonElement | null>(null);
 	const [prNote, setPrNote] = useState("");
 	const [working, setWorking] = useState(false);
 	const files = diff?.files ?? [];
@@ -73,20 +79,40 @@ export function SessionRail({
 	const additions = files.reduce((sum, file) => sum + (file.additions ?? 0), 0);
 	const deletions = files.reduce((sum, file) => sum + (file.deletions ?? 0), 0);
 	const open = pr?.ok ? pr.pr : null;
+	const mergeReason = open?.autoMerge ? "Auto-merge is already on" : working ? "Turning on auto-merge…" : open?.state !== "OPEN" ? "The pull request is not open" : "";
 	const failed = open?.checks.filter((check) => check.state === "fail").length ?? 0;
 	const running = open?.checks.filter((check) => check.state === "run" || check.state === "wait").length ?? 0;
 	const passed = open?.checks.filter((check) => check.state === "pass").length ?? 0;
 	const percent = usage ? Math.min(100, Math.round((usage.contextTokens / Math.max(1, usage.contextWindow)) * 100)) : null;
+	const reported = subscription?.percent == null ? null : Math.max(0, Math.round(subscription.percent));
+	const plan = subscription && (
+		<div className="rail-plan">
+			<div className="rail-plan-row"><b>{subscription.plan || "Plan not reported"}</b><span className="meta">{subscription.period ? `${subscription.period} limit` : "Usage limit"}</span></div>
+			{reported !== null && <div className="rail-plan-bar" role="meter" aria-label="Plan usage limit used" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.min(100, reported)}><span style={{ width: `${Math.min(100, reported)}%` }} /></div>}
+			<div className="rail-plan-row">
+				<span>{reported === null ? "Usage not available" : `${reported}% used · ${Math.max(0, 100 - reported)}% left`}</span>
+				<span className="meta">{subscription.resets ? `${subscription.stale ? "Reported reset" : "Resets"} ${subscription.resets}` : "Reset not reported"}</span>
+			</div>
+			{!subscription.period && reported !== null && <div className="meta">Period not reported</div>}
+			{subscription.stale && <div className="meta">Last reported usage may be out of date.</div>}
+		</div>
+	);
+	const costs = <>
+		<div className="rail-kv"><span>Session cost</span><span>${(session.costUsd ?? 0).toFixed(2)}</span></div>
+		{recentUsd !== null && <div className="rail-kv" title="Every Grok session on this computer, from Grok's own usage files"><span>Grok, last 7 days</span><span>${recentUsd.toFixed(2)}</span></div>}
+	</>;
 
 	function act(run: () => Promise<{ ok: boolean; error?: string; message?: string }>, done: string) {
 		setWorking(true);
-		setPrMenu(false);
+		setPrMenu(null);
 		void run().then((result) => setPrNote(result.ok ? (result.message || done) : (result.error || "That did not work."))).finally(() => setWorking(false));
 	}
 
 	return (
 		<aside className="session-rail" aria-label="Session details">
-			<RailCard title="Changes" extra={files.length && hasCounts ? <span className="meta"><span className="add">+{additions}</span> <span className="del">−{deletions}</span></span> : null}>
+			{folderMissing || !session.folder ? <RailCard title="Changes">
+				<p className="meta">{folderMissing ? "Folder missing. Choose a folder to see changes." : "Choose a folder to see changes."}</p>
+			</RailCard> : <RailCard title="Changes" extra={files.length && hasCounts ? <span className="meta"><span className="add">+{additions}</span> <span className="del">−{deletions}</span></span> : null}>
 				{!diff && <p className="meta">Reading the working tree…</p>}
 				{diff && !diff.ok && <p className="note">{diff.error}</p>}
 				{diff?.ok && diff.repo === false && <p className="note">This folder is not a git checkout.</p>}
@@ -113,7 +139,7 @@ export function SessionRail({
 							<button className="texty" title={open.url} onClick={() => onOpenUrl(open.url)}>PR #{open.number}</button>
 							<span className={`chip-tag ${open.state.toLowerCase()}`}>{open.isDraft ? "Draft" : open.state.toLowerCase()}</span>
 							<span className="spacer" />
-							<button className="icon-btn" aria-label="Pull request actions" aria-expanded={prMenu} onClick={() => setPrMenu((value) => !value)}>⋯</button>
+							<button className="icon-btn" aria-label="Pull request actions" aria-haspopup="menu" aria-expanded={!!prMenu} onClick={(event) => setPrMenu(prMenu ? null : event.currentTarget)}><Icon name="more-horizontal" /></button>
 						</div>
 						<span className="rail-pr-title">{open.title}</span>
 						{open.checks.length > 0 && (
@@ -129,10 +155,10 @@ export function SessionRail({
 						))}
 						{open.autoMerge && <span className="meta">Auto-merge on</span>}
 						{prMenu && (
-							<div className="rail-menu" role="menu">
-								<button role="menuitem" onClick={() => { setPrMenu(false); onOpenUrl(open.url); }}>Open on GitHub</button>
-								<button role="menuitem" disabled={open.autoMerge || working || open.state !== "OPEN"} onClick={() => act(onMergeWhenReady, "Auto-merge is on.")}>Merge when ready</button>
-							</div>
+							<PopupMenu className="rail-menu" aria-label="Pull request actions" opener={prMenu} onDismiss={() => setPrMenu(null)}>
+								<button role="menuitem" onClick={() => { setPrMenu(null); onOpenUrl(open.url); }}>Open on GitHub</button>
+								<button role="menuitem" disabled={!!mergeReason} onClick={() => act(onMergeWhenReady, "Auto-merge is on.")}>Merge when ready{mergeReason && <small className="menu-reason">{mergeReason}</small>}</button>
+							</PopupMenu>
 						)}
 					</div>
 				)}
@@ -141,22 +167,21 @@ export function SessionRail({
 				)}
 				{pr && !pr.ok && pr.error && <p className="meta">{pr.error}</p>}
 				{prNote && <p className="meta">{prNote}</p>}
-			</RailCard>
+			</RailCard>}
 			<RailCard title="Environment">
 				<div className="rail-row">Local · This computer</div>
-				<div className="rail-row" title={session.folder}>{session.folder}</div>
-				{branch?.ok && branch.repo !== false && branch.branch ? (
+				<div className="rail-row" title={session.folder || undefined}>{session.folder || "No folder chosen"}</div>
+				{branch?.ok && branch.repo !== false && branch.branch && (
 					<div className="rail-row meta" title={branch.upstream ?? ""}>
 						{branch.branch}
 						{branch.base && branch.base !== branch.branch ? ` · ${branch.ahead ?? 0} ahead of ${branch.base}` : ""}
 						{branch.behind ? ` · ${branch.behind} behind` : ""}
 					</div>
-				) : (
-					<div className="rail-row meta">{session.branch}</div>
 				)}
 				{session.worktreeFolder && <div className="rail-row meta">Worktree session</div>}
 			</RailCard>
 			<RailCard title="Context" extra={percent !== null ? <span className="meta">{percent}%</span> : null}>
+				{!usage && plan}
 				{!usage && <p className="meta">Shown after Grok's first reply in this session.</p>}
 				{usage && (() => {
 					const split = contextRows(usage, breakdown);
@@ -179,8 +204,8 @@ export function SessionRail({
 								))}
 							</div>
 							<div className="rail-kv"><span>Model</span><span>{usage.model}</span></div>
-							<div className="rail-kv"><span>Session cost</span><span>${(session.costUsd ?? 0).toFixed(2)}</span></div>
-							{recentUsd !== null && <div className="rail-kv" title="Every Grok session on this computer, from Grok's own usage files"><span>Grok, last 7 days</span><span>${recentUsd.toFixed(2)}</span></div>}
+							{plan}
+							{subscription ? <details className="rail-costs"><summary><Icon name="chevron-right" /> Cost figures reported by Grok</summary>{costs}</details> : costs}
 							<div className="ctx-foot">
 								<span className="meta">{tokens(split.untilCompact)} until auto-compact</span>
 								<button className="texty" title="Ask Grok to summarize the conversation so far" onClick={onCompact}>Compact session</button>
@@ -199,7 +224,7 @@ function RailCard({ title, extra, children }: { title: string; extra?: ReactNode
 	return (
 		<section className="rail-card">
 			<button className="rail-hd" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-				<span>{open ? "▾" : "▸"} {title}</span>
+				<span><Icon name={open ? "chevron-down" : "chevron-right"} /> {title}</span>
 				{extra}
 			</button>
 			{open && <div className="rail-bd">{children}</div>}

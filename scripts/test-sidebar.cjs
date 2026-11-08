@@ -31,6 +31,10 @@ const react = {
 		if (!(index in states)) { states[index] = typeof initial === "function" ? initial() : initial; }
 		return [states[index], (next) => { states[index] = typeof next === "function" ? next(states[index]) : next; }];
 	},
+	useRef(initial) {
+		const index = cursor++;
+		return states[index] ??= { current: initial };
+	},
 };
 const loaded = { exports: {} };
 const confirmModule = { exports: {} };
@@ -38,8 +42,10 @@ const source = transformSync(fs.readFileSync(path.join(__dirname, "../src/Sideba
 const confirmSource = transformSync(fs.readFileSync(path.join(__dirname, "../src/confirm.ts"), "utf8"), { loader: "ts", format: "cjs" }).code;
 const dataModule = { exports: {} };
 const dataSource = transformSync(fs.readFileSync(path.join(__dirname, "../src/data.ts"), "utf8"), { loader: "ts", format: "cjs" }).code;
+const sidebarModules = new Map([["./confirm", confirmModule], ["./data", dataModule]]);
+react.useLayoutEffect = react.useEffect;
 const context = vm.createContext({
-	require: (name) => name === "react" ? react : name === "./confirm" ? confirmModule.exports : name === "./data" ? dataModule.exports : { jsx, jsxs: jsx, Fragment: "fragment" },
+	require: (name) => name === "react" ? react : sidebarModules.get(name)?.exports ?? { jsx, jsxs: jsx, Fragment: "fragment" },
 	localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
 	Date: class extends Date { static now() { return now; } },
 	setInterval: (run, delay) => { const id = ++intervalId; intervals.set(id, { run, delay }); return id; },
@@ -52,6 +58,12 @@ const context = vm.createContext({
 });
 vm.runInContext(`(function(module, exports) {\n${confirmSource}\n})`, context)(confirmModule, confirmModule.exports);
 vm.runInContext(`(function(module, exports) {\n${dataSource}\n})`, context)(dataModule, dataModule.exports);
+for (const name of ["Icon", "PopupMenu"]) {
+	const module = { exports: {} };
+	const code = transformSync(fs.readFileSync(path.join(__dirname, `../src/${name}.tsx`), "utf8"), { loader: "tsx", format: "cjs", jsx: "automatic" }).code;
+	vm.runInContext(`(function(module, exports) {\n${code}\n})`, context)(module, module.exports);
+	sidebarModules.set(`./${name}`, module);
+}
 vm.runInContext(`(function(module, exports) {\n${source}\n})`, context)(loaded, loaded.exports);
 let confirmed = true;
 const sessions = [
@@ -100,6 +112,16 @@ function text(node) {
 	return node?.props ? text(node.props.children) : "";
 }
 let tree = render();
+assert.equal(findAll(tree, (node) => node.props?.["aria-label"] === "New session in Project")[0].props.className, "side-icon project-add");
+const search = findAll(tree, (node) => node.type === "button" && node.props["aria-label"] === "Search sessions")[0];
+let searchFocused = false;
+search.props.ref.current = { focus() { searchFocused = true; } };
+search.props.onClick();
+tree = render();
+findAll(tree, (node) => node.type === "input" && node.props["aria-label"] === "Search sessions")[0].props.onKeyDown({ key: "Escape", stopPropagation() {} });
+tree = render();
+assert.equal(findAll(tree, (node) => node.type === "input" && node.props["aria-label"] === "Search sessions").length, 0);
+assert.ok(searchFocused, "Escape returns focus to the sidebar search button");
 const ago = loaded.exports.ago;
 assert.equal(ago(now - 30000, now), "now");
 assert.equal(ago(now - 5 * 60000, now), "5m");
@@ -140,6 +162,7 @@ function checkFailedState() {
 	}
 	groupBy("State");
 	assert.equal(findAll(tree, (node) => node.props?.className === "group-label" && text(node) === "Failed").length, 1, "state grouping includes Failed");
+	assert.equal(findAll(tree, (node) => node.props?.className === "project-toggle").length, 0, "only project grouping has disclosure buttons");
 	props.sessions = props.sessions.map((item) => item.id === "second" ? { ...item, completed: true } : item);
 	tree = render();
 	assert.equal(findAll(tree, (node) => node.props?.className === "dot completed").length, 1, "marking a failed session completed shows Completed");
@@ -150,6 +173,131 @@ function checkFailedState() {
 	console.log("PASS failed sidebar state: dot, error label, live activity, grouping and completed precedence");
 }
 checkFailedState();
+
+function remount() {
+	effects.forEach((effect) => effect?.cleanup?.());
+	effects.length = 0;
+	states.length = 0;
+	render();
+	return render();
+}
+
+function checkProjectCollapse() {
+	const toggle = () => findAll(tree, (node) => node.type === "button" && node.props.className === "project-toggle")[0];
+	const rows = () => findAll(tree, (node) => node.props?.className === "session-hit");
+	const dot = () => findAll(toggle(), (node) => node.props?.role === "img")[0];
+	assert.equal(toggle().props["aria-expanded"], true);
+	props.activity = { second: "running" };
+	toggle().props.onClick();
+	tree = render();
+	assert.equal(toggle().props["aria-expanded"], false);
+	assert.equal(rows().length, 1);
+	assert.match(text(rows()[0]), /^First chat/, "pinned sessions stay visible when their project is collapsed");
+	assert.equal(dot().props["aria-label"], "Working");
+	props.activity = { second: "needs-you" };
+	tree = render();
+	assert.equal(dot().props["aria-label"], "Needs you");
+	tree = remount();
+	assert.equal(toggle().props["aria-expanded"], false, "a fresh sidebar restores the collapse from storage");
+	props.query = "second";
+	tree = render();
+	assert.equal(toggle().props["aria-expanded"], true);
+	assert.match(text(rows()[0]), /^Second chat/, "search can show a session in a collapsed project");
+	props.query = "";
+	tree = render();
+	assert.equal(toggle().props["aria-expanded"], false, "clearing search restores the collapse");
+	props.activeId = "second";
+	render();
+	tree = render();
+	assert.equal(toggle().props["aria-expanded"], true, "switching to a hidden session opens its project");
+	toggle().props.onClick();
+	render();
+	props.revealActiveOnMount = true;
+	tree = remount();
+	assert.equal(toggle().props["aria-expanded"], true, "a session switch while the sidebar was hidden opens its project on remount");
+	toggle().props.onClick();
+	tree = render();
+	assert.equal(toggle().props["aria-expanded"], false, "a reveal on mount does not prevent collapsing again");
+	toggle().props.onClick();
+	delete props.revealActiveOnMount;
+	props.activeId = "first";
+	props.activity = {};
+	tree = render();
+	console.log("PASS project groups: disclosure, restart persistence, hidden activity, search and session switches");
+}
+checkProjectCollapse();
+
+function checkChildSessions() {
+	const viewKey = "grok-code.sidebar.v1";
+	const originalView = storage.get(viewKey);
+	const parent = { ...sessions[0], pinned: false };
+	const child = { ...sessions[1], parentId: parent.id, folder: "C:/project-worktree", project: "Worktree" };
+	const grandchild = { ...child, id: "third", title: "Third chat", parentId: child.id };
+	const rowTitles = (root = tree) => findAll(root, (node) => node.props?.className === "session-hit").map((node) => node.props.title.split("\n")[0]);
+	const nestedRows = () => findAll(tree, (node) => node.props?.className === "session-children").flatMap(rowTitles);
+	const childToggle = () => findAll(tree, (node) => node.props?.className === "child-toggle")[0];
+	const projectToggle = () => findAll(tree, (node) => node.props?.className === "project-toggle" && node.props.title === parent.folder)[0];
+	const useView = (patch) => {
+		storage.set(viewKey, JSON.stringify({ ...JSON.parse(storage.get(viewKey)), ...patch }));
+		tree = remount();
+	};
+	props.sessions = [parent, child];
+	tree = render();
+	assert.deepEqual(rowTitles(), [parent.title, child.title]);
+	assert.deepEqual(nestedRows(), [child.title], "a cross-folder worktree is nested under its parent");
+	assert.equal(findAll(tree, (node) => node.props?.className === "project-toggle").length, 1, "the nested worktree does not create an empty project");
+	props.sessions = [parent, child, grandchild];
+	tree = render();
+	assert.deepEqual(nestedRows(), [child.title], "grandchildren stay flat and visible");
+	assert.ok(rowTitles().includes(grandchild.title));
+	childToggle().props.onClick();
+	props.activity = { second: "running" };
+	tree = render();
+	assert.equal(childToggle().props["aria-expanded"], false);
+	assert.match(childToggle().props["aria-label"], /Working$/);
+	props.activity = { second: "needs-you" };
+	tree = remount();
+	assert.deepEqual(rowTitles(), [parent.title, grandchild.title], "a parent's collapse survives a restart");
+	assert.ok(findAll(childToggle(), (node) => node.props?.className === "dot needs-you").length, "a collapsed parent shows its child's approval dot");
+	props.query = "second";
+	tree = render();
+	assert.deepEqual(rowTitles(), [child.title], "search finds a child with a collapsed and unmatched parent");
+	props.query = "";
+	tree = render();
+	assert.equal(childToggle().props["aria-expanded"], false, "search preserves the collapse preference");
+	projectToggle().props.onClick();
+	tree = render();
+	assert.ok(findAll(projectToggle(), (node) => node.props?.className === "dot needs-you").length, "a collapsed project carries its hidden child's approval dot");
+	props.activeId = child.id;
+	render();
+	tree = render();
+	assert.deepEqual(nestedRows(), [child.title], "switching to a nested worktree opens its actual project and parent");
+	for (const groupBy of ["date", "state"]) {
+		useView({ groupBy });
+		assert.deepEqual(nestedRows(), []);
+		assert.ok(rowTitles().includes(child.title), `${groupBy} grouping keeps child sessions as normal rows`);
+	}
+	useView({ groupBy: "project", status: "all" });
+	props.sessions = [{ ...parent, archived: true }, child];
+	tree = render();
+	assert.deepEqual(nestedRows(), [], "a visible archived parent leaves its child flat");
+	assert.ok(rowTitles().includes(child.title));
+	props.sessions = [child];
+	tree = render();
+	assert.deepEqual(rowTitles(), [child.title], "deleting a parent leaves its child visible as a normal row");
+	props.sessions = [{ ...parent, parentId: child.id }, child];
+	tree = render();
+	assert.equal(rowTitles().length, 2, "a cyclic link never hides either session");
+	assert.deepEqual(nestedRows(), []);
+	props.sessions = sessions;
+	props.activeId = parent.id;
+	props.activity = {};
+	storage.set(viewKey, originalView);
+	tree = remount();
+	console.log("PASS child sessions: cross-folder nesting, one level, collapse, hidden activity, search, selection and flat fallbacks");
+}
+checkChildSessions();
+
 const scroller = findAll(tree, (node) => node.props?.className === "session-scroll")[0];
 let focused = 0;
 let prevented = 0;
@@ -169,7 +317,8 @@ key("ArrowDown", { matches: () => false });
 assert.equal(prevented, 4, "other keys and rename inputs keep their own keyboard behavior");
 const secondRow = findAll(tree, (node) => node.props?.onContextMenu && text(node).includes("Second chat"))[0];
 assert.ok(secondRow);
-secondRow.props.onContextMenu({ preventDefault() {}, stopPropagation() {}, currentTarget: { getBoundingClientRect: () => ({ top: 10, left: 10, bottom: 30 }) } });
+const rowContext = { preventDefault() {}, stopPropagation() {}, currentTarget: { getBoundingClientRect: () => ({ top: 10, left: 10, bottom: 30 }), querySelector: () => null, focus() {} } };
+secondRow.props.onContextMenu(rowContext);
 tree = render();
 const openButton = findAll(tree, (node) => node.type === "button" && text(node) === "Open in a new window")[0];
 assert.ok(openButton);
@@ -177,10 +326,11 @@ openButton.props.onClick();
 assert.equal(opened, "second", "new-window action forwards its selected chat rather than the active chat");
 const rowMenu = () => {
 	tree = render();
-	findAll(tree, (node) => node.props?.onContextMenu && text(node).includes("Second chat"))[0].props.onContextMenu({ preventDefault() {}, stopPropagation() {}, currentTarget: { getBoundingClientRect: () => ({ top: 10, left: 10, bottom: 30 }) } });
+	findAll(tree, (node) => node.props?.onContextMenu && text(node).includes("Second chat"))[0].props.onContextMenu(rowContext);
 	tree = render();
 };
 const menuButton = (label) => findAll(tree, (node) => node.type === "button" && text(node).startsWith(label))[0];
+const popup = (label) => findAll(tree, (node) => node.props?.role === "menu" && node.props["aria-label"] === label)[0];
 async function checkActions() {
 	rowMenu();
 	assert.equal(menuButton("Export as Markdown"), undefined, "export stays hidden until the session has a Grok id");
@@ -209,9 +359,8 @@ async function checkActions() {
 	calls.length = 0;
 	props.activity = { second: "running" };
 	rowMenu();
-	menuButton("Delete").props.onClick();
-	await Promise.resolve();
-	assert.deepEqual(calls, ["notice:Stop this session before deleting it."], "a working session cannot be deleted");
+	assert.equal(menuButton("Delete").props.disabled, true, "a working session cannot be deleted");
+	assert.match(text(menuButton("Delete")), /Stop this session before deleting it\./);
 	props.activity = {};
 	calls.length = 0;
 	tree = render();
@@ -219,7 +368,15 @@ async function checkActions() {
 	assert.equal(opened, "second", "Ctrl+click opens the session in a new window");
 	assert.deepEqual(calls, [], "Ctrl+click does not also select it here");
 	rowMenu();
-	menuButton("Move to section").props.onClick({ currentTarget: { getBoundingClientRect: () => ({ top: 10, left: 10, right: 200, bottom: 30 }) } });
+	const cascadeEvent = { currentTarget: { getBoundingClientRect: () => ({ top: 10, left: 10, right: 200, bottom: 30 }) }, preventDefault() {}, stopPropagation() {} };
+	menuButton("Move to section").props.onKeyDown({ ...cascadeEvent, key: "ArrowRight" });
+	tree = render();
+	assert.equal(menuButton("Move to section").props["aria-expanded"], true, "ArrowRight opens the move submenu");
+	popup("Move to section").props.onKeyDown({ ...cascadeEvent, key: "ArrowLeft" });
+	tree = render();
+	assert.equal(popup("Move to section"), undefined, "ArrowLeft dismisses the submenu");
+	assert.ok(popup("Session actions"), "ArrowLeft leaves the parent menu open");
+	menuButton("Move to section").props.onClick(cascadeEvent);
 	tree = render();
 	menuButton("New section").props.onClick();
 	assert.match(calls.at(-1), /^move:second:sec-\d+$/, "New section from a row moves that session into it");
@@ -249,28 +406,52 @@ async function checkActions() {
 	assert.equal(findAll(tree, (node) => node.props?.className === "update-flag")[0].props.children.join(""), "Update available · 0.2.1");
 	account.props.onClick({ currentTarget: { getBoundingClientRect: () => ({ top: 900, left: 10 }) } });
 	tree = render();
-	const accountMenu = findAll(tree, (node) => node.props?.className === "row-pop account-menu")[0];
+	const accountMenu = popup("Account");
 	const updateAction = findAll(accountMenu, (node) => node.type === "button")[0];
 	assert.equal(updateAction.props.children.join(""), "Update to 0.2.1…", "update is the first account action");
 	updateAction.props.onClick();
 	tree = render();
 	assert.equal(calls.at(-1), "update");
-	assert.equal(findAll(tree, (node) => node.props?.className === "row-pop account-menu").length, 0, "the account menu closes before opening the update");
+	assert.equal(popup("Account"), undefined, "the account menu closes before opening the update");
 	props.update = null;
-	props.account = null;
+	props.account = { email: "account@example.test" };
 	props.signIn = "key";
+	props.keySource = "env";
 	tree = render();
-	assert.ok(text(findAll(tree, (node) => node.props?.className === "who")[0]).includes("API key"));
+	assert.ok(text(findAll(tree, (node) => node.props?.className === "who")[0]).includes("API key (XAI_API_KEY)"));
 	findAll(tree, (node) => node.props?.className === "account-btn")[0].props.onClick({ currentTarget: { getBoundingClientRect: () => ({ top: 900, left: 10 }) } });
 	tree = render();
-	const keyMenu = findAll(tree, (node) => node.props?.className === "row-pop account-menu")[0];
-	assert.ok(text(keyMenu).includes("Signed in with an API key"));
-	assert.ok(text(keyMenu).includes("This app never shows it"));
-	assert.equal(findAll(keyMenu, (node) => node.type === "button" && text(node) === "Sign out")[0].props.disabled, true);
-	assert.equal(text(keyMenu).includes("key-value-should-not-appear"), false);
-	findAll(tree, (node) => node.props?.["aria-label"] === "Close menu")[0].props.onClick();
+	const keyMenu = popup("Account");
+	assert.ok(text(keyMenu).includes("API key (XAI_API_KEY)"));
+	assert.ok(text(keyMenu).includes("Remove XAI_API_KEY from your environment to stop using it."));
+	const signOut = findAll(keyMenu, (node) => node.type === "button" && text(node).startsWith("Sign out"))[0];
+	assert.equal(signOut.props.disabled, true);
+	assert.match(text(signOut), /Set by XAI_API_KEY\./);
+	props.account = null;
+	props.signInMode = "key";
+	props.keySource = "app";
+	props.onSignOut = () => calls.push("remove key");
+	tree = render();
+	assert.ok(text(popup("Account")).includes("API key (saved in this app)"));
+	props.signIn = "none";
+	props.keyUnreadable = true;
+	props.keyRejected = true;
+	tree = render();
+	const failedKeyMenu = popup("Account");
+	assert.ok(text(failedKeyMenu).includes("The saved API key can't be read. Enter it again in Settings."));
+	assert.ok(text(failedKeyMenu).includes("Grok rejected the API key, or couldn't reach xAI to check it."));
+	assert.ok(!text(failedKeyMenu).includes("send a message"));
+	const removeKey = findAll(failedKeyMenu, (node) => node.type === "button" && text(node).trim() === "Remove the API key")[0];
+	assert.equal(removeKey.props.disabled, false);
+	removeKey.props.onClick();
+	assert.equal(calls.at(-1), "remove key");
 	delete props.account;
 	delete props.signIn;
+	delete props.signInMode;
+	delete props.keySource;
+	delete props.keyUnreadable;
+	delete props.keyRejected;
+	delete props.onSignOut;
 	tree = render();
 	assert.equal(findAll(tree, (node) => node.props?.className === "account-btn")[0].props["aria-label"], "Account and settings");
 	assert.equal(findAll(tree, (node) => node.props?.className === "update-flag").length, 0);
@@ -314,7 +495,9 @@ async function checkActions() {
 	tree = render();
 	const cliClick = { currentTarget: { getBoundingClientRect: () => ({ top: 10, left: 10, right: 80, bottom: 30 }) }, preventDefault() {}, stopPropagation() {} };
 	const flush = async () => { for (let step = 0; step < 8; step += 1) { await Promise.resolve(); } };
-	findAll(tree, (node) => node.props?.["aria-label"] === "Open a CLI session")[0].props.onClick(cliClick);
+	const cliButton = findAll(tree, (node) => node.props?.["aria-label"] === "Open CLI session")[0];
+	assert.deepEqual(findAll(cliButton, (node) => node.type === "span").map(text), ["Open CLI session…", "CLI…"]);
+	cliButton.props.onClick(cliClick);
 	await flush();
 	tree = render();
 	const cliRow = findAll(tree, (node) => node.type === "button" && text(node).includes("Fix the door"))[0];
@@ -323,7 +506,7 @@ async function checkActions() {
 	assert.equal(calls.at(-1), `cli:${cliId}`, "choosing a CLI session opens that id");
 	props.onListCliSessions = async () => { throw new Error("disk"); };
 	tree = render();
-	findAll(tree, (node) => node.props?.["aria-label"] === "Open a CLI session")[0].props.onClick(cliClick);
+	findAll(tree, (node) => node.props?.["aria-label"] === "Open CLI session")[0].props.onClick(cliClick);
 	await flush();
 	tree = render();
 	assert.equal(text(findAll(tree, (node) => node.props?.className === "meta").at(-1)), "Grok's sessions could not be read.");

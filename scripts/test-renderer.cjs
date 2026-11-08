@@ -8,7 +8,7 @@ const { transformSync } = require("esbuild");
 const storageLocks = new WeakMap();
 // App's child components render as named placeholders so a test can read the props App gives them.
 const PLACEHOLDERS = {
-	"./Panes": { PaneView: "PaneView", SideLog: "SideLog" },
+	"./Panes": { AppNote: "AppNote", PaneView: "PaneView", SideLog: "SideLog" },
 	"./Sidebar": { Sidebar: "Sidebar" },
 	"./SessionRail": { SessionRail: "SessionRail" },
 	"./DiffPane": { DiffPane: "DiffPane" },
@@ -18,7 +18,7 @@ const PLACEHOLDERS = {
 	"./SavedPromptPicker": { SavedPromptPicker: "SavedPromptPicker" },
 };
 
-function harness(storage = new Map(), search = "", clock = Date, timers = { setTimeout, clearTimeout }) {
+function harness(storage = new Map(), search = "", clock = Date, timers = { setTimeout, clearTimeout }, fresh = false) {
 	if (!storageLocks.has(storage)) {
 		const tails = new Map();
 		storageLocks.set(storage, {
@@ -58,6 +58,7 @@ function harness(storage = new Map(), search = "", clock = Date, timers = { setT
 	const confirms = [];
 	const notifications = [];
 	let confirmAnswer = true;
+	let chooseFixtureFolder = !fresh && !storage.has("grok-code.history.v1");
 	const windowEvents = new Map();
 	const jsx = (type, props, key) => ({ type, props: props ?? {}, key });
 	const react = {
@@ -106,6 +107,8 @@ function harness(storage = new Map(), search = "", clock = Date, timers = { setT
 		send: async (input) => { sends.push(input); return { ok: true, agentSessionId: "provider-session" }; },
 		decide: async (input) => { decisions.push(input); return { ok: true }; },
 		pickFolder: async () => pickedFolders.shift() ?? null,
+		branchInfo: async () => ({ ok: true, repo: true }),
+		addWorktree: async () => ({ ok: false, error: "No worktree fixture" }),
 		forgetSession: async (id) => { forgotten.push(id); },
 		pickFiles: async () => pickedFiles.shift() ?? [],
 		setAllowedFolders: async (input) => { allowedUpdates.push(input); return { ok: true }; },
@@ -157,6 +160,11 @@ function harness(storage = new Map(), search = "", clock = Date, timers = { setT
 			effects = [];
 			pending.forEach((effect) => effect());
 		}
+		if (chooseFixtureFolder) {
+			chooseFixtureFolder = false;
+			const choose = nodes(tree).find((node) => node.type === "button" && textOf(node) === "Choose folder…");
+			if (choose) { pickedFolders.unshift(api.homeDir); choose.props.onClick(); }
+		}
 		return tree;
 	}
 	function nodes(value, found = []) {
@@ -180,6 +188,7 @@ function harness(storage = new Map(), search = "", clock = Date, timers = { setT
 		storage, locks, sends, writes, historyWrites, settingsWrites, pickedFolders, forgotten, pickedFiles, allowedUpdates, newWindows, questionAnswers, planAnswers, decisions, cancels, confirms, notifications, files, api, settle, render, window: appWindow, document: appDocument,
 		unmount: () => hooks.forEach((hook) => hook?.cleanup?.()),
 		prFixPrompt: (number, alert) => load("prWatch.ts").prFixPrompt(number, alert),
+		cloudModels: () => load("cloud-models.ts"),
 		get confirmAnswer() { return confirmAnswer; },
 		set confirmAnswer(value) { confirmAnswer = value; },
 		windowEvent: (name, event = {}) => windowEvents.get(name)?.(event),
@@ -201,9 +210,10 @@ function harness(storage = new Map(), search = "", clock = Date, timers = { setT
 		customizeView: (props) => { component = () => load("Customize.tsx").Customize(props); dirty = true; return render(); },
 		customizeModule: () => load("Customize.tsx"),
 		catalog: () => load("connector-catalog.ts"),
+		redactKeys: (value) => load("redact.ts").redactKeys(value),
 		messageTime: (message) => load("Panes.tsx").messageTime(message),
 		supportReport: (result) => load("Setup.tsx").supportReport(result),
-		sideCap: (width, collapsed) => load("App.tsx").sideCap(width, collapsed),
+		sideCap: (width, sidebarWidth) => load("App.tsx").sideCap(width, sidebarWidth),
 		shouldCollapseSidebar: (width, panesOpen) => load("App.tsx").shouldCollapseSidebar(width, panesOpen),
 		markdown: (props) => { component = () => load("Markdown.tsx").Markdown(props); dirty = true; return render(); },
 		view: (id, model) => { component = () => { const pane = load("Panes.tsx").PaneView({ id, model }); return pane.type(pane.props); }; dirty = true; return render(); },
@@ -216,7 +226,7 @@ function harness(storage = new Map(), search = "", clock = Date, timers = { setT
 		filesView: (props) => { component = () => load("FilesPane.tsx").FilesPane({ ...props, autoSave: false }); dirty = true; return render(); },
 		message: (model, readOnly = false, extra = {}) => { component = () => { const pane = load("Panes.tsx").PaneView({ id: "chat", model }); const chat = pane.type(pane.props); const body = nodes(chat).find((node) => node.type.name === "MessageBody"); return body.type({ ...body.props, readOnly, ...extra }); }; dirty = true; return render(); },
 		userClipOverflows: (contentHeight, boxHeight) => load("Panes.tsx").userClipOverflows(contentHeight, boxHeight),
-		userClipBoxHeight: (fontSizePx) => load("Panes.tsx").userClipBoxHeight(fontSizePx),
+		userClipBoxHeight: (lineHeightPx) => load("Panes.tsx").userClipBoxHeight(lineHeightPx),
 		USER_MESSAGE_LINES: () => load("Panes.tsx").USER_MESSAGE_LINES,
 		contextSnapshot: (title, messages) => load("context-from-chat.ts").contextSnapshot(title, messages),
 		contextForGrok: (blocks, request) => load("context-from-chat.ts").contextForGrok(blocks, request),
@@ -260,6 +270,22 @@ function textOf(value) {
 
 function button(appWindow, label) {
 	return appWindow.node((node) => node.type === "button" && (node.props["aria-label"] === label || [node.props.children].flat()[0] === label));
+}
+
+function worktreeInput(appWindow) {
+	return appWindow.node((node) => node.props["aria-label"] === "Worktree");
+}
+
+function folderChip(appWindow) {
+	return appWindow.node((node) => node.type.name === "MenuButton" && node.props.icon === "folder");
+}
+
+function chooseEnvironment(appWindow, environment) {
+	appWindow.node((node) => node.type.name === "MenuButton" && node.props.title === "Environment").props.onClick();
+	appWindow.render();
+	const choice = button(appWindow, environment);
+	assert.equal(choice.props.disabled, false);
+	choice.props.onClick();
 }
 
 function queuedAction(appWindow, index, label) {
@@ -458,8 +484,10 @@ async function check() {
 	await new Promise((resolve) => setImmediate(resolve));
 	firstWindow.render();
 	secondWindow.render();
+	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(sharedStorage.get("grok-code.history.v1"), undefined, "all persistence writes must wait for the shared exclusive lock");
 	for (const appWindow of [firstWindow, secondWindow]) {
+		appWindow.render();
 		appWindow.sidebar().onNew();
 		appWindow.render();
 		sendPrompt(appWindow, "a new chat");
@@ -969,7 +997,9 @@ async function checkSavedSize() {
 }
 
 async function checkGrokState() {
-	const app = harness();
+	let escapeClock;
+	class Clock extends Date { static now() { return escapeClock ?? Date.now(); } }
+	const app = harness(new Map(), "", Clock);
 	await app.settle();
 	const id = app.model().session.id;
 	app.sidebar().onSelect(id);
@@ -979,13 +1009,36 @@ async function checkGrokState() {
 	assert.ok(strings(app.render()).includes("Managed in Grok's configuration"), "with no MCP report the + menu says where connectors live");
 	app.emit({ type: "mcp", servers: [{ name: "github", source: "user", status: "" }, { name: "linear", source: "project", status: "" }] });
 	app.emit({ type: "mcp-status", name: "github", status: "connected" });
-	app.emit({ type: "commands", commands: [{ name: "review", description: "Review the diff", hint: "" }, { name: "goal", description: "Set a goal", hint: "objective" }] });
+	app.emit({ type: "commands", commands: [{ name: "review-skill", description: "Review a change", hint: "path" }, { name: "review", description: "Review the diff", hint: "" }, { name: "goal", description: "Set a goal", hint: "objective" }] });
 	await app.settle();
 	assert.ok(strings(app.render()).includes("2 MCP servers from Grok"));
 	assert.ok(JSON.parse(app.storage.get("grok-code.commands.v1")).some((item) => item.name === "review"), "Grok's command list is cached for the next window");
+	let finishSkills;
+	app.api.customize = (folder, skillsOnly) => {
+		assert.equal(folder, app.model().session.folder);
+		assert.equal(skillsOnly, true);
+		return new Promise((resolve) => { finishSkills = resolve; });
+	};
 	typePrompt(app, "/rev");
-	const commandNames = app.nodes(app.node((node) => node.props["aria-label"] === "Commands")).filter((node) => node.props.role === "option").map((node) => [node.props.children].flat()[0]);
-	same(commandNames, ["/review"], "the / menu lists Grok's commands");
+	await app.settle();
+	const commandNodes = () => app.nodes(app.node((node) => node.props["aria-label"] === "Commands"));
+	const groupLabels = () => commandNodes().filter((node) => node.props.role === "group").map((node) => node.props["aria-label"]);
+	const selectedCommand = () => [commandNodes().find((node) => node.props["aria-selected"] === true).props.children].flat()[0];
+	const nextCommand = () => {
+		app.node((node) => node.props["aria-label"] === "Prompt").props.onKeyDown({ key: "ArrowDown", preventDefault() {} });
+		app.render();
+	};
+	same(groupLabels(), ["Grok, 2 commands"], "names alone do not classify a Grok command as a skill");
+	nextCommand();
+	assert.equal(selectedCommand(), "/review");
+	finishSkills({ ok: true, skills: [{ command: "/review-skill" }, { command: "/review", disabled: true }] });
+	await app.settle();
+	same(groupLabels(), ["Grok, 1 command", "Skills, 1 command"], "only an enabled inventory match goes in Skills");
+	assert.equal(selectedCommand(), "/review", "the active option survives regrouping");
+	nextCommand();
+	assert.equal(selectedCommand(), "/review-skill", "keyboard navigation skips group headings");
+	typePrompt(app, "/");
+	assert.match(groupLabels()[0], /^App, \d+ commands$/);
 	typePrompt(app, "");
 
 	const terminalWrites = [];
@@ -1050,8 +1103,15 @@ async function checkGrokState() {
 	const cards = rail.nodes(rail.rail(app.node((node) => node.type === "SessionRail").props)).filter((node) => node.type.name === "RailCard");
 	const railText = cards.map((card) => `${textOf(card.props.extra)} ${textOf(card.props.children)}`).join(" ");
 	assert.ok(railText.includes("11%"), "the rail's Context card shows the percentage");
-	assert.ok(railText.includes("$0.25"), "the rail shows the session cost");
 	const railProps = app.node((node) => node.type === "SessionRail").props;
+	const costs = rail.node((node) => node.type === "details" && node.props.className === "rail-costs");
+	assert.equal(costs.props.open, undefined, "subscription costs start collapsed");
+	assert.match(textOf(costs), /Cost figures reported by GrokSession cost\$0\.25/);
+	assert.doesNotMatch(app.node((node) => node.props.className === "usage-ring").props.title, /\$/, "the subscription composer tooltip stays about context");
+	const keyRail = harness();
+	const keyRailTree = keyRail.rail({ ...railProps, subscription: undefined });
+	assert.equal(keyRail.nodes(keyRailTree).some((node) => node.type === "details" && node.props.className === "rail-costs"), false);
+	assert.match(textOf(keyRail.nodes(keyRailTree).find((node) => node.type.name === "RailCard" && node.props.title === "Context").props.children), /Session cost\$0\.25/);
 	const parts = { systemPrompt: 2000, rules: 1000, skills: 9000, workflows: 200, mcp: 600, tools: 11600 };
 	const splitText = (contextTokens) => {
 		const splitRail = harness();
@@ -1134,7 +1194,7 @@ async function checkGrokState() {
 	twice.api.addWorktree = () => { worktreeCalls += 1; return new Promise((resolve) => { finishWorktree = resolve; }); };
 	twice.sidebar().onNew();
 	await twice.settle();
-	twice.node((node) => node.type === "input" && node.props.type === "checkbox" && node.props.title === undefined && typeof node.props.onChange === "function" && node.props.checked === false).props.onChange({ target: { checked: true } });
+	worktreeInput(twice).props.onChange({ target: { checked: true } });
 	twice.render();
 	const sendsBeforeTwice = twice.sends.length;
 	sendPrompt(twice, "make it twice");
@@ -1157,21 +1217,29 @@ async function checkGrokState() {
 	await app.settle();
 	app.node((node) => node.props.label === "+").props.onClick();
 	app.render();
+	escapeClock = Date.now();
 	app.key({ key: "Escape" });
 	await app.settle();
 	assert.deepEqual(app.cancels, [], "Escape that closes a menu does not stop Grok");
+	escapeClock += 499;
 	app.key({ key: "Escape" });
 	await app.settle();
-	same(app.cancels, [id], "Escape with nothing open stops Grok");
+	assert.deepEqual(app.cancels, [], "a second Escape inside the overlay's grace period does not stop Grok");
+	escapeClock += 1;
+	app.key({ key: "Escape" });
+	await app.settle();
+	same(app.cancels, [id], "Escape with nothing open stops Grok when the grace period expires");
 }
 
 async function checkLimitMeter() {
 	const app = harness();
 	const meter = () => app.node((node) => String(node.props.className || "").startsWith("limit-meter"));
 	const fresh = harness();
+	fresh.api.signInStatus = async () => ({ mode: "key", hasKey: true, keyReadable: true, keyring: true });
+	fresh.api.readiness = async () => ({ grok: { ok: true, signedIn: true, signIn: "saved", signInMode: "key", keyIgnored: true }, git: { ok: true }, gh: { ok: true } });
 	fresh.api.billing = async () => ({ ok: true, percent: 28, period: "weekly", resetsAt: "2026-11-11T22:56:56.873+00:00", tier: "SuperGrok" });
 	await fresh.settle();
-	assert.equal(textOf(fresh.node((node) => String(node.props.className || "").startsWith("limit-meter"))), "Weekly - 72% left", "a new session shows the limit before any message");
+	assert.equal(textOf(fresh.node((node) => String(node.props.className || "").startsWith("limit-meter"))), "Weekly · 72% left", "the active saved sign-in shows its limit before any message when Grok ignores the configured key");
 	let billing = { ok: false, error: "Grok did not return usage." };
 	app.api.billing = async () => billing;
 	await app.settle();
@@ -1179,27 +1247,31 @@ async function checkLimitMeter() {
 	assert.equal(textOf(meter()), "Limit", "no limit while Grok cannot be read");
 	assert.equal(meter().props.className, "limit-meter");
 	assert.match(meter().props.title, /isn't available/);
-	billing = { ok: true, percent: 80, period: "weekly", resetsAt: "2026-11-04T22:56:56.873+00:00", tier: "SuperGrok" };
+	billing = { ok: true, percent: 80, period: "weekly", resetsAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(), tier: "SuperGrok" };
 	sendPrompt(app, "first");
 	await app.settle();
 	app.emit({ type: "done", uiSessionId: id, turnId: app.sends.at(-1).turnId });
 	await app.settle();
-	assert.equal(textOf(meter()), "Weekly - 20% left", "a finished turn reads the limit");
+	assert.equal(textOf(meter()), "Weekly · 20% left", "a finished turn reads the limit");
 	assert.equal(meter().props.className, "limit-meter warn");
 	assert.match(meter().props.title, /^SuperGrok weekly limit 80% used · resets /);
+	assert.equal(app.node((node) => node.type === "SessionRail").props.subscription.stale, false);
 	billing = { ok: false, error: "Grok did not return usage." };
 	sendPrompt(app, "second");
 	await app.settle();
 	app.emit({ type: "done", uiSessionId: id, turnId: app.sends.at(-1).turnId });
 	await app.settle();
-	assert.equal(textOf(meter()), "Weekly - 20% left", "a failed read keeps the last limit");
+	assert.equal(textOf(meter()), "Weekly · 20% left", "a failed read keeps the last limit");
+	assert.match(meter().props.title, /may be out of date/);
+	assert.equal(app.node((node) => node.type === "SessionRail").props.subscription.stale, true);
 	billing = { ok: true, percent: 92.4, period: "monthly", resetsAt: "", tier: "SuperGrok" };
 	sendPrompt(app, "third");
 	await app.settle();
 	app.emit({ type: "done", uiSessionId: id, turnId: app.sends.at(-1).turnId });
 	await app.settle();
-	assert.equal(textOf(meter()), "Monthly - 8% left");
+	assert.equal(textOf(meter()), "Monthly · 8% left");
 	assert.equal(meter().props.className, "limit-meter high");
+	assert.equal(app.node((node) => node.type === "SessionRail").props.subscription.stale, false);
 }
 
 async function checkSlashCommands() {
@@ -1286,6 +1358,8 @@ async function checkSlashCommands() {
 	app.emit({ type: "done", uiSessionId: id, turnId: app.sends.at(-1).turnId });
 	await app.settle();
 	await run("/usage");
+	assert.equal(app.model().messages.at(-1).text, "Usage is unavailable.\nContext 11%");
+	await run("/cost");
 	assert.equal(app.model().messages.at(-1).text, "Usage is unavailable.\nContext 11% · $0.25");
 	await run("/delete");
 	assert.equal(app.node((node) => node.props.role === "alertdialog").props["aria-label"], 'Delete "New name"?');
@@ -1352,6 +1426,8 @@ async function checkToolRows() {
 	const toolApproval = show({ id: "tool-approve", kind: "mcp", title: "use_tool", detail: "Waiting for you", waiting: true, always: "conversation" });
 	assert.ok(button(toolApproval, "Allow for this conversation"), "a tool rule says it lasts one conversation");
 	assert.equal(button(toolApproval, "Always allow in this folder"), undefined);
+	const secretApproval = show({ id: "secret-approve", kind: "command", title: "run_terminal_command", detail: "Waiting for you", waiting: true, command: "curl [redacted]", always: "folder", noAlways: true });
+	assert.equal(button(secretApproval, "Always allow in this folder"), undefined, "a masked command cannot be remembered");
 	const chained = show({ id: "chained", kind: "command", title: "run_terminal_command", detail: "Waiting for you", waiting: true, command: "npm test && curl example.com" });
 	assert.equal(button(chained, "Always allow in this folder") || button(chained, "Allow for this conversation"), undefined, "a call Always allow could not remember offers no remembered grant");
 	const prefixed = show({ id: "prefix", kind: "command", title: "run_terminal_command", detail: "Waiting for you", waiting: true, command: "npm test && npm test -- --watch", commandPrefix: "npm test" });
@@ -1472,13 +1548,17 @@ async function checkToolRows() {
 	const groupView = harness();
 	groupView.group({ tools: groupTools.slice(0, 3), m: groupedModel });
 	const groupRows = () => groupView.nodes(groupView.render()).filter((node) => node.type.name === "ToolRow").length;
-	assert.equal(textOf(groupView.node((node) => node.props.className === "tool-head")), "▸Read 2 files, searched 1 time1 failed", "the group's row sums up its calls");
+	assert.equal(textOf(groupView.node((node) => node.props.className === "tool-head")), "Read 2 files, searched 1 time1 failed", "the group's row sums up its calls");
 	assert.equal(groupRows(), 0, "the folded rows stay hidden");
 	groupView.node((node) => node.props.className === "tool-head").props.onClick();
 	assert.equal(groupRows(), 3, "opening the group shows its rows");
 	const verboseView = harness();
 	verboseView.group({ tools: groupTools.slice(0, 3), m: { ...groupedModel, view: "verbose" } });
 	assert.equal(verboseView.nodes(verboseView.render()).filter((node) => node.type.name === "ToolRow").length, 3, "Verbose opens groups");
+	const deniedCommand = { ...groupTools[3], waiting: false, detail: "Denied" };
+	groupView.group({ tools: [...groupTools.slice(0, 3), deniedCommand], m: groupedModel });
+	const statuses = groupView.nodes(groupView.node((node) => node.props.className === "tool-head")).filter((node) => node.props.className?.startsWith("tool-status"));
+	assert.deepEqual(statuses.map((node) => [textOf(node), node.props.className]), [["1 denied", "tool-status"], ["1 failed", "tool-status bad"]], "only failures use the error color");
 }
 
 async function checkInboundTurns() {
@@ -1847,8 +1927,8 @@ async function checkRoutineBatchB() {
 }
 
 async function checkNativeTerminalRouting() {
-	const appWindow = harness();
-	await appWindow.settle();
+	const appWindow = await composerWindow();
+	const sessionId = appWindow.model().session.id;
 	let nextId = 0;
 	const writes = [];
 	const inputs = [];
@@ -1871,9 +1951,25 @@ async function checkNativeTerminalRouting() {
 	same(sizes, [["pty-1", 120, 40]], "terminal dimensions reach the host bridge");
 	terminal().onCloseTab("pty-1");
 	await appWindow.settle();
+	let finishOpen;
+	appWindow.api.terminalOpen = () => new Promise((resolve) => { finishOpen = resolve; });
+	terminal().onNew();
 	terminal().onClose();
 	await appWindow.settle();
-	same(closed, ["pty-1", "pty-2"], "closing a tab and then the pane stops all native tabs");
+	appWindow.emit({ type: "terminal-data", id: "pty-2", data: "still running while hidden" });
+	finishOpen({ ok: true, id: "pty-3", backend: "pty" });
+	await appWindow.settle();
+	same(closed, ["pty-1"], "closing the pane keeps open and opening terminals alive");
+	button(appWindow, "Terminal").props.onClick();
+	await appWindow.settle();
+	same(terminal().tabs.map((tab) => tab.id), ["pty-2", "pty-3"], "reopening shows both original tabs");
+	assert.equal(terminal().tabs[0].output, "still running while hidden");
+	terminal().onNew();
+	appWindow.sidebar().onDelete(sessionId);
+	await appWindow.settle();
+	finishOpen({ ok: true, id: "pty-4", backend: "pty" });
+	await appWindow.settle();
+	same(closed, ["pty-1", "pty-2", "pty-3", "pty-4"], "deleting the owner stops its tabs and closes a late open");
 }
 
 async function checkBrowserControl() {
@@ -1909,9 +2005,11 @@ async function checkBrowserControl() {
 	assert.equal(reports.at(-1).enabled, true, "a hidden pane still reports the current session and enabled switch");
 	app.emit({ type: "browser-open", uiSessionId: firstId, url: "https://example.test/path" });
 	await app.settle();
-	const browser = () => app.node((node) => node.type === "BrowserPane")?.props;
+	const browser = () => app.node((node) => node.type === "BrowserPane" && node.props.visible)?.props;
+	const retainedBrowser = (id) => app.node((node) => node.type === "BrowserPane" && node.props.uiSessionId === id)?.props;
 	assert.equal(browser().uiSessionId, firstId);
 	assert.equal(browser().tabs[0].url, "https://example.test/path");
+	const firstTab = browser().activeId;
 	app.emit({ type: "browser-activity", uiSessionId: firstId, text: "clicking a button", running: true });
 	await app.settle();
 	timers.advance(20000);
@@ -1940,12 +2038,26 @@ async function checkBrowserControl() {
 	assert.equal(app.sends.at(-1).browser, false, "side chats never get browser control");
 	const secondId = await startSession(app, "another session");
 	assert.equal(browser().uiSessionId, secondId);
+	assert.equal(retainedBrowser(firstId).visible, false);
+	assert.equal(retainedBrowser(firstId).reporting, false, "the retained background Browser cannot publish the window's active report");
+	retainedBrowser(firstId).onPageChanged(firstTab, "https://example.test/next", "Next page");
+	await app.settle();
+	assert.equal(retainedBrowser(firstId).tabs[0].url, "https://example.test/next");
+	assert.equal(browser().tabs.length, 0, "background navigation only updates the owning session");
 	browser().onClose();
 	await app.settle();
 	app.emit({ type: "browser-open", uiSessionId: firstId, url: "https://outside.test/" });
 	await app.settle();
 	assert.equal(browser(), undefined, "a background session cannot open the current session's pane");
 	assert.equal(reports.at(-1).uiSessionId, secondId);
+	app.sidebar().onSelect(firstId);
+	await app.settle();
+	assert.equal(retainedBrowser(firstId).reporting, true);
+	assert.equal(retainedBrowser(firstId).visible, false);
+	app.key({ key: "b", ctrlKey: true, shiftKey: true });
+	await app.settle();
+	assert.equal(browser().activeId, firstTab);
+	assert.equal(browser().tabs[0].url, "https://example.test/next");
 	const decisions = [];
 	const card = harness();
 	card.row({ tool: { id: "browser-site", kind: "browser", title: "Read example.test", waiting: true, always: "site" }, m: { session: { folder: "C:/project" }, decide: (...args) => decisions.push(args) } });
@@ -1962,6 +2074,7 @@ async function checkTerminalSelection() {
 	const writes = [];
 	appWindow.api.terminalOpen = async () => ({ ok: true, id: `tab-${++nextId}` });
 	appWindow.api.terminalWrite = async (id, text) => { writes.push([id, text]); return { ok: true }; };
+	appWindow.api.devScripts = async () => ({ ok: true, scripts: [{ script: "dev", command: "test server" }] });
 	appWindow.model().openLink("https://example.test", { ctrlKey: false, metaKey: false });
 	await appWindow.settle();
 	button(appWindow, "Browser pane").props.onClick();
@@ -1976,6 +2089,12 @@ async function checkTerminalSelection() {
 	terminal().onCloseTab("tab-2");
 	await appWindow.settle();
 	assert.equal(terminal().activeId, "tab-1", "closing the selected terminal selects a remaining tab");
+	terminal().onClose();
+	await appWindow.settle();
+	assert.equal(browser().devServers[0].running, true, "hiding Terminal leaves the dev server running in Browser");
+	button(appWindow, "Terminal").props.onClick();
+	await appWindow.settle();
+	assert.equal(terminal().activeId, "tab-1", "reopening Terminal keeps the dev server tab selected");
 	browser().onNewTab();
 	await appWindow.settle();
 	const closed = browser().activeId;
@@ -2076,16 +2195,31 @@ async function checkPlanResumeMode() {
 }
 
 async function checkFirstLaunch() {
-	const app = harness();
+	const app = harness(new Map(), "", Date, undefined, true);
+	app.api.listCliProjectFolders = async () => ["C:/work/example-project"];
+	app.api.readiness = async () => ({ grok: { ok: true, signedIn: true }, git: { ok: true } });
 	await app.settle();
 	const placeholder = app.model().session.id;
 	assert.ok(app.node((node) => node.props.className === "new-page"), "empty storage opens the New session form");
-	assert.ok(app.node((node) => node.props["aria-label"] === "Folder"));
-	assert.equal(app.sends.length, 0);
-	sendPrompt(app, "first session");
+	assert.equal(app.sidebar().sessions.length, 0, "the folderless placeholder is not selectable from the sidebar");
+	assert.equal(folderChip(app).props.label, "Choose folder…");
+	assert.ok(textOf(app.node((node) => node.props.className === "new-setup-status")).includes("Signed in"));
+	assert.ok(worktreeInput(app).props.disabled);
+	typePrompt(app, "first session");
+	assert.ok(button(app, "Send").props.disabled);
+	enterPrompt(app);
+	await app.settle();
+	assert.equal(app.sends.length, 0, "Enter preserves the draft until a project folder is chosen");
+	app.node((node) => node.type === "button" && node.props.title === "C:/work/example-project").props.onClick();
+	await app.settle();
+	assert.equal(worktreeInput(app).props.disabled, false);
+	assert.equal(button(app, "Send").props.disabled, false);
+	button(app, "Send").props.onClick();
 	await app.settle();
 	assert.equal(app.node((node) => node.props.className === "new-page"), undefined);
 	assert.equal(app.sends.length, 1);
+	assert.equal(app.sends[0].cwd, "C:/work/example-project");
+	assert.equal(app.sends[0].text, "first session");
 	same(app.sidebar().sessions.map((session) => session.id), [placeholder], "the first send replaces its placeholder without a duplicate sidebar session");
 	same(savedHistory(app).sessions.map((session) => session.id), [placeholder], "only that session is saved");
 }
@@ -2148,11 +2282,33 @@ async function checkSettingsSaveFailure() {
 	await app.settle();
 	app.key({ key: ",", ctrlKey: true });
 	await app.settle();
+	const props = () => app.node((node) => node.type?.name === "SettingsPage").props;
+	const view = harness();
+	view.settingsView(props());
+	const control = (label) => view.nodes(view.render()).find((node) => node.props["aria-label"] === label);
+	assert.equal(control("Auto save").props.role, "switch");
 	app.storage.failWrites = true;
-	app.node((node) => node.type?.name === "SettingsPage").props.onChange({ appearance: "light" });
+	control("Appearance").props.onChange({ target: { value: "light" } });
 	await app.settle();
 	assert.equal(app.notice(), "Settings could not be saved. Changes last until the app closes.");
-	assert.equal(app.node((node) => node.type?.name === "SettingsPage").props.settings.appearance, "light", "the failed save keeps the choice in memory");
+	assert.equal(props().settings.appearance, "light", "the failed save keeps the choice in memory");
+	assert.match(textOf(view.render()), /Not saved\./);
+	app.storage.failWrites = false;
+	button(view, "Sessions").props.onClick();
+	view.render();
+	assert.equal(button(view, "Save"), undefined, "branch prefix saves without an explicit button");
+	control("Branch prefix").props.onChange({ target: { value: "main" } });
+	assert.equal(control("Branch prefix").props["aria-invalid"], true);
+	assert.match(textOf(view.render()), /Not saved\. Use 1–40/);
+	control("Branch prefix").props.onBlur();
+	assert.equal(app.readSettings().branchPrefix, "grok");
+	control("Branch prefix").props.onChange({ target: { value: "features" } });
+	control("Branch prefix").props.onKeyDown({ key: "Enter", nativeEvent: {}, preventDefault() {} });
+	assert.equal(app.readSettings().branchPrefix, "features", "Enter saves a valid prefix immediately");
+	assert.ok(view.nodes(view.render()).some((node) => node.props.role === "status" && textOf(node).trim() === "Saved"));
+	control("Branch prefix").props.onChange({ target: { value: "work" } });
+	control("Branch prefix").props.onBlur();
+	assert.equal(app.readSettings().branchPrefix, "work", "leaving the field also saves a valid prefix");
 }
 
 function inactiveWorktree(clock = Date, autoArchiveDays = 1) {
@@ -2241,8 +2397,13 @@ async function checkSettingsBlocksShortcuts() {
 	await app.settle();
 	const second = await startSession(app, "session B");
 	assert.equal(app.model().session.id, second);
+	const body = app.document.body = {};
+	const opener = { isConnected: true, focus() { app.document.activeElement = this; } };
+	app.document.activeElement = opener;
 	app.key({ key: ",", ctrlKey: true });
 	await app.settle();
+	assert.equal(app.sidebar().inert, true);
+	assert.equal(app.node((node) => node.props.className === "workspace").props.inert, true);
 	app.key({ key: "Tab", ctrlKey: true });
 	await app.settle();
 	assert.equal(app.model().session.id, second, "Ctrl+Tab does not switch the session hidden behind Settings");
@@ -2250,8 +2411,12 @@ async function checkSettingsBlocksShortcuts() {
 	app.key({ key: "f", ctrlKey: true });
 	await app.settle();
 	assert.equal(app.model().findTick, findTick, "Ctrl+F does not open conversation search behind Settings");
-	app.key({ key: "Escape" });
+	app.document.activeElement = body;
+	app.key({ key: "Escape", target: { closest: (selector) => selector === ".side-col, .session-rail" } });
 	await app.settle();
+	assert.equal(app.node((node) => node.type?.name === "SettingsPage"), undefined, "Escape from the rail closes Settings");
+	assert.equal(app.document.activeElement, opener, "Settings restores focus to its opener");
+	assert.equal(app.sidebar().inert, false);
 	app.key({ key: "Tab", ctrlKey: true });
 	await app.settle();
 	assert.notEqual(app.model().session.id, second, "with Settings closed Ctrl+Tab switches again");
@@ -2460,7 +2625,7 @@ async function checkNewSessionDraftRelaunch() {
 	app.sidebar().onNewIn({ folder: "C:/draft-project", project: "draft-project", branch: "feature/draft", worktree: "draft-project", environment: "Local" });
 	await app.settle();
 	const draftId = app.model().session.id;
-	const worktree = () => app.node((node) => node.props.className === "toggle field-toggle").props.children[0];
+	const worktree = () => worktreeInput(app);
 	worktree().props.onChange({ target: { checked: true } });
 	app.render();
 	typePrompt(app, "Do this later");
@@ -2469,9 +2634,9 @@ async function checkNewSessionDraftRelaunch() {
 	await relaunch.settle();
 	assert.ok(relaunch.node((node) => node.props.className === "new-page"));
 	assert.equal(relaunch.node((node) => node.props["aria-label"] === "Prompt").props.value, "Do this later");
-	assert.equal(relaunch.node((node) => node.props["aria-label"] === "Folder").props.value, "c:/draft-project");
+	assert.equal(folderChip(relaunch).props.title, "C:/draft-project");
 	assert.equal(relaunch.model().session.branch, "feature/draft");
-	assert.equal(relaunch.node((node) => node.props.className === "toggle field-toggle").props.children[0].props.checked, true);
+	assert.equal(worktreeInput(relaunch).props.checked, true);
 	assert.equal(relaunch.sidebar().sessions.some((item) => item.id === draftId), false, "the restored form is not a sidebar session");
 	assert.equal(relaunch.sends.length, 0);
 	const otherWindow = harness(app.storage);
@@ -2485,7 +2650,7 @@ async function checkNewSessionDraftRelaunch() {
 	relaunch.sidebar().onNew();
 	await relaunch.settle();
 	assert.equal(relaunch.node((node) => node.props["aria-label"] === "Prompt").props.value, "Do this later");
-	assert.equal(relaunch.node((node) => node.props.className === "toggle field-toggle").props.children[0].props.checked, true, "the kept form keeps its worktree choice");
+	assert.equal(worktreeInput(relaunch).props.checked, true, "the kept form keeps its worktree choice");
 	typePrompt(relaunch, "");
 	await relaunch.settle();
 	relaunch.sidebar().onSelect(original);
@@ -2509,7 +2674,7 @@ async function checkKeptNewSessionForm() {
 	const app = await composerWindow();
 	const original = app.model().session.id;
 	const prompt = () => app.node((node) => node.props["aria-label"] === "Prompt").props.value;
-	const folder = () => app.node((node) => node.props["aria-label"] === "Folder").props.value;
+	const folder = () => folderChip(app).props.title;
 	app.sidebar().onNewIn({ folder: "C:/kept-project", project: "kept-project", branch: "main", worktree: "kept-project", environment: "Local" });
 	await app.settle();
 	const formId = app.model().session.id;
@@ -2530,14 +2695,14 @@ async function checkKeptNewSessionForm() {
 	await app.settle();
 	assert.equal(app.model().session.id, formId, "New session reopens the kept form");
 	assert.equal(prompt(), "Half-written task");
-	assert.equal(folder(), "c:/kept-project");
+	assert.equal(folder(), "C:/kept-project");
 	app.sidebar().onNew();
 	await app.settle();
 	assert.equal(prompt(), "Half-written task", "New session on the form keeps its text");
 	app.sidebar().onNewIn({ folder: "C:/other-project", project: "other-project", branch: "main", worktree: "other-project", environment: "Local" });
 	await app.settle();
 	assert.equal(prompt(), "Half-written task", "a folder picked in the sidebar keeps the text");
-	assert.equal(folder(), "c:/other-project");
+	assert.equal(folder(), "C:/other-project");
 	const before = app.sends.length;
 	sendPrompt(app, "Half-written task");
 	await app.settle();
@@ -3236,6 +3401,7 @@ async function checkFork() {
 	const fork = app.model().session;
 	assert.equal(app.sidebar().sessions[0].id, fork.id);
 	assert.notEqual(fork.id, source.id);
+	assert.equal(savedHistory(app).sessions.find((item) => item.id === fork.id).parentId, source.id, "the fork saves its source session ID");
 	assert.equal(fork.title, "Branch source (fork)");
 	assert.equal(fork.agentSessionId, "fork-provider");
 	same([fork.model, fork.effort, fork.folder, fork.worktreeFolder, fork.allowedFolders], [source.model, source.effort, source.folder, source.worktreeFolder, source.allowedFolders]);
@@ -3435,6 +3601,8 @@ async function checkResizeChurn() {
 	const timers = controlledTimers();
 	const app = await composerWindow(timers);
 	app.window.innerWidth = 1600;
+	app.windowEvent("resize");
+	timers.advance(100);
 	app.key({ key: "d", ctrlKey: true, shiftKey: true });
 	await app.settle();
 	const baseline = app.settingsWrites.length;
@@ -3448,6 +3616,20 @@ async function checkResizeChurn() {
 	await app.settle();
 	assert.equal(app.settingsWrites.length, baseline + 1, "one settings write commits the drag");
 	assert.equal(JSON.parse(app.storage.get("grok-code.settings.v1")).sideWidth, 926, "the final width leaves room for the sidebar and chat");
+	const splitter = () => app.node((node) => node.props["aria-label"] === "Resize panes").props;
+	for (const [key, shiftKey, width] of [["Home", false, 320], ["ArrowLeft", false, 344], ["ArrowLeft", true, 440], ["ArrowRight", false, 416], ["End", false, 926]]) {
+		let prevented = false;
+		splitter().onKeyDown({ key, shiftKey, preventDefault() { prevented = true; } });
+		await app.settle();
+		assert.ok(prevented);
+		assert.equal(splitter()["aria-valuenow"], width);
+		assert.equal(JSON.parse(app.storage.get("grok-code.settings.v1")).sideWidth, width);
+	}
+	for (const width of [320, 560, 926]) {
+		splitter().onDoubleClick();
+		await app.settle();
+		assert.equal(splitter()["aria-valuenow"], width);
+	}
 
 	const resized = harness(new Map(), "", Date, timers);
 	resized.window.innerWidth = 1600;
@@ -3463,6 +3645,79 @@ async function checkResizeChurn() {
 	timers.advance(1);
 	await resized.settle();
 	assert.equal(resized.node((node) => node.type === "SessionRail"), undefined, "the new width takes effect after 100 ms");
+}
+
+async function checkColumnWidths() {
+	const app = harness();
+	await app.settle();
+	const handle = (window, label) => window.node((node) => node.props["aria-label"] === label)?.props;
+	for (const [label, key, original, min, delta] of [
+		["Resize sidebar", "sidebarWidth", 268, 200, 40],
+		["Resize session rail", "railWidth", 280, 240, -40],
+	]) {
+		const divider = () => handle(app, label);
+		const storedWidth = () => JSON.parse(app.storage.get("grok-code.settings.v1"))[key];
+		assert.equal(divider().tabIndex, 0);
+		assert.equal(divider().title, "Drag, or use the arrow keys, to resize. Double-click to switch between narrow, default and wide.");
+		assert.equal(divider()["aria-valuenow"], original);
+		divider().onMouseDown({ button: 0, clientX: 700, preventDefault() {} });
+		app.windowEvent("mousemove", { clientX: 700 + delta });
+		await app.settle();
+		assert.equal(divider()["aria-valuenow"], original + 40);
+		assert.equal(storedWidth(), original, "drag preview does not write settings");
+		app.windowEvent("mouseup");
+		await app.settle();
+		assert.equal(storedWidth(), original + 40);
+		for (const [press, width] of [["Home", min], [delta > 0 ? "ArrowRight" : "ArrowLeft", min + 24], ["End", 420]]) {
+			divider().onKeyDown({ key: press, preventDefault() {} });
+			await app.settle();
+			assert.equal(divider()["aria-valuenow"], width);
+		}
+		for (const width of [min, original, 420]) {
+			divider().onDoubleClick();
+			await app.settle();
+			assert.equal(divider()["aria-valuenow"], width);
+		}
+	}
+	app.unmount();
+	const timers = controlledTimers();
+	const reopened = harness(app.storage, "", Date, timers);
+	await reopened.settle();
+	assert.equal(handle(reopened, "Resize sidebar")["aria-valuenow"], 420, "sidebar width survives restart");
+	assert.equal(handle(reopened, "Resize session rail")["aria-valuenow"], 420, "rail width survives restart");
+	reopened.window.innerWidth = 1100;
+	reopened.windowEvent("resize");
+	timers.advance(100);
+	reopened.editor();
+	await reopened.settle();
+	assert.equal(handle(reopened, "Resize sidebar")["aria-valuenow"], 374);
+	assert.equal(handle(reopened, "Resize panes")["aria-valuenow"], 320, "both widths leave 400px for chat at the desktop breakpoint");
+	assert.equal(handle(reopened, "Resize session rail"), undefined, "the saved rail steps aside when it does not fit");
+	reopened.window.innerWidth = 680;
+	reopened.windowEvent("resize");
+	timers.advance(100);
+	await reopened.settle();
+	assert.equal(handle(reopened, "Resize sidebar"), undefined, "a narrow window with panes still auto-collapses the sidebar");
+	assert.equal(handle(reopened, "Resize panes")["aria-valuenow"], 354, "a narrow window preserves 320px for chat");
+	const saved = JSON.parse(reopened.storage.get("grok-code.settings.v1"));
+	assert.equal(saved.sidebarWidth, 420);
+	assert.equal(saved.railWidth, 420, "automatic fit does not overwrite saved widths");
+	reopened.unmount();
+}
+
+async function checkHiddenSidebarProjectReveal() {
+	const app = await composerWindow();
+	const first = app.model().session.id;
+	await startSession(app, "Second session");
+	app.sidebar().onCollapse();
+	await app.settle();
+	app.key({ key: "Tab", ctrlKey: true });
+	await app.settle();
+	assert.equal(app.model().session.id, first);
+	button(app, "Show sidebar").props.onClick();
+	await app.settle();
+	assert.equal(app.sidebar().revealActiveOnMount, true, "the remounted sidebar reveals the session switched to while hidden");
+	app.unmount();
 }
 
 async function checkSmallUiBatch() {
@@ -3526,7 +3781,7 @@ async function checkSmallUiBatch() {
 
 	app.sidebar().onNewIn({ folder: "C:/project", project: "project", branch: "main", worktree: "project", environment: "Local" });
 	await app.settle();
-	app.node((node) => node.props.className === "toggle field-toggle").props.children[0].props.onChange({ target: { checked: true } });
+	worktreeInput(app).props.onChange({ target: { checked: true } });
 	let failWorktree;
 	app.api.addWorktree = () => new Promise((resolve) => { failWorktree = resolve; });
 	sendPrompt(app, "Try this worktree");
@@ -3542,8 +3797,8 @@ async function checkSmallUiBatch() {
 	await sizing.settle();
 	sizing.editor();
 	await sizing.settle();
-	assert.equal(sizing.sideCap(1100, false), 426);
-	assert.equal(sizing.sideCap(1100, true), 694);
+	assert.equal(sizing.sideCap(1100, 268), 426);
+	assert.equal(sizing.sideCap(1100, 0), 694);
 	const side = () => sizing.node((node) => node.props.className === "side-col");
 	assert.equal(side().props.style.width, 426);
 	assert.equal(JSON.parse(sizing.storage.get("grok-code.settings.v1")).sideWidth, 560, "narrowing does not change the saved preference");
@@ -3586,25 +3841,26 @@ async function checkReviewWorkspace() {
 	assert.equal(view.canMarkViewed(snapshot.files[0]), true);
 	assert.equal(view.canMarkViewed(snapshot.files[2]), false);
 	const progress = () => textOf(view.node((node) => node.props.className === "meta dp-progress"));
-	const viewed = () => view.node((node) => node.type === "input" && node.props.type === "checkbox" && !node.props["aria-label"]);
+	const viewed = () => view.node((node) => node.type === "button" && node.props.className?.includes("dp-viewed-toggle"));
 	const section = () => view.node((node) => node.type === "section" && node.props["aria-label"] === "Changes");
 	const sectionKey = (key, target = "SECTION") => section().props.onKeyDown({ key, altKey: true, defaultPrevented: false, target: { tagName: target }, preventDefault() {} });
+	const nav = (direction) => view.node((node) => node.type === "button" && node.props.title?.startsWith(`${direction} file (`));
 	assert.equal(progress(), "0 of 3 viewed · more files were left out");
-	assert.equal(button(view, "‹ Previous").props.disabled, true);
+	assert.equal(nav("Previous").props.disabled, true);
 	const scrollers = [];
 	// The side scroller's top is at 100; the diff's Previous / Next bar is 600 px above it, so the bar sits at scrollTop 300.
 	const side = { scrollTop: 900, getBoundingClientRect: () => ({ top: 100 }) };
 	let barTop = -500;
 	view.node((node) => node.props.className === "dp-body").props.ref.current = { scrollTo: () => scrollers.push("diff"), getBoundingClientRect: () => ({ top: barTop }) };
 	section().props.ref.current = { focus() {}, querySelector: () => side };
-	button(view, "Next ›").props.onClick();
+	nav("Next").props.onClick();
 	await update();
 	assert.equal(props().selectedFile, "b.txt");
 	same(scrollers, ["diff"], "a new file resets the Review diff scroller");
 	assert.equal(side.scrollTop, 300, "a reader below the bar in the side pane returns to the bar, not to the list");
 	side.scrollTop = 0;
 	barTop = 400;
-	button(view, "‹ Previous").props.onClick();
+	nav("Previous").props.onClick();
 	await update();
 	assert.equal(side.scrollTop, 0, "a reader at the list stays at the list");
 	sectionKey("ArrowDown", "TEXTAREA");
@@ -3615,57 +3871,52 @@ async function checkReviewWorkspace() {
 	assert.equal(props().selectedFile, "b.txt");
 	sectionKey("ArrowUp");
 	await update();
-	viewed().props.onChange();
+	viewed().props.onClick();
 	await update();
 	assert.equal(props().viewed["a.txt"], "a-1");
-	assert.equal(viewed().props.checked, true);
+	assert.equal(viewed().props["aria-pressed"], true);
 	assert.equal(progress(), "1 of 3 viewed · more files were left out");
 	assert.ok(view.node((node) => node.props["aria-label"] === "Viewed"));
-	viewed().props.onChange();
+	viewed().props.onClick();
 	await update();
-	assert.equal(props().viewed["a.txt"], undefined, "unticking clears the file fingerprint");
-	viewed().props.onChange();
+	assert.equal(props().viewed["a.txt"], undefined, "undoing Viewed clears the file fingerprint");
+	viewed().props.onClick();
 	await update();
 	snapshot.files[0] = ordinary("a.txt", "a-2");
 	props().onRefresh();
 	await update();
-	assert.equal(viewed().props.checked, false, "a changed hunk loses Viewed");
+	assert.equal(viewed().props["aria-pressed"], false, "a changed hunk loses Viewed");
 	assert.equal(progress(), "0 of 3 viewed · more files were left out");
 
-	const review = () => button(view, "Review in a large view");
+	const review = () => button(view, "Expand Changes");
 	assert.equal(review().props["aria-pressed"], false);
 	button(view, "Comment on line 1").props.onClick();
 	view.render();
 	view.node((node) => node.type === "textarea").props.onChange({ target: { value: "Retained draft" } });
 	view.render();
 	review().props.onClick();
-	view.render();
-	assert.equal(section().props.className, "pane fp-expanded dp-review");
-	assert.ok(view.node((node) => node.props.className === "fp-backdrop"));
+	await update();
+	assert.equal(section().props.className, "pane dp-review");
+	assert.ok(app.node((node) => node.props.className === "side-col expanded"));
 	assert.equal(view.node((node) => node.type === "textarea").props.value, "Retained draft");
 	button(view, "Return Changes to the side").props.onClick();
-	view.render();
+	await update();
 	assert.equal(view.node((node) => node.type === "textarea").props.value, "Retained draft", "toggle retains the comment draft without a remount");
 	review().props.onClick();
-	view.render();
+	await update();
 	let stopped = false;
 	view.node((node) => node.type === "textarea").props.onKeyDown({ key: "Escape", nativeEvent: { isComposing: false }, preventDefault() {}, stopPropagation() { stopped = true; } });
 	view.render();
 	assert.equal(stopped, true);
 	assert.equal(view.node((node) => node.type === "textarea"), undefined);
-	assert.equal(section().props.className, "pane fp-expanded dp-review", "comment Escape keeps the Review view");
-	sectionKey("Escape");
-	view.render();
-	assert.equal(section().props.className, "pane");
-	review().props.onClick();
-	view.render();
-	view.node((node) => node.props.className === "fp-backdrop").props.onClick();
-	view.render();
+	assert.equal(section().props.className, "pane dp-review", "comment Escape keeps the Review view");
+	app.key({ key: "Escape" });
+	await update();
 	assert.equal(section().props.className, "pane");
 	props().onSelectFile("conflict.txt");
 	await update();
 	assert.equal(viewed().props.disabled, true);
-	assert.equal(button(view, "Next ›").props.disabled, true);
+	assert.equal(nav("Next").props.disabled, true);
 	props().onViewed("a.txt", "a-2");
 	await app.settle();
 	const next = await startSession(app, "Another review session");
@@ -3677,9 +3928,87 @@ async function checkReviewWorkspace() {
 	assert.equal(savedHistory(app).viewed, undefined, "Viewed is not saved to history");
 }
 
+async function checkProgressiveChanges() {
+	const app = await composerWindow();
+	const requests = [];
+	const stops = [];
+	app.api.readChanges = (input) => new Promise((resolve) => requests.push({ input, resolve }));
+	app.api.stopChanges = async (id) => { stops.push(id); };
+	const inventory = { ok: true, files: [{ path: "a.txt", hunks: [], additions: 8 }, { path: "b.txt", from: "old.txt", hunks: [], additions: 3 }] };
+	const file = (path, id, truncated = false) => ({ path, truncated, hunks: [{ id, loc: "@@ -1 +1 @@", lines: [{ kind: "add", text: "changed" }] }] });
+	const props = () => app.node((node) => node.type === "DiffPane").props;
+	app.key({ key: "d", ctrlKey: true, shiftKey: true });
+	await app.settle();
+	assert.equal(props().loadingFiles, true);
+	assert.equal(requests[0].input.file, undefined, "read the inventory first");
+	requests[0].resolve(inventory);
+	await app.settle();
+	assert.equal(requests[1].input.file, "a.txt");
+	assert.equal(props().loadingFile, true);
+	props().onSelectFile("b.txt");
+	await app.settle();
+	assert.ok(stops.includes(requests[1].input.id), "changing files stops the previous patch load");
+	assert.equal(requests[2].input.from, "old.txt", "a selected rename carries both literal paths");
+	requests[1].resolve({ ok: true, files: [file("a.txt", "late")] });
+	requests[2].resolve({ ok: true, files: [file("b.txt", "preview", true)] });
+	await app.settle();
+	assert.equal(props().snapshot.files[0].patchLoaded, undefined, "ignore the superseded patch reply");
+	assert.equal(props().snapshot.files[1].truncated, true);
+	assert.equal(props().snapshot.files[1].additions, 3, "patch loading keeps the inventory counts");
+	props().onLoadFull();
+	await app.settle();
+	assert.equal(requests[3].input.full, true);
+	props().onStopLoad();
+	requests[3].resolve({ ok: true, files: [file("b.txt", "late-full")] });
+	await app.settle();
+	assert.ok(stops.includes(requests[3].input.id));
+	assert.equal(props().fileError, "Diff loading stopped.");
+	assert.equal(props().snapshot.files[1].hunks[0].id, "preview", "stopping a full load leaves the preview intact");
+	props().onLoadFull();
+	await app.settle();
+	requests[4].resolve({ ok: true, files: [file("b.txt", "full")] });
+	await app.settle();
+	props().onViewed("b.txt", "full");
+	props().onSelectFile("a.txt");
+	await app.settle();
+	assert.equal(props().snapshot.files[1].patchFingerprint, "full", "viewed metadata stays when the old patch body is released");
+	assert.equal(props().snapshot.files[1].hunks.length, 0);
+	props().onRefresh();
+	await app.settle();
+	assert.ok(stops.includes(requests[5].input.id));
+	assert.equal(props().loadingFiles, true);
+	same(props().snapshot.files.map((entry) => entry.path), ["a.txt", "b.txt"], "refresh leaves the rows mounted while the new inventory loads");
+	requests[6].resolve(inventory);
+	await app.settle();
+	assert.equal(requests[7].input.file, "a.txt", "refresh rereads the selected patch against the new list");
+	props().onScope("branch");
+	await app.settle();
+	assert.ok(stops.includes(requests[7].input.id));
+	assert.equal(requests[8].input.scope, "branch");
+	assert.equal(props().snapshot, undefined, "a previous scope's rows do not cross into the new scope");
+	requests[8].resolve({ ok: false, error: "Reading changed files timed out." });
+	await app.settle();
+	assert.equal(props().snapshot.error, "Reading changed files timed out.");
+	assert.equal(props().loadingFiles, false);
+	props().onClose();
+	await app.settle();
+	requests.at(-1).resolve(inventory);
+	await app.settle();
+	const beforeReopen = requests.length;
+	app.key({ key: "d", ctrlKey: true, shiftKey: true });
+	await app.settle();
+	assert.equal(requests.length, beforeReopen + 1, "reopening refreshes the file inventory even with the session rail visible");
+	assert.equal(requests.at(-1).input.file, undefined);
+	assert.equal(props().loadingFiles, true);
+	requests.at(-1).resolve(inventory);
+	await app.settle();
+	assert.equal(requests.at(-1).input.file, "a.txt", "the selected patch starts after the refreshed inventory");
+	console.log("PASS progressive Changes: list first, scoped patch loads, cancellation, retries, viewed metadata, and timeout errors");
+}
+
 async function checkCommitButtons() {
-	const commitText = "Commit the current uncommitted changes in this repository with a clear commit message. Don't push.";
-	const pushText = "Commit the current uncommitted changes in this repository with a clear commit message, then push the branch.";
+	const commitText = "Commit only these files in this repository with a clear commit message, and leave the other changes uncommitted: `a.txt`. Don't push.";
+	const pushText = "Commit only these files in this repository with a clear commit message, and leave the other changes uncommitted: `a.txt`. Then push the branch.";
 	const app = await composerWindow();
 	const snapshot = { ok: true, files: [{ path: "a.txt", hunks: [], additions: 1, deletions: 0 }] };
 	app.api.diff = async () => snapshot;
@@ -3762,6 +4091,8 @@ async function checkDirectCommitBridge() {
 	app.key({ key: "d", ctrlKey: true, shiftKey: true });
 	await app.settle();
 	const pane = () => app.node((node) => node.type === "DiffPane").props;
+	pane().onRefresh();
+	await app.settle();
 	const folder = app.model().session.folder;
 	const calls = [];
 	let finish;
@@ -3832,6 +4163,63 @@ async function checkRefreshScopes() {
 	app.node((node) => node.type === "DiffPane").props.onRefresh();
 	await app.settle();
 	same(calls, { diff: 1, branch: 1, pr: 1, commits: 1 }, "manual refresh reloads both scopes");
+}
+
+async function checkHeaderBranch() {
+	const app = harness(new Map([["grok-code.settings.v1", JSON.stringify({ railOpen: false })]]));
+	const emptyFolder = "C:/no-repo";
+	app.api.branchInfo = async (folder) => folder === emptyFolder ? { ok: true, repo: false } : { ok: true, branch: "git-topic" };
+	const header = () => app.node((node) => node.props.className === "session-title");
+	await app.settle();
+	assert.match(textOf(header()), / · git-topic/, "the header reads Git with both Changes and the rail closed");
+	app.pickedFolders.push(emptyFolder);
+	app.node((node) => node.props.label === app.model().session.project).props.onClick();
+	app.render();
+	button(app, "Choose a folder").props.onClick();
+	await app.settle();
+	assert.doesNotMatch(textOf(header()), / · (git-topic|main)/, "a non-repository folder has no branch suffix");
+	app.unmount();
+}
+
+async function checkSideDrafts() {
+	const app = await composerWindow();
+	const first = app.model().session.id;
+	const second = await startSession(app, "Second session");
+	app.key({ key: ";", ctrlKey: true });
+	app.render();
+	const side = () => app.node((node) => node.props["aria-label"] === "Side question").props;
+	side().onChange({ target: { value: "Draft for the second session" } });
+	app.sidebar().onSelect(first);
+	app.render();
+	assert.equal(side().value, "");
+	side().onChange({ target: { value: "Draft for the first session" } });
+	app.render();
+	side().onKeyDown({ key: "Enter", preventDefault() {} });
+	await app.settle();
+	assert.equal(side().value, "");
+	assert.equal(app.sends.at(-1).uiSessionId, `side-${first}`);
+	app.sidebar().onSelect(second);
+	app.render();
+	assert.equal(side().value, "Draft for the second session");
+	app.unmount();
+}
+
+async function checkComposerIme() {
+	const app = await composerWindow();
+	app.key({ key: ";", ctrlKey: true });
+	app.render();
+	const count = app.sends.length;
+	for (const label of ["Prompt", "Side question"]) {
+		const field = () => app.node((node) => node.props["aria-label"] === label).props;
+		const draft = "編集中";
+		field().onChange({ target: { value: draft } });
+		app.render();
+		field().onKeyDown({ key: "Enter", nativeEvent: { isComposing: true }, preventDefault() { assert.fail(`${label} consumed the IME Enter`); } });
+		await app.settle();
+		assert.equal(app.sends.length, count, `${label} does not send while composing`);
+		assert.equal(field().value, draft);
+	}
+	app.unmount();
 }
 
 async function checkSavedThinkingAndLegacySettings() {
@@ -4004,15 +4392,16 @@ async function checkTaskDetails() {
 async function checkLongMessages() {
 	const app = harness();
 	await app.settle();
-	const limit = app.userClipBoxHeight(16);
-	assert.equal(limit, app.USER_MESSAGE_LINES() * 1.45 * 16);
+	const lineHeight = 23;
+	const limit = app.userClipBoxHeight(lineHeight);
+	assert.equal(limit, app.USER_MESSAGE_LINES() * lineHeight);
 	assert.equal(app.userClipOverflows(limit, limit), false, "a message as tall as the eight-line box stays open");
 	assert.equal(app.userClipOverflows(limit + 1, limit), false, "one pixel of rounding stays open");
 	assert.equal(app.userClipOverflows(limit + 2, limit), true, "text taller than the box collapses");
 	const long = Array.from({ length: 12 }, (_, index) => `report line ${index}`).join("\n");
 	const model = { ...app.model(), messages: [{ id: "long-user", role: "user", text: long }, { id: "long-reply", role: "grok", text: long }] };
 	function watchClip(view) {
-		view.window.getComputedStyle = () => ({ fontSize: "16px" });
+		view.window.getComputedStyle = () => ({ lineHeight: `${lineHeight}px` });
 		let onResize = () => {};
 		view.window.ResizeObserver = class {
 			constructor(callback) { onResize = callback; }
@@ -4193,16 +4582,19 @@ async function checkSplitDiffs() {
 	same(app.splitRows(app.editRows({ oldText: "gone\n", newText: "" })), [{ left: { kind: "del", text: "gone" } }]);
 	const longLine = "L".repeat(400);
 	const painted = app.editDiff({ diff: replaced, view: "split" });
-	const changed = app.nodes(painted).find((node) => node.props.className === "edit-split-row" && textOf(node).includes("-d"));
-	assert.ok(textOf(changed).includes("+X"));
+	const changed = app.nodes(painted).find((node) => node.props.className === "edit-split-row" && app.nodes(node).some((cell) => cell.props.className === "edit-side dp-del"));
+	const diffCells = (row, className) => app.nodes(row).filter((node) => node.props.className === className).map(textOf);
+	same(diffCells(changed, "edit-marker"), ["−", "+"]);
+	same(diffCells(changed, "dp-text"), ["d", "X"]);
 	assert.ok(textOf(changed).includes("13"));
 	assert.ok(textOf(app.editDiff({ diff: { oldText: longLine, newText: `M${longLine}` }, view: "split" })).includes(longLine), "a long line stays whole in the split view");
 	const emptySide = app.editDiff({ diff: { oldText: "", newText: "only\n" }, view: "split" });
 	assert.ok(app.nodes(emptySide).some((node) => node.props.className === "edit-side edit-side-empty"));
 	assert.ok(textOf(emptySide).includes("+only"));
-	const narrow = app.editDiff({ diff: { oldText: "a", newText: "b" }, view: "split", width: limit - 1 });
+	const narrow = app.editDiff({ diff: { oldText: "+a", newText: "-b" }, view: "split", width: limit - 1 });
 	assert.equal(app.nodes(narrow).find((node) => node.props.className === "edit-split-row"), undefined);
-	assert.ok(app.nodes(narrow).some((node) => node.props.className === "dp-line dp-del"));
+	same(diffCells(narrow, "edit-marker"), ["−", "+"]);
+	same(diffCells(narrow, "dp-text"), ["+a", "-b"], "leading signs from the file stay in the code column");
 	assert.ok(textOf(narrow).includes("Showing unified because this column is narrow."));
 	assert.equal(app.nodes(narrow).find((node) => node.type === "button" && node.props.children === "Split").props["aria-pressed"], true, "a narrow column keeps the saved split choice");
 	const wide = app.editDiff({ diff: { oldText: "a", newText: "b" }, view: "split", width: limit });
@@ -4273,6 +4665,9 @@ async function checkSetupSheet() {
 	assert.equal(setupNode(good), undefined, "healthy launch stays closed");
 	assert.equal(checks, 1);
 	same(requests[0], { folder: good.model().session.folder, full: false }, "the launch check stays light and names the session folder");
+	const body = good.document.body = {};
+	const opener = { isConnected: true, focus() { good.document.activeElement = this; } };
+	good.document.activeElement = opener;
 	good.key({ key: ",", ctrlKey: true });
 	await good.settle();
 	const settings = good.node((node) => node.type.name === "SettingsPage");
@@ -4285,18 +4680,39 @@ async function checkSetupSheet() {
 	assert.ok(setupNode(good));
 	assert.equal(checks, 2, "manual setup runs a fresh check");
 	assert.ok(textOf(setupNode(good).type(setupNode(good).props)).includes("Grok is signed in."));
+	const setupDialog = () => good.nodes(setupNode(good).type(setupNode(good).props)).find((node) => node.props.role === "dialog");
+	const sheetRef = setupDialog().props.ref;
+	const sheet = { focus() { good.document.activeElement = this; } };
+	assert.equal(setupDialog().props.tabIndex, -1);
+	sheetRef(sheet);
+	assert.equal(good.document.activeElement, sheet, "Setup focuses the sheet on mount");
 	setupNode(good).props.onCheck();
 	await good.settle();
 	assert.equal(checks, 3);
 	same(requests.at(-1), { folder: good.model().session.folder, full: true }, "Check again requests full diagnostics for the session folder");
 	assert.ok(setupNode(good), "healthy recheck keeps sheet open");
+	assert.equal(setupDialog().props.ref, sheetRef, "a recheck does not remount the focus callback");
 	good.emit({ type: "account", account: { email: "someone@example.com", plan: "SuperGrok", team: "", version: "1.0.60" } });
 	await good.settle();
 	setupNode(good).props.onCheck();
 	await good.settle();
 	assert.equal(good.sidebar().account.version, "1.0.70", "a setup check replaces the Grok version saved from an older session");
 	assert.equal(good.sidebar().account.email, "someone@example.com", "and keeps the rest of the account");
-	const missing = harness();
+	good.document.activeElement = body;
+	good.key({ key: "Escape" });
+	await good.settle();
+	assert.equal(setupNode(good), undefined);
+	assert.equal(good.node((node) => node.type.name === "SettingsPage").props.initialTab, "about", "Escape returns from Setup to About");
+	good.node((node) => node.type.name === "SettingsPage").props.onCheckSetup();
+	await good.settle();
+	setupNode(good).props.onClose();
+	await good.settle();
+	const returned = good.node((node) => node.type.name === "SettingsPage");
+	assert.equal(returned.props.initialTab, "about", "dismissing Setup also returns to About");
+	returned.props.onClose();
+	await good.settle();
+	assert.equal(good.document.activeElement, opener, "closing the returned Settings restores the original opener");
+	const missing = harness(new Map(good.storage));
 	missing.api.readiness = async () => ({ ...healthy, grok: { ok: false, error: "Grok is not installed." } });
 	await missing.settle();
 	assert.ok(textOf(setupNode(missing).type(setupNode(missing).props)).includes("INSTALL GROK"));
@@ -4304,7 +4720,7 @@ async function checkSetupSheet() {
 	keyed.api.readiness = async () => ({ ...healthy, grok: { ok: true, signedIn: true, signIn: "key", apiKey: true, version: "1.0.70" } });
 	await keyed.settle();
 	assert.equal(setupNode(keyed), undefined, "an API key counts as signed in, so launch stays closed");
-	const signedOut = harness();
+	const signedOut = harness(new Map(good.storage));
 	signedOut.api.readiness = async () => ({ ...healthy, grok: { ok: true, signedIn: false } });
 	await signedOut.settle();
 	assert.ok(textOf(setupNode(signedOut).type(setupNode(signedOut).props)).includes("grok login"));
@@ -4334,7 +4750,7 @@ async function checkSetupSheet() {
 	assert.equal(latest.props.checking, false);
 	const sheetText = (app) => textOf(setupNode(app).type(setupNode(app).props));
 	const sheetButton = (app, label) => app.nodes(setupNode(app).type(setupNode(app).props)).find((node) => node.type === "button" && textOf(node) === label);
-	const clicked = harness();
+	const clicked = harness(new Map(good.storage));
 	let installs = 0;
 	let finishInstall;
 	let installChecks = 0;
@@ -4355,7 +4771,7 @@ async function checkSetupSheet() {
 	await clicked.settle();
 	assert.equal(installChecks, 2, "a finished install checks readiness again");
 	assert.ok(setupNode(clicked), "the sheet stays open after installing");
-	const failed = harness();
+	const failed = harness(new Map(good.storage));
 	failed.api.readiness = async () => missingWin;
 	failed.api.installGrok = async () => ({ ok: false, error: "The Grok installer failed." });
 	await failed.settle();
@@ -4376,7 +4792,7 @@ async function checkSetupSheet() {
 	const diagnostic = {
 		...healthy,
 		app: { version: "0.7.0", electron: "39.0.0", os: "win32 10.0.26300 x64" },
-		grok: { ok: true, signedIn: true, version: "1.0.77", at: { source: "installer", path: "~/.grok/bin/grok.exe" }, update: { checked: true, current: "1.0.77", latest: "1.0.77", available: false, autoUpdate: true, channel: "stable" }, token: "SECRET", email: "PRIVATE" },
+		grok: { ok: true, signedIn: true, signInMode: "grok", version: "1.0.77", at: { source: "installer", path: "~/.grok/bin/grok.exe" }, update: { checked: true, current: "1.0.77", latest: "1.0.77", available: false, autoUpdate: true, channel: "stable" }, token: "SECRET", email: "PRIVATE" },
 		config: { ok: true, files: [{ role: "user", path: "~/.grok/config.toml", broken: false }], warnings: ["hooks (unrecognized config key)", "privacy (unrecognized config key)"] },
 		hooks: "SECRET", permissions: "SECRET", mcpServers: "SECRET", env: "SECRET",
 	};
@@ -4400,7 +4816,7 @@ async function checkSetupSheet() {
 		XAI_API_KEY: apiKey,
 	});
 	assert.equal(keyReport, [
-		expectedReport.replace("Grok sign-in: signed in", "Grok sign-in: API key (XAI_API_KEY is set)"),
+		expectedReport.replace("Grok sign-in: signed in", "Grok sign-in: API key (XAI_API_KEY)"),
 		"HTTPS proxy: http://proxy.corp:8080",
 		"HTTP proxy: not set",
 		"NO_PROXY: localhost",
@@ -4412,9 +4828,15 @@ async function checkSetupSheet() {
 	assert.equal(keyReport.includes("SECRET"), false);
 	assert.equal(keyReport.includes("PRIVATE"), false);
 	const savedReport = good.supportReport({ ...diagnostic, grok: { ...diagnostic.grok, signIn: "saved", apiKey: true } });
-	assert.ok(savedReport.includes("Grok sign-in: saved sign-in; an API key is also set"));
+	assert.ok(savedReport.includes("Grok sign-in: saved sign-in"));
+	assert.ok(good.supportReport({ ...diagnostic, grok: { ...diagnostic.grok, signIn: "none", signedIn: false } }).includes("Grok sign-in: not signed in"));
+	assert.ok(!savedReport.includes("an API key is also set"));
 	assert.equal(savedReport.includes(apiKey), false);
-	assert.ok(gitSheet({ ...diagnostic, grok: { ok: true, signedIn: true, signIn: "key", apiKey: true } }).includes("Grok is signed in with an API key from XAI_API_KEY. The key is not shown."));
+	assert.ok(gitSheet({ ...diagnostic, grok: { ok: true, signedIn: true, signIn: "key", apiKey: true, keySource: "env" } }).includes("API key (XAI_API_KEY)"));
+	assert.ok(gitSheet({ ...diagnostic, grok: { ok: true, signedIn: true, signIn: "key", signInMode: "key", keySource: "app" } }).includes("API key (saved in this app)"));
+	const rejectedKey = gitSheet({ ...diagnostic, grok: { ok: true, signedIn: false, signIn: "none", signInMode: "key", keyRejected: true } });
+	assert.ok(rejectedKey.includes("Grok rejected the API key, or couldn't reach xAI to check it."));
+	assert.ok(!rejectedKey.includes("grok login"));
 	assert.ok(!gitSheet({ ...diagnostic, grok: { ok: true, signedIn: true, signIn: "key", apiKey: true } }).includes("grok login"));
 	assert.ok(gitSheet({ ...diagnostic, grok: { ...diagnostic.grok, signIn: "saved", apiKey: true } }).includes("XAI_API_KEY is also set. Grok uses the saved sign-in while it exists."));
 	assert.ok(gitSheet({ ...diagnostic, network: { httpsProxy: "http://proxy.corp:8080", httpProxy: "not set", noProxy: "localhost", caCerts: "~/.certs/corp.pem (found)" } }).includes("HTTPS proxy: http://proxy.corp:8080"));
@@ -4666,7 +5088,7 @@ async function checkCodeEditorIntegration() {
 	const first = app.editor();
 	const viewer = harness();
 	const editor = () => viewer.node(node => node.type === "CodeEditor");
-	const props = { ...first, docKey: "session-a:a.txt", file: "a.txt", line: 2, lineTick: 1 };
+	const props = { ...first, layout: undefined, docKey: "session-a:a.txt", file: "a.txt", line: 2, lineTick: 1 };
 	viewer.filesView(props);
 	assert.equal(editor().key, props.docKey);
 	assert.equal(editor().props.fileTypes, props.fileTypes);
@@ -5173,7 +5595,7 @@ async function checkSharedFolder() {
 		worktrees.push({ cwd, options });
 		return { ok: true, folder: `C:/work/trees/fresh-${worktrees.length}`, branch: `grok/fresh-${worktrees.length}` };
 	};
-	const worktreeChecked = () => app.node((node) => node.props.className === "toggle field-toggle").props.children[0].props.checked;
+	const worktreeChecked = () => worktreeInput(app).props.checked;
 	typePrompt(app, "move this draft");
 	button(app, "Start a worktree").props.onClick();
 	await app.settle();
@@ -5203,6 +5625,7 @@ async function checkSharedFolder() {
 	assert.equal(moved.folder, "C:/work/trees/fresh-1");
 	assert.equal(moved.branch, "grok/fresh-1");
 	assert.equal(moved.worktreeFolder, "C:/work/trees/fresh-1");
+	assert.equal(moved.parentId, undefined, "turning an unsent New session into a worktree does not make it its own parent");
 	assert.equal(app.sidebar().sessions.length, sessionCount + 1);
 	assert.equal(app.sends.length, beforeSend + 1);
 	assert.equal(app.sends.at(-1).text, "move this draft");
@@ -5248,6 +5671,7 @@ async function checkSharedFolder() {
 	assert.equal(prompt().props.value, "", "the draft moved off the original session");
 	assert.equal(worktrees.length, 1);
 	assert.equal(app.sidebar().sessions.length, sessionCount + 1, "leaving the new form creates no session");
+	assert.equal(savedHistory(app).newSessionDraft.session.parentId, a, "the unsent worktree form keeps its origin when put aside");
 	app.sidebar().onNew();
 	await app.settle();
 	assert.equal(app.model().session.id, existingFormId);
@@ -5261,7 +5685,66 @@ async function checkSharedFolder() {
 	assert.equal(app.model().session.id, existingFormId);
 	assert.equal(app.sends.at(-1).text, "existing session draft");
 	assert.equal(app.sends.at(-1).cwd, "C:/work/trees/fresh-2");
+	assert.equal(savedHistory(app).sessions.find((item) => item.id === existingFormId).parentId, a, "committing the worktree form saves its origin across folders");
 	console.log("PASS shared folder: worktree choices create only on first send, retain unsent forms and protect other drafts");
+}
+
+async function checkMissingSessionFolder() {
+	const folder = "C:/work/missing-project";
+	const replacement = "C:/work/replacement";
+	const id = "missing-folder";
+	const error = `That folder is not on this computer: ${folder}`;
+	const seed = { id, title: "Missing project", project: "missing-project", folder, worktree: "missing-project", environment: "Local", agentSessionId: "old-session" };
+	const history = { sessions: [seed], composerDrafts: { [id]: "Keep this draft" } };
+	const open = () => harness(new Map([["grok-code.history.v1", JSON.stringify(history)]]));
+	const prompt = (app) => app.node((node) => node.props["aria-label"] === "Prompt");
+	const banner = (app) => app.node((node) => node.props.className === "missing-folder-banner");
+	const known = open();
+	known.api.branchInfo = async () => ({ ok: false, error });
+	await known.settle();
+	assert.match(textOf(banner(known)), /Your draft is kept/);
+	assert.equal(button(known, "Send").props.disabled, true);
+	prompt(known).props.onKeyDown({ key: "Enter", preventDefault() {} });
+	await known.settle();
+	assert.equal(known.sends.length, 0, "Enter cannot bypass a missing-folder banner");
+	assert.equal(prompt(known).props.value, "Keep this draft");
+	const rail = harness();
+	const railTree = rail.rail({ session: seed, folderMissing: true, diff: { ok: false, error }, pr: { ok: false, error }, recentUsd: null });
+	const changes = rail.nodes(railTree).find((node) => node.props.title === "Changes");
+	assert.equal(textOf(changes), "Folder missing. Choose a folder to see changes.");
+	known.unmount();
+
+	const late = open();
+	const send = late.api.send;
+	late.api.send = async (input) => {
+		if (input.cwd === replacement) { return send(input); }
+		late.sends.push(input);
+		return { ok: false, error };
+	};
+	await late.settle();
+	sendPrompt(late, "Preserve the attempted draft");
+	await late.settle();
+	const reply = late.model().messages.at(-1);
+	assert.equal(reply.appNote, error);
+	const notes = harness();
+	const body = notes.message({ ...late.model(), messages: [reply] });
+	const note = notes.nodes(body).find((node) => node.type.name === "AppNote");
+	assert.equal(note.props.folder, true);
+	assert.match(textOf(note.type(note.props)), /Grok Code/);
+	assert.equal(prompt(late).props.value, "Preserve the attempted draft");
+	assert.equal(button(late, "Send").props.disabled, true);
+	late.pickedFolders.push(replacement);
+	button(late, "Choose folder…").props.onClick();
+	await late.settle();
+	assert.equal(banner(late), undefined);
+	assert.equal(late.sends.length, 1, "choosing a replacement never retries the failed turn");
+	assert.equal(late.model().session.agentSessionId, undefined);
+	assert.equal(prompt(late).props.value, "Preserve the attempted draft");
+	button(late, "Send").props.onClick();
+	await late.settle();
+	assert.equal(late.sends.at(-1).cwd, replacement);
+	late.unmount();
+	console.log("PASS missing session folder: branch detection, Enter guard, retained draft, labelled failure and explicit recovery");
 }
 
 async function checkDisconnectChoice() {
@@ -5305,6 +5788,7 @@ async function checkDisconnectChoice() {
 	await app.settle();
 	const fresh = app.model().session;
 	assert.notEqual(fresh.id, id);
+	assert.equal(savedHistory(app).sessions.find((item) => item.id === fresh.id).parentId, id, "the fresh session saves the disconnected session as its parent");
 	assert.equal(fresh.folder, folder);
 	assert.equal(fresh.agentSessionId, undefined);
 	assert.equal(app.model().messages.length, 0, "New session starts with no earlier chat");
@@ -5390,6 +5874,67 @@ async function checkSavedPromptIntegration() {
 	console.log("PASS saved prompts: composer save, selection insertion without sending, and settings cross-window sync");
 }
 
+async function checkPaneLayout() {
+	const app = harness();
+	app.window.innerWidth = 1400;
+	await app.settle();
+	const open = async (label) => { button(app, label).props.onClick(); await app.settle(); };
+	const grid = () => app.node((node) => node.props.className?.startsWith("side-col"));
+	const slot = (id) => app.node((node) => node.props["data-pane"] === id);
+	const placement = (id) => [slot(id).props.style.gridColumn, slot(id).props.style.gridRow];
+	const divider = () => app.node((node) => node.props["aria-label"] === "Resize stacked panes");
+	await open("Browser");
+	app.node((node) => node.type === "BrowserPane" && node.props.visible).props.onNewTab();
+	await app.settle();
+	await open("Terminal");
+	same(placement("browser"), [1, 1]);
+	same(placement("terminal"), [1, 3]);
+	assert.equal(divider().props["aria-orientation"], "horizontal");
+	divider().props.onKeyDown({ key: "ArrowDown", preventDefault() {} });
+	await app.settle();
+	assert.equal(divider().props["aria-valuenow"], 55);
+	assert.match(grid().props.style.gridTemplateRows, /55fr.*45fr/);
+	await open("Changes");
+	same(placement("diff"), [2, "1 / -1"], "the third pane spans the second column");
+	await open("Files");
+	same(placement("diff"), [2, 1]);
+	same(placement("editor"), [2, 3]);
+	const domOrder = () => app.nodes(grid()).filter((node) => node.props["data-pane"]).map((node) => node.props["data-pane"]);
+	const stableOrder = domOrder();
+	app.node((node) => node.type === "BrowserPane" && node.props.visible).props.layout.moveLater();
+	await app.settle();
+	same(placement("browser"), [1, 3]);
+	same(domOrder(), stableOrder, "moving a pane changes grid placement without moving its DOM slot");
+	app.editor().layout.onToggleExpand();
+	await app.settle();
+	assert.equal(grid().props.className, "side-col expanded");
+	assert.equal(slot("browser").props.hidden, true);
+	assert.equal(slot("terminal").props.hidden, true);
+	assert.equal(slot("editor").props.hidden, false);
+	assert.equal(app.node((node) => node.type === "BrowserPane").props.visible, false);
+	app.key({ key: "Escape" });
+	await app.settle();
+	assert.equal(grid().props.className, "side-col");
+	assert.equal(slot("browser").props.hidden, false);
+	assert.equal(divider().props["aria-valuenow"], 55, "restoring a pane keeps its split ratio");
+	app.editor().layout.onToggleExpand();
+	await app.settle();
+	app.sidebar().onNew();
+	await app.settle();
+	assert.equal(grid().props.className, "side-col", "starting another session reveals its composer");
+	app.unmount();
+	const narrow = harness();
+	narrow.window.innerWidth = 900;
+	await narrow.settle();
+	for (const label of ["Changes", "Browser", "Terminal"]) { button(narrow, label).props.onClick(); await narrow.settle(); }
+	const narrowGrid = narrow.node((node) => node.props.className === "side-col");
+	assert.equal(narrowGrid.props.style.gridTemplateColumns, "repeat(1, minmax(0, 1fr))");
+	assert.equal(narrowGrid.props["data-tall-stack"], true);
+	assert.ok(900 - narrowGrid.props.style.width - 6 >= 320, "a narrow grid preserves chat width");
+	narrow.unmount();
+	console.log("PASS pane layout: stacked splitter, two columns, stable slot movement, expand/restore and narrow fallback");
+}
+
 async function checkNarrowWindow() {
 	for (const width of [680, 900, 1400]) {
 		for (const savedCollapsed of [false, true]) {
@@ -5404,7 +5949,7 @@ async function checkNarrowWindow() {
 			const effectiveCollapsed = savedCollapsed || width < 1100;
 			assert.equal(!!app.node((node) => node.type === "Sidebar"), !effectiveCollapsed);
 			const pane = app.node((node) => node.props.className === "side-col");
-			const cap = app.sideCap(width, effectiveCollapsed);
+			const cap = app.sideCap(width, effectiveCollapsed ? 0 : 268);
 			assert.equal(pane.props.style.width, Math.min(560, cap));
 			assert.ok(pane.props.style.width >= 320);
 			assert.ok(width - (effectiveCollapsed ? 0 : 268) - 6 - cap >= (width < 1100 ? 320 : 400), "the pane cap preserves the chat's minimum width");
@@ -5465,7 +6010,618 @@ async function checkLoops() {
 	console.log("PASS scheduled loops: chat lines, sidebar count, and cold read");
 }
 
+async function checkSignInProfile() {
+	const app = harness();
+	const fakeKey = `xai-${"a".repeat(80)}`;
+	const mainRedact = require("../electron/redact.cjs").redactKeys;
+	for (const sample of [fakeKey, `\\n${fakeKey}`, "xai-grok-cli", "xai.api_key"]) {
+		assert.equal(app.redactKeys(sample) === mainRedact(sample), true, "both masking boundaries use the same pattern");
+	}
+	let mode = "grok";
+	let readinessCalls = 0;
+	let removeCalls = 0;
+	let oldBilling;
+	app.api.billing = () => new Promise((resolve) => { oldBilling = resolve; });
+	app.api.signInStatus = async () => ({ mode, hasKey: mode === "key", keyReadable: mode === "key", keyring: true });
+	app.api.readiness = async () => {
+		readinessCalls++;
+		return { grok: { ok: true, signedIn: true, signIn: mode === "key" ? "key" : "saved", signInMode: mode }, git: { ok: true }, gh: { ok: true } };
+	};
+	app.api.removeSignInKey = async () => { removeCalls++; return { ok: true }; };
+	await app.settle();
+	mode = "key";
+	app.emit({ type: "sign-in-changed" });
+	await app.settle();
+	oldBilling({ ok: true, percent: 99, period: "daily", resetsAt: "", tier: "old" });
+	await app.settle();
+	assert.equal(app.sidebar().signInMode, "key");
+	assert.equal(readinessCalls, 2, "sign-in changes rerun setup");
+	assert.equal(app.node((node) => node.props.className?.startsWith("limit-meter")), undefined, "key mode hides stale subscription limits");
+	sendPrompt(app, "/logout");
+	await app.settle();
+	assert.ok(app.node((node) => node.props.role === "alertdialog" && node.props["aria-label"] === "Change how Grok signs in?"));
+	button(app, "Remove key").props.onClick();
+	await app.settle();
+	assert.equal(removeCalls, 1, "/logout uses the confirmed key-removal flow");
+
+	sendPrompt(app, "Check masking");
+	await app.settle();
+	const turn = app.sends.at(-1);
+	app.emit({ type: "chunk", uiSessionId: turn.uiSessionId, turnId: turn.turnId, text: `Key:\n${fakeKey.slice(0, 14)}` });
+	await app.settle();
+	app.beforeUnload();
+	app.emit({ type: "chunk", uiSessionId: turn.uiSessionId, turnId: turn.turnId, text: fakeKey.slice(14) });
+	app.emit({ type: "done", uiSessionId: turn.uiSessionId, turnId: turn.turnId });
+	await app.settle();
+	assert.equal(app.model().messages.at(-1).text === "Key:\n[redacted]", true, "joined output is masked after a flush");
+	const history = savedHistory(app);
+	assert.equal(JSON.stringify(history).includes(fakeKey), false, "saved history has no complete key in joined output");
+
+	const session = history.sessions.find((item) => item.id === turn.uiSessionId);
+	session.folder = `C:/project/${fakeKey}`;
+	const toolPath = `${session.folder}/a.txt`;
+	const editorKey = JSON.stringify([session.id, session.folder, "a.txt"]);
+	const draft = { text: `draft=${fakeKey}\r\n`, baseText: `base=${fakeKey}\r\n`, recoveryTexts: [`recovery=${fakeKey}\r\n`], version: "a1" };
+	history.editorDrafts[editorKey] = draft;
+	history.extraChats[session.id].push({
+		id: "old-key", role: "grok", text: `Old:\n${fakeKey}`, parts: [{ kind: "text", text: fakeKey }],
+		contextFrom: [{ id: "earlier-chat", title: fakeKey }],
+		tools: [{ id: "old-tool", kind: "command", title: "Run", detail: `Error: ${fakeKey}`, output: fakeKey, path: toolPath }],
+	});
+	const reopened = harness(new Map([["grok-code.history.v1", JSON.stringify(history)]]));
+	await reopened.settle();
+	const old = reopened.model().messages.at(-1);
+	assert.equal(old.text === "Old:\n[redacted]" && old.parts[0].text === "[redacted]", true, "legacy chat is masked at load");
+	assert.equal(old.tools[0].output === "[redacted]" && old.tools[0].detail === "Error: [redacted]", true, "legacy tool output and errors are masked at load");
+	assert.equal(old.contextFrom[0].id === "earlier-chat" && old.contextFrom[0].title === "[redacted]", true, "copied chat titles are masked without changing context ids");
+	assert.equal(old.tools[0].path === toolPath && reopened.model().session.folder === session.folder, true, "paths retain their exact values at load");
+	const recovered = reopened.editor().draft;
+	assert.equal(recovered.text === draft.text && recovered.baseText === draft.baseText && recovered.recoveryTexts[0] === draft.recoveryTexts[0], true, "draft, baseline and recovery text retain their exact bytes at load");
+	reopened.sidebar().onRename(session.id, "History mask check");
+	await reopened.settle();
+	const saved = savedHistory(reopened);
+	assert.equal(JSON.stringify(saved.editorDrafts[editorKey]) === JSON.stringify(draft), true, "the next save preserves editor data byte for byte");
+	assert.equal(saved.extraChats[session.id].at(-1).text === "Old:\n[redacted]", true, "the next save masks legacy chat");
+	assert.equal(saved.extraChats[session.id].at(-1).tools[0].path === toolPath, true, "the next save preserves paths");
+	app.unmount();
+	reopened.unmount();
+	console.log("PASS sign-in profile: cross-window refresh, key removal, hidden limits and chat-only history masking");
+}
+
+async function checkSignInSettings() {
+	const app = harness();
+	const key = "test-not-a-key";
+	const saves = [];
+	let allowSignOut = false;
+	let saveError;
+	app.api.saveSignIn = async (input, options) => {
+		saves.push({ mode: input.mode, validKey: input.key === key, confirmed: options?.signOutConfirmed === true });
+		if (saveError) { return { ok: false, error: saveError }; }
+		if (!options?.signOutConfirmed) { app.confirmAnswer = allowSignOut; return { ok: false, needsSignOut: true }; }
+		return { ok: true };
+	};
+	app.settingsView({ settings: app.readSettings(), onChange() {}, onClose() {}, onCheckSetup() {}, onRun() {}, servers: [], folder: "C:/project", signInStatus: { mode: "grok", hasKey: false, keyReadable: false, keyring: true } });
+	await app.settle();
+	app.node((node) => node.props["aria-label"] === "xAI API key").props.onChange();
+	await app.settle();
+	const input = app.node((node) => node.props["aria-label"] === "xAI API key value");
+	assert.equal(input.props.type, "password");
+	assert.equal(input.props.autoComplete, "off");
+	assert.equal(Object.hasOwn(input.props, "value"), false, "the key field is uncontrolled");
+	const field = { value: "" };
+	input.props.ref.current = field;
+	async function save() {
+		field.value = ` ${key}\r\n`;
+		app.confirmAnswer = true;
+		app.node((node) => node.props["aria-label"] === "Sign-in settings").props.onSubmit({ preventDefault() {} });
+		await app.settle();
+		assert.equal(field.value === "", true, "Save clears the password field");
+	}
+	await save();
+	assert.deepEqual(saves, [{ mode: "key", validKey: true, confirmed: false }], "declining machine-wide sign-out prevents the confirmed save");
+	allowSignOut = true;
+	await save();
+	assert.deepEqual(saves.slice(1), [{ mode: "key", validKey: true, confirmed: false }, { mode: "key", validKey: true, confirmed: true }]);
+	assert.match(app.confirms.at(-1), /in a terminal too/);
+	saveError = "Enter an API key of 1 to 512 characters with no spaces.";
+	await save();
+	assert.equal(textOf(app.node((node) => node.props.role === "alert")), saveError, "fixed key validation errors explain what to correct");
+	app.unmount();
+}
+
+function fakeCloud(app, resumeResult = { ok: true }) {
+	const { items: models } = require("./fixtures/cloud/models.json");
+	const setups = [], sends = [], resumes = [], cancels = [];
+	app.api.cloudKeyStatus = async () => ({ hasKey: true, keyReadable: true, keyring: true, name: "Test Cursor key" });
+	app.api.cloudSetup = async (folder) => {
+		setups.push(folder);
+		const ref = folder.endsWith("second") ? "release" : "main";
+		return { ok: true, repoUrl: `https://github.com/example/${path.basename(folder)}`, ref, upstream: `origin/${ref}`, reachable: true, ahead: 0, behind: 0, dirty: false, models };
+	};
+	app.api.cloudSend = async (input) => { sends.push(input); return { ok: true }; };
+	app.api.cloudResume = async (input) => { resumes.push(input); return resumeResult; };
+	app.api.cloudCancel = async (id) => { cancels.push(id); return { ok: true }; };
+	return { setups, sends, resumes, cancels, models };
+}
+
+async function openCloudForm(app, attachment) {
+	await app.settle();
+	app.sidebar().onNewIn({ folder: "C:/first", project: "first", branch: "main", worktree: "first", environment: "Local" });
+	await app.settle();
+	if (attachment) { stageAttachments(app, [attachment]); await app.settle(); }
+	chooseEnvironment(app, "Cloud");
+	await app.settle();
+}
+
+function cloudState(app, turn, active, result = {}) {
+	app.emit({ type: "cloud-state", uiSessionId: turn.uiSessionId, turnId: turn.turnId, agentId: "bc-example", runId: "run-example", active, ...result });
+}
+
+function cloudReply(app, turn) {
+	const replies = app.model().messages.filter((item) => item.role === "grok");
+	const matches = replies.filter((item) => item.id === `grok-${turn.turnId}`);
+	assert.equal(matches.length, 1, "the Cloud turn has exactly one reply keyed by turn id");
+	return matches[0];
+}
+
+function checkCloudModels() {
+	const app = harness();
+	const { items: models } = require("./fixtures/cloud/models.json");
+	const { defaultVariant, chooseVariant } = app.cloudModels();
+	for (const model of models) {
+		same(chooseVariant(model), model.variants.find((variant) => variant.isDefault), `${model.id} selects Cursor's default variant`);
+	}
+	const grok = models.find((model) => model.id === "grok-4.7");
+	const selected = defaultVariant(models);
+	assert.equal(selected.id, grok.id);
+	same(selected.params, grok.variants.find((variant) => variant.isDefault).params);
+	assert.equal(selected.isMaxMode, true);
+	assert.equal(defaultVariant(models.filter((model) => model.id !== grok.id)).id, "default");
+	const opus = models.find((model) => model.id === "claude-opus-5");
+	const maxFast = opus.variants.find((variant) => variant.params.some((param) => param.id === "effort" && param.value === "max") && variant.params.some((param) => param.id === "context" && param.value === "1m") && variant.params.some((param) => param.id === "fast" && param.value === "true"));
+	const withoutThinking = chooseVariant(opus, maxFast.params, "thinking", "false");
+	same(Object.fromEntries(withoutThinking.params.map(({ id, value }) => [id, value])), { cyber: "false", thinking: "false", context: "1m", effort: "low", fast: "true" }, "equal matches keep the first provider variant and preserve context and speed");
+	for (const current of opus.variants) {
+		for (const parameter of opus.parameters) {
+			for (const option of parameter.values) {
+				if (!opus.variants.some((variant) => variant.params.some((param) => param.id === parameter.id && param.value === option.value))) { continue; }
+				const next = chooseVariant(opus, current.params, parameter.id, option.value);
+				assert.ok(opus.variants.some((variant) => JSON.stringify(variant) === JSON.stringify(next)), "a value row picks a real Cursor variant");
+				assert.ok(next.params.some((param) => param.id === parameter.id && param.value === option.value), "the requested value is selected");
+				assert.ok(next.params.some((param) => param.id === "cyber" && param.value === "false"), "unlisted cyber parameter is preserved");
+			}
+		}
+	}
+	app.unmount();
+	console.log("PASS Cloud models: provider defaults, Max Mode, Auto fallback and constrained value rows");
+}
+
+async function checkCloudSend() {
+	const app = harness(), bridge = fakeCloud(app);
+	const steers = [];
+	app.api.steer = async (id, text) => { steers.push([id, text]); return { ok: true }; };
+	await openCloudForm(app);
+	assert.deepEqual(bridge.setups, ["C:/first"]);
+	app.pickedFolders.push("C:/second");
+	folderChip(app).props.onClick();
+	app.render();
+	button(app, "Choose a folder").props.onClick();
+	await app.settle();
+	assert.deepEqual(bridge.setups, ["C:/first", "C:/second"], "changing the Cloud form's folder checks its new upstream");
+	const prompt = `Cloud task ${"a".repeat(100)}`;
+	sendPrompt(app, prompt);
+	await app.settle();
+	assert.equal(app.sends.length, 0, "Cloud uses its own bridge");
+	assert.equal(bridge.sends.length, 1);
+	const turn = bridge.sends[0];
+	assert.equal(turn.uiSessionId, app.model().session.id);
+	assert.equal(turn.name, prompt.slice(0, 80));
+	assert.equal(turn.text, prompt);
+	assert.equal(turn.cloud.repoUrl, "https://github.com/example/second");
+	assert.equal(turn.cloud.ref, "release");
+	assert.equal(turn.cloud.autoCreatePR, false);
+	const grok = bridge.models.find((model) => model.id === "grok-4.7");
+	same(turn.cloud.model, { id: grok.id, params: grok.variants.find((variant) => variant.isDefault).params });
+	cloudReply(app, turn);
+	cloudState(app, turn, true);
+	await app.settle();
+	sendPrompt(app, "Queue this for the same Cloud agent");
+	await app.settle();
+	assert.equal(bridge.sends.length, 1);
+	assert.deepEqual(steers, []);
+	assert.ok(app.nodes().some((node) => node.props.className === "queued" && textOf(node).includes("Queue this for the same Cloud agent")));
+	cloudState(app, turn, false);
+	app.emit({ type: "error", uiSessionId: turn.uiSessionId, turnId: turn.turnId, message: "Cursor could not finish this turn." });
+	await app.settle();
+	assert.equal(bridge.sends.length, 1, "an error does not start the queued Cloud message");
+	assert.equal(app.model().busy, false);
+	same(savedHistory(app).queued[turn.uiSessionId].map((item) => item.text), ["Queue this for the same Cloud agent"]);
+	app.unmount();
+
+	const withFile = harness(), attached = fakeCloud(withFile);
+	await openCloudForm(withFile, "C:/first/notes.md");
+	sendPrompt(withFile, "Send my staged notes");
+	await withFile.settle();
+	assert.equal(attached.sends.length, 0, "a staged Local attachment cannot be sent after switching the form to Cloud");
+	assert.equal(withFile.notice(), "Cloud sessions can't take attachments yet.");
+	assert.equal(withFile.node((node) => node.props["aria-label"] === "Prompt").props.value, "Send my staged notes");
+	withFile.unmount();
+	console.log("PASS Cloud send: folder recheck, turn reply id, queue, error hold and attachment refusal");
+}
+
+async function checkCloudModelRetry() {
+	const app = harness(), bridge = fakeCloud(app);
+	await openCloudForm(app);
+	sendPrompt(app, "Start the Cloud agent");
+	await app.settle();
+	const turn = bridge.sends[0];
+	assert.equal(turn.cloud.repoUrl, "https://github.com/example/first");
+	assert.equal(turn.cloud.ref, "main");
+	app.emit({ type: "error", uiSessionId: turn.uiSessionId, turnId: turn.turnId, message: "Cursor refused to start the agent." });
+	await app.settle();
+	app.beforeUnload();
+	await app.settle();
+	assert.equal(app.model().session.cloud.agentId, undefined);
+	app.unmount();
+
+	const reopened = harness(app.storage, `?session=${encodeURIComponent(turn.uiSessionId)}`);
+	const retry = fakeCloud(reopened);
+	const setup = reopened.api.cloudSetup;
+	reopened.api.cloudSetup = async (folder) => ({ ...await setup(folder), repoUrl: "https://github.com/example/other", ref: "different-ref", upstream: "origin/different-ref" });
+	await reopened.settle();
+	reopened.node((node) => node.props.title === "Cursor model (Ctrl+Shift+I)").props.onClick();
+	await reopened.settle();
+	button(reopened, "Try again").props.onClick();
+	await reopened.settle();
+	assert.deepEqual(retry.setups, ["C:/first"], "Try again reloads the model catalog from the folder's current setup");
+	button(reopened, "Auto").props.onClick();
+	await reopened.settle();
+	sendPrompt(reopened, "Retry with Auto");
+	await reopened.settle();
+	assert.equal(retry.sends.length, 1);
+	const sent = retry.sends[0];
+	assert.equal(sent.uiSessionId, turn.uiSessionId);
+	same(sent.cloud.model, { id: "default", params: [] });
+	assert.equal(sent.cloud.repoUrl, turn.cloud.repoUrl, "model selection preserves the saved session repository");
+	assert.equal(sent.cloud.ref, turn.cloud.ref, "model selection preserves the saved starting ref");
+	reopened.unmount();
+	console.log("PASS Cloud model retry: a refreshed catalog does not change the saved repository or starting ref");
+}
+
+async function startCloudReply() {
+	const app = harness(), bridge = fakeCloud(app);
+	await openCloudForm(app);
+	sendPrompt(app, "Start this Cloud task");
+	await app.settle();
+	assert.equal(bridge.sends.length, 1);
+	const turn = bridge.sends[0];
+	cloudState(app, turn, true);
+	app.emit({ type: "chunk", uiSessionId: turn.uiSessionId, turnId: turn.turnId, text: "Original partial reply" });
+	app.emit({ type: "thought", uiSessionId: turn.uiSessionId, turnId: turn.turnId, text: "Original thought" });
+	app.emit({ type: "tool", uiSessionId: turn.uiSessionId, turnId: turn.turnId, tool: { id: "old-tool", kind: "tool", title: "Read", detail: "Completed", waiting: false } });
+	await app.settle();
+	app.beforeUnload();
+	await app.settle();
+	assert.match(cloudReply(app, turn).text, /Original partial reply/);
+	return { app, bridge, turn };
+}
+
+async function checkCloudReplay() {
+	const warning = "Interrupted when this window closed. The Cloud agent may have started; check [Cursor agents](https://cursor.com/agents) before sending again.";
+	const { app, turn } = await startCloudReply();
+	app.unmount();
+	const reopened = harness(app.storage, `?session=${encodeURIComponent(turn.uiSessionId)}`);
+	const bridge = fakeCloud(reopened);
+	await reopened.settle();
+	assert.equal(bridge.resumes.length, 1, "opening saved history resumes the active Cloud run");
+	assert.equal(bridge.resumes[0].uiSessionId, turn.uiSessionId);
+	assert.equal(bridge.resumes[0].turnId, turn.turnId);
+	assert.equal(bridge.resumes[0].cloud.runId, "run-example");
+	assert.equal(cloudReply(reopened, turn).text, "Original partial reply", "an active run's reply is restored without a warning");
+	const forTurn = { uiSessionId: turn.uiSessionId, turnId: turn.turnId };
+	reopened.emit({ type: "turn-start", ...forTurn, resume: true });
+	await reopened.settle();
+	const reset = cloudReply(reopened, turn);
+	assert.equal(reset.text, "");
+	assert.equal(reset.thought || "", "");
+	assert.equal(reset.tools?.length ?? 0, 0);
+	assert.equal(reset.parts?.length ?? 0, 0);
+	const branch = "cursor/example", prUrl = "https://github.com/example/first/pull/1";
+	const links = `\n\nBranch: ${branch} · <${prUrl}>`;
+	reopened.emit({ type: "chunk", ...forTurn, text: "Replayed reply" });
+	reopened.emit({ type: "chunk", ...forTurn, text: links });
+	cloudState(reopened, turn, false, { branch, prUrl });
+	reopened.emit({ type: "done", ...forTurn });
+	await reopened.settle();
+	const final = cloudReply(reopened, turn);
+	assert.equal(final.text, `Replayed reply${links}`);
+	assert.equal(final.streaming, false);
+	assert.equal(reopened.model().messages.filter((message) => message.role === "grok").length, 1);
+	assert.equal(reopened.model().session.cloud.prUrl, prUrl);
+	assert.equal(reopened.model().session.cloud.active, false);
+	reopened.unmount();
+
+	const beforeCreate = harness();
+	const creatingBridge = fakeCloud(beforeCreate);
+	await openCloudForm(beforeCreate);
+	sendPrompt(beforeCreate, "Reload while Cursor starts the agent");
+	await beforeCreate.settle();
+	assert.equal(creatingBridge.sends.length, 1);
+	const creating = creatingBridge.sends[0];
+	beforeCreate.beforeUnload();
+	await beforeCreate.settle();
+	const pending = savedHistory(beforeCreate).sessions.find((item) => item.id === creating.uiSessionId).cloud;
+	assert.equal(!!pending.active, false);
+	assert.equal(pending.agentId, undefined);
+	assert.equal(pending.runId, undefined);
+	beforeCreate.unmount();
+	const reloadedOwner = harness(beforeCreate.storage, `?session=${encodeURIComponent(creating.uiSessionId)}`);
+	const lateBridge = fakeCloud(reloadedOwner);
+	await reloadedOwner.settle();
+	assert.equal(lateBridge.resumes.length, 0, "startup cannot resume before Cursor returns run ids");
+	const savedReply = cloudReply(reloadedOwner, creating);
+	assert.equal(savedReply.streaming, false);
+	assert.equal(savedReply.text, warning, "an interrupted create without run ids warns before another send");
+	cloudState(reloadedOwner, creating, true);
+	await reloadedOwner.settle();
+	assert.equal(lateBridge.resumes.length, 1, "the owning window reload resumes when the late Cloud state arrives");
+	const resumed = lateBridge.resumes[0];
+	assert.equal(resumed.uiSessionId, creating.uiSessionId);
+	assert.equal(resumed.turnId, creating.turnId);
+	assert.equal(resumed.cloud.agentId, "bc-example");
+	assert.equal(resumed.cloud.runId, "run-example");
+	same(cloudReply(reloadedOwner, creating), savedReply, "receiving run ids preserves the saved reply until replay starts");
+	reloadedOwner.emit({ type: "turn-start", uiSessionId: creating.uiSessionId, turnId: creating.turnId, resume: true });
+	await reloadedOwner.settle();
+	const replaying = cloudReply(reloadedOwner, creating);
+	assert.equal(replaying.streaming, true);
+	assert.equal(replaying.text, "");
+	reloadedOwner.unmount();
+	console.log("PASS Cloud restart: startup and late-id resume replace one reply and preserve result links after done");
+}
+
+async function checkCloudWindows() {
+	const { app: owner, bridge, turn } = await startCloudReply();
+	const observer = harness(owner.storage, `?session=${encodeURIComponent(turn.uiSessionId)}`);
+	const refused = "This session is running in another window.";
+	const other = fakeCloud(observer, { ok: false, error: refused });
+	await observer.settle();
+	assert.equal(other.resumes.length, 1);
+	assert.equal(other.resumes[0].turnId, turn.turnId);
+	assert.equal(observer.notice(), refused);
+	const forTurn = { uiSessionId: turn.uiSessionId, turnId: turn.turnId };
+	owner.emit({ type: "turn-start", ...forTurn, resume: true });
+	owner.emit({ type: "chunk", ...forTurn, text: "Owner replay" });
+	owner.emit({ type: "tool", ...forTurn, tool: { id: "new-tool", kind: "tool", title: "Read", detail: "Completed", waiting: false } });
+	await owner.settle();
+	assert.equal(cloudReply(owner, turn).text, "Owner replay");
+	assert.equal(owner.model().messages.filter((message) => message.role === "grok").length, 1);
+	button(owner, "Stop").props.onClick();
+	await owner.settle();
+	assert.deepEqual(bridge.cancels, [turn.uiSessionId]);
+	assert.deepEqual(owner.cancels, [], "Cloud Stop does not call the local agent");
+	assert.deepEqual(other.cancels, []);
+	observer.unmount();
+	owner.unmount();
+	console.log("PASS Cloud windows: another window's resume is refused and owner replay and Stop still work");
+}
+
+const runOnField = (app) => app.node((node) => node.props["aria-label"] === "Run on");
+const machineNameField = (app) => app.node((node) => node.props["aria-label"] === "Machine name");
+
+async function chooseMachine(app, name) {
+	runOnField(app).props.onChange({ target: { value: "machine" } });
+	await app.settle();
+	if (name !== undefined) {
+		machineNameField(app).props.onChange({ target: { value: name } });
+		await app.settle();
+	}
+}
+
+function enterPrompt(app) {
+	app.node((node) => node.props["aria-label"] === "Prompt").props.onKeyDown({ key: "Enter", shiftKey: false, preventDefault() {} });
+}
+
+async function checkMachineDraft() {
+	const app = harness();
+	fakeCloud(app);
+	await app.settle();
+	const original = await startSession(app, "A saved Local session");
+	app.emit({ type: "done", uiSessionId: original, turnId: app.sends.at(-1).turnId });
+	await app.settle();
+	assert.equal(runOnField(app), undefined);
+	await openCloudForm(app);
+	assert.equal(runOnField(app).props.value, "cloud");
+	assert.equal(machineNameField(app), undefined);
+	await chooseMachine(app, "  laptop-2_  ");
+	typePrompt(app, "Keep this machine draft");
+	app.sidebar().onSelect(original);
+	await app.settle();
+	assert.equal(runOnField(app), undefined);
+	app.sidebar().onNew();
+	await app.settle();
+	assert.equal(runOnField(app).props.value, "machine");
+	assert.equal(machineNameField(app).props.value, "  laptop-2_  ");
+	app.beforeUnload();
+	await app.settle();
+	app.unmount();
+
+	const reloaded = harness(app.storage);
+	fakeCloud(reloaded);
+	await reloaded.settle();
+	assert.equal(runOnField(reloaded).props.value, "machine");
+	assert.equal(machineNameField(reloaded).props.value, "  laptop-2_  ");
+	assert.equal(reloaded.node((node) => node.props["aria-label"] === "Prompt").props.value, "Keep this machine draft");
+	chooseEnvironment(reloaded, "Local");
+	await reloaded.settle();
+	assert.equal(runOnField(reloaded), undefined);
+	assert.equal(machineNameField(reloaded), undefined);
+	chooseEnvironment(reloaded, "Cloud");
+	await reloaded.settle();
+	assert.equal(runOnField(reloaded).props.value, "cloud");
+	assert.equal(machineNameField(reloaded), undefined, "switching environments resets the machine choice");
+	reloaded.unmount();
+	console.log("PASS My machines draft: Cloud-only Run on, kept and restored names, and environment reset");
+}
+
+async function checkMachineSend() {
+	const remembered = [{ name: "desktop", repo: "example/first" }, { name: "other-machine", repo: "example/other" }];
+	const storage = new Map([["grok-code.settings.v1", JSON.stringify({ cursorMachines: [
+		{ name: "desktop", repo: " EXAMPLE/FIRST " }, remembered[0], remembered[1],
+		{ name: "-invalid", repo: "example/first" }, { name: "no-repo", repo: " " },
+	] })]]);
+	const app = harness(storage), bridge = fakeCloud(app);
+	const copied = [];
+	app.api.copyText = async (text) => { copied.push(text); return { ok: true }; };
+	await openCloudForm(app);
+	same(app.readSettings().cursorMachines, remembered);
+	const prToggle = () => app.node((node) => node.type === "label" && textOf(node).trim() === "Open a pull request");
+	app.nodes(prToggle()).find((node) => node.type === "input").props.onChange({ target: { checked: true } });
+	await app.settle();
+	assert.equal(app.nodes(prToggle()).find((node) => node.type === "input").props.checked, true);
+	await chooseMachine(app);
+	assert.equal(prToggle(), undefined);
+	const suggestions = () => {
+		const list = app.node((node) => node.type === "datalist" && node.props.id === machineNameField(app).props.list);
+		assert.ok(list);
+		return app.nodes(list).filter((node) => node.type === "option").map((node) => node.props.value);
+	};
+	same(suggestions(), ["desktop"], "suggestions stay with this repository");
+	const hint = app.node((node) => node.props.id === machineNameField(app).props["aria-describedby"]);
+	assert.equal(textOf(hint), "Letters, digits, dots, dashes and underscores. Start with a letter or digit, and don't end with a dot. Capitals count: type it as the worker shows it.");
+	const draftId = app.model().session.id;
+	typePrompt(app, "Run this on my machine");
+	assert.equal(button(app, "Send").props.disabled, true, "a blank machine name keeps Send disabled");
+	machineNameField(app).props.onChange({ target: { value: "laptop." } });
+	await app.settle();
+	assert.equal(button(app, "Send").props.disabled, true);
+	enterPrompt(app);
+	await app.settle();
+	assert.equal(bridge.sends.length, 0);
+	assert.equal(app.sidebar().sessions.some((item) => item.id === draftId), false, "Enter cannot create a machine session with an invalid name");
+	machineNameField(app).props.onChange({ target: { value: "  laptop  " } });
+	await app.settle();
+	assert.equal(button(app, "Send").props.disabled, false);
+	const branchNote = "The agent is told to work on a branch of its own, started from main on GitHub, and not to push, so its commits stay in that clone. It works with that computer's Git sign-in, so nothing but that instruction stops a push.";
+	assert.ok(app.nodes().some((node) => node.type === "p" && textOf(node) === branchNote));
+	const commands = [
+		"git clone https://github.com/example/first.git first-cursor-laptop",
+		"cursor-agent worker start --name laptop --worker-dir first-cursor-laptop",
+	];
+	const copyButtons = app.nodes().filter((node) => node.type === "button" && node.props["aria-label"]?.startsWith("Copy "));
+	same(copyButtons.map((node) => node.props["aria-label"]), commands.map((command) => `Copy ${command}`), "setup has exactly two commands and no cd");
+	for (const node of copyButtons) { node.props.onClick(); }
+	await app.settle();
+	assert.deepEqual(copied, commands);
+	sendPrompt(app, "Run this on my machine");
+	await app.settle();
+	assert.equal(bridge.sends.length, 1);
+	const turn = bridge.sends[0];
+	assert.equal(turn.cloud.machine, "laptop");
+	assert.equal(turn.cloud.autoCreatePR, false);
+	const saved = savedHistory(app).sessions.find((item) => item.id === turn.uiSessionId);
+	assert.equal(saved.cloud.machine, "laptop");
+	assert.equal(Object.hasOwn(saved, "cloudMachineDraft"), false);
+	same(app.readSettings().cursorMachines, remembered, "sending does not remember a name");
+	const branch = "grok/machine-8b7104e0";
+	cloudState(app, turn, true, { branch });
+	await app.settle();
+	same(app.readSettings().cursorMachines, remembered, "an agent id does not mean the worker ran successfully");
+	cloudState(app, turn, false);
+	app.emit({ type: "done", uiSessionId: turn.uiSessionId, turnId: turn.turnId });
+	await app.settle();
+	same(app.readSettings().cursorMachines, remembered, "done without a machine name does not remember it");
+	assert.ok(app.nodes().some((node) => node.props.className === "meta" && textOf(node).includes(`first · ${branch} · laptop`)));
+	sendPrompt(app, "/status");
+	await app.settle();
+	assert.match(app.model().messages.at(-1).text, /Grok 4\.7 · Max · laptop/);
+	assert.equal(bridge.sends.length, 1, "/status stays local");
+	app.node((node) => node.props.title === "Environment").props.onClick();
+	await app.settle();
+	assert.ok(app.nodes().some((node) => node.type === "small" && textOf(node) === "laptop, through Cursor"));
+
+	for (const name of ["Laptop", "laptop"]) {
+		await openCloudForm(app);
+		await chooseMachine(app, name);
+		const count = bridge.sends.length;
+		sendPrompt(app, `Run successfully on ${name}`);
+		await app.settle();
+		assert.equal(bridge.sends.length, count + 1);
+		const accepted = bridge.sends.at(-1);
+		assert.equal(accepted.cloud.machine, name);
+		cloudState(app, accepted, true);
+		cloudState(app, accepted, false);
+		app.emit({ type: "done", uiSessionId: accepted.uiSessionId, turnId: accepted.turnId, machine: name });
+		await app.settle();
+	}
+	same(app.readSettings().cursorMachines, [{ name: "laptop", repo: "example/first" }, { name: "Laptop", repo: "example/first" }, ...remembered], "successful completions remember both spellings for the same normalized repository");
+	await openCloudForm(app);
+	await chooseMachine(app);
+	same(suggestions(), ["laptop", "Laptop", "desktop"], "the suggestions preserve both spellings");
+	app.unmount();
+	console.log("PASS My machines send: validation, PR off, setup copy, successful-only case-sensitive remembering, and session labels");
+}
+
+async function checkMachineBranch() {
+	const app = harness(), bridge = fakeCloud(app);
+	const setup = app.api.cloudSetup;
+	app.api.cloudSetup = async (folder) => ({ ...await setup(folder), ref: "topic;example", upstream: "origin/topic;example" });
+	await openCloudForm(app);
+	typePrompt(app, "Use the current branch");
+	assert.equal(button(app, "Send").props.disabled, false, "ordinary Cloud can use this Git branch");
+	await chooseMachine(app, "laptop");
+	const error = "A machine session can't use this branch name. Switch the folder to a branch whose name has only letters, digits, dots, dashes, underscores and slashes.";
+	assert.ok(app.nodes().some((node) => textOf(node) === error));
+	assert.equal(app.nodes().filter((node) => node.type === "button" && node.props["aria-label"]?.startsWith("Copy ")).length, 0);
+	assert.equal(button(app, "Send").props.disabled, true);
+	enterPrompt(app);
+	await app.settle();
+	assert.equal(bridge.sends.length, 0);
+	assert.ok(app.node((node) => node.props.className === "new-page"));
+	app.unmount();
+	console.log("PASS My machines branch check: unsafe shell ref hides setup commands and prevents Send and Enter");
+}
+
+async function checkMachineSettingsHelp() {
+	const app = harness();
+	const copied = [], opened = [];
+	app.api.copyText = async (command) => { copied.push(command); return { ok: true }; };
+	app.api.openExternal = async (url) => { opened.push(url); return { ok: true }; };
+	app.settingsView({ settings: app.readSettings(), initialTab: "general", onChange() {}, onClose() {}, onCheckSetup() {}, onRun() {}, servers: [], folder: "C:/project" });
+	await app.settle();
+	assert.ok(app.nodes().some((node) => node.type === "h3" && textOf(node) === "My machines"));
+	assert.ok(app.nodes().some((node) => node.type === "p" && textOf(node).includes("With My machines, they run on a computer of yours instead.")));
+	const commands = [
+		"curl https://cursor.com/install -fsS | bash",
+		"irm 'https://cursor.com/install?win32=true' | iex",
+		"cursor-agent login",
+	];
+	for (const command of commands) {
+		const copy = button(app, `Copy ${command}`);
+		assert.ok(copy, `Settings shows a Copy button for ${command}`);
+		copy.props.onClick();
+	}
+	button(app, "Open Cursor's dashboard").props.onClick();
+	await app.settle();
+	assert.deepEqual(copied, commands);
+	assert.deepEqual(opened, ["https://cursor.com/dashboard?tab=cloud-agents"]);
+	app.unmount();
+	console.log("PASS My machines Settings help copies the exact install and login commands and opens the Cursor dashboard");
+}
+
 async function main() {
+	checkCloudModels();
+	await checkCloudSend();
+	await checkCloudModelRetry();
+	await checkCloudReplay();
+	await checkCloudWindows();
+	await checkMachineDraft();
+	await checkMachineSend();
+	await checkMachineBranch();
+	await checkMachineSettingsHelp();
+	await checkSignInProfile();
+	await checkSignInSettings();
+	await checkPaneLayout();
 	await checkNarrowWindow();
 	await require("./test-saved-prompts.cjs")();
 	await require("./test-customize-renderer.cjs")({ harness, button, textOf });
@@ -5514,6 +6670,8 @@ async function main() {
 	await checkUnarchiveAfterAutoArchive();
 	await checkRememberedAccount();
 	await checkSettingsBlocksShortcuts();
+	await checkSideDrafts();
+	await checkComposerIme();
 	await checkComposerDraftRelaunch();
 	await checkNewSessionDraftRelaunch();
 	await checkKeptNewSessionForm();
@@ -5533,8 +6691,11 @@ async function main() {
 	await checkSteer();
 	await checkStreamHistorySaves();
 	await checkResizeChurn();
+	await checkColumnWidths();
+	await checkHiddenSidebarProjectReveal();
 	await checkSmallUiBatch();
 	await checkRefreshScopes();
+	await checkHeaderBranch();
 	await checkSavedThinkingAndLegacySettings();
 	await checkBackgroundWorkHistory();
 	await checkTaskDetails();
@@ -5550,6 +6711,7 @@ async function main() {
 	await checkDirectCommitBridge();
 	await checkRevertHunkBridge();
 	await checkReviewWorkspace();
+	await checkProgressiveChanges();
 	await checkEditorLanguagesAndSettings();
 	await checkCodeEditorIntegration();
 	await checkConfirmHostAndQueue();
@@ -5558,6 +6720,7 @@ async function main() {
 	await checkPrWatchWindows();
 	await checkAppUpdates();
 	await checkSharedFolder();
+	await checkMissingSessionFolder();
 	await checkDisconnectChoice();
 	await checkContextFromChat();
 	await checkCliSession();

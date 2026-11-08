@@ -34,8 +34,16 @@ function loadSource() {
 		theme: "dark",
 		getAttribute(name) { return name === "data-theme" ? this.theme : null; },
 	};
+	const bodyChildren = new Set();
+	const document = {
+		documentElement,
+		body: { append(node) { bodyChildren.add(node); } },
+		createElement() {
+			return { style: {}, children: [], append(child) { this.children.push(child); }, remove() { bodyChildren.delete(this); } };
+		},
+	};
 	const windowMock = {
-		document: { documentElement },
+		document,
 		matchMedia() { return { matches: false, addEventListener() {}, removeEventListener() {} }; },
 	};
 	function load(fileName) {
@@ -72,7 +80,7 @@ function loadSource() {
 		if (typeof node.type === "function") { return textOf(node.type(node.props)); }
 		return textOf(node.props?.children);
 	}
-	return { load, react, walk, textOf, documentElement };
+	return { load, react, walk, textOf, documentElement, document, bodyChildren };
 }
 
 function mount(env, Component, props) {
@@ -146,9 +154,12 @@ module.exports = async function mermaidMathChecks() {
 	let config = null;
 	mermaidRuntime.load = async () => ({
 		initialize(next) { config = next; },
-		async render(_id, source) {
+		async render(id, source, container) {
 			draws += 1;
-			if (source.includes("bad")) { throw new Error("draw failed"); }
+			if (source.includes("bad")) {
+				(container ?? env.document.body).append({ id: `d${id}` });
+				throw new Error("draw failed");
+			}
 			return { svg: `<svg data-source="${source.length}"></svg>` };
 		},
 	});
@@ -182,10 +193,11 @@ module.exports = async function mermaidMathChecks() {
 	const failed = mount(env, MermaidDiagram, { text: "bad graph", raw: "```mermaid\nbad graph\n```\n", onCopy() {} });
 	await settle(failed);
 	assert.equal(draws, 2);
+	assert.equal(env.bodyChildren.size, 0, "a rejected diagram leaves no render container in the body");
 	const failure = env.textOf(failed.render());
 	assert.ok(failure.includes("This diagram could not be drawn."));
 	assert.ok(failure.includes("bad graph"));
 	await settle(failed);
 	assert.equal(draws, 2, "a failed diagram is not drawn again");
-	console.log("PASS mermaid and math: dollar rules, code spans, one draw per source, no draw before the fence, failure fallback");
+	console.log("PASS mermaid and math: dollar rules, code spans, one draw per source, no draw before the fence, failure fallback and cleanup");
 };

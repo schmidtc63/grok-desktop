@@ -1,16 +1,21 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type MouseEvent, type SetStateAction } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type CSSProperties, type DragEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type SetStateAction } from "react";
 import { caseKey, FILE_MANAGER, keyLabel, modKey, PLATFORM, SHORTCUTS } from "./data";
 import { addContextPick, CONTEXT_PICK_LIMIT, contextChoices, contextForGrok, contextPicksFrom, contextSnapshot, type ContextPick } from "./context-from-chat";
 import { BrowserPane, type BrowserTab, type DevServer } from "./BrowserPane";
 import { addProblem } from "./browserDiagnostics";
+import { chooseVariant, defaultVariant, sameCloudParams } from "./cloud-models";
 import { askConfirm, setConfirmHost, type PendingConfirm } from "./confirm";
 import { DiffPane, type DiffComment, type PrInfo } from "./DiffPane";
 import { FilesPane } from "./FilesPane";
-import { PaneView, SideLog, type BackgroundTask, type EditorDraft, type FolderFiles, type OpenFile, type PaneModel } from "./Panes";
+import { Icon, type IconName } from "./Icon";
+import type { PaneLayoutControls } from "./PaneActions";
+import { AppNote, PaneView, SideLog, type BackgroundTask, type EditorDraft, type FolderFiles, type OpenFile, type PaneModel } from "./Panes";
+import { PopupMenu } from "./PopupMenu";
 import { prAlertText, prFixPrompt, prWatchStep } from "./prWatch";
+import { redactKeys } from "./redact";
 import { SessionRail } from "./SessionRail";
 import { Setup } from "./Setup";
-import { DEFAULT_SETTINGS, readSettings, settingsKey, SettingsPage, type AppSettings, type SettingsTab } from "./Settings";
+import { DEFAULT_SETTINGS, normalizeCursorMachines, readSettings, settingsKey, SettingsPage, type AppSettings, type SettingsTab } from "./Settings";
 import { Sidebar } from "./Sidebar";
 import { SavedPromptPicker } from "./SavedPromptPicker";
 import { insertSavedPrompt, MAX_PROMPT_TEXT, MAX_SAVED_PROMPTS, promptNameError } from "./saved-prompts";
@@ -25,6 +30,8 @@ import {
 	MODELS,
 	PANES,
 	type ChatMessage,
+	type CursorModel,
+	type CursorVariant,
 	type Environment,
 	mapMode,
 	type PermissionMode,
@@ -32,18 +39,37 @@ import {
 	type Session,
 	type SidePaneId,
 	type TranscriptView,
+	validMachineName,
 } from "./types";
 
 type Menu = string | null;
+type ColumnWidth = "sidebarWidth" | "railWidth" | "sideWidth";
 type ConfirmItem = PendingConfirm & { id: number };
 type Notice = { id: number; text: string };
 type BackgroundWork = Record<string, { tasks: GrokBgTask[]; agents: GrokSubagent[] }>;
+type ChangeRead = { id: string; key: string; patch: boolean };
+type ChangePatch = { key: string; loading: boolean; file?: DiffFile; error?: string; full?: boolean };
 
 const historyKey = "grok-code.history.v1";
 const PR_POLL_MS = 180000;
+const ESCAPE_STOP_GRACE_MS = 500;
+const SIDEBAR_MIN = 200;
+const RAIL_MIN = 240;
+const COLUMN_MAX = 420;
+const PANE_MIN = 320;
+const PANE_SPLITTER_WIDTH = 6;
+const PANE_ORDER = [...PANES, ...MENU_PANES].map((pane) => pane.id);
+const PANE_SPLIT_MIN = 25;
+const PANE_SPLIT_MAX = 75;
+const RAIL_CHAT_MIN = 560;
 const commandsKey = "grok-code.commands.v1";
+const COMMAND_GROUPS = ["App", "Grok", "Skills"] as const;
+type CommandGroup = typeof COMMAND_GROUPS[number];
 const accountKey = "grok-code.account.v1";
 const SIDE_BUSY = "The side chat is still answering. Wait for it to finish.";
+const CLOUD_ATTACHMENTS = "Cloud sessions can't take attachments yet.";
+const MACHINE_REF_ERROR = "A machine session can't use this branch name. Switch the folder to a branch whose name has only letters, digits, dots, dashes, underscores and slashes.";
+const CLOUD_APP_COMMANDS = new Set(["config", "status", "info", "new", "rename", "delete", "copy", "find", "transcript", "expand", "model", "cd", "resume", "help", "theme"]);
 const VIEWS: TranscriptView[] = ["normal", "thinking", "verbose"];
 const VIEW_LABEL: Record<TranscriptView, string> = { normal: "Normal", thinking: "Thinking", verbose: "Verbose" };
 const PROTECTED = [/^\.mcp\.json$/i, /^\.claude\/settings(\.local)?\.json$/i, /^\.grok\/config\.toml$/i];
@@ -105,6 +131,32 @@ interface TurnTarget {
 	replyId: string;
 	turnId: string;
 	where: "main" | "side";
+	awaitingReplay?: boolean;
+}
+
+function maskDisplay<T extends object>(value: T, ...fields: (keyof T)[]): T {
+	let result = value;
+	for (const field of fields) {
+		const text = value[field];
+		if (typeof text !== "string") { continue; }
+		const masked = redactKeys(text);
+		if (masked !== text) { result = { ...result, [field]: masked }; }
+	}
+	return result;
+}
+
+function maskChat(message: ChatMessage): ChatMessage {
+	return {
+		...maskDisplay(message, "text", "thought", "appNote"),
+		contextFrom: message.contextFrom?.map((pick) => maskDisplay(pick, "title")),
+		parts: message.parts?.map((part) => part.kind === "tool" ? part : maskDisplay(part, "text")),
+		tools: message.tools?.map((tool) => ({
+			...maskDisplay(tool, "title", "detail", "summary", "label", "description", "command", "input", "output", "plan", "commandPrefix"),
+			diff: tool.diff && maskDisplay(tool.diff, "oldText", "newText"),
+			questions: tool.questions?.map((question) => ({ ...maskDisplay(question, "header", "question"), options: question.options.map((option) => maskDisplay(option, "label", "description")) })),
+			todos: tool.todos?.map((todo) => maskDisplay(todo, "text")),
+		})),
+	};
 }
 
 function readHistory(): History | null {
@@ -120,8 +172,8 @@ function readHistory(): History | null {
 		const queued: Record<string, Queued[]> = {};
 		for (const [id, items] of Object.entries(value.queued ?? {})) {
 			if (!Array.isArray(items)) { continue; }
-			const valid = items.filter((item: Queued) => item && typeof item.id === "string" && typeof item.text === "string" && item.text.trim() && Array.isArray(item.attachments) && item.attachments.every((file) => typeof file === "string"));
-			if (valid.length) { queued[id] = valid; }
+			const valid: Queued[] = items.filter((item: Queued) => item && typeof item.id === "string" && typeof item.text === "string" && item.text.trim() && Array.isArray(item.attachments) && item.attachments.every((file) => typeof file === "string"));
+			if (valid.length) { queued[id] = valid.map((item) => item.contextFrom?.length ? { ...item, contextFrom: item.contextFrom.map((pick) => maskDisplay(pick, "title")) } : item); }
 		}
 		const attachments = Object.fromEntries(Object.entries(value.attachments ?? {}).filter(([, files]) => Array.isArray(files) && files.length && files.every((file) => typeof file === "string"))) as Record<string, string[]>;
 		const backgroundWork: BackgroundWork = {};
@@ -129,23 +181,51 @@ function readHistory(): History | null {
 			const work = entry as BackgroundWork[string] | null;
 			if (!work || !Array.isArray(work.tasks) || !Array.isArray(work.agents)) { continue; }
 			const valid = (item: GrokBgTask | GrokSubagent) => item && typeof item.id === "string" && typeof item.status === "string" && item.status !== "running";
-			backgroundWork[id] = { tasks: recentTasks(work.tasks.filter(valid)), agents: recentAgents(work.agents.filter(valid)) };
+			backgroundWork[id] = {
+				tasks: recentTasks(work.tasks.filter(valid)).map((task) => maskDisplay(task, "label", "command")),
+				agents: recentAgents(work.agents.filter(valid)).map((agent) => maskDisplay(agent, "label", "output")),
+			};
 		}
-		return { sessions: value.sessions, extraChats: value.extraChats ?? {}, modes, prePlan, editorDrafts: value.editorDrafts ?? {}, composerDrafts: value.composerDrafts ?? {}, queued, attachments, backgroundWork, newSessionDraft, deleted: Array.isArray(value.deleted) ? value.deleted : [] };
+		const extraChats = Object.fromEntries(Object.entries<ChatMessage[]>(value.extraChats ?? {}).map(([id, messages]) => [id, messages.map(maskChat)]));
+		const sessions = (value.sessions as Session[]).map((session) => maskDisplay(session, "title", "detail"));
+		return { sessions, extraChats, modes, prePlan, editorDrafts: value.editorDrafts ?? {}, composerDrafts: value.composerDrafts ?? {}, queued, attachments, backgroundWork, newSessionDraft, deleted: Array.isArray(value.deleted) ? value.deleted : [] };
 	} catch {
 		return null;
 	}
 }
 
-function restoredChats(store: Record<string, ChatMessage[]>) {
-	return Object.fromEntries(Object.entries(store).map(([id, messages]) => [id, messages.map((message) => ({
-		...message,
-		pending: false,
-		streaming: false,
-		text: message.pending || message.streaming ? `${message.text}${message.text ? "\n" : ""}Interrupted when this window closed.` : message.text,
-		parts: message.pending || message.streaming ? undefined : message.parts,
-		tools: message.tools?.map((tool) => tool.waiting ? { ...tool, waiting: false, detail: "Approval closed with the previous window." } : tool),
-	}))]));
+const INTERRUPTED_NOTE = "Interrupted when this window closed.";
+
+function missingFolderError(error?: string) {
+	return !!error && /^(That folder is not on this computer:|That path is not a folder:|Choose a folder for this session\.$)/.test(error);
+}
+
+function replyWithNote(message: ChatMessage, note: string, separator = "\n"): ChatMessage {
+	const appNote = redactKeys(note);
+	return { ...message, pending: false, streaming: false, text: `${message.text}${message.text ? separator : ""}${appNote}`, appNote };
+}
+
+function restoredChats(store: Record<string, ChatMessage[]>, sessions: Session[] = []) {
+	const clouds = new Map(sessions.filter((item) => item.environment === "Cloud").map((item) => [item.id, item]));
+	return Object.fromEntries(Object.entries(store).map(([id, messages]) => [id, messages.map((message): ChatMessage => {
+		const legacyNote = message.role === "grok" ? /(?:^|\n)((?:That folder is not on this computer:|That path is not a folder:|Grok exited\.|Interrupted when this window closed\.)[^\n]*)$/.exec(message.text)?.[1] : undefined;
+		const appNote = typeof message.appNote === "string" ? message.appNote : legacyNote;
+		const lastPart = message.parts?.at(-1);
+		const parts = legacyNote && !message.appNote && lastPart?.kind === "text" && lastPart.text.trim() === legacyNote ? message.parts?.slice(0, -1) : message.parts;
+		const restored = { ...message, appNote, parts, pending: false, streaming: false };
+		const interrupted = message.pending || message.streaming;
+		const session = clouds.get(id);
+		if (session) {
+			const active = session.cloud?.active && message.id === `grok-${session.cloud.turnId}`;
+			if (!interrupted || active || message.role !== "grok") { return restored; }
+			const warning = "Interrupted when this window closed. The Cloud agent may have started; check [Cursor agents](https://cursor.com/agents) before sending again.";
+			return replyWithNote(restored, warning, "\n\n");
+		}
+		return {
+			...(interrupted ? replyWithNote(restored, INTERRUPTED_NOTE) : restored),
+			tools: message.tools?.map((tool) => tool.waiting ? { ...tool, waiting: false, detail: "Approval closed with the previous window." } : tool),
+		};
+	})]));
 }
 
 function sameRecords(previous: Record<string, unknown> | undefined, current: Record<string, unknown>) {
@@ -177,7 +257,8 @@ function mergeChats(saved: Record<string, ChatMessage[]>, current: Record<string
 
 function slimChats(store: Record<string, ChatMessage[]>) {
 	const cut = (value: string | undefined, size: number) => (value && value.length > size ? `${value.slice(0, size)}…` : value);
-	return Object.fromEntries(Object.entries(store).map(([id, messages]) => [id, messages.map((message) => {
+	return Object.fromEntries(Object.entries(store).map(([id, messages]) => [id, messages.map((raw) => {
+		const message = maskChat(raw);
 		const slim = message.thought && message.thought.length > 20000 ? { ...message, thought: cut(message.thought, 20000) } : message;
 		return slim.tools ? { ...slim, tools: slim.tools.map((tool) => ({ ...tool, output: undefined, input: undefined, command: cut(tool.command, 2000), plan: cut(tool.plan, 20000), diff: tool.diff && tool.diff.oldText.length + tool.diff.newText.length <= 8000 ? tool.diff : undefined })) } : slim;
 	})]));
@@ -213,12 +294,13 @@ function keptDrafts(store: History["editorDrafts"], gone: Set<string>) {
 const HISTORY_FULL = "Chat history is full and is not being saved. Delete old sessions to free space.";
 const HISTORY_FAILED = "Chat history could not be saved on this computer.";
 
-function newSession(seed?: Partial<ProjectSeed>): Session {
+function newSession(seed?: Partial<ProjectSeed>, parentId?: string): Session {
 	const folder = seed?.folder ?? window.grokCode?.homeDir ?? "";
 	const project = seed?.project ?? shortPath(folder);
 	const now = Date.now();
 	return {
 		id: `new-${crypto.randomUUID()}`, title: "New session", project,
+		...(parentId ? { parentId } : {}),
 		folder,
 		branch: seed?.branch ?? "main", worktree: seed?.worktree ?? project,
 		environment: seed?.environment ?? "Local", status: "idle", detail: "Empty", when: "now",
@@ -239,8 +321,12 @@ function permissionGroup(mode: PermissionMode) {
 	return mode === "Always-approve" ? "yolo" : mode === "Auto-review" ? "auto" : "ask";
 }
 
-export function sideCap(windowWidth: number, sidebarCollapsed: boolean): number {
-	return Math.max(320, windowWidth - (sidebarCollapsed ? 0 : 268) - 6 - (windowWidth < 1100 ? 320 : 400));
+function chatMin(windowWidth: number): number {
+	return windowWidth < 1100 ? 320 : 400;
+}
+
+export function sideCap(windowWidth: number, sidebarWidth: number): number {
+	return Math.max(PANE_MIN, windowWidth - sidebarWidth - PANE_SPLITTER_WIDTH - chatMin(windowWidth));
 }
 
 export function shouldCollapseSidebar(windowWidth: number, panesOpen: boolean): boolean {
@@ -249,6 +335,10 @@ export function shouldCollapseSidebar(windowWidth: number, panesOpen: boolean): 
 
 function folderKey(folder: string) {
 	return caseKey(folder.trim().replace(/\\/g, "/").replace(/\/+$/, ""));
+}
+
+function cursorRepoSlug(url?: string) {
+	return /^https:\/\/github\.com\/([A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+)$/.exec(url ?? "")?.[1] ?? "";
 }
 
 function shortPath(folder: string) {
@@ -296,18 +386,23 @@ function readAccount(): GrokAccount | null | undefined {
 
 type GrokLimit = { percent: number | null; period: string; resetsAt: string; tier: string };
 
+function formatLimitReset(resetsAt?: string) {
+	return resetsAt ? new Date(resetsAt).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "";
+}
+
 // Grok's usage limit as one line, for /usage and the composer meter.
 function limitLine(limit: GrokLimit) {
 	return [
 		[limit.tier, limit.period, "limit", limit.percent !== null ? `${limit.percent}% used` : ""].filter(Boolean).join(" "),
-		limit.resetsAt ? `resets ${new Date(limit.resetsAt).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}` : "",
+		limit.resetsAt ? `resets ${formatLimitReset(limit.resetsAt)}` : "",
 	].filter(Boolean).join(" · ");
 }
 
 export function App() {
 	const [history] = useState(readHistory);
 	const [settings, setSettings] = useState<AppSettings>(readSettings);
-	const [sessions, setSessions] = useState<Session[]>(() => history?.sessions.map((item) => ({ ...item, status: "idle" })) ?? [newSession()]);
+	const [sessions, setSessions] = useState<Session[]>(() => history?.sessions.map((item) => ({ ...item, status: "idle" })) ?? [newSession({ folder: "" })]);
+	const firstSessionId = useRef(history ? null : sessions[0].id);
 	const [activeId, setActiveId] = useState(() => {
 		const requested = new URLSearchParams(window.location?.search ?? "").get("session");
 		return history?.sessions.find((item) => item.id === requested)?.id ?? history?.sessions.find((item) => !item.archived)?.id ?? "";
@@ -317,10 +412,14 @@ export function App() {
 	const [restoredForm] = useState<Session | null>(() => (history?.newSessionDraft && !new URLSearchParams(window.location?.search ?? "").get("session") ? { ...history.newSessionDraft.session, id: `new-${crypto.randomUUID()}` } : null));
 	const [pending, setPending] = useState<Session | null>(() => restoredForm ?? (history ? null : sessions[0]));
 	const [useWorktree, setUseWorktree] = useState(history?.newSessionDraft?.useWorktree ?? false);
+	const [cliProjectFolders, setCliProjectFolders] = useState<string[]>([]);
 	const [panes, setPanes] = useState<SidePaneId[]>([]);
 	const [focusedPane, setFocusedPane] = useState<SidePaneId | null>(null);
+	const [expandedPane, setExpandedPane] = useState<SidePaneId | null>(null);
+	const [paneSplit, setPaneSplit] = useState(50);
+	const paneDrag = useRef<{ id: number; y: number; height: number; start: number } | null>(null);
 	const [menu, setMenu] = useState<Menu>(null);
-	const [fileMenu, setFileMenu] = useState<{ file: string; x: number; y: number } | null>(null);
+	const [fileMenu, setFileMenu] = useState<{ file: string; x: number; y: number; opener: HTMLElement } | null>(null);
 	const [query, setQuery] = useState("");
 	const [drafts, setDrafts] = useState<Record<string, string>>(() => ({
 		...Object.fromEntries(Object.entries(history?.composerDrafts ?? {}).filter(([id, text]) => typeof text === "string" && sessions.some((item) => item.id === id))),
@@ -345,12 +444,14 @@ export function App() {
 	backgroundWorkRef.current = backgroundWork;
 	const [suggestions, setSuggestions] = useState<Record<string, string>>({});
 	const suggestionGeneration = useRef<Record<string, number>>({});
-	const [popIndex, setPopIndex] = useState(0);
+	const [popValue, setPopValue] = useState<string | null>(null);
 	const popupList = useRef<HTMLDivElement>(null);
+	const [skillCommands, setSkillCommands] = useState<{ folder: string; names: Set<string> } | null>(null);
+	const skillRequest = useRef<{ folder: string; commands: GrokCommand[] } | null>(null);
 	const [popClosed, setPopClosed] = useState("");
 	const [sideOpen, setSideOpen] = useState(false);
 	const [promptLibrary, setPromptLibrary] = useState<{ mode: "save" | "insert"; sessionId: string; text: string; start: number; end: number } | null>(null);
-	const [sideText, setSideText] = useState("");
+	const [sideTexts, setSideTexts] = useState<Record<string, string>>({});
 	const [sideChats, setSideChats] = useState<Record<string, ChatMessage[]>>({});
 	const [sideAgents, setSideAgents] = useState<Record<string, string>>({});
 	const sideSeen = useRef<Record<string, string>>({});
@@ -396,6 +497,7 @@ export function App() {
 	const [settingsOpen, setSettingsOpen] = useState<SettingsTab | null>(null);
 	const [setup, setSetup] = useState<{ result?: GrokReadiness; open: boolean; checking: boolean; installing: "" | "grok" | "git" | "update" }>({ open: false, checking: false, installing: "" });
 	const setupCheck = useRef(0);
+	const setupFromAbout = useRef(false);
 	const [confirms, setConfirms] = useState<ConfirmItem[]>([]);
 	const confirmQueue = useRef<ConfirmItem[]>([]);
 	const confirmIds = useRef(0);
@@ -403,13 +505,15 @@ export function App() {
 	const confirmShown = useRef(false);
 	const answerRef = useRef<(yes: boolean) => void>(() => {});
 	const [renaming, setRenaming] = useState<string | null>(null);
-	const [extraChats, setChatState] = useState<Record<string, ChatMessage[]>>(() => restoredChats(history?.extraChats ?? {}));
+	const [extraChats, setChatState] = useState<Record<string, ChatMessage[]>>(() => restoredChats(history?.extraChats ?? {}, history?.sessions));
 	const urgentSave = useRef(false);
 	const setExtraChats = useCallback((update: SetStateAction<Record<string, ChatMessage[]>>) => {
 		urgentSave.current = true;
 		setChatState(update);
 	}, []);
 	const [deleted, setDeleted] = useState<string[]>(history?.deleted ?? []);
+	const deletedRef = useRef(deleted);
+	deletedRef.current = deleted;
 	const [views, setViews] = useState<Record<string, TranscriptView>>({});
 	const [findTick, setFindTick] = useState(0);
 	const [findAt, setFindAt] = useState({ tick: 0, text: "" });
@@ -418,7 +522,8 @@ export function App() {
 	const [servers, setServers] = useState<GrokMcpServer[]>([]);
 	const [diffScope, setDiffScope] = useState<Record<string, string>>({});
 	const [commits, setCommits] = useState<Record<string, { sha: string; short: string; subject: string }[]>>({});
-	const [branches, setBranches] = useState<Record<string, BranchInfo | undefined>>({});
+	const [branches, setBranches] = useState<Record<string, { folder: string; info: BranchInfo } | undefined>>({});
+	const [missingFolders, setMissingFolders] = useState<Record<string, string>>({});
 	const [prs, setPrs] = useState<Record<string, PrStatus | undefined>>({});
 	const [comments, setComments] = useState<Record<string, DiffComment[]>>({});
 	const [viewed, setViewed] = useState<Record<string, Record<string, string>>>({});
@@ -426,6 +531,10 @@ export function App() {
 	const [diffTick, setDiffTick] = useState(0);
 	const [remoteTick, setRemoteTick] = useState(0);
 	const [diffs, setDiffs] = useState<Record<string, DiffSnapshot | undefined>>({});
+	const [changeList, setChangeList] = useState<{ key: string; context: string; revision: string; snapshot: DiffSnapshot }>();
+	const [changePatch, setChangePatch] = useState<ChangePatch>();
+	const [changeMarks, setChangeMarks] = useState<{ key: string; values: Map<string, string> }>();
+	const changeRead = useRef<ChangeRead | null>(null);
 	const [folderLists, setFolderLists] = useState<Record<string, FolderFiles | undefined>>({});
 	const [openFiles, setOpenFiles] = useState<Record<string, OpenFile | undefined>>({});
 	const [editorDrafts, setEditorDrafts] = useState<History["editorDrafts"]>(() => Object.fromEntries(Object.entries(history?.editorDrafts ?? {}).map(([key, draft]) => [key, draft && { ...draft, saving: false }])));
@@ -435,8 +544,6 @@ export function App() {
 	const [terminals, setTerminals] = useState<Record<string, TerminalTab[]>>({});
 	const terminalsRef = useRef(terminals);
 	terminalsRef.current = terminals;
-	const terminalVisible = useRef(false);
-	const terminalGeneration = useRef(0);
 	const [activeTerminal, setActiveTerminal] = useState<Record<string, string>>({});
 	const [terminalError, setTerminalError] = useState("");
 	const [browserTabs, setBrowserTabs] = useState<Record<string, BrowserTab[]>>({});
@@ -448,17 +555,6 @@ export function App() {
 	useEffect(() => () => { for (const timer of Object.values(browserActivityTimers.current)) { clearTimeout(timer); } }, []);
 	const [devScripts, setDevScripts] = useState<Record<string, { script: string; command: string }[]>>({});
 	const [devTabs, setDevTabs] = useState<Record<string, string>>({});
-	useEffect(() => {
-		const visible = panes.includes("terminal");
-		if (terminalVisible.current && !visible) {
-			terminalGeneration.current += 1;
-			for (const tab of Object.values(terminalsRef.current).flat()) { void window.grokCode?.terminalClose?.(tab.id); }
-			setTerminals({});
-			setActiveTerminal({});
-			setDevTabs({});
-		}
-		terminalVisible.current = visible;
-	}, [panes]);
 	const [selectTick, setSelectTick] = useState(0);
 	const [modes, setModes] = useState<Record<string, PermissionMode>>(history?.modes ?? {});
 	const [prePlan, setPrePlan] = useState<Record<string, PermissionMode>>(history?.prePlan ?? {});
@@ -470,10 +566,23 @@ export function App() {
 	const [breakdown, setBreakdown] = useState<(ContextBreakdown & { id: string }) | null>(null);
 	const [recentUsd, setRecentUsd] = useState<number | null>(null);
 	const [limit, setLimit] = useState<GrokLimit | null>(null);
+	const [limitStale, setLimitStale] = useState(false);
+	const limitRead = useRef(0);
+	const [signInStatus, setSignInStatus] = useState<GrokSignInStatus>();
+	const signInEpoch = useRef(0);
+	const [cloudKeyStatus, setCloudKeyStatus] = useState<CursorKeyStatus>();
+	const cloudKeyEpoch = useRef(0);
+	const cloudKeyAvailable = !!cloudKeyStatus?.hasKey && cloudKeyStatus.keyReadable;
+	const [cloudSetup, setCloudSetup] = useState<{ id: string; folder: string; result?: CursorSetupResult } | null>(null);
+	const cloudSetupEpoch = useRef(0);
+	const [cursorModels, setCursorModels] = useState<CursorModel[]>([]);
+	const keyMode = setup.result?.grok.signIn === "key" || (!setup.result?.grok.keyIgnored && (signInStatus?.mode ?? setup.result?.grok.signInMode) === "key");
 	const [account, setAccount] = useState<GrokAccount | null | undefined>(readAccount);
 	const [addingFolder, setAddingFolder] = useState(false);
 	const [windowWidth, setWindowWidth] = useState(() => window.innerWidth ?? 1400);
-	const sideCol = useRef<HTMLDivElement | null>(null);
+	const [resizePreview, setResizePreview] = useState<{ key: ColumnWidth; width: number } | null>(null);
+	const resizeCleanup = useRef<(() => void) | null>(null);
+	useEffect(() => () => resizeCleanup.current?.(), []);
 	const turnTargets = useRef<Record<string, TurnTarget>>({});
 	const sessionsRef = useRef(sessions);
 	const loopEpoch = useRef<Record<string, number>>({});
@@ -487,9 +596,11 @@ export function App() {
 	const creatingWorktree = useRef(false);
 	const autoArchiving = useRef(new Set<string>());
 	const settingsRef = useRef(settings);
-	const keyActions = useRef<Record<string, () => void>>({});
+	const keyActions = useRef<Record<string, () => void> & { restorePane?: () => boolean }>({});
 	const inboundAccept = useRef<(agentSessionId: string, text: string) => InboundResult>(() => ({ accepted: false }));
 	const overlayOpen = useRef(false);
+	const overlayOpener = useRef<HTMLElement | null>(null);
+	const escapeStopAfter = useRef(0);
 	const settingsShown = useRef(false);
 	const editorDraftsRef = useRef(editorDrafts);
 	const queuedRef = useRef(queued);
@@ -497,8 +608,23 @@ export function App() {
 	const promptRef = useRef<HTMLTextAreaElement | null>(null);
 	const appVersion = useRef("");
 	sessionsRef.current = sessions;
-	overlayOpen.current = menu !== null || fileMenu !== null || shortcuts || settingsOpen !== null || rewindAsk !== null || setup.open || promptLibrary !== null;
-	settingsShown.current = settingsOpen !== null;
+	const hasOverlay = menu !== null || fileMenu !== null || shortcuts || settingsOpen !== null || rewindAsk !== null || setup.open || promptLibrary !== null;
+	const settingsCover = settingsOpen !== null || (setup.open && setupFromAbout.current);
+	if (hasOverlay && !overlayOpen.current && !promptLibrary) {
+		overlayOpener.current = document.activeElement as HTMLElement | null;
+	}
+	overlayOpen.current = hasOverlay;
+	useLayoutEffect(() => {
+		if (!hasOverlay) { return; }
+		return () => { escapeStopAfter.current = Date.now() + ESCAPE_STOP_GRACE_MS; };
+	}, [hasOverlay]);
+	useEffect(() => {
+		if (hasOverlay) { return; }
+		const opener = overlayOpener.current;
+		overlayOpener.current = null;
+		if (opener?.isConnected && document.activeElement === document.body) { opener.focus(); }
+	}, [hasOverlay]);
+	settingsShown.current = settingsCover;
 	confirmShown.current = confirms.length > 0;
 	pendingRef.current = pending;
 	draftsRef.current = drafts;
@@ -512,12 +638,28 @@ export function App() {
 	const lastSaved = useRef<History | null>(history ? { sessions, extraChats, modes, prePlan, editorDrafts, composerDrafts: drafts, queued, attachments, backgroundWork, newSessionDraft: restoredForm ? history.newSessionDraft : undefined, deleted } : null);
 	const saveHistory = useRef<() => boolean>(() => true);
 
+	useEffect(() => {
+		const orphaned = new Set(Object.keys(terminalsRef.current).filter((id) => !terminalOwner(id)));
+		if (!orphaned.size) { return; }
+		const closed = new Set<string>();
+		for (const id of orphaned) {
+			for (const tab of terminalsRef.current[id] ?? []) {
+				closed.add(tab.id);
+				stopTerminal(tab.id);
+			}
+		}
+		setTerminals((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !orphaned.has(id))));
+		setActiveTerminal((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !orphaned.has(id))));
+		setDevTabs((current) => Object.fromEntries(Object.entries(current).filter(([, id]) => !closed.has(id))));
+	}, [sessions, pending, deleted]);
+
 	function answerConfirm(yes: boolean, id = confirmQueue.current[0]?.id) {
 		const first = confirmQueue.current[0];
 		if (!first || first.id !== id) { return; }
 		const next = confirmQueue.current.slice(1);
 		confirmQueue.current = next;
 		confirmShown.current = next.length > 0;
+		if (!next.length) { escapeStopAfter.current = Date.now() + ESCAPE_STOP_GRACE_MS; }
 		setConfirms(next);
 		first.resolve(yes);
 	}
@@ -548,10 +690,22 @@ export function App() {
 		setAttachmentsState(attachmentsRef.current);
 	}
 
+	const persistSettings = useCallback((next: AppSettings) => {
+		try {
+			localStorage.setItem(settingsKey, JSON.stringify(next));
+			return true;
+		} catch {
+			setNotice("Settings could not be saved. Changes last until the app closes.");
+			return false;
+		}
+	}, [setNotice]);
+
 	function changeSettings(patch: Partial<AppSettings>) {
-		settingsRef.current = { ...settingsRef.current, ...patch };
+		const next = { ...settingsRef.current, ...patch };
+		settingsRef.current = next;
 		if (patch.promptSuggestions === false) { clearSuggestions(); }
-		setSettings((current) => ({ ...current, ...patch }));
+		setSettings(next);
+		return persistSettings(next);
 	}
 
 	function invalidateSuggestion(id: string) {
@@ -581,22 +735,35 @@ export function App() {
 		return (grokTasks[session.id] ?? []).filter((task) => task.status === "running").length + (subagents[session.id] ?? []).filter((agent) => agent.status === "running").length;
 	}
 
-	function checkSetup(open = true) {
+	function checkSetup(open = true, openOnFailure = true) {
 		const api = window.grokCode;
 		if (!api?.readiness) { return; }
 		const check = ++setupCheck.current;
 		setSetup((current) => ({ ...current, open: open || current.open, checking: true }));
-		void api.readiness({ folder: session.folder, full: open }).then((result) => {
+		void api.readiness({ folder: session.folder || api.homeDir || "", full: open }).then((result) => {
 			if (check !== setupCheck.current) { return; }
 			// The account menu keeps the version from the last Grok session start, and Grok may have updated itself since.
 			const version = result.grok.ok ? result.grok.version : "";
 			if (version) { setAccount((current) => (current && current.version !== version ? { ...current, version } : current)); }
-			setSetup((current) => ({ ...current, result, open: current.open || !result.grok.ok || !result.grok.signedIn, checking: false }));
+			setSetup((current) => ({ ...current, result, open: current.open || (openOnFailure && (!result.grok.ok || !result.grok.signedIn)), checking: false }));
 		}).catch(() => {
 			if (check !== setupCheck.current) { return; }
 			setSetup((current) => ({ ...current, checking: false }));
 			setNotice("Setup could not be checked. Try again.");
 		});
+	}
+
+	function openSetupFromAbout() {
+		if (!window.grokCode?.readiness) { return; }
+		setupFromAbout.current = true;
+		setSettingsOpen(null);
+		checkSetup();
+	}
+
+	function closeSetup() {
+		if (setupFromAbout.current) { setSettingsOpen("about"); }
+		setupFromAbout.current = false;
+		setSetup((current) => ({ ...current, open: false }));
 	}
 
 	async function runInstall(kind: "grok" | "git" | "update") {
@@ -614,13 +781,30 @@ export function App() {
 		checkSetup();
 	}
 
-	useEffect(() => { checkSetup(false); }, []);
+	function loadSignInStatus() {
+		const epoch = signInEpoch.current;
+		void window.grokCode?.signInStatus?.().then((result) => {
+			if (epoch === signInEpoch.current) { setSignInStatus(result); }
+		}).catch(() => {});
+	}
+
+	function loadCloudKeyStatus() {
+		const epoch = cloudKeyEpoch.current;
+		void window.grokCode?.cloudKeyStatus?.().then((result) => {
+			if (epoch === cloudKeyEpoch.current) { setCloudKeyStatus(result); }
+		}).catch(() => {});
+	}
+
+	useEffect(() => { loadSignInStatus(); loadCloudKeyStatus(); checkSetup(false, !firstRun); }, []);
 
 	useEffect(() => { void window.grokCode?.inbound?.(settings.acceptLocalTurns).then((result) => { if (result && !result.ok) { setNotice(result.error || "Turns from local tools could not be switched."); } }); }, [settings.acceptLocalTurns]);
 
 	useEffect(() => {
 		const reload = (event: StorageEvent) => {
-			if (event.key === settingsKey) { setSettings(readSettings()); }
+			if (event.key === settingsKey) {
+				settingsRef.current = readSettings();
+				setSettings(settingsRef.current);
+			}
 			if (event.key === historyKey) {
 				const saved = readHistory();
 				const manual = new Map((saved?.sessions ?? []).filter((item) => item.titleAuto === false).map((item) => [item.id, item.title]));
@@ -633,9 +817,13 @@ export function App() {
 				if (!last) { return; }
 				const remoteSessions = new Map((saved?.sessions ?? []).map((item) => [item.id, item]));
 				const watchPatches = new Map<string, Partial<Session>>();
+				const cloudPatches = new Map<string, Pick<Session, "cloud" | "cloudModelLabel">>();
 				for (const item of sessionsRef.current) {
 					const remote = remoteSessions.get(item.id);
 					const old = last.sessions.find((entry) => entry.id === item.id);
+					if (item.environment === "Cloud" && !turnTargets.current[item.id] && remote?.cloud && item.cloud === old?.cloud && JSON.stringify(item.cloud) !== JSON.stringify(remote.cloud)) {
+						cloudPatches.set(item.id, { cloud: remote.cloud, cloudModelLabel: item.cloudModelLabel === old?.cloudModelLabel ? remote.cloudModelLabel : item.cloudModelLabel });
+					}
 					if (!remote && saved?.deleted.includes(item.id)) { watchPatches.set(item.id, { prWatch: undefined }); }
 					if (!remote || (!item.prWatch && !remote.prWatch)) { continue; }
 					const patch: Partial<Session> = {};
@@ -645,6 +833,12 @@ export function App() {
 					}
 					if (item.archived === old?.archived && item.archived !== remote.archived) { patch.archived = remote.archived; }
 					if (Object.keys(patch).length) { watchPatches.set(item.id, patch); }
+				}
+				if (cloudPatches.size) {
+					const adoptCloud = (item: Session) => cloudPatches.has(item.id) ? { ...item, ...cloudPatches.get(item.id) } : item;
+					lastSaved.current = { ...last, sessions: last.sessions.map(adoptCloud) };
+					sessionsRef.current = sessionsRef.current.map(adoptCloud);
+					setSessions((current) => current.map(adoptCloud));
 				}
 				const added = (saved?.sessions ?? []).filter((item) => item.prWatch && !sessionsRef.current.some((entry) => entry.id === item.id));
 				if (watchPatches.size || added.length) { setSessions((current) => [...current.map((item) => watchPatches.has(item.id) ? { ...item, ...watchPatches.get(item.id) } : item), ...added.filter((item) => !current.some((entry) => entry.id === item.id))]); }
@@ -678,13 +872,7 @@ export function App() {
 		return () => window.removeEventListener("storage", reload);
 	}, []);
 
-	useEffect(() => {
-		try {
-			localStorage.setItem(settingsKey, JSON.stringify(settings));
-		} catch {
-			setNotice("Settings could not be saved. Changes last until the app closes.");
-		}
-	}, [settings]);
+	useEffect(() => { persistSettings(settingsRef.current); }, [persistSettings]);
 
 	useEffect(() => {
 		const root = typeof document === "undefined" ? undefined : document.documentElement;
@@ -732,7 +920,7 @@ export function App() {
 				const changes = Object.fromEntries(Object.entries(item).filter(([key, value]) => value !== old?.[key as keyof Session] && !(item.titleAuto === true && remote?.titleAuto === false && (key === "title" || key === "titleAuto"))));
 				currentSessions.set(item.id, currentSessions.has(item.id) ? { ...currentSessions.get(item.id), ...changes } as Session : item);
 			}
-			const order = [...sessions.filter((item) => !savedIds.has(item.id)).map((item) => item.id), ...savedIds].filter((id) => !gone.has(id) && id !== newSessionDraft?.session.id);
+			const order = [...sessions.filter((item) => !savedIds.has(item.id)).map((item) => item.id), ...savedIds].filter((id) => !gone.has(id) && id !== newSessionDraft?.session.id && (id !== firstSessionId.current || currentSessions.get(id)?.folder));
 			const chats = slimChats(mergeChats(saved?.extraChats ?? {}, extraChats, previous?.extraChats ?? {}));
 			for (const id of gone) { delete chats[id]; }
 			const composerDrafts = { ...saved?.composerDrafts };
@@ -744,7 +932,7 @@ export function App() {
 			const queue = { ...saved?.queued };
 			for (const [id, items] of Object.entries(currentQueue)) {
 				if (items === previous?.queued?.[id]) { continue; }
-				if (items.length) { queue[id] = items; } else { delete queue[id]; }
+				if (items.length) { queue[id] = items.map((item) => item.contextFrom?.length ? { ...item, contextFrom: item.contextFrom.map((pick) => maskDisplay(pick, "title")) } : item); } else { delete queue[id]; }
 			}
 			const staged = { ...saved?.attachments };
 			for (const [id, files] of Object.entries(currentAttachments)) {
@@ -754,15 +942,18 @@ export function App() {
 			const work = { ...saved?.backgroundWork };
 			for (const [id, entry] of Object.entries(currentWork)) {
 				if (entry === previous?.backgroundWork?.[id]) { continue; }
-				const tasks = entry.tasks.filter((task) => task.status !== "running");
-				const agents = entry.agents.filter((agent) => agent.status !== "running").map((agent) => agent.output ? { ...agent, output: agent.output.slice(0, 2000) } : agent);
+				const tasks = entry.tasks.filter((task) => task.status !== "running").map((task) => maskDisplay(task, "label", "command"));
+				const agents = entry.agents.filter((agent) => agent.status !== "running").map((raw) => {
+					const agent = maskDisplay(raw, "label", "output");
+					return agent.output ? { ...agent, output: agent.output.slice(0, 2000) } : agent;
+				});
 				if (tasks.length || agents.length) { work[id] = { tasks, agents }; } else { delete work[id]; }
 			}
 			for (const id of Object.keys(queue)) { if (!order.includes(id)) { delete queue[id]; } }
 			for (const id of Object.keys(staged)) { if (!order.includes(id)) { delete staged[id]; } }
 			for (const id of Object.keys(work)) { if (!order.includes(id.startsWith("side-") ? id.slice(5) : id)) { delete work[id]; } }
 			localStorage.setItem(historyKey, JSON.stringify({
-				sessions: order.map((id) => currentSessions.get(id)),
+				sessions: order.map((id) => maskDisplay(currentSessions.get(id)!, "title", "detail")),
 				extraChats: chats,
 				modes: { ...saved?.modes, ...Object.fromEntries(Object.entries(modes).filter(([id, value]) => value !== previous?.modes[id])) },
 				prePlan: { ...saved?.prePlan, ...Object.fromEntries(Object.entries(prePlan).filter(([id, value]) => value !== previous?.prePlan[id])) },
@@ -874,6 +1065,7 @@ export function App() {
 	function readColdLoops(uiSessionId: string) {
 		if (!uiSessionId || uiSessionId.startsWith("side-")) { return; }
 		const item = sessionsRef.current.find((entry) => entry.id === uiSessionId);
+		if (item?.environment === "Cloud") { return; }
 		const agentSessionId = item?.agentSessionId;
 		const read = window.grokCode?.sessionLoops;
 		if (!agentSessionId || !read) { return; }
@@ -891,7 +1083,7 @@ export function App() {
 		return api.onEvent((event) => {
 			if (event.type === "inbound" && event.requestId) { void api.inboundResult?.(event.requestId, inboundAccept.current(event.agentSessionId ?? "", event.text ?? "")); return; }
 			if (event.type === "browser-open") {
-				if (!settingsRef.current.browserControl || event.uiSessionId !== activeIdRef.current || !event.url) { return; }
+				if (!settingsRef.current.browserControl || event.uiSessionId !== activeIdRef.current || !event.url || sessionsRef.current.some((item) => item.id === event.uiSessionId && item.environment === "Cloud")) { return; }
 				let url: URL;
 				try { url = new URL(event.url); } catch { return; }
 				if (url.protocol !== "http:" && url.protocol !== "https:") { return; }
@@ -928,6 +1120,23 @@ export function App() {
 				return;
 			}
 			if (event.type === "models" && event.models) { setModels(event.models); return; }
+			if (event.type === "sign-in-changed") {
+				signInEpoch.current++;
+				setLimit(null);
+				setLimitStale(false);
+				loadSignInStatus();
+				checkSetup(false, false);
+				return;
+			}
+			if (event.type === "cloud-key-changed") {
+				cloudKeyEpoch.current++;
+				cloudSetupEpoch.current++;
+				setCloudKeyStatus(undefined);
+				setCloudSetup(null);
+				setCursorModels([]);
+				loadCloudKeyStatus();
+				return;
+			}
 			if (event.type === "account") {
 				const value = event.account ?? null;
 				setAccount(value);
@@ -989,15 +1198,33 @@ export function App() {
 				setSessions((current) => current.map((item) => (item.id === id && item.titleAuto === true ? manual ? { ...item, title: manual.title, titleAuto: false } : item.title !== title ? { ...item, title } : item : item)));
 				return;
 			}
+			if (event.type === "cloud-state" && event.uiSessionId && event.turnId && typeof event.active === "boolean") {
+				const { uiSessionId, turnId, agentId, runId, active, branch, prUrl } = event;
+				const merge = (item: Session): Session => item.id === uiSessionId && item.environment === "Cloud" && item.cloud ? {
+					...item,
+					cloud: { ...item.cloud, turnId, active, ...(agentId ? { agentId } : {}), ...(runId ? { runId } : {}), ...(branch ? { branch } : {}), prUrl: prUrl || (branch && branch !== item.cloud.branch ? undefined : item.cloud.prUrl) },
+				} : item;
+				sessionsRef.current = sessionsRef.current.map(merge);
+				setSessions((current) => current.map(merge));
+				const item = sessionsRef.current.find((entry) => entry.id === uiSessionId);
+				if (active && item?.cloud && !turnTargets.current[uiSessionId]) { void resumeCloud(item); }
+				return;
+			}
 			// Grok ran a steer that arrived after the turn ended as a turn of its own; it shows as a new message and reply.
 			if (event.type === "turn-start" && event.uiSessionId && event.turnId) {
 				const id = event.uiSessionId;
-				if (turnTargets.current[id] || !sessionsRef.current.some((item) => item.id === id)) { return; }
+				const item = sessionsRef.current.find((entry) => entry.id === id);
+				if (!item || (!event.resume && turnTargets.current[id])) { return; }
 				const stamp = Date.now();
 				const replyId = `grok-${event.turnId}`;
 				turnTargets.current[id] = { sessionId: id, replyId, turnId: event.turnId, where: "main" };
-				const asked: ChatMessage[] = event.text ? [{ id: `user-${event.turnId}`, role: "user", text: event.text, at: stamp, live: true }] : [];
-				setExtraChats((list) => ({ ...list, [id]: [...(list[id] ?? []), ...asked, { id: replyId, role: "grok", text: "", pending: true, streaming: true, live: true }] }));
+				const reply: ChatMessage = { id: replyId, role: "grok", text: "", pending: true, streaming: true, live: true };
+				const asked: ChatMessage[] = !event.resume && event.text ? [{ id: `user-${event.turnId}`, role: "user", text: event.text, at: stamp, live: true }] : [];
+				setExtraChats((list) => {
+					const messages = list[id] ?? [];
+					const replay = event.resume && messages.some((message) => message.id === replyId);
+					return { ...list, [id]: replay ? messages.map((message) => message.id === replyId ? reply : message) : [...messages, ...asked, reply] };
+				});
 				setSessions((list) => list.map((item) => (item.id === id ? { ...item, lastActivityAt: stamp, completed: false } : item)));
 				setBusy((list) => ({ ...list, [id]: true }));
 				return;
@@ -1006,6 +1233,8 @@ export function App() {
 			const target = uiId ? turnTargets.current[uiId] : undefined;
 			if (!uiId || !target || event.turnId !== target.turnId) { return; }
 			const sessionId = target.sessionId;
+			const targetSession = sessionsRef.current.find((item) => item.id === sessionId);
+			const cloud = targetSession?.environment === "Cloud";
 			if (event.type === "mode") {
 				const nextMode = event.mode;
 				if (nextMode && target.where === "main") { changeMode(sessionId, nextMode); }
@@ -1029,16 +1258,29 @@ export function App() {
 				notify(event.tool.questions ? "question" : "permission", sessionId, event.tool.questions ? "Grok has a question." : "Grok needs your approval.");
 			}
 			if (event.type === "done" || event.type === "error") {
+				if (cloud && event.type === "done" && validMachineName(event.machine)) {
+					const repo = cursorRepoSlug(targetSession.cloud?.repoUrl).toLowerCase();
+					if (repo) { changeSettings({ cursorMachines: normalizeCursorMachines([{ name: event.machine, repo }, ...settingsRef.current.cursorMachines]) }); }
+				}
+				if (cloud && event.type === "error") { setHeld((current) => ({ ...current, [sessionId]: true })); }
 				setBusy((current) => ({ ...current, [uiId]: false }));
 				setNotices((list) => list.some((item) => item.text === SIDE_BUSY) ? list.filter((item) => item.text !== SIDE_BUSY) : list);
-				setDiffTick((value) => value + 1);
-				setRemoteTick((value) => value + 1);
-				setFileTick((value) => value + 1);
+				if (!cloud) {
+					setDiffTick((value) => value + 1);
+					setRemoteTick((value) => value + 1);
+					setFileTick((value) => value + 1);
+				}
 				if (target.where === "main") {
 					const away = sessionId !== activeIdRef.current;
 					setSessions((current) => current.map((item) => (item.id === sessionId ? { ...item, lastActivityAt: Date.now(), unread: away || item.unread, completed: false, failed: event.type === "error" } : item)));
-					notify("done", sessionId, event.type === "error" ? "Grok stopped with an error." : "Grok finished.");
+					const agent = cloud ? "Cursor" : "Grok";
+					notify("done", sessionId, event.type === "error" ? `${agent} stopped with an error.` : `${agent} finished.`);
 				}
+			}
+			if (target.awaitingReplay && event.type === "error") {
+				delete turnTargets.current[uiId];
+				if (event.message) { setNotice(event.message); }
+				return;
 			}
 			writeReply(uiId, (message) => {
 				if (event.type === "steer" && event.text) {
@@ -1048,11 +1290,11 @@ export function App() {
 					const base = message.pending ? "" : message.text;
 					const parts = [...(message.parts ?? [])];
 					const last = parts[parts.length - 1];
-					if (last && last.kind === "text") { parts[parts.length - 1] = { kind: "text", text: last.text + event.text }; } else { parts.push({ kind: "text", text: event.text }); }
-					return { ...message, pending: false, text: base + event.text, parts };
+					if (last && last.kind === "text") { parts[parts.length - 1] = { kind: "text", text: redactKeys(last.text + event.text) }; } else { parts.push({ kind: "text", text: redactKeys(event.text) }); }
+					return { ...message, pending: false, text: redactKeys(base + event.text), parts };
 				}
 				if (event.type === "thought" && event.text) {
-					return { ...message, thought: (message.thought ?? "") + event.text };
+					return { ...message, thought: redactKeys((message.thought ?? "") + event.text) };
 				}
 				if (event.type === "tool" && event.tool) {
 					const tools = message.tools ? [...message.tools] : [];
@@ -1084,19 +1326,18 @@ export function App() {
 				if (event.type === "done") {
 					const stoppedTurn = event.stopReason === "cancelled";
 					if (message.pending && !message.text) {
-						return { ...message, at: Date.now(), pending: false, streaming: false, text: stoppedTurn ? "Stopped." : "No reply." };
+						return replyWithNote({ ...message, at: Date.now() }, stoppedTurn ? "Stopped." : "No reply.");
 					}
 					return { ...message, at: Date.now(), pending: false, streaming: false };
 				}
 				if (event.type === "error" && event.message) {
-					const prefix = message.text ? `${message.text}\n` : "";
-					return { ...message, at: Date.now(), pending: false, streaming: false, text: `${prefix}${event.message}`, parts: [...(message.parts ?? []), { kind: "text", text: `${message.text ? "\n" : ""}${event.message}` }] };
+					return replyWithNote({ ...message, at: Date.now() }, event.message);
 				}
 				return message;
 			}, event.type === "chunk" || event.type === "thought");
 			if (event.type === "done" || event.type === "error") {
 				delete turnTargets.current[uiId];
-				if (target.where === "main" && event.type === "done" && event.stopReason !== "cancelled" && settingsRef.current.promptSuggestions) {
+				if (!cloud && target.where === "main" && event.type === "done" && event.stopReason !== "cancelled" && settingsRef.current.promptSuggestions) {
 					const generation = suggestionGeneration.current[sessionId] ?? 0;
 					suggestionGeneration.current[sessionId] = generation;
 					void api.suggestPrompt?.(sessionId).then((text) => {
@@ -1108,14 +1349,103 @@ export function App() {
 			}
 		});
 	}, [writeReply, openUpdate]);
+	useEffect(() => {
+		for (const item of sessionsRef.current) {
+			if (item.environment === "Cloud" && item.cloud?.active) { void resumeCloud(item); }
+		}
+	}, []);
 
 	const visible = pending ?? sessions.find((item) => item.id === activeId) ?? sessions.find((item) => !item.archived) ?? sessions[0];
 	const session = visible;
+	const isCloud = session.environment === "Cloud";
+	const firstRun = !!pending && !history?.sessions.length && !sessions.some((item) => item.agentSessionId || (item.id !== pending.id && item.folder));
 	useEffect(() => {
-		if (!panes.includes("browser")) {
-			void window.grokCode?.browserTabs?.({ uiSessionId: session.id, enabled: settings.browserControl, visible: false, activeId: "", tabs: [] }).catch(() => {});
+		if (!firstRun) { return; }
+		let cancelled = false;
+		void window.grokCode?.listCliProjectFolders?.().then((folders) => {
+			if (!cancelled) { setCliProjectFolders(folders); }
+		}).catch(() => {});
+		return () => { cancelled = true; };
+	}, [firstRun]);
+	const visiblePanes = isCloud ? panes.filter((pane) => pane === "editor") : panes;
+	const fullPane = expandedPane && visiblePanes.includes(expandedPane) ? expandedPane : null;
+	const shownPaneIds = fullPane ? [fullPane] : visiblePanes;
+	const browserVisible = shownPaneIds.includes("browser");
+	const cloudSetupResult = cloudSetup?.id === session.id && cloudSetup.folder === session.folder ? cloudSetup.result : undefined;
+	const cloudCatalog = pending ? cloudSetupResult?.models ?? [] : cursorModels;
+	const cloudChoice = isCloud ? session.cloud?.model ?? defaultVariant(cloudCatalog) : undefined;
+	const cloudModel = cloudCatalog.find((item) => item.id === cloudChoice?.id);
+	const cloudVariant = cloudChoice && cloudModel?.variants.find((item) => sameCloudParams(item.params, cloudChoice.params));
+	const machineDraft = pending?.cloudMachineDraft;
+	const machineMode = typeof machineDraft === "string";
+	const machineName = machineMode ? machineDraft.trim() : "";
+	const machineRef = cloudSetupResult?.ref ?? "";
+	const machineRefValid = /^[A-Za-z0-9._\/-]+$/.test(machineRef);
+	const machineReady = validMachineName(machineName) && machineRefValid;
+	const machineRepo = cursorRepoSlug(cloudSetupResult?.repoUrl);
+	const cloneName = `${machineRepo.split("/").at(-1)}-cursor-${machineName}`;
+	const clonePath = cloneName.startsWith("-") ? `./${cloneName}` : cloneName;
+	const machineCommands = machineMode && machineReady && machineRepo ? [
+		`git clone ${cloudSetupResult?.repoUrl}.git ${clonePath}`,
+		`cursor-agent worker start --name ${machineName} --worker-dir ${clonePath}`,
+	] : [];
+	const cloudReady = cloudKeyAvailable && cloudSetupResult?.ok && cloudSetupResult.reachable === true && !!cloudSetupResult.repoUrl && !!cloudSetupResult.ref && !cloudSetupResult.modelsError && !!cloudVariant && (!machineMode || machineReady);
+	const cloudModelLabel = cloudModel && cloudVariant
+		? `${cloudModel.displayName}${cloudVariant.isMaxMode ? " · Max" : ""}`
+		: session.cloudModelLabel || cloudChoice?.id || "Cursor model";
+	const cloudModelLocked = !!session.cloud?.agentId || !!busy[session.id] || !!session.cloud?.active;
+
+	async function checkCloudSetup(item: Session) {
+		const epoch = ++cloudSetupEpoch.current;
+		const { id, folder } = item;
+		setCloudSetup({ id, folder });
+		let result: CursorSetupResult;
+		try {
+			const setup = window.grokCode?.cloudSetup;
+			result = setup ? await setup(folder) : { ok: false, error: "Reopen this window to check Cloud setup." };
+		} catch {
+			result = { ok: false, error: "Cloud setup could not be checked. Try again." };
 		}
-	}, [session.id, settings.browserControl, panes]);
+		if (epoch !== cloudSetupEpoch.current) { return; }
+		setCloudSetup({ id, folder, result });
+		if (result.models?.length) { setCursorModels(result.models); }
+	}
+
+	useEffect(() => {
+		if (!pending?.folder || !isCloud || !cloudKeyAvailable) { return; }
+		void checkCloudSetup(pending);
+		return () => { cloudSetupEpoch.current++; };
+	}, [pending?.id, pending?.folder, isCloud, cloudKeyAvailable, cloudKeyStatus]);
+
+	function changeCloudChoice(model: CursorModel, variant: CursorVariant, autoCreatePR?: boolean) {
+		const update = (item: Session): Session => {
+			if (item.id !== session.id || item.environment !== "Cloud" || item.cloud?.agentId || turnTargets.current[item.id]) { return item; }
+			return {
+				...item,
+				cloudModelLabel: `${model.displayName}${variant.isMaxMode ? " · Max" : ""}`,
+				cloud: {
+					...item.cloud,
+					repoUrl: item.cloud?.repoUrl ?? cloudSetupResult?.repoUrl ?? "",
+					ref: item.cloud?.ref ?? cloudSetupResult?.ref ?? "",
+					model: { id: model.id, params: variant.params },
+					autoCreatePR: autoCreatePR ?? item.cloud?.autoCreatePR ?? false,
+				},
+			};
+		};
+		if (pending) { setPending((item) => item ? update(item) : item); }
+		else { setSessions((items) => items.map(update)); }
+	}
+
+	const browserPaneIds = [...new Set([
+		...Object.keys(browserTabs).filter((id) => id === session.id || keptForm.current?.session.id === id || sessions.some((item) => item.id === id && !item.archived)),
+		...(browserVisible ? [session.id] : []),
+	])];
+	const currentBrowserMounted = browserPaneIds.includes(session.id);
+	useLayoutEffect(() => {
+		if (!currentBrowserMounted) {
+			void window.grokCode?.browserTabs?.({ uiSessionId: session.id, enabled: !isCloud && settings.browserControl, visible: false, activeId: "", tabs: [] }).catch(() => {});
+		}
+	}, [session.id, isCloud, settings.browserControl, currentBrowserMounted]);
 	useEffect(() => { setRewindAsk(null); }, [session.id]);
 	// The session on screen, which is the first one before any is picked; a new-session page is none.
 	activeIdRef.current = pending ? "" : session.id;
@@ -1123,6 +1453,8 @@ export function App() {
 	const mode = knownMode(modes[session.id] ?? settings.defaultMode, settings);
 	const view = views[session.id] ?? settings.defaultView;
 	const prompt = drafts[session.id] ?? "";
+	const sideText = sideTexts[session.id] ?? "";
+	const setSideText = (text: string) => setSideTexts((current) => ({ ...current, [session.id]: text }));
 	const setPrompt = (next: string | ((current: string) => string)) => {
 		const sessionId = session.id;
 		const current = draftsRef.current;
@@ -1133,12 +1465,32 @@ export function App() {
 	};
 	const messages = extraChats[session.id] ?? [];
 	const scope = diffScope[session.id] ?? "uncommitted";
-	const diffOpen = panes.includes("diff");
+	const diffOpen = visiblePanes.includes("diff");
 	const railOpen = settings.railOpen;
-	const sidebarCollapsed = settings.sidebarCollapsed || shouldCollapseSidebar(windowWidth, panes.length > 0);
-	const paneWidth = Math.min(settings.sideWidth, sideCap(windowWidth, sidebarCollapsed));
+	const panesOpen = visiblePanes.length > 0;
+	const sidebarCollapsed = settings.sidebarCollapsed || shouldCollapseSidebar(windowWidth, panesOpen);
+	const sidebarActiveId = pending ? "" : session.id;
+	const previousSidebarId = useRef(sidebarActiveId);
+	const revealSidebarProject = useRef(false);
+	useLayoutEffect(() => {
+		if (!sidebarCollapsed) { revealSidebarProject.current = false; }
+		else if (sidebarActiveId && previousSidebarId.current !== sidebarActiveId) { revealSidebarProject.current = true; }
+		previousSidebarId.current = sidebarActiveId;
+	}, [sidebarActiveId, sidebarCollapsed]);
+	const preferredWidth = (key: ColumnWidth) => resizePreview?.key === key ? resizePreview.width : settings[key];
+	const sidebarCap = Math.min(COLUMN_MAX, windowWidth - chatMin(windowWidth) - (panesOpen ? PANE_MIN + PANE_SPLITTER_WIDTH : 0));
+	const sidebarWidth = sidebarCollapsed ? 0 : Math.min(Math.max(SIDEBAR_MIN, preferredWidth("sidebarWidth")), sidebarCap);
+	const paneCap = sideCap(windowWidth, sidebarWidth);
+	const twoColumnMin = PANE_MIN * 2 + PANE_SPLITTER_WIDTH * 3;
+	const paneColumns = shownPaneIds.length >= 3 && paneCap >= twoColumnMin ? 2 : 1;
+	const paneMin = paneColumns === 2 ? twoColumnMin : PANE_MIN;
+	const paneWidth = Math.min(Math.max(paneMin, preferredWidth("sideWidth")), paneCap);
+	const firstPaneColumn = Math.ceil(shownPaneIds.length / paneColumns);
+	const paneRows = Math.max(1, firstPaneColumn);
+	const railWidth = Math.min(Math.max(RAIL_MIN, preferredWidth("railWidth")), COLUMN_MAX);
 	// Like Claude's rail, it steps aside when the chat column would get too narrow.
-	const railShown = railOpen && windowWidth - (sidebarCollapsed ? 0 : 260) - (panes.length ? paneWidth : 0) - 280 >= 560;
+	const railCap = Math.min(COLUMN_MAX, windowWidth - sidebarWidth - (panesOpen ? paneWidth + PANE_SPLITTER_WIDTH : 0) - RAIL_CHAT_MIN);
+	const railShown = !isCloud && railOpen && railWidth <= railCap;
 	const model = session.model ?? settings.model;
 	const effort = session.effort ?? settings.effort;
 	const modelInfo = models.find((item) => item.id === model);
@@ -1147,9 +1499,133 @@ export function App() {
 	const fastBase = Object.entries(FAST_MODEL).find(([, fast]) => fast === model)?.[0];
 	const baseModel = fastBase ?? model;
 	const fastOn = !!fastBase;
+	const branchRead = branches[session.id];
+	const branch = branchRead?.folder === session.folder ? branchRead.info : undefined;
+	function folderUnavailable(item: Session) {
+		if (item.environment !== "Local") { return false; }
+		const read = branches[item.id];
+		return missingFolders[item.id] === item.folder || (read?.folder === item.folder && missingFolderError(read.info.error));
+	}
+	const folderMissing = !pending && folderUnavailable(session);
+	const titleBranch = isCloud ? session.cloud?.branch ?? session.branch : branch?.ok && branch.repo !== false ? branch.branch : undefined;
+	const worktreeReason = !session.folder ? "Choose a project folder first."
+		: setup.result?.git.ok === false ? "Git is not installed."
+		: !window.grokCode?.branchInfo || !window.grokCode.addWorktree ? "Reopen this window to use worktrees."
+		: !branch ? "Checking the folder for Git…"
+		: !branch.ok ? branch.error || "The folder could not be checked for Git."
+		: branch.repo === false ? "This folder is not a Git checkout."
+		: "";
 
 	useEffect(() => {
-		if (!diffOpen && !railShown) { return; }
+		const api = window.grokCode;
+		if (session.environment !== "Local" || !session.folder || !api?.branchInfo) { return; }
+		const { id, folder } = session;
+		let cancel = false;
+		void api.branchInfo(folder).catch(() => ({ ok: false })).then((info) => {
+			if (!cancel) { setBranches((current) => ({ ...current, [id]: { folder, info } })); }
+		});
+		return () => { cancel = true; };
+	}, [session.id, session.folder, session.environment, diffTick]);
+
+	const progressiveChanges = !!window.grokCode?.readChanges && !!window.grokCode?.stopChanges;
+	const wantsChangeList = progressiveChanges && (diffOpen || railShown) && !!session.folder;
+	const changesContext = JSON.stringify([session.id, session.folder, scope]);
+	const changesKey = JSON.stringify([changesContext, diffTick, diffOpen]);
+	const inventory = changeList?.key === changesKey ? changeList.snapshot : undefined;
+	const shownInventory = inventory ?? (changeList?.context === changesContext && changeList.snapshot.ok ? changeList.snapshot : undefined);
+	const patchTarget = inventory?.files?.find((file) => file.path === diffFile) ?? inventory?.files?.[0];
+	const patchKey = diffOpen && patchTarget ? JSON.stringify([changeList?.revision, patchTarget.path]) : "";
+	const activePatch = changePatch?.key === patchKey ? changePatch : undefined;
+	const knownMarks = changeMarks?.key === changesKey ? changeMarks.values : undefined;
+	const paneChanges = useMemo(() => {
+		if (!shownInventory?.files || (!activePatch?.file && !knownMarks?.size)) { return shownInventory; }
+		return { ...shownInventory, files: shownInventory.files.map((file) => {
+			const patch = activePatch?.file;
+			if (patch?.path === file.path) { return { ...file, ...patch, additions: file.additions ?? patch.additions, deletions: file.deletions ?? patch.deletions, patchLoaded: true }; }
+			const patchFingerprint = knownMarks?.get(file.path);
+			return patchFingerprint ? { ...file, patchFingerprint } : file;
+		}) };
+	}, [shownInventory, activePatch?.file, knownMarks]);
+
+	function cancelChangeRead(read: ChangeRead) {
+		if (changeRead.current !== read) { return; }
+		changeRead.current = null;
+		void window.grokCode?.stopChanges?.(read.id).catch(() => {});
+	}
+
+	function readChanges(key: string, input: Omit<ChangesRequest, "id">, onResult: (snapshot: DiffSnapshot) => void): ChangeRead {
+		if (changeRead.current) { cancelChangeRead(changeRead.current); }
+		const read = { id: crypto.randomUUID(), key, patch: input.file !== undefined };
+		changeRead.current = read;
+		const finish = (result: DiffSnapshot) => {
+			if (changeRead.current !== read) { return; }
+			changeRead.current = null;
+			onResult(result);
+		};
+		void window.grokCode?.readChanges?.({ ...input, id: read.id }).then(finish).catch(() => finish({ ok: false, error: read.patch ? "The file diff could not be read." : "The changed files could not be read." }));
+		return read;
+	}
+
+	useEffect(() => {
+		setChangeMarks(undefined);
+		if (!wantsChangeList) { setChangeList(undefined); return; }
+		setChangeList((current) => current?.key === changesKey ? { ...current, key: "" } : current);
+		const read = readChanges(changesKey, { cwd: session.folder, scope }, (snapshot) => setChangeList({ key: changesKey, context: changesContext, revision: read.id, snapshot }));
+		return () => cancelChangeRead(read);
+	}, [wantsChangeList, changesKey]);
+
+	function rememberChangeMark(file: string, fingerprint: string | null) {
+		setChangeMarks((current) => {
+			const existing = current?.key === changesKey ? current.values : undefined;
+			if (!fingerprint && !existing?.has(file)) { return current; }
+			const values = new Map(existing);
+			if (fingerprint) { values.set(file, fingerprint); } else { values.delete(file); }
+			return { key: changesKey, values };
+		});
+	}
+
+	function loadChangePatch(full = false) {
+		if (!patchKey || !patchTarget) { return; }
+		const { path: file, from } = patchTarget;
+		setChangePatch((current) => ({ key: patchKey, file: full && current?.key === patchKey ? current.file : undefined, loading: true }));
+		readChanges(patchKey, { cwd: session.folder, scope, file, ...(from ? { from } : {}), full }, (snapshot) => {
+			const result = snapshot.ok ? snapshot.files?.find((entry) => entry.path === file) : undefined;
+			if (!result) {
+				setChangePatch((current) => ({ ...current, key: patchKey, loading: false, error: snapshot.error || "This file is no longer in the changes. Refresh the list." }));
+				return;
+			}
+			setChangePatch({ key: patchKey, file: result, loading: false, full });
+			const mark = viewed[session.id]?.[file];
+			if (mark) {
+				const matches = !result.truncated && result.hunks.length > 0 && result.hunks.every((hunk) => hunk.reviewable !== false) && result.hunks.map((hunk) => hunk.id).join("\n") === mark;
+				rememberChangeMark(file, matches ? mark : null);
+			}
+		});
+	}
+
+	useEffect(() => {
+		if (!patchKey) { setChangePatch(undefined); return; }
+		if (changeRead.current && !changeRead.current.patch) { return; }
+		loadChangePatch();
+		return () => {
+			const read = changeRead.current;
+			if (read?.patch && read.key === patchKey) { cancelChangeRead(read); }
+		};
+	}, [patchKey]);
+
+	function stopChangeLoad() {
+		const read = changeRead.current;
+		if (!read) { return; }
+		cancelChangeRead(read);
+		if (read.patch) {
+			setChangePatch((current) => ({ key: read.key, file: current?.key === read.key ? current.file : undefined, loading: false, error: "Diff loading stopped." }));
+		} else {
+			setChangeList({ key: read.key, context: changesContext, revision: read.id, snapshot: { ok: false, error: "Stopped reading changed files." } });
+		}
+	}
+
+	useEffect(() => {
+		if (progressiveChanges || (!diffOpen && !railShown) || !session.folder) { return; }
 		const id = session.id;
 		const folder = session.folder;
 		const api = window.grokCode;
@@ -1164,12 +1640,11 @@ export function App() {
 		}).catch(() => {
 			if (!cancel) { setDiffs((current) => ({ ...current, [id]: { ok: false, error: "The diff could not be read." } })); }
 		});
-		void api.branchInfo?.(folder).then((result) => { if (!cancel) { setBranches((current) => ({ ...current, [id]: result })); } }).catch(() => {});
 		return () => { cancel = true; };
-	}, [diffOpen, railShown, session.id, session.folder, diffTick, scope]);
+	}, [progressiveChanges, diffOpen, railShown, session.id, session.folder, diffTick, scope]);
 
 	useEffect(() => {
-		if (!diffOpen && !railShown) { return; }
+		if ((!diffOpen && !railShown) || !session.folder) { return; }
 		const id = session.id;
 		const folder = session.folder;
 		const api = window.grokCode;
@@ -1236,7 +1711,7 @@ export function App() {
 	function createPr() {
 		const api = window.grokCode;
 		if (!api?.prCreate) { return Promise.resolve({ ok: false, error: "Reopen this window to create a pull request." }); }
-		return api.prCreate(session.folder, branches[session.id]?.branch).then((result) => {
+		return api.prCreate(session.folder, branch?.branch).then((result) => {
 			const number = result.ok && /\/pull\/(\d+)/.exec(result.url ?? "")?.[1];
 			if (number) { updateSession(session.id, { prWatch: { number: Number(number), failing: [], seenAt: new Date().toISOString() } }); }
 			setDiffTick((value) => value + 1);
@@ -1266,26 +1741,50 @@ export function App() {
 		if (slash) {
 			const needle = slash[1].toLowerCase();
 			const names = new Set<string>();
-			const list = [...BUILT_INS, ...commands].filter((item) => {
-				if (names.has(item.name) || !item.name.toLowerCase().includes(needle)) { return false; }
+			const skills = skillCommands?.folder === session.folder ? skillCommands.names : undefined;
+			const groups: Record<CommandGroup, GrokCommand[]> = {
+				App: isCloud ? BUILT_INS.filter((item) => CLOUD_APP_COMMANDS.has(item.name)) : BUILT_INS,
+				Grok: isCloud ? [] : commands.filter((item) => !skills?.has(item.name)),
+				Skills: isCloud ? [] : commands.filter((item) => skills?.has(item.name)),
+			};
+			const items = COMMAND_GROUPS.flatMap((group) => groups[group].flatMap((item) => {
+				if (names.has(item.name) || !item.name.toLowerCase().includes(needle)) { return []; }
 				names.add(item.name);
-				return true;
-			});
-			return { kind: "slash" as const, needle, items: list.map((item) => ({ value: `/${item.name} `, label: `/${item.name}`, detail: item.description, hint: item.hint })) };
+				return [{ group, value: `/${item.name} `, label: `/${item.name}`, detail: item.description, hint: item.hint }];
+			}));
+			return { kind: "slash" as const, needle, items };
 		}
 		const mention = /(?:^|\s)@([\w./-]*)$/.exec(prompt);
-		if (mention) {
+		if (mention && !isCloud) {
 			const needle = mention[1].toLowerCase();
 			const files = (folderLists[session.id]?.files ?? []).filter((file) => file.toLowerCase().includes(needle)).slice(0, 12);
 			return { kind: "mention" as const, needle, items: files.map((file) => ({ value: file, label: file, detail: "", hint: "" })) };
 		}
 		return null;
-	}, [prompt, popClosed, commands, folderLists, session.id]);
+	}, [prompt, popClosed, commands, skillCommands, folderLists, session.id, session.folder, isCloud]);
 
-	useEffect(() => { setPopIndex(0); }, [popup?.kind, popup?.needle]);
+	const slashFolder = popup?.kind === "slash" && !isCloud && commands.length ? session.folder : "";
+	useEffect(() => {
+		const api = window.grokCode;
+		if (!slashFolder || !api?.customize || (skillRequest.current?.folder === slashFolder && skillRequest.current.commands === commands)) { return; }
+		const request = { folder: slashFolder, commands };
+		skillRequest.current = request;
+		const fail = () => {
+			if (skillRequest.current === request) { skillRequest.current = null; setSkillCommands(null); }
+		};
+		void api.customize(slashFolder, true).then((result) => {
+			if (skillRequest.current !== request) { return; }
+			if (!result.ok) { fail(); return; }
+			setSkillCommands({ folder: slashFolder, names: new Set(result.skills?.filter((skill) => !skill.disabled && skill.command).map((skill) => skill.command.replace(/^\//, ""))) });
+		}).catch(fail);
+	}, [slashFolder, commands]);
+
+	const popIndex = Math.max(0, popup?.items.findIndex((item) => item.value === popValue) ?? 0);
+	const activePopValue = popup?.items[popIndex]?.value;
+	useEffect(() => { setPopValue(null); }, [popup?.kind, popup?.needle]);
 	useEffect(() => {
 		popupList.current?.querySelector<HTMLElement>("[aria-selected='true']")?.scrollIntoView({ block: "nearest" });
-	}, [popIndex, popup?.kind, popup?.needle]);
+	}, [activePopValue, popIndex, popup?.kind, popup?.needle]);
 
 	// Opening a session reads it; "Mark as unread" on the open session stays until you leave it.
 	useEffect(() => {
@@ -1303,6 +1802,13 @@ export function App() {
 			if (!item.hint) { void submit(item.value); return; }
 			setPrompt(item.value);
 		} else { setPrompt((current) => current.replace(/@([\w./-]*)$/, `@${item.value} `)); }
+	}
+
+	function renderPopupItem(item: NonNullable<typeof popup>["items"][number], index: number) {
+		return <button key={item.value} type="button" role="option" aria-selected={index === popIndex} className={index === popIndex ? "item on" : "item"} onMouseEnter={() => setPopValue(item.value)} onClick={() => pickPopup(index)}>
+			{item.label}
+			{item.detail && <small>{item.detail}</small>}
+		</button>;
 	}
 
 	const folderFiles = folderLists[session.id];
@@ -1396,7 +1902,7 @@ export function App() {
 		if (!days) { return; }
 		const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
 		for (const item of sessions) {
-			if (item.archived || item.pinned || busy[item.id] || (item.lastActivityAt ?? Date.now()) >= cutoff || autoArchiving.current.has(item.id)) { continue; }
+			if (item.archived || item.pinned || busy[item.id] || item.cloud?.active || (item.lastActivityAt ?? Date.now()) >= cutoff || autoArchiving.current.has(item.id)) { continue; }
 			const api = window.grokCode;
 			if (!item.worktreeFolder || !api?.removeWorktree || sharesFolder(item)) {
 				updateSession(item.id, { archived: true });
@@ -1411,27 +1917,44 @@ export function App() {
 	}, [settings.autoArchiveDays]);
 
 	useEffect(() => {
-		if (!panes.includes("browser")) { return; }
+		if (isCloud || !panes.includes("browser")) { return; }
 		const id = session.id;
 		void window.grokCode?.devScripts?.(session.folder).then((result) => setDevScripts((current) => ({ ...current, [id]: result.scripts ?? [] }))).catch(() => {});
-	}, [panes, session.id, session.folder]);
+	}, [panes, isCloud, session.id, session.folder]);
 
 	function togglePane(id: SidePaneId) {
+		if (isCloud && id !== "editor") { return; }
 		if (id === "editor" && panes.includes("editor")) { flushEditor(); }
+		setExpandedPane(null);
 		setPanes((current) => (current.includes(id) ? current.filter((pane) => pane !== id) : [...current, id]));
 		setFocusedPane(id);
 		setMenu(null);
 	}
 
 	function showPane(id: SidePaneId) {
+		if (isCloud && id !== "editor") { return; }
+		setExpandedPane((current) => current === id ? current : null);
 		setPanes((current) => (current.includes(id) ? current : [...current, id]));
 		setFocusedPane(id);
 	}
 
 	function closePane(id: SidePaneId) {
 		if (id === "editor") { flushEditor(); }
+		setExpandedPane((current) => current === id ? null : current);
 		setPanes((current) => current.filter((pane) => pane !== id));
 		setFocusedPane((current) => (current === id ? null : current));
+	}
+
+	function movePane(id: SidePaneId, step: -1 | 1) {
+		setPanes((current) => {
+			const index = current.indexOf(id);
+			const next = index + step;
+			if (index < 0 || next < 0 || next >= current.length) { return current; }
+			const reordered = [...current];
+			[reordered[index], reordered[next]] = [reordered[next], reordered[index]];
+			return reordered;
+		});
+		setExpandedPane(null);
 	}
 
 	// The form on screen when it has text that would be lost with it; the first-launch form is already in the list.
@@ -1450,6 +1973,7 @@ export function App() {
 	function selectSession(id: string, find?: string) {
 		flushEditor();
 		leaveForm();
+		setExpandedPane(null);
 		setActiveId(id);
 		setMenu(null);
 		if (find) { setFindAt((current) => ({ tick: current.tick + 1, text: find })); }
@@ -1459,12 +1983,13 @@ export function App() {
 
 	function createSession(seed?: Partial<ProjectSeed>) {
 		flushEditor();
+		setExpandedPane(null);
 		const base = seed?.folder ? seed : { folder: session.folder, project: session.project, branch: session.branch, worktree: session.project, environment: "Local" as Environment };
 		// A form with text, on screen or kept, comes back with it; a folder picked in the sidebar still applies.
 		const kept = formWithText() ?? keptForm.current;
 		keptForm.current = null;
 		const reopen = kept && !seed?.folder;
-		const created = reopen ? kept.session : { ...newSession(base), ...(kept ? { id: kept.session.id } : {}) };
+		const created = reopen ? kept.session : { ...newSession(base, kept?.session.parentId), ...(kept ? { id: kept.session.id } : {}) };
 		setPending(created);
 		setUseWorktree(reopen ? kept.useWorktree : false);
 		setMenu(null);
@@ -1472,16 +1997,87 @@ export function App() {
 		setTimeout(() => promptRef.current?.focus?.(), 0);
 	}
 
+	function choosePendingFolder(folder: string, draftId = pendingRef.current?.id) {
+		const draft = pendingRef.current;
+		if (!draft || draft.id !== draftId || !folder) { return; }
+		const changed = folderKey(draft.folder) !== folderKey(folder);
+		const project = shortPath(folder);
+		const next = { ...draft, folder, project, worktree: project };
+		pendingRef.current = next;
+		setPending(next);
+		if (draft.id === firstSessionId.current) {
+			const apply = (items: Session[]) => items.map((item) => item.id === draft.id ? { ...item, folder, project, worktree: project } : item);
+			sessionsRef.current = apply(sessionsRef.current);
+			setSessions(apply);
+		}
+		if (changed) { setUseWorktree(false); }
+		setMenu(null);
+	}
+
+	function pickPendingFolder() {
+		const draft = pendingRef.current;
+		const api = window.grokCode;
+		if (!draft || !api?.pickFolder) { return; }
+		void api.pickFolder().then((folder) => {
+			if (folder && pendingRef.current?.folder === draft.folder) { choosePendingFolder(folder, draft.id); }
+		}).catch(() => setNotice("The folder picker could not open."));
+	}
+
+	function choosePendingEnvironment(environment: Environment) {
+		if (!pending || environment === pending.environment || environment === "SSH" || (environment === "Cloud" && !cloudKeyAvailable)) { setMenu(null); return; }
+		setCloudSetup(null);
+		setMenu(null);
+		setUseWorktree(false);
+		setPending((item) => item?.id === pending.id ? { ...item, environment, cloud: undefined, cloudModelLabel: undefined, cloudMachineDraft: undefined } : item);
+	}
+
 	function stepSession(step: number) {
-		const list = sessionsRef.current.filter((item) => !item.archived);
+		const list = sessionsRef.current.filter((item) => !item.archived && (item.id !== firstSessionId.current || item.folder));
 		if (!list.length) { return; }
 		const found = list.findIndex((item) => item.id === (pendingRef.current ? "" : activeIdRef.current));
 		const index = found < 0 ? (step < 0 ? 0 : -1) : found;
 		selectSession(list[(index + step + list.length) % list.length].id);
 	}
 
+	async function resumeCloud(item: Session) {
+		const resume = window.grokCode?.cloudResume;
+		const { cloud, id } = item;
+		const turnId = cloud?.turnId;
+		if (turnTargets.current[id]) { return true; }
+		if (!resume || !cloud || !turnId) {
+			setHeld((current) => ({ ...current, [id]: true }));
+			setNotice("This Cursor run could not be resumed.");
+			return false;
+		}
+		turnTargets.current[id] = { sessionId: id, replyId: `grok-${turnId}`, turnId, where: "main", awaitingReplay: true };
+		setBusy((current) => ({ ...current, [id]: true }));
+		const fallback = "This Cursor run could not be resumed.";
+		const result = await resume({ uiSessionId: id, turnId, cloud }).catch(() => ({ ok: false, error: fallback }));
+		if (result.ok) { return true; }
+		if (turnTargets.current[id]?.turnId === turnId) {
+			delete turnTargets.current[id];
+			setHeld((current) => ({ ...current, [id]: true }));
+			setBusy((current) => ({ ...current, [id]: false }));
+			setNotice(result.error || fallback);
+		}
+		return false;
+	}
+
 	function stop(uiId: string) {
 		setHeld((current) => ({ ...current, [uiId]: true }));
+		const item = sessionsRef.current.find((entry) => entry.id === uiId);
+		if (item?.environment === "Cloud") {
+			const cancel = window.grokCode?.cloudCancel;
+			const fallback = "Cursor could not stop this run. Check https://cursor.com/agents.";
+			if (!cancel) { setNotice(fallback); return; }
+			void (async () => {
+				if (!turnTargets.current[uiId] && item.cloud?.active && !await resumeCloud(item)) { return; }
+				if (!turnTargets.current[uiId]) { return; }
+				const result = await cancel(uiId).catch(() => ({ ok: false, error: fallback }));
+				if (!result.ok) { setNotice(result.error || fallback); }
+			})();
+			return;
+		}
 		void window.grokCode?.cancel(uiId);
 	}
 
@@ -1490,12 +2086,35 @@ export function App() {
 	}
 
 	function folderBusy(item: Session) {
-		return sessionsRef.current.some((other) => other.id !== item.id && !other.archived && folderKey(other.folder) === folderKey(item.folder) && (busy[other.id] || busy[`side-${other.id}`]));
+		return item.environment !== "Cloud" && sessionsRef.current.some((other) => other.id !== item.id && other.environment !== "Cloud" && !other.archived && folderKey(other.folder) === folderKey(item.folder) && (busy[other.id] || busy[`side-${other.id}`]));
 	}
 
 	function noteFolderClash(item: Session) {
 		if (collisionSeen[item.id] || !folderBusy(item)) { return; }
 		setCollisionSeen((current) => (current[item.id] ? current : { ...current, [item.id]: true }));
+	}
+
+	async function chooseSessionFolder() {
+		const api = window.grokCode;
+		if (!api?.pickFolder) { setNotice("Choose the folder from the desktop window."); return; }
+		const { id, folder } = session;
+		try {
+			const picked = await api.pickFolder();
+			if (!picked || turnTargets.current[id] || !sessionsRef.current.some((item) => item.id === id && item.folder === folder)) { return; }
+			// Grok's previous folder and its Always allow rules cannot follow the new folder.
+			await api.forgetSession?.(id);
+			const name = shortPath(picked);
+			const sameFolder = folderKey(picked) === folderKey(folder);
+			setSessions((current) => current.map((item) => item.id === id && item.folder === folder ? { ...item, folder: picked, project: name, worktree: name, worktreeFolder: sameFolder ? item.worktreeFolder : undefined, agentSessionId: undefined, allowedFolders: undefined, prWatch: undefined } : item));
+			setMissingFolders((current) => ({ ...current, [id]: "" }));
+			setBranches((current) => ({ ...current, [id]: undefined }));
+			setDiffTick((value) => value + 1);
+			setSideAgents((list) => Object.fromEntries(Object.entries(list).filter(([sessionId]) => sessionId !== id)));
+			delete sideSeen.current[id];
+			if (activeIdRef.current === id && !pendingRef.current) { setMenu(null); promptRef.current?.focus?.(); }
+		} catch {
+			setNotice("The session folder could not be changed.");
+		}
 	}
 
 	inboundAccept.current = (agentSessionId, text) => {
@@ -1515,6 +2134,7 @@ export function App() {
 
 	function openPromptLibrary(mode: "save" | "insert") {
 		const field = promptRef.current;
+		overlayOpener.current = null;
 		setMenu(null);
 		setPromptLibrary({ mode, sessionId: session.id, text: prompt, start: field?.selectionStart ?? prompt.length, end: field?.selectionEnd ?? prompt.length });
 	}
@@ -1556,16 +2176,20 @@ export function App() {
 		newSession: () => createSession(),
 		next: () => stepSession(1),
 		previous: () => stepSession(-1),
-		stop: () => { if (busy[session.id]) { stop(session.id); } },
+		stop: () => { if (busy[session.id] || session.cloud?.active) { stop(session.id); } },
 		cycleView: () => setViews((current) => ({ ...current, [session.id]: VIEWS[(VIEWS.indexOf(current[session.id] ?? settingsRef.current.defaultView) + 1) % VIEWS.length] })),
 		find: () => setFindTick((value) => value + 1),
-		side: () => setSideOpen((value) => !value),
+		side: () => { if (!isCloud) { setSideOpen((value) => !value); } },
 		savedPrompts: () => openPromptLibrary("insert"),
 		terminal: () => togglePane("terminal"),
 		diff: () => togglePane("diff"),
 		browser: () => togglePane("browser"),
-		select: () => { showPane("browser"); setSelectTick((value) => value + 1); },
-		closePane: () => { const target = focusedPane && panes.includes(focusedPane) ? focusedPane : panes[panes.length - 1]; if (target) { closePane(target); } },
+		select: () => { if (!isCloud) { showPane("browser"); setSelectTick((value) => value + 1); } },
+		mode: () => { if (!isCloud) { setMenu("mode"); } },
+		model: () => { if (!isCloud || !cloudModelLocked) { setMenu("model"); } },
+		effort: () => { if (!isCloud) { setMenu("effort"); } },
+		closePane: () => { const target = focusedPane && shownPaneIds.includes(focusedPane) ? focusedPane : shownPaneIds[shownPaneIds.length - 1]; if (target) { closePane(target); } },
+		restorePane: () => { if (!fullPane) { return false; } setExpandedPane(null); return true; },
 	};
 
 	const slashActions: Record<string, (arg: string) => void | Promise<void>> = {
@@ -1574,6 +2198,7 @@ export function App() {
 		new: () => keyActions.current.newSession?.(),
 		rename: (arg) => { if (arg) { renameSession(session.id, arg); } else { setRenaming(session.id); } },
 		delete: async () => {
+			if (isCloud && (turnTargets.current[session.id] || session.cloud?.active)) { setNotice("Stop this session first."); return; }
 			if (activity[session.id]) { setNotice("Stop this session before deleting it."); return; }
 			if (await askConfirm({ title: `Delete "${session.title}"?`, body: "Its transcript is removed from this app and cannot be restored.", ok: "Delete", danger: true })) { deleteSession(session.id); }
 		},
@@ -1600,7 +2225,7 @@ export function App() {
 		"view-plan": () => togglePane("plan"),
 		plan: () => changeMode(session.id, "Plan"),
 		auto: () => changeMode(session.id, "Auto-review"),
-		model: () => setMenu("model"),
+		model: () => keyActions.current.model?.(),
 		effort: () => setMenu("effort"),
 		cd: () => setMenu("folder"),
 		resume: () => { changeSettings({ sidebarCollapsed: false }); setNotice("Pick a session in the sidebar, or search for one."); },
@@ -1634,8 +2259,7 @@ export function App() {
 			if (event.key === "Escape") {
 				// Esc closes whatever is open; only with nothing open does it stop Grok.
 				const target = event.target as Element | null;
-				if (target?.closest?.(".side-q")) { setSideOpen(false); return; }
-				if (target?.closest?.(".side-col, .session-rail")) { return; }
+				if (setupFromAbout.current) { closeSetup(); return; }
 				if (overlayOpen.current) {
 					setMenu(null);
 					setFileMenu(null);
@@ -1644,11 +2268,16 @@ export function App() {
 					setRewindAsk(null);
 					setSettingsOpen(null);
 					setSetup((current) => ({ ...current, open: false }));
-				} else {
-					keyActions.current.stop?.();
+					return;
 				}
+				if (target?.closest?.(".side-q")) { setSideOpen(false); return; }
+				if (keyActions.current.restorePane?.()) { event.preventDefault(); return; }
+				if (target?.closest?.(".side-col, .session-rail")) { return; }
+				if (Date.now() < escapeStopAfter.current) { return; }
+				keyActions.current.stop?.();
 				return;
 			}
+			if (setupFromAbout.current) { return; }
 			if (/^[1-9]$/.test(event.key) && !event.ctrlKey && !event.altKey && !event.metaKey && document.querySelector(".pop")) {
 				const items = Array.from(document.querySelectorAll<HTMLButtonElement>(".pop button:not(:disabled)"));
 				const item = items[Number(event.key) - 1];
@@ -1674,9 +2303,9 @@ export function App() {
 			if (event.shiftKey && key === "d") { run("diff"); return; }
 			if (event.shiftKey && key === "s") { run("select"); return; }
 			if (event.shiftKey && key === "p") { run("savedPrompts"); return; }
-			if (event.shiftKey && key === "m") { event.preventDefault(); setMenu("mode"); return; }
-			if (event.shiftKey && key === "i") { event.preventDefault(); setMenu("model"); return; }
-			if (event.shiftKey && key === "e") { event.preventDefault(); setMenu("effort"); return; }
+			if (event.shiftKey && key === "m") { run("mode"); return; }
+			if (event.shiftKey && key === "i") { run("model"); return; }
+			if (event.shiftKey && key === "e") { run("effort"); return; }
 			if (event.shiftKey) { return; }
 			if (event.altKey) {
 				if (event.key === "1") { run("newSession"); }
@@ -1741,6 +2370,7 @@ export function App() {
 		const body = text.trim();
 		const target = sessionsRef.current.find((item) => item.id === targetId);
 		if (!body || !target) { return false; }
+		if (!target.folder) { setNotice("Choose a project folder before sending."); return false; }
 		const sessionId = target.id;
 		const picks = side ? [] : contextPicksFrom(contextFrom, sessionId);
 		const uiId = side ? `side-${sessionId}` : sessionId;
@@ -1749,13 +2379,16 @@ export function App() {
 		const chosenModel = target.model ?? current.model;
 		const chosenEffort = target.effort ?? current.effort;
 		const chosenMode = side ? "Normal" : knownMode(modes[sessionId] ?? current.defaultMode, current);
-		if (target.environment !== "Local") {
-			setNotice("SSH and Cloud execution are not available. Choose Local before sending.");
-			return false;
-		}
+		const cloud = target.environment === "Cloud";
+		const api = window.grokCode;
+		if (target.environment === "SSH") { setNotice("SSH execution is not available."); return false; }
+		if (folderUnavailable(target)) { return false; }
+		if (cloud && side) { setNotice("Side chat is unavailable in Cloud sessions."); return false; }
+		if (cloud && (files.length || picks.length)) { setNotice(CLOUD_ATTACHMENTS); return false; }
+		if (cloud && (!target.cloud || !api?.cloudSend)) { setNotice("Cursor cloud is unavailable for this session."); return false; }
 		if (!side) { noteFolderClash(target); }
 		if (!side) { invalidateSuggestion(sessionId); }
-		if (turnTargets.current[uiId] || (!side && branching === sessionId)) {
+		if (turnTargets.current[uiId] || (!side && branching === sessionId) || (cloud && (target.cloud?.active || (steer && queuedRef.current[sessionId]?.length)))) {
 			if (side) {
 				setNotice(SIDE_BUSY);
 				return false;
@@ -1763,38 +2396,51 @@ export function App() {
 			const item = { id: crypto.randomUUID(), text: body, attachments: files, ...(picks.length ? { contextFrom: picks } : {}) };
 			setHeld((list) => ({ ...list, [sessionId]: false }));
 			// Attachments, earlier-chat context and commands cannot go into a running turn, so they wait; a steer Grok refuses joins the queue.
-			if (steer && turnTargets.current[uiId] && window.grokCode?.steer && !files.length && !picks.length && !body.startsWith("/")) {
+			if (!cloud && steer && turnTargets.current[uiId] && api?.steer && !files.length && !picks.length && !body.startsWith("/")) {
 				void steerQueued(item, sessionId, true);
 				return true;
 			}
 			setQueued((list) => ({ ...list, [sessionId]: [...(list[sessionId] ?? []), item] }));
+			if (cloud && target.cloud?.active && !turnTargets.current[uiId]) { void resumeCloud(target); }
 			return true;
 		}
-		if (!target.model) { updateSession(sessionId, { model: chosenModel, effort: chosenEffort }); }
+		if (!cloud && !target.model) { updateSession(sessionId, { model: chosenModel, effort: chosenEffort }); }
 		if (!side) {
 			setHeld((list) => ({ ...list, [sessionId]: false }));
-			if (!modes[sessionId]) { changeMode(sessionId, chosenMode); }
+			if (!cloud && !modes[sessionId]) { changeMode(sessionId, chosenMode); }
 		}
 		if (!side && target.title === "New session" && target.titleAuto !== false) {
 			const title = body.replace(/\s+/g, " ").slice(0, 48);
 			setSessions((list) => list.map((item) => (item.id === sessionId && item.title === "New session" ? { ...item, title, titleAuto: true, detail: "Live", when: "now" } : item)));
 		}
 		const stamp = Date.now();
-		const replyId = `${side ? "side-grok" : "grok"}-${stamp}`;
 		const turnId = crypto.randomUUID();
+		const replyId = `${side ? "side-grok" : "grok"}-${cloud ? turnId : stamp}`;
 		turnTargets.current[uiId] = { sessionId, replyId, turnId, where: side ? "side" : "main" };
-		const userMessage: ChatMessage = { id: `${side ? "side-user" : "user"}-${stamp}`, role: "user", text: body, at: stamp, live: true, ...(files.length ? { attachments: files } : {}), ...(picks.length ? { contextFrom: picks } : {}) };
+		const userMessage: ChatMessage = { id: `${side ? "side-user" : "user"}-${cloud ? turnId : stamp}`, role: "user", text: body, at: stamp, live: true, ...(files.length ? { attachments: files } : {}), ...(picks.length ? { contextFrom: picks } : {}) };
 		const replyMessage: ChatMessage = { id: replyId, role: "grok", text: "", pending: true, streaming: true, live: true };
 		const store = side ? setSideChats : setExtraChats;
 		store((list) => ({ ...list, [sessionId]: [...(list[sessionId] ?? []), userMessage, replyMessage] }));
 		if (!side) { setSessions((list) => list.map((item) => (item.id === sessionId ? { ...item, lastActivityAt: stamp, completed: false } : item))); }
-		const api = window.grokCode;
 		if (!api) {
-			writeReply(uiId, (message) => ({ ...message, at: Date.now(), pending: false, streaming: false, text: "Open this window from the desktop app to talk to Grok." }));
+			writeReply(uiId, (message) => replyWithNote({ ...message, at: Date.now() }, "Open this window from the desktop app to talk to Grok."));
 			delete turnTargets.current[uiId];
 			return true;
 		}
 		setBusy((list) => ({ ...list, [uiId]: true }));
+		if (cloud && target.cloud && api.cloudSend) {
+			const fallback = "Cursor could not start this turn.";
+			const name = ((extraChats[sessionId] ?? []).find((message) => message.role === "user")?.text ?? body).slice(0, 80);
+			void api.cloudSend({ uiSessionId: uiId, turnId, text: body, name, cloud: target.cloud }).catch(() => ({ ok: false, error: fallback })).then((result) => {
+				if (result.ok || turnTargets.current[uiId]?.turnId !== turnId) { return; }
+				setHeld((list) => ({ ...list, [sessionId]: true }));
+				setBusy((list) => ({ ...list, [uiId]: false }));
+				updateSession(sessionId, { failed: true });
+				writeReply(uiId, (message) => replyWithNote({ ...message, at: Date.now() }, result.error || fallback));
+				delete turnTargets.current[uiId];
+			});
+			return true;
+		}
 		const sideAgent = sideAgents[sessionId];
 		// A side question carries the main-chat messages it has not seen yet; a reply still streaming waits for the next one.
 		const main = (extraChats[sessionId] ?? []).filter((message) => !message.streaming);
@@ -1833,12 +2479,21 @@ export function App() {
 				setSessions((list) => list.map((item) => (item.id === sessionId && item.folder === folder ? { ...item, agentSessionId: undefined } : item)));
 			}
 			if (result.ok) { return; }
+			if (missingFolderError(result.error) && sessionsRef.current.some((item) => item.id === sessionId && item.folder === folder)) {
+				setMissingFolders((list) => ({ ...list, [sessionId]: folder }));
+				if (queuedRef.current[sessionId]?.length) { setHeld((list) => ({ ...list, [sessionId]: true })); }
+				if (!side && steer && (!draftsRef.current[sessionId] || draftsRef.current[sessionId].trim() === body)) {
+					setDrafts((list) => list[sessionId] ? list : { ...list, [sessionId]: prompt.trim() === body ? prompt : body });
+					if (files.length) { setAttachments((list) => ({ ...list, [sessionId]: [...new Set([...files, ...(list[sessionId] ?? [])])].slice(0, 20) })); }
+					if (picks.length) { setContextPicks((list) => ({ ...list, [sessionId]: picks.reduce((current, pick) => addContextPick(current, pick), list[sessionId] ?? []) })); }
+				}
+			}
 			setBusy((list) => ({ ...list, [uiId]: false }));
-			writeReply(uiId, (message) => ({ ...message, at: Date.now(), pending: false, streaming: false, text: `${message.text ? `${message.text}\n` : ""}${result.error || "Grok could not start."}` }));
+			writeReply(uiId, (message) => replyWithNote({ ...message, at: Date.now() }, result.error || "Grok could not start."));
 			if (turnTargets.current[uiId]?.turnId === turnId) { delete turnTargets.current[uiId]; }
 		}).catch(() => {
 			setBusy((list) => ({ ...list, [uiId]: false }));
-			writeReply(uiId, (message) => ({ ...message, at: Date.now(), pending: false, streaming: false, text: message.text || "Grok could not start." }));
+			writeReply(uiId, (message) => replyWithNote({ ...message, at: Date.now() }, "Grok could not start."));
 			if (turnTargets.current[uiId]?.turnId === turnId) { delete turnTargets.current[uiId]; }
 		});
 		return true;
@@ -1847,12 +2502,25 @@ export function App() {
 	useEffect(() => {
 		for (const [sessionId, items] of Object.entries(queued)) {
 			if (!items.length || queuedRef.current[sessionId] !== items || held[sessionId] || busy[sessionId] || turnTargets.current[sessionId] || branching === sessionId) { continue; }
-			setQueued((current) => ({ ...current, [sessionId]: (current[sessionId] ?? []).filter((item) => item.id !== items[0].id) }));
-			send(items[0].text, false, sessionId, items[0].attachments, false, items[0].contextFrom ?? []);
+			const target = sessionsRef.current.find((item) => item.id === sessionId);
+			if (target && folderUnavailable(target)) {
+				setHeld((current) => ({ ...current, [sessionId]: true }));
+				continue;
+			}
+			if (target?.environment === "Cloud" && target.cloud?.active) { void resumeCloud(target); continue; }
+			const [first] = items;
+			if (target?.environment === "Cloud" && !send(first.text, false, sessionId, first.attachments, false, first.contextFrom ?? [])) {
+				setHeld((current) => ({ ...current, [sessionId]: true }));
+				continue;
+			}
+			setQueued((current) => ({ ...current, [sessionId]: (current[sessionId] ?? []).filter((item) => item.id !== first.id) }));
+			if (target?.environment !== "Cloud") { send(first.text, false, sessionId, first.attachments, false, first.contextFrom ?? []); }
 		}
-	}, [queued, held, busy, branching]);
+	}, [queued, held, busy, branching, branches, missingFolders]);
 
 	function sendNow(sessionId: string, itemId: string) {
+		const target = sessionsRef.current.find((item) => item.id === sessionId);
+		if (target && folderUnavailable(target)) { return; }
 		setQueued((current) => {
 			const items = current[sessionId] ?? [];
 			const item = items.find((entry) => entry.id === itemId);
@@ -1954,7 +2622,7 @@ export function App() {
 		const at = messages.findIndex((item) => item.id === message.id);
 		const next = messages.findIndex((item, index) => index > at && item.role === "user");
 		const copied = (next < 0 ? messages : messages.slice(0, next)).map((item) => (!item.point ? item : item.point.agentSessionId === point.agentSessionId ? { ...item, point: { ...item.point, agentSessionId } } : { ...item, point: undefined }));
-		const forked: Session = { ...newSession({ folder: source.folder, project: source.project, branch: source.branch, worktree: source.worktree, environment: source.environment }), title: `${source.title} (fork)`, titleAuto: false, detail: "Fork", agentSessionId, model: source.model, effort: source.effort, allowedFolders: source.allowedFolders, worktreeFolder: source.worktreeFolder };
+		const forked: Session = { ...newSession({ folder: source.folder, project: source.project, branch: source.branch, worktree: source.worktree, environment: source.environment }, source.id), title: `${source.title} (fork)`, titleAuto: false, detail: "Fork", agentSessionId, model: source.model, effort: source.effort, allowedFolders: source.allowedFolders, worktreeFolder: source.worktreeFolder };
 		setSessions((current) => [forked, ...current]);
 		setExtraChats((list) => ({ ...list, [forked.id]: copied }));
 		if (modes[source.id]) { changeMode(forked.id, modes[source.id]); }
@@ -1965,8 +2633,22 @@ export function App() {
 	async function commitPending(): Promise<Session | null> {
 		const draft = pendingRef.current;
 		if (!draft) { return session; }
+		if (!draft.folder) { return null; }
 		let created = draft;
-		if (useWorktree) {
+		if (draft.environment === "Cloud") {
+			if (draft.id !== session.id || draft.folder !== session.folder || !cloudReady || !cloudSetupResult?.repoUrl || !cloudSetupResult.ref || !cloudChoice) {
+				setNotice("Finish checking the Cloud session's repository and model before sending.");
+				return null;
+			}
+			const { cloudMachineDraft, ...base } = draft;
+			const machine = typeof cloudMachineDraft === "string" ? cloudMachineDraft.trim() : undefined;
+			created = { ...base, branch: cloudSetupResult.ref, cloudModelLabel, cloud: {
+				repoUrl: cloudSetupResult.repoUrl, ref: cloudSetupResult.ref, model: { id: cloudChoice.id, params: cloudChoice.params },
+				autoCreatePR: machine ? false : draft.cloud?.autoCreatePR ?? false,
+				...(machine ? { machine } : {}),
+			} };
+		} else if (useWorktree) {
+			if (worktreeReason) { setNotice(worktreeReason); return null; }
 			const api = window.grokCode;
 			if (!api?.addWorktree) {
 				setNotice("Reopen this window to create a worktree.");
@@ -1995,6 +2677,7 @@ export function App() {
 	}
 
 	function startWorktreeFromHere() {
+		if (isCloud) { return; }
 		const source = session;
 		let target = pendingRef.current;
 		if (!target) {
@@ -2003,7 +2686,7 @@ export function App() {
 				return;
 			}
 			flushEditor();
-			target = { ...newSession({ folder: source.folder, project: source.project, branch: source.branch, worktree: source.worktree, environment: source.environment }), ...(source.model ? { model: source.model } : {}), ...(source.effort ? { effort: source.effort } : {}) };
+			target = { ...newSession({ folder: source.folder, project: source.project, branch: source.branch, worktree: source.worktree, environment: source.environment }, source.id), ...(source.model ? { model: source.model } : {}), ...(source.effort ? { effort: source.effort } : {}) };
 			const nextDrafts = { ...draftsRef.current, [source.id]: "", [target.id]: draftsRef.current[source.id] ?? "" };
 			draftsRef.current = nextDrafts;
 			setDrafts(nextDrafts);
@@ -2022,7 +2705,8 @@ export function App() {
 
 	function startFreshSession() {
 		const source = session;
-		const created: Session = { ...newSession({ folder: source.folder, project: source.project, branch: source.branch, worktree: source.worktree, environment: source.environment }), ...(source.model ? { model: source.model } : {}), ...(source.effort ? { effort: source.effort } : {}) };
+		if (isCloud) { createSession({ folder: source.folder, project: source.project, environment: "Cloud" }); return; }
+		const created: Session = { ...newSession({ folder: source.folder, project: source.project, branch: source.branch, worktree: source.worktree, environment: source.environment }, source.id), ...(source.model ? { model: source.model } : {}), ...(source.effort ? { effort: source.effort } : {}) };
 		sessionsRef.current = [created, ...sessionsRef.current.filter((item) => item.id !== created.id)];
 		setSessions((current) => [created, ...current.filter((item) => item.id !== created.id)]);
 		selectSession(created.id);
@@ -2031,6 +2715,7 @@ export function App() {
 	// A command picked in Settings, such as /create-skill, goes to this session and leaves its draft alone.
 	async function runFromSettings(text: string) {
 		setSettingsOpen(null);
+		if (isCloud) { setNotice("Local Grok commands are unavailable in Cloud sessions."); return; }
 		const target = await commitPending();
 		if (target) { send(text, false, target.id); }
 	}
@@ -2039,25 +2724,44 @@ export function App() {
 		const sessionId = session.id;
 		const stamp = crypto.randomUUID();
 		const at = Date.now();
-		setExtraChats((current) => ({ ...current, [sessionId]: [...(current[sessionId] ?? []), { id: `user-${stamp}`, role: "user", text, at, live: true }, { id: `grok-${stamp}`, role: "grok", text: lines.join("\n"), at, live: true }] }));
+		const appNote = lines.join("\n");
+		setExtraChats((current) => ({ ...current, [sessionId]: [...(current[sessionId] ?? []), { id: `user-${stamp}`, role: "user", text, at, live: true }, { id: `grok-${stamp}`, role: "grok", text: appNote, appNote, at, live: true }] }));
 		setNotice(lines.join(" · "));
 	}
 
-	async function showUsage(text: string) {
+	async function readLimit() {
+		const epoch = signInEpoch.current;
+		const request = ++limitRead.current;
 		const result = await window.grokCode?.billing?.().catch(() => ({ ok: false as const, error: "Grok did not return usage." }));
-		if (result?.ok) { setLimit(result); }
-		const lines = result?.ok ? [limitLine(result)] : [result?.error || "Grok did not return usage."];
+		if (epoch !== signInEpoch.current) { return undefined; }
+		if (request === limitRead.current) {
+			if (result?.ok) { setLimit(result); }
+			setLimitStale(!result?.ok);
+		}
+		return result;
+	}
+
+	async function showUsage(text: string) {
+		const epoch = signInEpoch.current;
+		const result = keyMode ? undefined : await readLimit();
+		if (epoch !== signInEpoch.current) { return; }
+		const lines = keyMode ? ["Subscription limits aren't shown in API-key mode."] : result?.ok ? [limitLine(result)] : [result?.error || "Grok did not return usage."];
 		const percent = session.usage?.contextWindow ? Math.min(100, Math.round((session.usage.contextTokens / Math.max(1, session.usage.contextWindow)) * 100)) : null;
-		if (percent !== null) { lines.push(`Context ${percent}% · $${(session.costUsd ?? 0).toFixed(2)}`); }
+		if (percent !== null) { lines.push(`Context ${percent}%${keyMode || text === "/cost" ? ` · $${(session.costUsd ?? 0).toFixed(2)}` : ""}`); }
 		postLocal(text, lines);
 	}
 
 	async function submit(value = prompt) {
 		const text = value.trim();
-		if (!text) { return; }
+		if (!text) {
+			if (isCloud && queuedRef.current[session.id]?.length && held[session.id] && !busy[session.id]) { setHeld((current) => ({ ...current, [session.id]: false })); }
+			return;
+		}
 		if (text === "/config") { setSettingsOpen("general"); setPrompt(""); return; }
+		if (isCloud && text.startsWith("!") && text.length > 1) { setNotice("The local terminal is unavailable in Cloud sessions."); return; }
 		if (text.startsWith("!") && text.length > 1 && pending) { setNotice("Send a first message to start this session, then run terminal commands with !."); return; }
 		if (text.startsWith("!") && text.length > 1 && !pending) {
+			if (folderMissing) { return; }
 			setPrompt("");
 			await runInTerminal(text.slice(1).trim());
 			return;
@@ -2066,7 +2770,7 @@ export function App() {
 			const percent = session.usage?.contextWindow ? Math.min(100, Math.round((session.usage.contextTokens / Math.max(1, session.usage.contextWindow)) * 100)) : null;
 			const lines = [
 				appVersion.current ? `Codewomplers Grok Desktop ${appVersion.current}` : "Codewomplers Grok Desktop",
-				`${model} · ${effort} · ${mode}`,
+				isCloud ? `${cloudModelLabel} · ${session.cloud?.machine ?? "Cloud"}` : `${model} · ${effort} · ${mode}`,
 				session.folder,
 				...(percent != null ? [`Context ${percent}% · $${(session.costUsd ?? 0).toFixed(2)}`] : []),
 			];
@@ -2076,6 +2780,10 @@ export function App() {
 		}
 		const local = /^\/([\w:.-]+)(?:\s+([\s\S]*))?$/.exec(text);
 		const action = local ? slashActions[local[1]] : undefined;
+		if (isCloud && local && !CLOUD_APP_COMMANDS.has(local[1]) && (action || local[1] === "btw" || local[1] === "loop" || commands.some((item) => item.name === local[1]))) {
+			setNotice(local[1] === "btw" ? "Side chat is unavailable in Cloud sessions." : "Local Grok commands are unavailable in Cloud sessions.");
+			return;
+		}
 		if (local && action) {
 			const arg = (local[2] ?? "").trim();
 			if (arg && !TAKES_ARG.has(local[1])) { setNotice(`/${local[1]} takes no argument.`); return; }
@@ -2084,15 +2792,17 @@ export function App() {
 			await action(arg);
 			return;
 		}
+		if (folderMissing) { return; }
 		if (text.startsWith("/btw ")) {
 			setSideOpen(true);
 			if (send(text.slice(5), true)) { setPrompt(""); }
 			return;
 		}
-		const target = await commitPending();
-		if (!target) { return; }
 		const files = attachments[session.id] ?? [];
 		const picks = contextPicks[session.id] ?? [];
+		if (isCloud && (files.length || picks.length)) { setNotice(CLOUD_ATTACHMENTS); return; }
+		const target = await commitPending();
+		if (!target) { return; }
 		if (send(text, false, target.id, files, true, picks)) {
 			setDrafts((current) => ((current[target.id] ?? "") === prompt ? { ...current, [session.id]: "", [target.id]: "" } : current));
 			setAttachments((current) => ({ ...current, [session.id]: [], [target.id]: [] }));
@@ -2101,6 +2811,7 @@ export function App() {
 	}
 
 	function addAttachments(paths: string[]) {
+		if (isCloud) { setNotice(CLOUD_ATTACHMENTS); return; }
 		const sessionId = session.id;
 		const clean = paths.filter(Boolean);
 		if (!clean.length) { return; }
@@ -2109,7 +2820,9 @@ export function App() {
 
 	function onDrop(event: DragEvent) {
 		const api = window.grokCode;
-		if (!api?.pathForFile || !event.dataTransfer?.files?.length) { return; }
+		if (!event.dataTransfer?.files?.length) { return; }
+		if (isCloud) { event.preventDefault(); setNotice(CLOUD_ATTACHMENTS); return; }
+		if (!api?.pathForFile) { return; }
 		event.preventDefault();
 		addAttachments(Array.from(event.dataTransfer.files).map((file) => api.pathForFile(file)));
 	}
@@ -2118,6 +2831,7 @@ export function App() {
 		const api = window.grokCode;
 		const image = Array.from(event.clipboardData?.items ?? []).find((item) => item.type.startsWith("image/"));
 		const blob = image?.getAsFile();
+		if (isCloud && blob) { event.preventDefault(); setNotice(CLOUD_ATTACHMENTS); return; }
 		if (!api?.saveImage || !blob) { return; }
 		event.preventDefault();
 		const reader = new FileReader();
@@ -2150,19 +2864,29 @@ export function App() {
 		setFileMenu(null);
 	}
 
-	function signOut() {
+	async function signOut() {
 		const api = window.grokCode;
-		if (!api?.signOut) { return; }
-		const request = api.signOut;
-		void askConfirm({ title: "Sign out of Grok?", body: "This signs Grok out on this computer, in a terminal too. Grok's background commands will stop.", ok: "Sign out", danger: true }).then((yes) => {
-			if (!yes) { return; }
-			void request().then((result) => setNotice(result.ok ? "Signed out. Grok asks you to sign in when you next send a message." : result.error || "Grok could not sign out."));
-		});
+		try {
+			const status = api?.signInStatus ? await api.signInStatus() : signInStatus;
+			if (status?.mode === "key" && status.hasKey) {
+				if (!api?.removeSignInKey || !await askConfirm({ title: "Change how Grok signs in?", body: "Every session's Grok stops, and Grok's background commands and scheduled loops stop.", ok: "Remove key", danger: true })) { return; }
+				const result = await api.removeSignInKey();
+				setNotice(result.ok ? "API key removed." : result.error || "The API key could not be removed.");
+				return;
+			}
+			const check = setup.result?.grok;
+			if (check?.keySource === "env" && check.signIn !== "saved") { setNotice("Remove XAI_API_KEY from your environment to stop using it."); return; }
+			if (!api?.signOut || !await askConfirm({ title: "Sign out of Grok?", body: "This signs Grok out on this computer, in a terminal too. Grok's background commands and scheduled loops will stop.", ok: "Sign out", danger: true })) { return; }
+			const result = await api.signOut();
+			setNotice(result.ok ? "Signed out. Grok asks you to sign in when you next send a message." : result.error || "Grok could not sign out.");
+		} catch {
+			setNotice("Grok's sign-in could not be changed.");
+		}
 	}
 
 	function openUrl(url: string, external: boolean) {
 		const api = window.grokCode;
-		if (external || !settingsRef.current.linksInBuiltIn) {
+		if (external || isCloud || !settingsRef.current.linksInBuiltIn) {
 			void api?.openExternal?.(url).then((result) => { if (!result.ok) { setNotice(result.error || "That link could not open."); } });
 			return;
 		}
@@ -2315,20 +3039,30 @@ export function App() {
 		void api.openImage(file).then((result) => { if (!result.ok) { setNotice(result.error || "That image could not open."); } });
 	}
 
+	function terminalOwner(id: string) {
+		if (deletedRef.current.includes(id)) { return undefined; }
+		if (pendingRef.current?.id === id) { return pendingRef.current; }
+		if (keptForm.current?.session.id === id) { return keptForm.current.session; }
+		return sessionsRef.current.find((item) => item.id === id);
+	}
+
 	async function openTerminal(sessionId = session.id, folder = session.folder, title = "") {
 		const api = window.grokCode;
 		if (!api?.terminalOpen) {
 			setTerminalError("Reopen this window to open a terminal.");
 			return "";
 		}
-		const generation = terminalGeneration.current;
-		const result = await api.terminalOpen({ cwd: folder });
-		if (!result.ok || !result.id) {
-			setTerminalError(result.error || "The terminal could not start.");
+		const result = await api.terminalOpen({ cwd: folder }).catch(() => null);
+		const owner = terminalOwner(sessionId);
+		if (owner?.environment !== "Local" || folderKey(owner.folder) !== folderKey(folder)) {
+			if (result?.id) { stopTerminal(result.id); }
+			return "";
+		}
+		if (!result?.ok || !result.id) {
+			setTerminalError(result?.error || "The terminal could not start.");
 			return "";
 		}
 		const id = result.id;
-		if (generation !== terminalGeneration.current) { void api.terminalClose?.(id); return ""; }
 		setTerminalError("");
 		setTerminals((current) => ({ ...current, [sessionId]: [...(current[sessionId] ?? []), { id, title: title || `Terminal ${(current[sessionId]?.length ?? 0) + 1}`, cwd: folder, running: true, output: "", received: 0, backend: result.backend }] }));
 		setActiveTerminal((current) => ({ ...current, [sessionId]: id }));
@@ -2354,7 +3088,7 @@ export function App() {
 	}
 
 	function stopTerminal(id: string) {
-		void window.grokCode?.terminalClose?.(id);
+		void window.grokCode?.terminalClose?.(id).catch(() => {});
 	}
 
 	const sideId = `side-${session.id}`;
@@ -2414,7 +3148,7 @@ export function App() {
 			}),
 			folderFiles: paneFiles,
 			openFile,
-			fileMenu: (file, event) => setFileMenu({ file, x: event.clientX, y: event.clientY }),
+			fileMenu: showFileMenu,
 			openLink,
 			copyText: (text) => copyText(text),
 			quote: (text) => {
@@ -2533,6 +3267,10 @@ export function App() {
 		})();
 	}
 
+	function showFileMenu(file: string, event: MouseEvent) {
+		setFileMenu({ file, x: event.clientX, y: event.clientY, opener: event.currentTarget as HTMLElement });
+	}
+
 	function openIn(target: "explorer" | "vscode", file?: string, line?: number) {
 		const api = window.grokCode;
 		if (!api?.openIn) {
@@ -2553,8 +3291,12 @@ export function App() {
 	}
 
 	function deleteSession(id: string) {
-		void window.grokCode?.stopSession?.(id);
-		setDeleted((current) => [...current, id]);
+		const item = sessionsRef.current.find((entry) => entry.id === id);
+		if (item?.environment === "Cloud") {
+			if (turnTargets.current[id] || item.cloud?.active) { setNotice("Stop this session first."); return; }
+		} else { void window.grokCode?.stopSession?.(id); }
+		deletedRef.current = [...deletedRef.current, id];
+		setDeleted(deletedRef.current);
 		// The window always has an unarchived session, so deleting the last one leaves a new one in the same folder.
 		setSessions((current) => {
 			const rest = current.filter((item) => item.id !== id);
@@ -2571,6 +3313,7 @@ export function App() {
 
 	// Archives, or unarchives, a session. Archiving stops its Grok; the sidebar asks first when that would stop work.
 	function archiveSession(id: string, target: Session | undefined) {
+		if (target?.environment === "Cloud" && !target.archived && (turnTargets.current[id] || target.cloud?.active)) { setNotice("Stop this session first."); return; }
 		if (target && !target.archived && target.worktreeFolder && window.grokCode?.removeWorktree && !sharesFolder(target)) {
 			setHeld((current) => ({ ...current, [id]: true }));
 			void window.grokCode.removeWorktree(target.folder, target.worktreeFolder, { force: false }).then(async (result) => {
@@ -2588,7 +3331,10 @@ export function App() {
 			}).catch(() => setNotice("The worktree could not be restored."));
 			return;
 		}
-		if (target && !target.archived) { setHeld((current) => ({ ...current, [id]: true })); void window.grokCode?.stopSession?.(id); }
+		if (target && !target.archived) {
+			setHeld((current) => ({ ...current, [id]: true }));
+			if (target.environment !== "Cloud") { void window.grokCode?.stopSession?.(id); }
+		}
 		// Unarchive counts as activity, so automatic archiving does not archive it again at the next launch.
 		setSessions((current) => current.map((item) => (item.id === id ? { ...item, archived: !item.archived, pinned: false, ...(item.archived ? { lastActivityAt: Date.now() } : {}) } : item)));
 	}
@@ -2597,39 +3343,73 @@ export function App() {
 	// The context split and the week's spend are read from Grok's files, and the usage limit from Grok (a one-shot Grok when none is running), when a turn ends or the session changes.
 	const agentId = session.agentSessionId ?? "";
 	const idle = !busy[session.id];
+	const signInRevision = signInEpoch.current;
 	useEffect(() => {
-		if (!idle) { return; }
+		if (!idle || isCloud) { return; }
 		const api = window.grokCode;
 		void api?.recentSpend?.().then((result) => { if (result.ok && result.usd != null) { setRecentUsd(result.usd); } });
-		// A failed read keeps the last limit shown; before any Grok runs there is none.
-		void api?.billing?.().then((result) => { if (result.ok) { setLimit(result); } }).catch(() => {});
+		if (!keyMode) { void readLimit(); }
 		if (!agentId) { return; }
 		void api?.contextBreakdown?.(agentId).then((result) => {
 			if (result.ok && result.parts) { setBreakdown({ id: agentId, parts: result.parts, autoCompactPercent: result.autoCompactPercent ?? 85 }); }
 		});
-	}, [agentId, idle]);
+	}, [agentId, idle, keyMode, isCloud, signInRevision]);
+	useEffect(() => {
+		const reset = Date.parse(limit?.resetsAt ?? "");
+		if (!Number.isFinite(reset)) { return; }
+		let timer: ReturnType<typeof setTimeout>;
+		const markAtReset = () => {
+			const delay = reset - Date.now();
+			if (delay <= 0) { setLimitStale(true); }
+			else { timer = setTimeout(markAtReset, Math.min(delay, 2_147_483_647)); }
+		};
+		markAtReset();
+		return () => clearTimeout(timer);
+	}, [limit]);
 	const queue = queued[session.id] ?? [];
 	const files = attachments[session.id] ?? [];
 	const chatChoices = contextChoices(sessions, session.id);
 	const chosenChats = contextPicks[session.id] ?? [];
-	const isBusy = !!busy[session.id];
-	const suggestion = settings.promptSuggestions && !prompt && !isBusy && !pending ? suggestions[session.id] ?? "" : "";
-	const sendLabel = isBusy && !prompt.trim() ? "Stop" : "Send";
-	const recentFolders = [...new Map(sessions.map((item) => [folderKey(item.folder), item.folder])).values()].slice(0, 8);
-	const browserList = browserTabs[session.id] ?? [];
-	const servers2: DevServer[] = (devScripts[session.id] ?? []).map((item) => ({ ...item, running: !!devTabs[`${session.id}:${item.script}`] }));
+	const isBusy = !!busy[session.id] || !!(isCloud && session.cloud?.active);
+	const releaseCloudQueue = isCloud && queue.length > 0 && held[session.id] && !busy[session.id];
+	const suggestion = !isCloud && settings.promptSuggestions && !prompt && !isBusy && !pending ? suggestions[session.id] ?? "" : "";
+	const sendLabel = isBusy && !prompt.trim() && !releaseCloudQueue ? "Stop" : "Send";
+	const recentFolders = [...new Map(sessions.filter((item) => item.folder).map((item) => [folderKey(item.folder), item.folder])).values()].slice(0, 5);
+	const projectPicks = firstRun ? cliProjectFolders : recentFolders;
 	const diffComments = comments[session.id] ?? [];
 	const prInfo = prs[session.id];
-	const branch = branches[session.id];
 
 	function sidePane(id: SidePaneId) {
 		const focus = () => setFocusedPane(id);
+		const index = visiblePanes.indexOf(id);
+		const shownIndex = shownPaneIds.indexOf(id);
+		const shown = shownIndex >= 0;
+		const second = paneColumns === 2 && shownIndex >= firstPaneColumn;
+		const row = second ? shownIndex - firstPaneColumn : shownIndex;
+		const rowsInSecond = shownPaneIds.length - firstPaneColumn;
+		const gridRow = second && row === rowsInSecond - 1 && rowsInSecond < paneRows
+			? `${paneRows === 2 ? row * 2 + 1 : row + 1} / -1`
+			: paneRows === 2 ? row * 2 + 1 : row + 1;
+		const layout: PaneLayoutControls = {
+			expanded: fullPane === id,
+			onToggleExpand: () => setExpandedPane((current) => current === id ? null : id),
+			...(index > 0 ? { moveEarlier: () => movePane(id, -1) } : {}),
+			...(index >= 0 && index < visiblePanes.length - 1 ? { moveLater: () => movePane(id, 1) } : {}),
+		};
 		let body = null;
 		if (id === "diff") {
 			body = (
 				<DiffPane
-					key={session.id}
-					snapshot={diffs[session.id]}
+					key={JSON.stringify([session.id, session.folder])}
+					layout={layout}
+					snapshot={progressiveChanges ? (session.folder ? paneChanges : { ok: false, error: "Choose a folder to see changes." }) : diffs[session.id]}
+					progressive={progressiveChanges}
+					loadingFiles={wantsChangeList && !inventory}
+					loadingFile={!!patchKey && (!activePatch || activePatch.loading)}
+					fileError={activePatch?.error}
+					fullLimitReached={!!activePatch?.full && !!activePatch.file?.truncated}
+					onLoadFull={() => loadChangePatch(!!activePatch?.file?.truncated)}
+					onStopLoad={stopChangeLoad}
 					scope={scope}
 					onScope={(value) => setDiffScope((current) => ({ ...current, [session.id]: value }))}
 					commits={commits[session.id] ?? []}
@@ -2639,7 +3419,7 @@ export function App() {
 					busy={isBusy}
 					onCommit={async (input) => {
 						const commit = window.grokCode?.gitCommit;
-						const result: WriteResult & { message?: string; committed?: boolean; sha?: string } = commit ? await commit(session.folder, { ...input, expected: branches[session.id]?.branch }).catch(() => ({ ok: false, error: "The commit could not be checked. Refresh to see what happened." })) : { ok: false, error: "Reopen this window to commit." };
+						const result: WriteResult & { message?: string; committed?: boolean; sha?: string } = commit ? await commit(session.folder, { ...input, expected: branch?.branch }).catch(() => ({ ok: false, error: "The commit could not be checked. Refresh to see what happened." })) : { ok: false, error: "Reopen this window to commit." };
 						setNotice(result.ok ? result.message || "Committed." : result.error || "The commit could not be checked. Refresh to see what happened.", result.ok);
 						return result;
 					}}
@@ -2661,11 +3441,14 @@ export function App() {
 					}}
 					comments={diffComments}
 					viewed={viewed[session.id] ?? {}}
-					onViewed={(file, fingerprint) => setViewed((current) => {
-						const mine = { ...(current[session.id] ?? {}) };
-						if (fingerprint) { mine[file] = fingerprint; } else { delete mine[file]; }
-						return { ...current, [session.id]: mine };
-					})}
+					onViewed={(file, fingerprint) => {
+						if (progressiveChanges) { rememberChangeMark(file, fingerprint); }
+						setViewed((current) => {
+							const mine = { ...current[session.id], ...(fingerprint ? { [file]: fingerprint } : {}) };
+							if (!fingerprint) { delete mine[file]; }
+							return { ...current, [session.id]: mine };
+						});
+					}}
 					onAddComment={(comment) => setComments((current) => ({ ...current, [session.id]: [...(current[session.id] ?? []), { ...comment, id: crypto.randomUUID() }] }))}
 					onRemoveComment={(commentId) => setComments((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((item) => item.id !== commentId) }))}
 					onSendComments={() => {
@@ -2680,13 +3463,14 @@ export function App() {
 					onCreatePr={createPr}
 					onMergeWhenReady={mergeWhenReady}
 					onOpenFile={openFile}
-					onFileMenu={(file, event) => setFileMenu({ file, x: event.clientX, y: event.clientY })}
+					onFileMenu={showFileMenu}
 					onClose={() => closePane("diff")}
 				/>
 			);
 		} else if (id === "editor") {
 			body = (
 				<FilesPane
+					layout={layout}
 					docKey={editorKey}
 					fileTypes={settings.editorFileTypes}
 					files={modelForPanes.folderFiles}
@@ -2707,14 +3491,16 @@ export function App() {
 					onOverride={() => saveEditor(editorOpen?.version)}
 					onDiscard={() => { void reloadEditor(); }}
 					onClearRecovery={() => setEditorDrafts((current) => (current[editorKey] ? { ...current, [editorKey]: { ...current[editorKey]!, recoveryTexts: [] } } : current))}
-					onFileMenu={(file, event) => setFileMenu({ file, x: event.clientX, y: event.clientY })}
+					onFileMenu={showFileMenu}
 					onClose={() => closePane("editor")}
 				/>
 			);
 		} else if (id === "terminal") {
 			body = (
 				<TerminalPane
+					layout={layout}
 					tabs={sessionTerminals}
+					terminalScreenReader={settings.terminalScreenReader}
 					activeId={sessionTerminals.find((tab) => tab.id === activeTerminal[session.id])?.id ?? sessionTerminals[0]?.id ?? ""}
 					error={terminalError}
 					onActivate={(tabId) => setActiveTerminal((current) => ({ ...current, [session.id]: tabId }))}
@@ -2741,97 +3527,209 @@ export function App() {
 				/>
 			);
 		} else if (id === "browser") {
-			body = (
-				<BrowserPane
-					key={session.id}
-					uiSessionId={session.id}
-					controlEnabled={settings.browserControl}
-					controlStopped={browserStopped[session.id] ?? false}
-					controlActivity={browserActivity[session.id]}
-					onStopControl={() => browserAccess(true)}
-					onResumeControl={() => browserAccess(false)}
-					tabs={browserList}
-					activeId={browserList.find((tab) => tab.id === activeBrowser[session.id])?.id ?? browserList[0]?.id ?? ""}
-					onActivate={(tabId) => setActiveBrowser((current) => ({ ...current, [session.id]: tabId }))}
-					onNewTab={() => {
-						const tabId = crypto.randomUUID();
-						setBrowserTabs((current) => ({ ...current, [session.id]: [...(current[session.id] ?? []), { id: tabId, url: "", title: "New tab" }] }));
-						setActiveBrowser((current) => ({ ...current, [session.id]: tabId }));
-					}}
-					onCloseTab={(tabId) => setBrowserTabs((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((tab) => tab.id !== tabId) }))}
-					onNavigate={(tabId, raw) => {
-						let url: URL;
-						try { url = new URL(/^[a-z]+:\/\//i.test(raw.trim()) ? raw.trim() : `http://${raw.trim()}`); } catch { setBrowserError("Type an http or https address."); return; }
-						if (url.protocol !== "http:" && url.protocol !== "https:") { setBrowserError("Only http and https addresses open here."); return; }
-						setBrowserError("");
-						setBrowserTabs((current) => ({ ...current, [session.id]: (current[session.id] ?? []).map((tab) => (tab.id === tabId ? { ...tab, url: url.toString(), title: url.host } : tab)) }));
-					}}
-					onPageChanged={(tabId, url, title) => setBrowserTabs((current) => ({ ...current, [session.id]: (current[session.id] ?? []).map((tab) => (tab.id === tabId ? { ...tab, url: url || tab.url, title: title || tab.title } : tab)) }))}
-					error={browserError}
-					keepCookies={settings.keepCookies}
-					onKeepCookies={(on) => changeSettings({ keepCookies: on })}
-					onClearData={() => { void Promise.all(["persist:grok-code", "temp:grok-code"].map((partition) => window.grokCode?.clearBrowsingData?.(partition))).then((results) => { const failed = results.find((result) => result && !result.ok); setNotice(failed ? (failed.error || "Browsing data could not be cleared.") : "Browsing data cleared.", !failed); }); }}
-					linksInBuiltIn={settings.linksInBuiltIn}
-					onLinksInBuiltIn={(on) => changeSettings({ linksInBuiltIn: on, linkAsked: true })}
-					devServers={servers2}
-					onStartServer={(script) => { void startServer(script); }}
-					onStopServer={(script) => { const tabId = devTabs[`${session.id}:${script}`]; if (tabId) { stopTerminal(tabId); } }}
-					onStopAll={() => Object.entries(devTabs).filter(([key]) => key.startsWith(`${session.id}:`)).forEach(([, tabId]) => stopTerminal(tabId))}
-					selectTick={selectTick}
-					onPicked={(pick) => {
-						setPrompt((current) => `${current}${current ? "\n\n" : ""}Selected element on ${pick.url}: \`${pick.selector}\`\n\`\`\`html\n${pick.html}\n\`\`\``);
-						promptRef.current?.focus?.();
-					}}
-					onProblem={(tabId, problem) => setBrowserTabs((current) => ({ ...current, [session.id]: (current[session.id] ?? []).map((tab) => tab.id === tabId ? { ...tab, problems: addProblem(tab.problems ?? [], problem) } : tab) }))}
-					onClearProblems={(tabId) => setBrowserTabs((current) => ({ ...current, [session.id]: (current[session.id] ?? []).map((tab) => tab.id === tabId ? { ...tab, problems: [] } : tab) }))}
-					onDiagnostics={(text) => {
-						setPrompt((current) => `${current}${current ? "\n\n" : ""}${text}`);
-						promptRef.current?.focus?.();
-					}}
-					onClose={() => closePane("browser")}
-				/>
-			);
+			body = browserPaneIds.map((ownerId) => {
+				const reporting = ownerId === session.id;
+				const visible = reporting && browserVisible;
+				const tabs = browserTabs[ownerId] ?? [];
+				const servers: DevServer[] = (devScripts[ownerId] ?? []).map((item) => ({ ...item, running: !!devTabs[`${ownerId}:${item.script}`] }));
+				const updateTabs = (update: (tabs: BrowserTab[]) => BrowserTab[]) => {
+					setBrowserTabs((current) => ({ ...current, [ownerId]: update(current[ownerId] ?? []) }));
+				};
+				const updateTab = (tabId: string, update: (tab: BrowserTab) => BrowserTab) => {
+					updateTabs((list) => list.map((tab) => tab.id === tabId ? update(tab) : tab));
+				};
+				const activate = (tabId: string) => setActiveBrowser((current) => ({ ...current, [ownerId]: tabId }));
+				return <div className="browser-pane-host" hidden={!visible} inert={!visible} key={ownerId}>
+					<BrowserPane
+						uiSessionId={ownerId}
+						visible={visible}
+						reporting={reporting}
+						layout={visible ? layout : undefined}
+						controlEnabled={reporting && !isCloud && settings.browserControl}
+						controlStopped={browserStopped[ownerId] ?? false}
+						controlActivity={browserActivity[ownerId]}
+						onStopControl={() => browserAccess(true)}
+						onResumeControl={() => browserAccess(false)}
+						tabs={tabs}
+						activeId={tabs.find((tab) => tab.id === activeBrowser[ownerId])?.id ?? tabs[0]?.id ?? ""}
+						onActivate={activate}
+						onNewTab={() => {
+							const tabId = crypto.randomUUID();
+							updateTabs((list) => [...list, { id: tabId, url: "", title: "New tab" }]);
+							activate(tabId);
+						}}
+						onCloseTab={(tabId) => updateTabs((list) => list.filter((tab) => tab.id !== tabId))}
+						onNavigate={(tabId, raw) => {
+							let url: URL;
+							try { url = new URL(/^[a-z]+:\/\//i.test(raw.trim()) ? raw.trim() : `http://${raw.trim()}`); } catch { setBrowserError("Type an http or https address."); return; }
+							if (url.protocol !== "http:" && url.protocol !== "https:") { setBrowserError("Only http and https addresses open here."); return; }
+							setBrowserError("");
+							updateTab(tabId, (tab) => ({ ...tab, url: url.toString(), title: url.host }));
+						}}
+						onPageChanged={(tabId, url, title) => updateTab(tabId, (tab) => ({ ...tab, url: url || tab.url, title: title || tab.title }))}
+						error={browserError}
+						keepCookies={settings.keepCookies}
+						onKeepCookies={(on) => changeSettings({ keepCookies: on })}
+						onClearData={() => { void Promise.all(["persist:grok-code", "temp:grok-code"].map((partition) => window.grokCode?.clearBrowsingData?.(partition))).then((results) => { const failed = results.find((result) => result && !result.ok); setNotice(failed ? (failed.error || "Browsing data could not be cleared.") : "Browsing data cleared.", !failed); }); }}
+						linksInBuiltIn={settings.linksInBuiltIn}
+						onLinksInBuiltIn={(on) => changeSettings({ linksInBuiltIn: on, linkAsked: true })}
+						devServers={servers}
+						onStartServer={(script) => { void startServer(script); }}
+						onStopServer={(script) => { const tabId = devTabs[`${ownerId}:${script}`]; if (tabId) { stopTerminal(tabId); } }}
+						onStopAll={() => Object.entries(devTabs).filter(([key]) => key.startsWith(`${ownerId}:`)).forEach(([, tabId]) => stopTerminal(tabId))}
+						selectTick={selectTick}
+						onPicked={(pick) => {
+							if (!visible) { return; }
+							setPrompt((current) => `${current}${current ? "\n\n" : ""}Selected element on ${pick.url}: \`${pick.selector}\`\n\`\`\`html\n${pick.html}\n\`\`\``);
+							promptRef.current?.focus?.();
+						}}
+						onProblem={(tabId, problem) => updateTab(tabId, (tab) => ({ ...tab, problems: addProblem(tab.problems ?? [], problem) }))}
+						onClearProblems={(tabId) => updateTab(tabId, (tab) => ({ ...tab, problems: [] }))}
+						onDiagnostics={(text) => {
+							if (!visible) { return; }
+							setPrompt((current) => `${current}${current ? "\n\n" : ""}${text}`);
+							promptRef.current?.focus?.();
+						}}
+						onClose={() => closePane("browser")}
+					/>
+				</div>;
+			});
 		} else {
-			body = <PaneView id={id} model={modelForPanes} />;
+			body = <PaneView id={id} model={modelForPanes} layout={layout} />;
 		}
-		return <div key={id} className={focusedPane === id ? "side-slot focused" : "side-slot"} onMouseDownCapture={focus} onFocusCapture={focus}>{body}</div>;
+		return <div key={id} data-pane={id} hidden={!shown} inert={!shown} style={shown ? { gridColumn: second ? 2 : 1, gridRow } : undefined} className={focusedPane === id ? "side-slot focused" : "side-slot"} onMouseDownCapture={focus} onFocusCapture={focus}>{body}</div>;
 	}
 
-	function startResize(event: MouseEvent) {
-		event.preventDefault();
-		const startX = event.clientX;
-		const startWidth = paneWidth;
-		let width = startWidth;
-		const move = (moveEvent: globalThis.MouseEvent) => {
-			width = Math.min(Math.max(startWidth - (moveEvent.clientX - startX), 320), sideCap(window.innerWidth, settings.sidebarCollapsed || shouldCollapseSidebar(window.innerWidth, panes.length > 0)));
-			if (sideCol.current) { sideCol.current.style.width = `${width}px`; }
+	function paneRowDivider() {
+		const bound = (value: number) => Math.min(PANE_SPLIT_MAX, Math.max(PANE_SPLIT_MIN, Math.round(value)));
+		return <div
+			className="splitter pane-row-splitter"
+			style={{ gridRow: 2, gridColumn: paneColumns === 2 && shownPaneIds.length === 3 ? 1 : "1 / -1" }}
+			role="separator" aria-orientation="horizontal" aria-label="Resize stacked panes"
+			aria-valuenow={paneSplit} aria-valuemin={PANE_SPLIT_MIN} aria-valuemax={PANE_SPLIT_MAX} tabIndex={0}
+			onPointerDown={(event) => {
+				const height = (event.currentTarget.parentElement?.clientHeight ?? 0) - PANE_SPLITTER_WIDTH * 3;
+				if (event.button !== 0 || height <= 0) { return; }
+				event.preventDefault();
+				event.currentTarget.focus();
+				paneDrag.current = { id: event.pointerId, y: event.clientY, height, start: paneSplit };
+				event.currentTarget.setPointerCapture(event.pointerId);
+			}}
+			onPointerMove={(event) => {
+				const drag = paneDrag.current;
+				if (drag?.id === event.pointerId) { setPaneSplit(bound(drag.start + (event.clientY - drag.y) / drag.height * 100)); }
+			}}
+			onLostPointerCapture={() => { paneDrag.current = null; }}
+			onDoubleClick={() => setPaneSplit(50)}
+			onKeyDown={(event) => {
+				const step = event.shiftKey ? 15 : 5;
+				const next = event.key === "ArrowUp" ? paneSplit - step : event.key === "ArrowDown" ? paneSplit + step
+					: event.key === "Home" ? PANE_SPLIT_MIN : event.key === "End" ? PANE_SPLIT_MAX : null;
+				if (next !== null) { event.preventDefault(); setPaneSplit(bound(next)); }
+			}}
+		/>;
+	}
+
+	function resizeHandle(key: ColumnWidth, label: string, width: number, min: number, max: number) {
+		const direction = key === "sidebarWidth" ? 1 : -1;
+		const edge = key === "sidebarWidth" ? " sidebar-splitter" : key === "railWidth" ? " rail-splitter" : "";
+		const bound = (value: number) => Math.min(Math.max(value, min), max);
+		const save = (value: number) => changeSettings({ [key]: bound(value) });
+		const start = (event: MouseEvent<HTMLDivElement>) => {
+			if (event.button > 0) { return; }
+			event.preventDefault();
+			resizeCleanup.current?.();
+			const startX = event.clientX;
+			let next = width;
+			setResizePreview({ key, width });
+			const move = (moveEvent: globalThis.MouseEvent) => {
+				const value = bound(width + direction * (moveEvent.clientX - startX));
+				if (value === next) { return; }
+				next = value;
+				setResizePreview({ key, width: next });
+			};
+			const finish = () => {
+				cleanup();
+				setResizePreview(null);
+				if (next !== width) { save(next); }
+			};
+			const cleanup = () => {
+				window.removeEventListener("mousemove", move);
+				window.removeEventListener("mouseup", finish);
+				window.removeEventListener("blur", finish);
+				resizeCleanup.current = null;
+			};
+			resizeCleanup.current = cleanup;
+			window.addEventListener("mousemove", move);
+			window.addEventListener("mouseup", finish);
+			window.addEventListener("blur", finish);
 		};
-		const up = () => {
-			window.removeEventListener("mousemove", move);
-			window.removeEventListener("mouseup", up);
-			if (width !== startWidth) { changeSettings({ sideWidth: width }); }
+		const onKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+			const step = (event.shiftKey ? 96 : 24) * direction;
+			let next;
+			if (event.key === "ArrowLeft") { next = width - step; }
+			else if (event.key === "ArrowRight") { next = width + step; }
+			else if (event.key === "Home") { next = min; }
+			else if (event.key === "End") { next = max; }
+			else { return; }
+			event.preventDefault();
+			save(next);
 		};
-		window.addEventListener("mousemove", move);
-		window.addEventListener("mouseup", up);
+		const onDoubleClick = () => {
+			const defaultWidth = bound(DEFAULT_SETTINGS[key]);
+			let next = min;
+			if (width < max && width === min) { next = defaultWidth; }
+			else if (width < max && width === defaultWidth) { next = max; }
+			save(next);
+		};
+		return <div
+			className={`splitter${edge}${resizePreview?.key === key ? " resizing" : ""}`}
+			role="separator"
+			aria-orientation="vertical"
+			aria-label={label}
+			aria-valuenow={width}
+			aria-valuemin={min}
+			aria-valuemax={max}
+			inert={settingsCover}
+			tabIndex={0}
+			title="Drag, or use the arrow keys, to resize. Double-click to switch between narrow, default and wide."
+			onMouseDown={start}
+			onKeyDown={onKeyDown}
+			onDoubleClick={onDoubleClick}
+		/>;
 	}
 
 	const contextPercent = usage ? Math.min(100, Math.round((usage.contextTokens / Math.max(1, usage.contextWindow)) * 100)) : null;
 	const limitLeft = limit && limit.percent !== null ? Math.max(0, Math.round(100 - limit.percent)) : null;
 	const limitName = limit?.period ? `${limit.period[0].toUpperCase()}${limit.period.slice(1)}` : "Limit";
-	const limitTitle = limit ? limitLine(limit) : "Grok's usage limit isn't available.";
+	const limitTitle = limit ? `${limitLine(limit)}${limitStale ? " · Last reported; may be out of date." : ""}` : "Grok's usage limit isn't available.";
+	const contextTitle = `Context about ${contextPercent}% used${keyMode ? ` · session cost $${(session.costUsd ?? 0).toFixed(2)}${recentUsd !== null ? `\nGrok, last 7 days on this computer: $${recentUsd.toFixed(2)}` : ""}` : ""}`;
 	const showFolderWarn = !collisionSeen[session.id] && folderBusy(session);
 	// shortcut: the disconnect choice is the main chat only; a side-chat exit keeps its error text
 	const lastGrok = [...messages].reverse().find((message) => message.role === "grok" && !message.pending);
-	const showDisconnect = !pending && session.failed === true && !busy[session.id] && !!lastGrok?.text.split("\n").some((line) => line.startsWith("Grok exited."));
+	const wasInterrupted = lastGrok?.appNote === INTERRUPTED_NOTE;
+	const showDisconnect = !pending && !folderMissing && !isCloud && !busy[session.id] && (wasInterrupted || (session.failed === true && !!lastGrok?.appNote?.startsWith("Grok exited.")));
+	const mountedPanes = PANE_ORDER.filter((id) => visiblePanes.includes(id)
+		|| (id === "terminal" && sessionTerminals.length > 0)
+		|| (id === "browser" && browserPaneIds.length > 0));
+	const paneGridStyle: CSSProperties = {
+		width: fullPane ? undefined : paneWidth,
+		gridTemplateColumns: `repeat(${paneColumns}, minmax(0, 1fr))`,
+		gridTemplateRows: paneRows === 2 ? `minmax(0, ${paneSplit}fr) 6px minmax(0, ${100 - paneSplit}fr)`
+			: `repeat(${paneRows}, minmax(${paneRows > 2 ? "240px" : "0"}, 1fr))`,
+		rowGap: paneRows === 2 ? 0 : undefined,
+	};
 
 	return (
-		<div className={sidebarCollapsed ? "app collapsed" : "app"}>
-			{(menu || fileMenu) && <button className="backdrop" aria-label="Close menu" onClick={() => { setMenu(null); setFileMenu(null); }} />}
+		<div className={sidebarCollapsed ? "app collapsed" : "app"} style={{ "--sidebar-width": `${sidebarWidth}px`, "--rail-width": `${railWidth}px` } as CSSProperties}>
+			{(menu || fileMenu) && <button className="backdrop" inert={settingsCover} aria-label="Close menu" onClick={() => { setMenu(null); setFileMenu(null); }} />}
 			{!sidebarCollapsed && (
 				<Sidebar
-					sessions={sessions}
+					inert={settingsCover}
+					revealActiveOnMount={revealSidebarProject.current}
+					sessions={sessions.filter((item) => item.id !== firstSessionId.current || item.folder)}
 					chats={extraChats}
-					activeId={pending ? "" : session.id}
+					activeId={sidebarActiveId}
 					query={query}
 					activity={activity}
 					onQuery={setQuery}
@@ -2841,6 +3739,7 @@ export function App() {
 					onPin={(id) => setSessions((current) => current.map((item) => (item.id === id ? { ...item, pinned: !item.pinned } : item)))}
 					onArchive={(id) => {
 						const target = sessions.find((item) => item.id === id);
+						if (target?.environment === "Cloud") { archiveSession(id, target); return; }
 						const working = busy[id] || busy[`side-${id}`] || [...(grokTasks[id] ?? []), ...(grokTasks[`side-${id}`] ?? [])].some((task) => task.status === "running") || [...(subagents[id] ?? []), ...(subagents[`side-${id}`] ?? [])].some((agent) => agent.status === "running");
 						if (target && !target.archived && working) {
 							void askConfirm({ title: "Archive this session?", body: "Grok is still working in this session. Archiving stops the turn and any background commands.", ok: "Archive and stop", danger: true }).then((yes) => { if (yes) { archiveSession(id, target); } });
@@ -2864,7 +3763,12 @@ export function App() {
 					onNotice={setNotice}
 					account={account}
 					signIn={setup.result?.grok.ok ? setup.result.grok.signIn : undefined}
-					recentUsd={recentUsd}
+					signInMode={signInStatus?.mode ?? setup.result?.grok.signInMode}
+					keySource={setup.result?.grok.keySource}
+					keyIgnored={setup.result?.grok.keyIgnored}
+					keyUnreadable={setup.result?.grok.keyUnreadable}
+					keyRejected={setup.result?.grok.keyRejected}
+					recentUsd={keyMode ? recentUsd : null}
 					onShortcuts={() => setShortcuts(true)}
 					onOpenUrl={(url) => openUrl(url, true)}
 					onSignOut={signOut}
@@ -2872,16 +3776,18 @@ export function App() {
 					onUpdate={() => { void openUpdate(update); }}
 				/>
 			)}
-			<main className="workspace">
+			{!sidebarCollapsed && resizeHandle("sidebarWidth", "Resize sidebar", sidebarWidth, SIDEBAR_MIN, sidebarCap)}
+			<main className="workspace" inert={settingsCover}>
 				<header className="topbar">
-					{sidebarCollapsed && <button className="icon-btn" aria-label="Show sidebar" title={shouldCollapseSidebar(windowWidth, panes.length > 0) ? "Show sidebar and return to chat" : "Show sidebar"} onClick={() => {
-						if (shouldCollapseSidebar(windowWidth, panes.length > 0)) {
+					{sidebarCollapsed && <button className="icon-btn" aria-label="Show sidebar" title={shouldCollapseSidebar(windowWidth, visiblePanes.length > 0) ? "Show sidebar and return to chat" : "Show sidebar"} onClick={() => {
+						if (shouldCollapseSidebar(windowWidth, visiblePanes.length > 0)) {
 							if (panes.includes("editor")) { flushEditor(); }
 							setPanes([]);
 							setFocusedPane(null);
+							setExpandedPane(null);
 						}
 						if (settings.sidebarCollapsed) { changeSettings({ sidebarCollapsed: false }); }
-					}}>☰</button>}
+					}}><Icon name="sidebar" /></button>}
 					<div className="session-title">
 						{renaming === session.id ? (
 							<input
@@ -2898,93 +3804,112 @@ export function App() {
 						) : (
 							<button type="button" className="title-btn" title="Rename" onClick={() => { if (!pending) { setRenaming(session.id); } }}>{pending ? "New session" : session.title}</button>
 						)}
-						<button type="button" className="icon-btn caret" aria-label="Session menu" aria-expanded={menu === "session"} onClick={() => setMenu(menu === "session" ? null : "session")}>⌄</button>
-						<span className="meta">{session.project} · {session.branch}{isBusy ? " · working" : ""}</span>
+						<button type="button" className="icon-btn caret" aria-label="Session menu" aria-haspopup="menu" aria-expanded={menu === "session"} onClick={() => setMenu(menu === "session" ? null : "session")}><Icon name="chevron-down" /></button>
+						<span className="meta">{session.project}{titleBranch ? ` · ${titleBranch}` : ""}{session.cloud?.machine ? ` · ${session.cloud.machine}` : ""}{isBusy ? " · working" : ""}</span>
 					</div>
 					<span className="spacer" />
 					<div className="pane-switch" role="toolbar" aria-label="Panes">
-						{PANES.map((pane) => (
+						{PANES.filter((pane) => !isCloud || pane.id === "editor").map((pane) => (
 							<button key={pane.id} type="button" className={panes.includes(pane.id) ? "pane-tab on" : "pane-tab"} aria-pressed={panes.includes(pane.id)} aria-label={pane.label} title={pane.label} onClick={() => togglePane(pane.id)}>
 								<PaneIcon id={pane.id} />
 							</button>
 						))}
-						<button type="button" className="pane-tab" aria-label="More" title="More" aria-expanded={menu === "more"} onClick={() => setMenu(menu === "more" ? null : "more")}>⋮</button>
+						<button type="button" className="pane-tab" aria-label="More" title="More" aria-haspopup="menu" aria-expanded={menu === "more"} onClick={() => setMenu(menu === "more" ? null : "more")}><Icon name="more" /></button>
 					</div>
 					{menu === "session" && (
-						<div className="pop down session-menu">
+						<PopupMenu className="pop down session-menu" aria-label="Session menu" onDismiss={() => setMenu(null)}>
 							<div className="menu-label">Transcript view</div>
 							{VIEWS.map((item) => (
-								<button key={item} type="button" className={view === item ? "item on" : "item"} onClick={() => { setViews((current) => ({ ...current, [session.id]: item })); setMenu(null); }}>{VIEW_LABEL[item]}{view === item && <span className="check">✓</span>}</button>
+								<button key={item} type="button" className={view === item ? "item on" : "item"} role="menuitemradio" aria-checked={view === item} onClick={() => { setViews((current) => ({ ...current, [session.id]: item })); setMenu(null); }}>{VIEW_LABEL[item]}{view === item && <Icon name="check" className="menu-check" />}</button>
 							))}
 							<div className="menu-label">Open in</div>
-							<button type="button" className="item" disabled={!!pending} onClick={() => { openSessionWindow(session.id); setMenu(null); }}>New window</button>
-							<button type="button" className="item" onClick={() => openIn("explorer")}>{FILE_MANAGER}</button>
-							<button type="button" className="item" onClick={() => openIn("vscode")}>VS Code</button>
+							<button type="button" className="item" role="menuitem" disabled={!!pending} onClick={() => { openSessionWindow(session.id); setMenu(null); }}>New window{pending && <small>Send a first message to start the session.</small>}</button>
+							<button type="button" className="item" role="menuitem" onClick={() => openIn("explorer")}>{FILE_MANAGER}</button>
+							<button type="button" className="item" role="menuitem" onClick={() => openIn("vscode")}>VS Code</button>
 							<hr />
-							<button type="button" className="item" disabled={railOpen && !railShown} onClick={() => { changeSettings({ railOpen: !railOpen }); setMenu(null); }}>{railOpen && !railShown ? "Session rail (window too narrow)" : railShown ? "Hide session rail" : "Show session rail"}</button>
-							<button type="button" className="item" disabled={!!pending} onClick={() => { setRenaming(session.id); setMenu(null); }}>Rename</button>
-						</div>
+							{!isCloud && <button type="button" className="item" role="menuitem" disabled={railOpen && !railShown} onClick={() => { changeSettings({ railOpen: !railOpen }); setMenu(null); }}>{railOpen && !railShown ? "Session rail (window too narrow)" : railShown ? "Hide session rail" : "Show session rail"}</button>}
+							<button type="button" className="item" role="menuitem" disabled={!!pending} onClick={() => { setRenaming(session.id); setMenu(null); }}>Rename{pending && <small>Send a first message to start the session.</small>}</button>
+						</PopupMenu>
 					)}
 					{menu === "more" && (
-						<div className="pop down more-menu">
-							{MENU_PANES.map((pane) => (
-								<button key={pane.id} type="button" className={panes.includes(pane.id) ? "item on" : "item"} onClick={() => togglePane(pane.id)}>
+						<PopupMenu className="pop down more-menu" aria-label="More" onDismiss={() => setMenu(null)}>
+							{!isCloud && MENU_PANES.map((pane) => (
+								<button key={pane.id} type="button" className={panes.includes(pane.id) ? "item on" : "item"} role="menuitemcheckbox" aria-checked={panes.includes(pane.id)} onClick={() => togglePane(pane.id)}>
 									{pane.label}
 									<small>{pane.id === "plan" ? (planText || todos.length ? "Grok's current plan" : "No plan yet") : `${backgroundTasks.filter((task) => task.running).length} running`}</small>
+									{panes.includes(pane.id) && <Icon name="check" className="menu-check" />}
 								</button>
 							))}
 							<hr />
-							<button type="button" className="item" disabled={railOpen && !railShown} onClick={() => { changeSettings({ railOpen: !railOpen }); setMenu(null); }}>{railOpen && !railShown ? "Session rail (window too narrow)" : railShown ? "Hide session rail" : "Show session rail"}</button>
-							<button type="button" className="item" onClick={() => { setShortcuts(true); setMenu(null); }}>Keyboard shortcuts<small>{keyLabel("Ctrl+/")}</small></button>
-							<button type="button" className="item" onClick={() => { setSettingsOpen("general"); setMenu(null); }}>Settings</button>
-						</div>
+							<button type="button" className="item" role="menuitem" disabled={railOpen && !railShown} onClick={() => { changeSettings({ railOpen: !railOpen }); setMenu(null); }}>{railOpen && !railShown ? "Session rail (window too narrow)" : railShown ? "Hide session rail" : "Show session rail"}</button>
+							<button type="button" className="item" role="menuitem" onClick={() => { setShortcuts(true); setMenu(null); }}>Keyboard shortcuts<small>{keyLabel("Ctrl+/")}</small></button>
+							<button type="button" className="item" role="menuitem" onClick={() => { setSettingsOpen("general"); setMenu(null); }}>Settings</button>
+						</PopupMenu>
 					)}
 				</header>
 				<div className="stage">
-					<div className="stage-main">
+					<div className={pending && !messages.length ? "stage-main new-stage" : "stage-main"} inert={!!fullPane}>
 						{pending && (
 							<div className="new-page">
-								<h1>New session</h1>
-								<div className="new-row">
-									<label className="field">
-										<span>Environment</span>
-										<select aria-label="Environment" value="Local" onChange={() => {}}>
-											<option value="Local">Local · this computer</option>
-											<option value="SSH" disabled>SSH · not available</option>
-											<option value="Cloud" disabled>Cloud · not available</option>
+								<h1>{pending.folder ? "What should Grok work on?" : "Where should Grok work?"}</h1>
+								{!pending.folder && <p className="new-folder-intro">Choose the project folder for this session.</p>}
+								{isCloud && <div aria-label="Cloud setup">
+									<label className="field">Run on
+										<select aria-label="Run on" value={machineMode ? "machine" : "cloud"} onChange={(event) => {
+											const cloudMachineDraft = event.target.value === "machine" ? "" : undefined;
+											setPending((item) => item ? { ...item, cloudMachineDraft } : item);
+										}}>
+											<option value="cloud">Cursor's cloud</option>
+											<option value="machine">My machine</option>
 										</select>
 									</label>
-									<label className="field">
-										<span>Folder</span>
-										<select
-											aria-label="Folder"
-											value={folderKey(pending.folder)}
-											onChange={(event) => {
-												if (event.target.value === "__pick") {
-													void window.grokCode?.pickFolder().then((picked) => { if (picked) { setPending((item) => (item ? { ...item, folder: picked, project: shortPath(picked), worktree: shortPath(picked) } : item)); } });
-													return;
-												}
-												const folder = recentFolders.find((item) => folderKey(item) === event.target.value);
-												if (folder) { setPending((item) => (item ? { ...item, folder, project: shortPath(folder), worktree: shortPath(folder) } : item)); }
-											}}
-										>
-											{[...new Map([[folderKey(pending.folder), pending.folder], ...recentFolders.map((item) => [folderKey(item), item] as [string, string])]).entries()].map(([value, folder]) => <option key={value} value={value}>{folder}</option>)}
-											<option value="__pick">Choose a folder…</option>
-										</select>
-									</label>
-									<label className="toggle field-toggle" title="Work on a new branch in its own git worktree">
-										<input type="checkbox" checked={useWorktree} onChange={(event) => setUseWorktree(event.target.checked)} /> Worktree
-									</label>
-								</div>
+									{machineMode && <>
+										<label className="field">Machine name
+											<input aria-label="Machine name" aria-describedby="cursor-machine-name-hint" list="cursor-machine-names" value={machineDraft} onChange={(event) => {
+												const cloudMachineDraft = event.target.value;
+												setPending((item) => item ? { ...item, cloudMachineDraft } : item);
+											}} />
+										</label>
+										<datalist id="cursor-machine-names">
+											{settings.cursorMachines.filter((item) => item.repo === machineRepo.toLowerCase()).map(({ name }) => <option key={name} value={name} />)}
+										</datalist>
+										<p className="note" id="cursor-machine-name-hint">Letters, digits, dots, dashes and underscores. Start with a letter or digit, and don't end with a dot. Capitals count: type it as the worker shows it.</p>
+									</>}
+									{cloudSetupResult?.repoUrl && cloudSetupResult.ref && <p className="note">{cloudSetupResult.repoUrl.replace(/^https:\/\//, "")}, branch {cloudSetupResult.ref}</p>}
+									{!cloudKeyAvailable ? <p className="note">Add a Cursor API key in Settings.</p> : !cloudSetupResult ? <p className="note" role="status">Checking Cloud setup…</p> : <>
+										{cloudSetupResult.reachable === true && <p className="note">Cursor can reach this repository.</p>}
+										{cloudSetupResult.reachable === false && <p className="note">Cursor can't reach this repository yet. <button type="button" className="texty" onClick={() => openUrl("https://cursor.com/dashboard?tab=integrations", true)}>Open Cursor's GitHub integration</button></p>}
+										{cloudSetupResult.error && <p className="note" role="alert">{cloudSetupResult.error}</p>}
+										<button type="button" className="texty" onClick={() => void checkCloudSetup(pending)}>Check again</button>
+									</>}
+									{machineMode ? <>
+										{machineRef && !machineRefValid && <p className="note" role="alert">{MACHINE_REF_ERROR}</p>}
+										{machineCommands.length > 0 && <>
+											<p className="note"><strong>Set it up on that computer</strong></p>
+											<p className="note">Run these in the folder where the clone should go, the second once the clone has finished.</p>
+											{machineCommands.map((command) => <p className="note" key={command}><code>{command}</code> <button type="button" className="texty" aria-label={`Copy ${command}`} onClick={() => copyText(command)}>Copy</button></p>)}
+										</>}
+										<p className="note">First time on that computer? Settings has the install steps. <button type="button" className="texty" onClick={() => setSettingsOpen("general")}>Open Settings</button></p>
+										<p className="note">The agent runs commands, switches branches and commits on {validMachineName(machineName) ? machineName : "that computer"}, in the folder its worker runs in, as that computer's user. Give the worker its own clone, as above, not a folder you work in.</p>
+										{machineRefValid && <p className="note">The agent is told to work on a branch of its own, started from {machineRef} on GitHub, and not to push, so its commits stay in that clone. It works with that computer's Git sign-in, so nothing but that instruction stops a push.</p>}
+									</> : <>
+										<p className="note">Cloud sessions start from what's on GitHub. Your uncommitted changes and unpushed commits aren't included.</p>
+										{!!cloudSetupResult?.ahead && <p className="note">This branch is {cloudSetupResult.ahead} {cloudSetupResult.ahead === 1 ? "commit" : "commits"} ahead of its upstream.</p>}
+										{!!cloudSetupResult?.behind && <p className="note">This branch is {cloudSetupResult.behind} {cloudSetupResult.behind === 1 ? "commit" : "commits"} behind its upstream.</p>}
+									</>}
+									<p className="note">Cloud sessions use your Cursor credit.</p>
+									{!machineMode && <label className="toggle"><input type="checkbox" checked={pending.cloud?.autoCreatePR ?? false} disabled={!cloudModel || !cloudVariant} onChange={(event) => { if (cloudModel && cloudVariant) { changeCloudChoice(cloudModel, cloudVariant, event.target.checked); } }} /> Open a pull request</label>}
+									{cloudSetupResult?.modelsError && <p className="note" role="alert">{cloudSetupResult.modelsError} <button type="button" className="texty" onClick={() => void checkCloudSetup(pending)}>Try again</button></p>}
+								</div>}
 							</div>
 						)}
 						<div className="chat-row">
 							<PaneView id="chat" model={modelForPanes} />
 						</div>
 						<div className="dock" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}>
-							{sideOpen && (
+							{!isCloud && sideOpen && (
 								<div className="side-q" role="dialog" aria-label="Side chat">
-									<div className="side-q-hd"><b>Side chat</b><span className="meta">Reads this session; nothing goes back into it. It is not added to this chat's history; Grok keeps its own copy in ~/.grok/sessions.</span><span className="spacer" /><button type="button" className="pane-x" aria-label="Close side chat" onClick={() => setSideOpen(false)}>×</button></div>
+									<div className="side-q-hd"><b>Side chat</b><span className="meta">Reads this session; nothing goes back into it. It is not added to this chat's history; Grok keeps its own copy in ~/.grok/sessions.</span><span className="spacer" /><button type="button" className="pane-x" aria-label="Close side chat" onClick={() => setSideOpen(false)}><Icon name="close" /></button></div>
 									<SideLog messages={sideChats[session.id] ?? []} model={sideModel} />
 									<textarea
 										aria-label="Side question"
@@ -2993,7 +3918,7 @@ export function App() {
 										placeholder="Ask a side question"
 										onChange={(event) => setSideText(event.target.value)}
 										onKeyDown={(event) => {
-											if (event.key === "Enter" && !event.shiftKey) {
+											if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent?.isComposing) {
 												event.preventDefault();
 												if (send(sideText, true)) { setSideText(""); }
 											}
@@ -3001,22 +3926,27 @@ export function App() {
 									/>
 								</div>
 							)}
+							{folderMissing && <div className="missing-folder-banner">
+								<Icon name="folder-unavailable" />
+								<p role="status" id="missing-session-folder">This session's folder is missing.<small>Choose a folder to send. Your draft is kept.</small></p>
+								<button type="button" className="yes" disabled={!!busy[session.id]} onClick={() => void chooseSessionFolder()}>Choose folder…</button>
+							</div>}
 							<div className="composer">
 								{session.prWatch?.alert && <div className="queue pr-alert">
 									<span>{prAlertText(session.prWatch.number, session.prWatch.alert)}</span>
 									<button className="texty" onClick={askGrokToFix}>Ask Grok to fix</button>
-										<button className="texty" aria-label="Dismiss pull request alert" onClick={dismissPrAlert}>×</button>
+										<button className="texty" aria-label="Dismiss pull request alert" onClick={dismissPrAlert}><Icon name="close" /></button>
 									</div>}
 								{queue.length > 0 && (
 									<div className="queue">
-										{held[session.id] && <p className="note">Held until you press Send now or send a new message.</p>}
+									{held[session.id] && <p className="note">{isCloud ? "Held until you press Send." : "Held until you press Send now or send a new message."}</p>}
 										{queue.map((item) => (
 											<div className="queued" key={item.id}>
 												<span>{item.text}{item.contextFrom?.length ? ` · ${item.contextFrom.map((pick) => pick.title).join(", ")}` : ""}</span>
-												{busy[session.id] && !held[session.id] && !item.attachments.length && !item.contextFrom?.length && !item.text.trim().startsWith("/") && <button className="texty" onClick={() => void steerQueued(item)}>Steer</button>}
-												<button className="texty" onClick={() => sendNow(session.id, item.id)}>Send now</button>
+												{!isCloud && busy[session.id] && !held[session.id] && !item.attachments.length && !item.contextFrom?.length && !item.text.trim().startsWith("/") && <button className="texty" onClick={() => void steerQueued(item)}>Steer</button>}
+												{!isCloud && <button className="texty" disabled={folderMissing} onClick={() => sendNow(session.id, item.id)}>Send now</button>}
 												<button className="texty" onClick={() => editQueued(item)}>Edit</button>
-												<button className="texty" aria-label="Remove queued message" onClick={() => setQueued((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((entry) => entry.id !== item.id) }))}>×</button>
+												<button className="texty" aria-label="Remove queued message" onClick={() => setQueued((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((entry) => entry.id !== item.id) }))}><Icon name="close" /></button>
 											</div>
 										))}
 									</div>
@@ -3026,7 +3956,7 @@ export function App() {
 										{(contextPicks[session.id] ?? []).map((pick) => (
 											<span className="attach-chip" key={pick.id} title={`Earlier context from ${pick.title}`}>
 												{pick.title}
-												<button type="button" aria-label={`Remove context from ${pick.title}`} onClick={() => setContextPicks((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((item) => item.id !== pick.id) }))}>×</button>
+												<button type="button" aria-label={`Remove context from ${pick.title}`} onClick={() => setContextPicks((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((item) => item.id !== pick.id) }))}><Icon name="close" /></button>
 											</span>
 										))}
 									</div>
@@ -3036,7 +3966,7 @@ export function App() {
 										{files.map((file) => (
 											<span className="attach-chip" key={file} title={file}>
 												{imageSrc(file) ? <button type="button" className="thumb" aria-label={`View ${file.split(/[\\/]/).pop()}`} onClick={() => openImage(file)}><img src={imageSrc(file)} alt={file.split(/[\\/]/).pop()} /></button> : file.split(/[\\/]/).pop()}
-												<button type="button" aria-label={`Remove ${file.split(/[\\/]/).pop()}`} onClick={() => setAttachments((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((item) => item !== file) }))}>×</button>
+												<button type="button" aria-label={`Remove ${file.split(/[\\/]/).pop()}`} onClick={() => setAttachments((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((item) => item !== file) }))}><Icon name="close" /></button>
 											</span>
 										))}
 									</div>
@@ -3045,12 +3975,13 @@ export function App() {
 									<div className="mention pop-list" role="listbox" ref={popupList} aria-label={popup.kind === "slash" ? "Commands" : "Files"}>
 										{popup.kind === "mention" && folderFiles?.status === "loading" && <div className="item">Reading this folder…</div>}
 										{popup.kind === "mention" && folderFiles?.status === "error" && <div className="item">{folderFiles.error}</div>}
-										{popup.items.map((item, index) => (
-											<button key={item.value} type="button" role="option" aria-selected={index === popIndex} className={index === popIndex ? "item on" : "item"} onMouseEnter={() => setPopIndex(index)} onClick={() => pickPopup(index)}>
-												{item.label}
-												{item.detail && <small>{item.detail}</small>}
-											</button>
-										))}
+										{popup.kind === "slash" ? COMMAND_GROUPS.map((group) => {
+											const options = popup.items.flatMap((item, index) => item.group === group ? [renderPopupItem(item, index)] : []);
+											return options.length > 0 && <div key={group} className="command-group" role="group" aria-label={`${group}, ${options.length} ${options.length === 1 ? "command" : "commands"}`}>
+												<div className="command-group-label" aria-hidden="true">{group}<span>{options.length}</span></div>
+												{options}
+											</div>;
+										}) : popup.items.map(renderPopupItem)}
 										{popup.items.length === 0 && <div className="item">{popup.kind === "slash" ? "No commands match." : folderFiles?.status === "ready" ? "No files match." : ""}</div>}
 									</div>
 								)}
@@ -3062,9 +3993,13 @@ export function App() {
 								)}
 								{showDisconnect && (
 									<div className="disconnect-choice">
-										<p>Grok disconnected. The next message continues this conversation. New session starts fresh in this folder.</p>
-										<button type="button" className="texty" onClick={() => promptRef.current?.focus?.()}>Resume</button>
-										<button type="button" className="texty" onClick={startFreshSession}>New session</button>
+										<AppNote>
+											<p>{wasInterrupted ? "The previous turn was interrupted." : "Grok disconnected."} The next message continues this conversation. New session starts fresh in this folder.</p>
+											<div className="app-note-actions">
+												<button type="button" className="texty" onClick={() => promptRef.current?.focus?.()}>Resume</button>
+												<button type="button" className="texty" onClick={startFreshSession}>New session</button>
+											</div>
+										</AppNote>
 									</div>
 								)}
 								{(loops[session.id] ?? []).map((loop) => {
@@ -3075,15 +4010,24 @@ export function App() {
 								<textarea
 									ref={promptRef}
 									aria-label="Prompt"
+									aria-describedby={folderMissing ? "missing-session-folder" : undefined}
 									rows={2}
-									placeholder={suggestion ? `${suggestion}   (Tab to use)` : isBusy ? "Steer Grok while it works" : pending ? "Describe a task to start a new session" : "Reply to Grok, or type / for commands and @ to mention files"}
+									placeholder={suggestion ? `${suggestion}   (Tab to use)` : isBusy ? (isCloud ? "Queue a message while Cursor works" : "Steer Grok while it works") : pending ? "Describe a task to start a new session" : isCloud ? "Reply to Cursor" : "Reply to Grok, or type / for commands and @ to mention files"}
 									value={prompt}
 									onChange={(event) => setPrompt(event.target.value)}
 									onPaste={onPaste}
 									onKeyDown={(event) => {
+										if (event.key === "Enter" && event.nativeEvent?.isComposing) { return; }
 										if (popup && popup.items.length) {
-											if (event.key === "ArrowDown") { event.preventDefault(); setPopIndex((index) => (index + 1) % popup.items.length); return; }
-											if (event.key === "ArrowUp") { event.preventDefault(); setPopIndex((index) => (index - 1 + popup.items.length) % popup.items.length); return; }
+											if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+												event.preventDefault();
+												const step = event.key === "ArrowDown" ? 1 : -1;
+												setPopValue((current) => {
+													const index = Math.max(0, popup.items.findIndex((item) => item.value === current));
+													return popup.items[(index + step + popup.items.length) % popup.items.length].value;
+												});
+												return;
+											}
 											if (event.key === "Enter" && !event.shiftKey && popup.kind === "slash" && !popup.items[popIndex]?.hint) { event.preventDefault(); void submit(popup.items[popIndex].value); return; }
 											if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) { event.preventDefault(); pickPopup(popIndex); return; }
 										}
@@ -3100,229 +4044,270 @@ export function App() {
 									}}
 								/>
 								<div className="composer-row">
-									<MenuButton label="+" title="Add files, folders and commands" open={menu === "plus"} onClick={() => setMenu(menu === "plus" ? null : "plus")} />
-									<MenuButton label={session.environment} title="Environment" open={menu === "env"} onClick={() => setMenu(menu === "env" ? null : "env")} />
-									<MenuButton label={shortPath(session.folder)} title={session.folder} open={menu === "folder"} onClick={() => setMenu(menu === "folder" ? null : "folder")} />
-									<MenuButton label={mode} title={keyLabel("Permission mode (Ctrl+Shift+M)")} open={menu === "mode"} onClick={() => setMenu(menu === "mode" ? null : "mode")} />
-									<span className="spacer" />
-									<span className={`limit-meter${limitLeft === null ? "" : limitLeft <= 10 ? " high" : limitLeft <= 25 ? " warn" : ""}`} title={limitTitle} aria-label={limitTitle}>{limitLeft === null ? "Limit" : `${limitName} - ${limitLeft}% left`}</span>
-									{contextPercent !== null && <span className="usage-ring" title={`Context about ${contextPercent}% used · session cost $${(session.costUsd ?? 0).toFixed(2)}${recentUsd !== null ? `\nGrok, last 7 days on this computer: $${recentUsd.toFixed(2)}` : ""}`} style={{ ["--pct" as string]: `${contextPercent}` }} aria-label={`Context ${contextPercent}% used`} />}
-									<MenuButton label={`${baseModel}${fastOn ? " · fast" : ""} · ${effort}`} title={keyLabel("Model (Ctrl+Shift+I) and effort (Ctrl+Shift+E)")} open={menu === "model" || menu === "effort"} onClick={() => setMenu(menu === "model" ? null : "model")} />
-									<button
-										type="button"
-										className={sendLabel === "Stop" ? "send-btn stop" : "send-btn"}
-										aria-label={sendLabel}
-										title={sendLabel === "Stop" ? "Stop (Esc)" : isBusy ? (prompt.trim().startsWith("/") || files.length || chosenChats.length ? "Queue (Enter)" : "Steer (Enter)") : "Send (Enter)"}
-										disabled={sendLabel === "Send" && !prompt.trim()}
-										onClick={() => { if (sendLabel === "Stop") { stop(session.id); } else { void submit(); } }}
-									>
-										{sendLabel === "Stop" ? "■" : "↑"}
-									</button>
-								</div>
-								{menu === "plus" && (
-									<div className="pop up">
+									<div className="composer-primary">
+										<MenuButton label="+" icon="plus" title={isCloud ? "Commands and saved prompts" : "Add files, folders and commands"} open={menu === "plus" || menu === "context"} onClick={() => setMenu(menu === "plus" || menu === "context" ? null : "plus")} />
+										<MenuButton label={session.environment} icon="monitor" title="Environment" open={menu === "env"} onClick={() => setMenu(menu === "env" ? null : "env")} />
+										<MenuButton label={session.folder ? shortPath(session.folder) : "Choose folder…"} icon="folder" title={session.folder || "Choose a project folder"} open={menu === "folder"} onClick={() => setMenu(menu === "folder" ? null : "folder")} />
+										{pending && !isCloud && <label className="chip worktree-chip" title="Work on a new branch in its own Git worktree">
+											<input type="checkbox" aria-label="Worktree" checked={useWorktree} disabled={!!worktreeReason && !useWorktree} aria-describedby={worktreeReason ? "worktree-unavailable" : undefined} onChange={(event) => setUseWorktree(event.target.checked)} /> Worktree
+										</label>}
+										{!isCloud && <MenuButton label={mode} icon="shield" title={keyLabel("Permission mode (Ctrl+Shift+M)")} open={menu === "mode"} onClick={() => setMenu(menu === "mode" ? null : "mode")} />}
+									</div>
+									<div className="composer-actions">
+										{!isCloud && !keyMode && <span className={`limit-meter${limitLeft === null ? "" : limitLeft <= 10 ? " high" : limitLeft <= 25 ? " warn" : ""}`} title={limitTitle} aria-label={limitTitle}>{limitLeft === null ? "Limit" : <><span className="limit-period">{limitName} · </span>{limitLeft}% left</>}</span>}
+										{!isCloud && contextPercent !== null && <span className="usage-ring" title={contextTitle} style={{ ["--pct" as string]: `${contextPercent}` }} aria-label={`Context ${contextPercent}% used`} />}
+										{isCloud ? <MenuButton label={cloudModelLabel} icon="spark" title={keyLabel("Cursor model (Ctrl+Shift+I)")} open={menu === "model" && !cloudModelLocked} disabled={cloudModelLocked} onClick={() => setMenu(menu === "model" ? null : "model")} /> :
+											<MenuButton label={`${baseModel}${fastOn ? " · fast" : ""} · ${effort}`} icon="spark" title={keyLabel("Model (Ctrl+Shift+I) and effort (Ctrl+Shift+E)")} open={menu === "model" || menu === "effort"} onClick={() => setMenu(menu === "model" ? null : "model")} />}
 										<button
 											type="button"
-											className="item"
-											onClick={() => {
-												const api = window.grokCode;
-												if (!api?.pickFiles) {
-													setNotice("Reopen this window to add files.");
-													return;
-												}
-												void api.pickFiles().then((paths) => {
-													addAttachments(paths);
-													setMenu(null);
-												});
-											}}
+											className={sendLabel === "Stop" ? "send-btn stop" : "send-btn"}
+											aria-label={sendLabel}
+													title={sendLabel === "Stop" ? "Stop (Esc)" : folderMissing || (pending && !session.folder) ? "Choose a folder to send" : isBusy ? (isCloud || prompt.trim().startsWith("/") || files.length || chosenChats.length ? "Queue (Enter)" : "Steer (Enter)") : "Send (Enter)"}
+													disabled={sendLabel === "Send" && (folderMissing || (!!pending && (!session.folder || (isCloud && !cloudReady))) || (!prompt.trim() && !releaseCloudQueue))}
+											onClick={() => { if (sendLabel === "Stop") { stop(session.id); } else { void submit(); } }}
 										>
-											Add files or photos
-										</button>
-										<button type="button" className="item" disabled={addingFolder} onClick={() => void addFolder()}>{addingFolder ? "Adding folder…" : "Add folder"}<small>Grok can also work in this folder.</small></button>
-										<button type="button" className="item" onClick={() => { setPrompt("/"); setPopClosed(""); setMenu(null); promptRef.current?.focus?.(); }}>Slash commands</button>
-										<button type="button" className="item" onClick={() => openPromptLibrary("insert")}>Saved prompts<small>{keyLabel("Search and insert without sending (Ctrl+Shift+P)")}</small></button>
-										<button type="button" className="item" disabled={!prompt.trim()} onClick={() => openPromptLibrary("save")}>Save current prompt</button>
-										<button type="button" className="item" onClick={() => setMenu("context")}>Context from another chat<small>Up to three earlier chats, labelled as context.</small></button>
-										<button type="button" className="item" onClick={() => { setSettingsOpen("skills"); setMenu(null); }}>Skills and tools<small>{servers.length ? `${servers.length} MCP servers from Grok` : "Managed in Grok's configuration"}</small></button>
-										{!!session.allowedFolders?.length && <div className="menu-label">Added folders</div>}
-										{session.allowedFolders?.map((folder) => <div className="item" key={folder}>{folder}</div>)}
-									</div>
-								)}
-								{menu === "context" && (
-									<div className="pop up" role="menu" aria-label="Earlier chats">
-										{chatChoices.length === 0 && <div className="item">No other chats yet.</div>}
-										{chatChoices.map((item) => {
-											const added = chosenChats.some((pick) => pick.id === item.id);
-											return (
-												<button key={item.id} type="button" className="item" disabled={added || chosenChats.length >= CONTEXT_PICK_LIMIT} onClick={() => { setContextPicks((current) => ({ ...current, [session.id]: addContextPick(current[session.id] ?? [], item) })); setMenu(null); }}>
-													{item.title}
-													{item.archived && <small>Archived</small>}
-													{added && <small>Added</small>}
-												</button>
-											);
-										})}
-										{chosenChats.length >= CONTEXT_PICK_LIMIT && <div className="item">Three chats is the limit.</div>}
-									</div>
-								)}
-								{menu === "env" && (
-									<div className="pop up">
-										{(["Local", "SSH", "Cloud"] as Environment[]).map((environment) => (
-											<button key={environment} type="button" className={session.environment === environment ? "item on" : "item"} disabled={environment !== "Local"} onClick={() => setMenu(null)}>
-												{environment}
-												<small>{environment === "Local" ? "This computer" : "Not available yet"}</small>
-											</button>
-										))}
-									</div>
-								)}
-								{menu === "folder" && (
-									<div className="pop up">
-										<div className="item">{session.folder}</div>
-										<button type="button" className="item" onClick={() => openIn("explorer")}>Open in {FILE_MANAGER}</button>
-										<button
-											type="button"
-											className="item"
-											disabled={!!busy[session.id]}
-											onClick={() => {
-												const api = window.grokCode;
-												if (!api) {
-													setNotice("Choose the folder from the desktop window.");
-													return;
-												}
-												const sessionId = session.id;
-												void api.pickFolder().then((picked) => {
-													if (!picked) { return; }
-													const name = shortPath(picked);
-													const update = (item: Session) => (item.id === sessionId ? { ...item, folder: picked, project: name, worktree: name, agentSessionId: undefined, allowedFolders: undefined, prWatch: undefined } : item);
-													setSessions((current) => current.map(update));
-													setPending((item) => (item ? update(item) : item));
-													// The side chat's Grok conversation keeps the old folder's approvals, so it starts over with the main chat.
-													setSideAgents((list) => Object.fromEntries(Object.entries(list).filter(([id]) => id !== sessionId)));
-													delete sideSeen.current[sessionId];
-													// Without this, a return to the old folder would reload the old conversation and its Always allow rules.
-													void api.forgetSession?.(sessionId);
-													setMenu(null);
-												});
-											}}
-										>
-											Choose a folder
-											<small>The next message starts a new Grok conversation in that folder.</small>
+											<Icon name={sendLabel === "Stop" ? "stop" : "send"} />
 										</button>
 									</div>
-								)}
-								{menu === "mode" && (
-									<div className="pop up">
-										{isBusy && <div className="menu-label">Stop or finish this turn before changing mode.</div>}
-										{MODES.map((item) => (
-											<button
-												key={item.id}
+									{menu === "plus" && (
+										<PopupMenu className="pop up" aria-label="Add to prompt" onDismiss={() => setMenu(null)}>
+											{!isCloud && <><button role="menuitem"
 												type="button"
-												className={mode === item.id ? "mode-row on" : "mode-row"}
-												disabled={isBusy}
+												className="item"
 												onClick={() => {
-													if (turnTargets.current[session.id]) { return; }
-													changeMode(session.id, item.id);
-													setMenu(null);
+													const api = window.grokCode;
+													if (!api?.pickFiles) {
+														setNotice("Reopen this window to add files.");
+														return;
+													}
+													void api.pickFiles().then((paths) => {
+														addAttachments(paths);
+														setMenu(null);
+													});
 												}}
 											>
-												{item.id}
-												<small>{item.detail}</small>
-												{restartStops(item.id) > 0 && <small className="mode-warn">Restarts Grok and stops {restartStops(item.id)} running background {restartStops(item.id) === 1 ? "task" : "tasks"}.</small>}
+												Add files or photos
 											</button>
-										))}
-									</div>
-								)}
-								{(menu === "model" || menu === "effort") && (
-									<div className="pop up right">
-										{menu === "model" && (
-											<>
-												<div className="menu-label">Model</div>
-												{modelList.map((item) => (
-													<button key={item} type="button" className={baseModel === item ? "item on" : "item"} onClick={() => {
-														const next = fastOn && FAST_MODEL[item] ? FAST_MODEL[item] : item;
-														const allowed = models.find((entry) => entry.id === next)?.efforts;
-														const choice = { model: next, effort: allowed?.length && !allowed.includes(effort) ? allowed[allowed.length > 1 ? 1 : 0] : (next === "grok-4.5" && effort === "xhigh" ? "high" : effort) };
-														changeSettings(choice);
-														if (pending) { setPending((current) => current ? { ...current, ...choice } : current); } else { updateSession(session.id, choice); }
-													}}>
-														{models.find((entry) => entry.id === item)?.name ?? item}
-														<small>{models.find((entry) => entry.id === item)?.description ?? ""}</small>
+											<button role="menuitem" type="button" className="item" disabled={addingFolder} onClick={() => void addFolder()}>{addingFolder ? "Adding folder…" : "Add folder"}<small>{addingFolder ? "Wait for the folder to finish adding." : "Grok can also work in this folder."}</small></button></>}
+											<button role="menuitem" type="button" className="item" onClick={() => { setPrompt("/"); setPopClosed(""); setMenu(null); promptRef.current?.focus?.(); }}>Slash commands</button>
+											<button role="menuitem" type="button" className="item" onClick={() => openPromptLibrary("insert")}>Saved prompts<small>{keyLabel("Search and insert without sending (Ctrl+Shift+P)")}</small></button>
+											<button role="menuitem" type="button" className="item" disabled={!prompt.trim()} onClick={() => openPromptLibrary("save")}>Save current prompt{!prompt.trim() && <small>Type a prompt first.</small>}</button>
+											{!isCloud && <><button role="menuitem" type="button" className="item" onClick={() => setMenu("context")}>Context from another chat<small>Up to three earlier chats, labelled as context.</small></button>
+											<button role="menuitem" type="button" className="item" onClick={() => { setSettingsOpen("skills"); setMenu(null); }}>Skills and tools<small>{servers.length ? `${servers.length} MCP servers from Grok` : "Managed in Grok's configuration"}</small></button>
+											{!!session.allowedFolders?.length && <div className="menu-label">Added folders</div>}
+											{session.allowedFolders?.map((folder) => <div className="item" key={folder}>{folder}</div>)}</>}
+										</PopupMenu>
+									)}
+									{!isCloud && menu === "context" && (
+										<PopupMenu className="pop up" aria-label="Earlier chats" opener={overlayOpener.current} onDismiss={() => setMenu(null)}>
+											{chatChoices.length === 0 && <div className="item">No other chats yet.</div>}
+											{chatChoices.map((item) => {
+												const added = chosenChats.some((pick) => pick.id === item.id);
+												return (
+													<button role="menuitem" key={item.id} type="button" className="item" disabled={added || chosenChats.length >= CONTEXT_PICK_LIMIT} onClick={() => { setContextPicks((current) => ({ ...current, [session.id]: addContextPick(current[session.id] ?? [], item) })); setMenu(null); }}>
+														{item.title}
+														{item.archived && <small>Archived</small>}
+														{added ? <small>Added</small> : chosenChats.length >= CONTEXT_PICK_LIMIT && <small>Three chats are already selected.</small>}
 													</button>
-												))}
-												{FAST_MODEL[baseModel] && (
-													<label className="item toggle">
-														<input type="checkbox" checked={fastOn} onChange={(event) => {
-															const choice = { model: event.target.checked ? FAST_MODEL[baseModel] : baseModel, effort };
+												);
+											})}
+											{chosenChats.length >= CONTEXT_PICK_LIMIT && <div className="item">Three chats is the limit.</div>}
+										</PopupMenu>
+									)}
+									{menu === "env" && (
+										<PopupMenu className="pop up" aria-label="Environment" onDismiss={() => setMenu(null)}>
+											{(["Local", "SSH", "Cloud"] as Environment[]).map((environment) => (
+												<button role="menuitemradio" aria-checked={session.environment === environment} key={environment} type="button" className={session.environment === environment ? "item on" : "item"} disabled={environment !== session.environment && (!pending || environment === "SSH" || (environment === "Cloud" && !cloudKeyAvailable))} onClick={() => choosePendingEnvironment(environment)}>
+													{environment}
+													<small>{environment === "Local" ? "This computer" : environment === "Cloud" ? (session.cloud?.machine ? `${session.cloud.machine}, through Cursor` : "Cursor's computers") : "Not available yet"}</small>
+													{environment !== "SSH" && environment !== session.environment && !pending && <small>Choose this environment when starting a new session.</small>}
+													{environment === "Cloud" && environment !== session.environment && pending && !cloudKeyAvailable && <small>Add a Cursor API key in Settings.</small>}
+													{environment === session.environment && <Icon name="check" className="menu-check" />}
+												</button>
+											))}
+										</PopupMenu>
+									)}
+									{menu === "folder" && pending && (
+										<PopupMenu className="pop up" aria-label="Folder" opener={overlayOpener.current} onDismiss={() => setMenu(null)}>
+											{session.folder && <><div className="item">{session.folder}</div><button role="menuitem" type="button" className="item" onClick={() => openIn("explorer")}>Open in {FILE_MANAGER}</button></>}
+											<button role="menuitem" type="button" className="item" onClick={pickPendingFolder}>Choose a folder</button>
+										</PopupMenu>
+									)}
+									{menu === "folder" && !pending && (
+										<PopupMenu className="pop up" aria-label="Folder" opener={overlayOpener.current} onDismiss={() => setMenu(null)}>
+											<div className="item">{session.folder}</div>
+											<button role="menuitem" type="button" className="item" onClick={() => openIn("explorer")}>Open in {FILE_MANAGER}</button>
+											<button role="menuitem"
+												type="button"
+												className="item"
+												disabled={isCloud || !!busy[session.id]}
+												onClick={() => void chooseSessionFolder()}
+											>
+												Choose a folder
+												<small>{isCloud ? (pending ? "Choose the repository on the New session page." : "This Cloud session's repository is fixed.") : busy[session.id] ? "Stop or finish the turn before changing folders." : "The next message starts a new Grok conversation in that folder."}</small>
+											</button>
+										</PopupMenu>
+									)}
+									{!isCloud && menu === "mode" && (
+										<PopupMenu className="pop up" aria-label="Permission mode" opener={overlayOpener.current} onDismiss={() => setMenu(null)}>
+											{isBusy && <div className="menu-label">Stop or finish this turn before changing mode.</div>}
+											{MODES.map((item) => (
+												<button role="menuitemradio" aria-checked={mode === item.id}
+													key={item.id}
+													type="button"
+													className={mode === item.id ? "mode-row on" : "mode-row"}
+													disabled={isBusy}
+													onClick={() => {
+														if (turnTargets.current[session.id]) { return; }
+														changeMode(session.id, item.id);
+														setMenu(null);
+													}}
+												>
+													{item.id}
+													<small>{item.detail}</small>
+													{mode === item.id && <Icon name="check" className="menu-check" />}
+													{restartStops(item.id) > 0 && <small className="mode-warn">Restarts Grok and stops {restartStops(item.id)} running background {restartStops(item.id) === 1 ? "task" : "tasks"}.</small>}
+												</button>
+											))}
+										</PopupMenu>
+									)}
+									{isCloud && menu === "model" && !cloudModelLocked && (
+										<PopupMenu className="pop up right" aria-label="Cursor models" opener={overlayOpener.current} onDismiss={() => setMenu(null)}>
+											<div className="menu-label">Cursor models</div>
+											{cloudCatalog.map((item) => {
+												const variant = chooseVariant(item);
+												return <button role="menuitemradio" aria-checked={item.id === cloudChoice?.id} key={item.id} type="button" className={item.id === cloudChoice?.id ? "item on" : "item"} disabled={!variant} onClick={() => { if (variant) { changeCloudChoice(item, variant); } }}>{item.displayName}{variant?.isMaxMode ? " · Max" : ""}{!variant && <small>Cursor reports no available configuration.</small>}{item.id === cloudChoice?.id && <Icon name="check" className="menu-check" />}</button>;
+											})}
+											{!cloudCatalog.length && <p className="note">{cloudSetupResult?.modelsError || "Cursor models aren't available yet."} {!pending && cloudKeyAvailable && <button role="menuitem" type="button" className="texty" onClick={() => void checkCloudSetup(session)}>Try again</button>}</p>}
+											{cloudModel && cloudChoice && cloudModel.parameters?.map((parameter) => (
+												<div key={parameter.id}>
+													<div className="menu-label">{parameter.displayName || parameter.id}</div>
+													{parameter.values.map((value) => {
+														const selected = cloudChoice.params.some((param) => param.id === parameter.id && param.value === value.value);
+														const variant = chooseVariant(cloudModel, cloudChoice.params, parameter.id, value.value);
+														return <button role="menuitemradio" aria-checked={selected} key={value.value} type="button" className={selected ? "item on" : "item"} disabled={!variant} onClick={() => { if (variant) { changeCloudChoice(cloudModel, variant); } }}>{value.displayName || value.value}{variant?.isMaxMode ? " · Max" : ""}{!variant && <small>Unavailable with the current configuration.</small>}{selected && <Icon name="check" className="menu-check" />}</button>;
+													})}
+												</div>
+											))}
+										</PopupMenu>
+									)}
+									{!isCloud && (menu === "model" || menu === "effort") && (
+										<PopupMenu key={menu} className="pop up right" aria-label="Model and effort" opener={overlayOpener.current} onDismiss={() => setMenu(null)}>
+											{menu === "model" && (
+												<>
+													<div className="menu-label">Model</div>
+													{modelList.map((item) => (
+														<button role="menuitemradio" aria-checked={baseModel === item} key={item} type="button" className={baseModel === item ? "item on" : "item"} onClick={() => {
+															const next = fastOn && FAST_MODEL[item] ? FAST_MODEL[item] : item;
+															const allowed = models.find((entry) => entry.id === next)?.efforts;
+															const choice = { model: next, effort: allowed?.length && !allowed.includes(effort) ? allowed[allowed.length > 1 ? 1 : 0] : (next === "grok-4.5" && effort === "xhigh" ? "high" : effort) };
 															changeSettings(choice);
 															if (pending) { setPending((current) => current ? { ...current, ...choice } : current); } else { updateSession(session.id, choice); }
-														}} /> Fast mode
-														<small>Grok's faster build of this model</small>
-													</label>
-												)}
-											</>
-										)}
-										<div className="menu-label">Effort</div>
-										{efforts.map((item) => (
-											<button key={item} type="button" className={effort === item ? "mode-row on" : "mode-row"} onClick={() => {
-												const choice = { model, effort: item };
-												changeSettings(choice);
-												if (pending) { setPending((current) => current ? { ...current, ...choice } : current); } else { updateSession(session.id, choice); }
-												setMenu(null);
-											}}>{item}<small>{EFFORT_DETAIL[item] ?? ""}</small></button>
-										))}
-									</div>
-								)}
+														}}>
+															{models.find((entry) => entry.id === item)?.name ?? item}
+															<small>{models.find((entry) => entry.id === item)?.description ?? ""}</small>
+															{baseModel === item && <Icon name="check" className="menu-check" />}
+														</button>
+													))}
+													{FAST_MODEL[baseModel] && (
+														<button type="button" className="item" role="menuitemcheckbox" aria-checked={fastOn} onClick={() => {
+															const choice = { model: fastOn ? baseModel : FAST_MODEL[baseModel], effort };
+															changeSettings(choice);
+															if (pending) { setPending((current) => current ? { ...current, ...choice } : current); } else { updateSession(session.id, choice); }
+														}}>
+															Fast mode
+															<small>Grok's faster build of this model</small>
+															<Icon name={fastOn ? "check-square" : "square"} className="menu-check" />
+														</button>
+													)}
+												</>
+											)}
+											<div className="menu-label">Effort</div>
+											{efforts.map((item) => (
+												<button role="menuitemradio" aria-checked={effort === item} key={item} type="button" className={effort === item ? "mode-row on" : "mode-row"} onClick={() => {
+													const choice = { model, effort: item };
+													changeSettings(choice);
+													if (pending) { setPending((current) => current ? { ...current, ...choice } : current); } else { updateSession(session.id, choice); }
+													setMenu(null);
+												}}>{item}<small>{EFFORT_DETAIL[item] ?? ""}</small>{effort === item && <Icon name="check" className="menu-check" />}</button>
+											))}
+										</PopupMenu>
+									)}
+								</div>
 							</div>
-							{notices.map((item) => <div key={item.id} className="note composer-note" role="status">{item.text}<button type="button" className="texty" aria-label="Dismiss" onClick={() => setNotices((list) => list.filter((entry) => entry.id !== item.id))}>×</button></div>)}
+							{pending && <>
+								{!session.folder && <p className="new-send-note">Choose a folder to send. You can type your task now.</p>}
+								{!isCloud && worktreeReason && <p className="new-worktree-help" id="worktree-unavailable">Worktree: {worktreeReason}</p>}
+								<div className="new-project-picks" role="group" aria-label={firstRun ? "From your Grok CLI sessions" : "Projects"}>
+									{projectPicks.length > 0 && <span>{firstRun ? "From your Grok CLI sessions:" : "Projects:"}</span>}
+									{projectPicks.map((folder) => <button key={folder} type="button" aria-pressed={folderKey(session.folder) === folderKey(folder)} title={folder} onClick={() => choosePendingFolder(folder)}><Icon name="folder" />{shortPath(folder)}</button>)}
+									<button type="button" onClick={pickPendingFolder}><Icon name="folder" />{session.folder ? "Other folder…" : "Choose folder…"}</button>
+								</div>
+								{firstRun && !isCloud && <div className="new-setup-status" role="group" aria-label="Setup checks">
+									{setup.result ? <>
+										<span>{setup.result.grok.ok && <Icon name="check" />} {setup.result.grok.ok ? "Grok CLI installed" : "Grok CLI not installed"}</span>
+										<span>{setup.result.grok.signedIn && <Icon name="check" />} {setup.result.grok.signedIn ? "Signed in" : "Sign-in needed"}</span>
+										<span>{setup.result.git.ok && <Icon name="check" />} {setup.result.git.ok ? "Git installed" : "Git not found"}</span>
+									</> : setup.checking && <span role="status">Checking setup…</span>}
+									<button className="texty" type="button" disabled={setup.checking} onClick={() => checkSetup()}>Check setup</button>
+								</div>}
+							</>}
+							{notices.map((item) => <div key={item.id} className="note composer-note" role="status">{item.text}<button type="button" className="texty" aria-label="Dismiss" onClick={() => setNotices((list) => list.filter((entry) => entry.id !== item.id))}><Icon name="close" /></button></div>)}
 						</div>
 					</div>
 					{railShown && (
-						<SessionRail
-							key={session.id}
-							session={session}
-							diff={diffs[session.id]}
-							branch={branch}
-							pr={prInfo}
-							usage={usage}
-							breakdown={breakdown && breakdown.id === agentId ? breakdown : undefined}
-							recentUsd={recentUsd}
-							onOpenDiff={(file) => { if (file) { setDiffFile(file); } showPane("diff"); }}
-							onCompact={() => { send("/compact", false); }}
-							onOpenUrl={(url) => openUrl(url, true)}
-							onCreatePr={createPr}
-							onMergeWhenReady={mergeWhenReady}
-						/>
+						<div className="rail-column" inert={!!fullPane}>
+							{resizeHandle("railWidth", "Resize session rail", railWidth, RAIL_MIN, railCap)}
+							<SessionRail
+								key={session.id}
+								session={session}
+								folderMissing={folderMissing}
+								diff={progressiveChanges ? shownInventory : diffs[session.id]}
+								branch={branch}
+								pr={prInfo}
+								usage={usage}
+								breakdown={breakdown && breakdown.id === agentId ? breakdown : undefined}
+								recentUsd={recentUsd}
+								subscription={keyMode ? undefined : { plan: account?.plan || limit?.tier || "", percent: limit?.percent ?? null, period: limit?.period ? limitName : "", resets: formatLimitReset(limit?.resetsAt), stale: !!limit && limitStale }}
+								onOpenDiff={(file) => { if (file) { setDiffFile(file); } showPane("diff"); }}
+								onCompact={() => { send("/compact", false); }}
+								onOpenUrl={(url) => openUrl(url, true)}
+								onCreatePr={createPr}
+								onMergeWhenReady={mergeWhenReady}
+							/>
+						</div>
 					)}
-					{panes.length > 0 && (
-						<>
-							<div className="splitter" role="separator" aria-orientation="vertical" aria-label="Resize panes" onMouseDown={startResize} />
-							<div className="side-col" ref={sideCol} style={{ width: paneWidth }}>
-								{panes.map((id) => sidePane(id))}
-							</div>
-						</>
+					{panesOpen && !fullPane && resizeHandle("sideWidth", "Resize panes", paneWidth, paneMin, paneCap)}
+					{mountedPanes.length > 0 && (
+						<div key="pane-grid" className={fullPane ? "side-col expanded" : "side-col"} data-tall-stack={paneRows > 2 || undefined} hidden={!panesOpen} style={paneGridStyle}>
+							{mountedPanes.map(sidePane)}
+							{paneRows === 2 && paneRowDivider()}
+						</div>
 					)}
 				</div>
 			</main>
 			{fileMenu && (
-				<div className="file-menu" style={{ top: Math.min(fileMenu.y, window.innerHeight - 260), left: Math.min(fileMenu.x, window.innerWidth - 220) }} role="menu">
+				<PopupMenu className="file-menu" aria-label="File actions" opener={fileMenu.opener} onDismiss={() => setFileMenu(null)} inert={settingsCover} style={{ top: Math.min(fileMenu.y, window.innerHeight - 260), left: Math.min(fileMenu.x, window.innerWidth - 220) }}>
 					<button type="button" role="menuitem" onClick={() => openFile(fileMenu.file)}>Open</button>
-					<button type="button" role="menuitem" onClick={() => { setPrompt((current) => `${current}${current && !current.endsWith(" ") ? " " : ""}@${fileMenu.file} `); setFileMenu(null); promptRef.current?.focus?.(); }}>Attach as context</button>
+					{!isCloud && <button type="button" role="menuitem" onClick={() => { setPrompt((current) => `${current}${current && !current.endsWith(" ") ? " " : ""}@${fileMenu.file} `); setFileMenu(null); promptRef.current?.focus?.(); }}>Attach as context</button>}
 					<button type="button" role="menuitem" onClick={() => openIn("vscode", fileMenu.file)}>Open in VS Code</button>
 					<button type="button" role="menuitem" onClick={() => { void window.grokCode?.reveal(session.folder, fileMenu.file).then((result) => { if (!result.ok) { setNotice(result.error || "That file is not in this folder."); } }); setFileMenu(null); }}>Show in {FILE_MANAGER}</button>
 					<div className="menu-label">Copy</div>
 					<button type="button" role="menuitem" onClick={() => { copyText(PLATFORM === "win32" ? `${session.folder.replace(/[\\/]+$/, "")}\\${fileMenu.file.replace(/\//g, "\\")}` : `${session.folder.replace(/\/+$/, "")}/${fileMenu.file}`, "Copied the absolute path."); setFileMenu(null); }}>Absolute path</button>
 					<button type="button" role="menuitem" onClick={() => { copyText(fileMenu.file, "Copied the relative path."); setFileMenu(null); }}>Relative path</button>
 					<button type="button" role="menuitem" onClick={() => { copyText(fileMenu.file.split(/[\\/]/).pop() ?? fileMenu.file, "Copied the filename."); setFileMenu(null); }}>Filename</button>
-				</div>
+				</PopupMenu>
 			)}
 			{shortcuts && (
 				<div className="overlay" onClick={() => setShortcuts(false)}>
 					<div className="sheet" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="Keyboard shortcuts">
 						<h2>Keyboard shortcuts</h2>
-						<ul>
-							{SHORTCUTS.map(([key, label]) => (
-								<li key={`${key}-${label}`}><span>{label}</span><kbd>{keyLabel(key)}</kbd></li>
-							))}
-						</ul>
+						{Object.entries(SHORTCUTS).map(([group, shortcuts]) => (
+							<div className="shortcut-group" key={group}>
+								<h3>{group}</h3>
+								<ul>{shortcuts.map(([key, label]) => <li key={`${key}-${label}`}><span>{label}</span><kbd>{keyLabel(key)}</kbd></li>)}</ul>
+							</div>
+						))}
 						<button className="texty" onClick={() => setShortcuts(false)}>Close</button>
 					</div>
 				</div>
@@ -3353,8 +4338,8 @@ export function App() {
 				</div>
 			)}
 			{promptLibrary && <SavedPromptPicker prompts={settings.savedPrompts} draft={promptLibrary.text} mode={promptLibrary.mode} onSave={savePrompt} onInsert={insertPrompt} onClose={closePromptLibrary} />}
-			{settingsOpen && <SettingsPage settings={settings} onChange={changeSettings} onClose={() => setSettingsOpen(null)} onCheckSetup={() => { setSettingsOpen(null); checkSetup(); }} servers={servers} folder={session.folder} onRun={(text) => void runFromSettings(text)} initialTab={settingsOpen} />}
-			{setup.open && <Setup result={setup.result} checking={setup.checking} installing={setup.installing} onInstallGrok={() => void runInstall("grok")} onInstallGit={() => void runInstall("git")} onUpdateGrok={() => void runInstall("update")} onCheck={() => checkSetup()} onCopy={(text) => void copyText(text)} onClose={() => setSetup((current) => ({ ...current, open: false }))} />}
+			{settingsOpen && <SettingsPage settings={settings} onChange={changeSettings} onClose={() => setSettingsOpen(null)} onCheckSetup={openSetupFromAbout} servers={servers} folder={session.folder} onRun={(text) => void runFromSettings(text)} initialTab={settingsOpen} signInStatus={signInStatus} signInCheck={setup.result?.grok} cloudKeyStatus={cloudKeyStatus} />}
+			{setup.open && <Setup result={setup.result} checking={setup.checking} installing={setup.installing} onInstallGrok={() => void runInstall("grok")} onInstallGit={() => void runInstall("git")} onUpdateGrok={() => void runInstall("update")} onCheck={() => checkSetup()} onCopy={(text) => void copyText(text)} onClose={closeSetup} onOpenSignIn={() => { closeSetup(); setSettingsOpen("general"); }} />}
 			{confirms[0] && (
 				<div key={confirms[0].id} className="overlay confirm-overlay">
 					<div className="sheet" role="alertdialog" aria-modal="true" aria-label={confirms[0].title}>
@@ -3372,23 +4357,17 @@ export function App() {
 }
 
 function PaneIcon({ id }: { id: SidePaneId }) {
-	const paths: Record<string, string> = {
-		terminal: "M3 4.5h10v7H3zM5 7l1.5 1.2L5 9.4M8 9.5h2.5",
-		diff: "M5 3v6M2 6h6M8 12.5h6M11 3.5v0",
-		browser: "M2.5 4h11v8h-11zM2.5 6h11",
-		editor: "M4 2.5h5l3 3v8H4zM9 2.5v3h3",
-	};
-	return (
-		<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
-			<path d={paths[id] ?? ""} fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
-		</svg>
-	);
+	return id === "plan" || id === "tasks" ? null : <Icon name={id} />;
 }
 
-function MenuButton({ label, title, open, onClick }: { label: string; title?: string; open: boolean; onClick: () => void }) {
+function MenuButton({ label, icon, title, open, disabled, onClick }: { label: string; icon: IconName; title?: string; open: boolean; disabled?: boolean; onClick: () => void }) {
+	const add = icon === "plus";
+	const letters = icon === "folder" ? [...label] : [];
+	const display = letters.length > 22 ? `${letters.slice(0, 11).join("")}…${letters.slice(-10).join("")}` : label;
 	return (
-		<button type="button" className={open ? "chip hot" : "chip"} title={title} onClick={onClick} aria-expanded={open}>
-			{label}
+		<button type="button" className={`chip${open ? " hot" : ""}${add ? " chip-add" : ""}`} title={title} aria-label={add ? title : display !== label ? label : undefined} disabled={disabled} onClick={onClick} aria-haspopup="menu" aria-expanded={open}>
+			<Icon name={icon} />
+			{!add && <><span className="chip-label">{display}</span><Icon name="chevron-down" className="chip-caret" /></>}
 		</button>
 	);
 }

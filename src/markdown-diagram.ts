@@ -1,6 +1,6 @@
 export interface MermaidApi {
 	initialize: (config: { startOnLoad: boolean; securityLevel: "strict"; theme: "default" | "dark" }) => void;
-	render: (id: string, source: string) => Promise<{ svg: string }>;
+	render: (id: string, source: string, container: HTMLDivElement) => Promise<{ svg: string }>;
 }
 
 export type DiagramResult = { ok: true; svg: string } | { ok: false };
@@ -46,15 +46,21 @@ export function drawDiagram(source: string, theme: "default" | "dark"): Promise<
 	const cached = drawn.get(key);
 	if (cached) { return cached; }
 	const job = (async (): Promise<DiagramResult> => {
+		let container: HTMLDivElement | undefined;
 		try {
 			const api = await mermaidRuntime.load();
 			api.initialize({ startOnLoad: false, securityLevel: "strict", theme });
+			container = document.createElement("div");
+			container.style.cssText = "position: fixed; inset: 0; overflow: hidden; visibility: hidden";
+			document.body.append(container);
 			sequence += 1;
-			const rendered = await api.render(`mmd-${sequence}`, source);
+			const rendered = await api.render(`mmd-${sequence}`, source, container);
 			if (typeof rendered?.svg !== "string" || !rendered.svg.includes("<svg")) { return { ok: false }; }
 			return { ok: true, svg: rendered.svg };
 		} catch {
 			return { ok: false };
+		} finally {
+			container?.remove();
 		}
 	})();
 	drawn.set(key, job);

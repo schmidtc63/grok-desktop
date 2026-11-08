@@ -34,6 +34,7 @@ const react = {
 		}
 	},
 };
+react.useLayoutEffect = react.useEffect;
 const jsx = (type, props) => ({ type, props: props ?? {} });
 
 // A test that needs to see the confirm questions passes the confirm module the component should share.
@@ -46,6 +47,9 @@ function load(name, globals = {}, confirm) {
 		if (id === "react/jsx-runtime") { return { jsx, jsxs: jsx, Fragment: "fragment" }; }
 		if (id === "./confirm") { return confirm ?? load("confirm.ts", globals); }
 		if (id === "./data") { return load("data.ts", globals); }
+		if (id === "./Icon") { return load("Icon.tsx", globals); }
+		if (id === "./PaneActions") { return load("PaneActions.tsx", globals); }
+		if (id === "./PopupMenu") { return { PopupMenu: (props) => jsx("div", { role: "menu", ...props }) }; }
 		if (id === "./Markdown") { return { Markdown: (props) => jsx("markdown", props) }; }
 		if (id === "./CodeEditorLoader") { return { CodeEditorLoader: (props) => jsx("code-editor", props) }; }
 		throw new Error(`Unexpected import ${id}`);
@@ -109,6 +113,60 @@ const { SessionRail } = load("SessionRail.tsx");
 const filesPane = load("FilesPane.tsx");
 const { shouldAutoSave, FilesPane } = filesPane;
 const { fromFile } = filesPane;
+
+check("PopupMenu moves focus with arrows, dismisses on Escape, and preserves action focus", () => {
+	const pending = [];
+	const { PopupMenu } = load("PopupMenu.tsx", { queueMicrotask: (run) => pending.push(run) });
+	const body = {};
+	const document = { body, activeElement: body };
+	const menu = {
+		isConnected: true,
+		ownerDocument: document,
+		querySelectorAll: () => [first, disabled, nested, last],
+		contains: (item) => [menu, first, disabled, nested, last].includes(item),
+	};
+	function control(owner, disabled = false) {
+		return { isConnected: true, closest: () => owner, matches: () => disabled, focus() { document.activeElement = this; } };
+	}
+	const first = control(menu);
+	const last = control(menu);
+	const disabled = control(menu, true);
+	const nested = control({});
+	const opener = control(null);
+	const destination = control(null);
+	for (const nextFocus of [body, destination]) {
+		menu.isConnected = true;
+		opener.focus();
+		const state = { cursor: 0, values: [], effects: [] };
+		let node;
+		hooks = state;
+		try {
+			node = PopupMenu({ opener, onDismiss: () => { menu.isConnected = false; document.activeElement = nextFocus; } });
+			node.props.ref.current = menu;
+			state.effects.forEach((run) => run());
+		} finally {
+			hooks = undefined;
+		}
+		function press(key) {
+			let prevented = false;
+			let stopped = false;
+			node.props.onKeyDown({ key, currentTarget: menu, preventDefault() { prevented = true; }, stopPropagation() { stopped = true; } });
+			assert.ok(prevented && stopped);
+		}
+		assert.equal(document.activeElement, first);
+		press("ArrowDown");
+		assert.equal(document.activeElement, last);
+		press("ArrowDown");
+		assert.equal(document.activeElement, first);
+		press("ArrowUp");
+		assert.equal(document.activeElement, last);
+		press("Escape");
+		assert.equal(menu.isConnected, false);
+		state.values.forEach((value) => value.cleanup?.());
+		pending.splice(0).forEach((run) => run());
+		assert.equal(document.activeElement, nextFocus === body ? opener : destination);
+	}
+});
 
 const hunk = {
 	id: "h1",
@@ -210,9 +268,10 @@ check("Revert is available only in Uncommitted changes", () => {
 	for (const scope of ["abc123", "branch", "uncommitted"]) {
 		const render = renderer(MenuPane, { ...diffProps, scope });
 		render().elements.find((node) => node.props["aria-label"] === "Changes menu" && node.type === "button").props.onClick({ currentTarget: { getBoundingClientRect: () => ({ bottom: 40, right: 400 }) } });
-		const item = render().elements.find((node) => node.props.role === "menuitem" && node.props.children === "Revert file…");
+		const item = render().elements.find((node) => node.props.role === "menuitem" && flatten(node).text.join("").startsWith("Revert file…"));
 		assert.equal(item.props.disabled, scope !== "uncommitted");
-		assert.equal(item.props.title, scope !== "uncommitted" ? "Switch to Uncommitted changes to revert a file" : undefined);
+		const reason = flatten(item).elements.find((node) => node.props.className === "menu-reason");
+		assert.equal(reason?.props.children, scope !== "uncommitted" ? "Switch to Uncommitted changes to revert a file" : undefined);
 	}
 });
 
@@ -355,6 +414,70 @@ check("File checkboxes appear only where the commit buttons appear, all checked"
 	}
 });
 
+check("Paged changes reveal unchecked files and bulk inclusion affects only listed files", () => {
+	const files = Array.from({ length: 84 }, (_, index) => ({ path: `file-${index + 1}.txt`, hunks: [] }));
+	const render = renderer(DiffPane, { ...pickProps, progressive: true, snapshot: { ok: true, files } });
+	const master = (tree) => flatten(tree.elements.find((node) => node.props.className === "dp-include-all")).elements.find((node) => node.type === "input");
+	let tree = render();
+	assert.ok(tree.text.join("").includes("Showing 40 of 84 changed files."));
+	assert.equal(pickBoxes(tree).length, 40);
+	assert.equal(master(tree).props.checked, true);
+	pickBox(tree, files[0].path).props.onChange();
+	commitButton(render(), "Show more files").props.onClick();
+	tree = render();
+	assert.ok(tree.text.join("").includes("Showing 80 of 84 changed files."));
+	assert.equal(pickBoxes(tree).length, 80);
+	assert.equal(pickBox(tree, files[0].path).props.checked, false);
+	assert.equal(pickBox(tree, files[39].path).props.checked, true);
+	assert.equal(pickBox(tree, files[40].path).props.checked, false);
+	let focused = false;
+	tree.elements.find((node) => node.type === "button" && node.props.title === files[40].path).props.ref({ focus: () => { focused = true; } });
+	assert.equal(focused, true);
+	assert.ok(tree.elements.some((node) => node.props.title === files[0].path && node.props.className === "file-row on"));
+	const checkbox = {};
+	master(tree).props.ref(checkbox);
+	assert.equal(checkbox.indeterminate, true);
+	master(tree).props.onChange();
+	commitButton(render(), "Show more files").props.onClick();
+	tree = render();
+	assert.equal(pickBox(tree, files[79].path).props.checked, true);
+	assert.equal(pickBox(tree, files[80].path).props.checked, false);
+	commitButton(tree, "Commit").props.onClick();
+	assert.equal(commitModal(render()).props["aria-label"], "Commit 80 files?");
+});
+
+check("A cut patch can be stopped, retried, and marked viewed only when complete", () => {
+	const file = { path: "src/a.ts", hunks: [] };
+	const line = { ...hunk, lines: [{ kind: "add", text: "- literal content" }] };
+	const calls = [];
+	const props = {
+		...diffProps, progressive: true, loadingFile: true, snapshot: { ok: true, files: [file] }, viewed: {},
+		onStopLoad: () => calls.push("stop"), onLoadFull: () => calls.push("load"),
+		onViewed: (name, fingerprint) => { props.viewed[name] = fingerprint; calls.push(fingerprint); },
+	};
+	const render = renderer(DiffPane, props);
+	const viewed = (tree) => tree.elements.find((node) => node.props.className === "texty dp-viewed-toggle");
+	commitButton(render(), "Stop loading").props.onClick();
+	props.loadingFile = false;
+	props.fileError = "The diff timed out.";
+	let tree = render();
+	assert.equal(tree.elements.find((node) => node.props.role === "alert").props.children, "The diff timed out.");
+	commitButton(tree, "Retry diff").props.onClick();
+	props.fileError = undefined;
+	props.snapshot = { ok: true, files: [{ ...file, patchLoaded: true, truncated: true, hunks: [line] }] };
+	tree = render();
+	assert.equal(viewed(tree).props.disabled, true);
+	assert.equal(tree.elements.find((node) => node.props.className === "dp-text").props.children, "- literal content");
+	assert.equal(tree.elements.find((node) => node.props["aria-label"] === "Added line").props.children, "+");
+	commitButton(tree, "Load full diff for this file").props.onClick();
+	props.snapshot = { ok: true, files: [{ ...file, patchLoaded: true, hunks: [line] }] };
+	viewed(render()).props.onClick();
+	assert.equal(viewed(render()).props["aria-pressed"], true);
+	viewed(render()).props.onClick();
+	assert.equal(viewed(render()).props["aria-pressed"], false);
+	assert.deepEqual(calls, ["stop", "load", "load", line.id, null]);
+});
+
 check("Clicking a file checkbox does not select or open the file row", () => {
 	const calls = [];
 	const render = renderer(DiffPane, { ...pickProps, onSelectFile: (file) => calls.push(`select:${file}`), onOpenFile: (file) => calls.push(`open:${file}`) });
@@ -394,6 +517,27 @@ check("Review shows the same checkboxes and state, and leaves the side-pane scro
 	assert.ok(commitButton(tree, "Commit"));
 });
 
+check("The workspace owns Changes expansion and movement without remounting its review", () => {
+	const { DiffPane: WorkspacePane } = load("DiffPane.tsx", { window: { innerWidth: 800 } });
+	let moved = 0;
+	const layout = { expanded: false, onToggleExpand() { layout.expanded = !layout.expanded; }, moveLater() { moved++; } };
+	const render = renderer(WorkspacePane, { ...pickProps, layout });
+	const button = (label) => render().elements.find((el) => el.type === "button" && el.props["aria-label"] === label);
+	pickBox(render(), "src/b.ts").props.onChange();
+	button("Expand Changes").props.onClick();
+	assert.ok(render().elements.some((el) => el.props.className === "pane dp-review"));
+	assert.ok(!render().elements.some((el) => el.props.className === "fp-backdrop"));
+	assert.equal(pickBox(render(), "src/b.ts").props.checked, false);
+	button("Changes menu").props.onClick({ currentTarget: { getBoundingClientRect: () => ({ bottom: 40, right: 400 }) } });
+	const menu = render().elements.filter((el) => el.props.role === "menuitem");
+	assert.equal(menu.find((el) => flatten(el).text.join("").startsWith("Move earlier")).props.disabled, true);
+	menu.find((el) => flatten(el).text.join("") === "Move later").props.onClick();
+	assert.equal(moved, 1);
+	assert.equal(button("Changes menu").props["aria-expanded"], false);
+	button("Return Changes to the side").props.onClick();
+	assert.ok(render().elements.some((el) => el.props.className === "pane-bd dp-side"));
+});
+
 const railProps = {
 	session: { folder: "C:/project", branch: "feature", environment: "Local" },
 	diff: { ok: true, files: [] }, branch: { ok: true, branch: "feature", base: "main", ahead: 1 },
@@ -425,7 +569,7 @@ check("Merge when ready shows the message the merge reports", () => {
 	const onMergeWhenReady = () => ({ then(run) { run({ ok: true, message: "Merged." }); return { finally: (done) => done() }; } });
 	const render = renderer(MenuPane, { ...diffProps, pr, comments: [], onMergeWhenReady });
 	render().elements.find((node) => node.type === "button" && node.props["aria-label"] === "Pull request menu").props.onClick({ currentTarget: { getBoundingClientRect: () => ({ bottom: 40, right: 400 }) } });
-	render().elements.find((node) => node.props.role === "menuitem" && node.props.children === "Merge when ready").props.onClick();
+	render().elements.find((node) => node.props.role === "menuitem" && flatten(node).text.join("") === "Merge when ready").props.onClick();
 	assert.ok(render().text.join("").includes("Merged."));
 });
 
@@ -656,7 +800,7 @@ async function main() {
 			};
 			const render = renderer(ConfirmPane, props);
 			render().elements.find((node) => node.type === "button" && node.props["aria-label"] === "Changes menu").props.onClick({ currentTarget: { getBoundingClientRect: () => ({ bottom: 40, right: 400 }) } });
-			render().elements.find((node) => node.props.role === "menuitem" && node.props.children === "Revert file…").props.onClick();
+			render().elements.find((node) => node.props.role === "menuitem" && flatten(node).text.join("") === "Revert file…").props.onClick();
 			assert.deepEqual(questions, ["Revert src/a.ts?\n\nThis puts the file back as it was at the last commit. This cannot be undone."]);
 			assert.deepEqual(reverted, [], "revert waits for the answer promise");
 			props.selectedFile = "src/b.ts";
@@ -713,14 +857,14 @@ async function main() {
 			rig.asks[0].resolve(false);
 		}
 	});
-	await checkAsync("Commit and Commit and push name only the checked files, and all checked keeps the fixed requests", async () => {
+	await checkAsync("Commit and Commit and push name the checked files, even when every file is checked", async () => {
 		const fixed = [
 			{ title: "Commit 3 files?" },
 			{ title: "Commit 3 files and push?" },
 		];
 		const fixedRequests = [
-			"Commit the current uncommitted changes in this repository with a clear commit message. Don't push.",
-			"Commit the current uncommitted changes in this repository with a clear commit message, then push the branch.",
+			"Commit only these files in this repository with a clear commit message, and leave the other changes uncommitted: `src/a.ts`, `src/b.ts`, `src/c.ts`. Don't push.",
+			"Commit only these files in this repository with a clear commit message, and leave the other changes uncommitted: `src/a.ts`, `src/b.ts`, `src/c.ts`. Then push the branch.",
 		];
 		const rig = commitRig(pickProps);
 		await rig.press("Commit");
@@ -752,7 +896,7 @@ async function main() {
 		await rig.press("Commit");
 		await rig.press("Commit and push");
 		assert.deepEqual(rig.asks.slice(before), fixed, "with every file checked again, the fixed questions return");
-		assert.deepEqual(rig.requests.slice(before), fixedRequests, "with every file checked again, the fixed requests return");
+		assert.deepEqual(rig.requests.slice(before), fixedRequests, "with every file checked again, every file is named");
 	});
 	await checkAsync("A file that appears later is included, and an unchecked file that left the list counts for nothing", async () => {
 		const rig = commitRig(pickProps);
@@ -765,7 +909,7 @@ async function main() {
 		rig.props.snapshot = { ok: true, files: [pickFiles[0], pickFiles[2]] };
 		const gone = await rig.press("Commit and push");
 		assert.equal(gone.ask.title, "Commit 2 files and push?");
-		assert.equal(gone.request, "Commit the current uncommitted changes in this repository with a clear commit message, then push the branch.");
+		assert.equal(gone.request, "Commit only these files in this repository with a clear commit message, and leave the other changes uncommitted: `src/a.ts`, `src/c.ts`. Then push the branch.");
 	});
 	await checkAsync("A renamed file is named by its old and new path", async () => {
 		const renamed = { path: "src/new.ts", from: "src/old.ts", additions: 0, deletions: 0, hunks: [hunk] };
@@ -807,7 +951,7 @@ async function main() {
 			assert.ok(!tree.text.join("").includes("Host commit result."), "the pane leaves commit result notices to App");
 		}
 	});
-	await checkAsync("Commit failure and rejection preserve exclusions, while a landed push failure clears them", async () => {
+	await checkAsync("A failed commit keeps the draft and shows the error, while a landed push failure closes the dialog", async () => {
 		for (const outcome of [{ ok: false, error: "Hook refused." }, { ok: false, committed: true, error: "Push refused." }, null]) {
 			const rig = commitRig({ ...pickProps, onCommit: async () => { if (!outcome) { throw new Error("Bridge closed."); } return outcome; } });
 			rig.toggle("src/b.ts");
@@ -816,10 +960,21 @@ async function main() {
 			modalButton(rig.render(), "Commit and push").props.onClick();
 			await new Promise((resolve) => setImmediate(resolve));
 			const tree = rig.render();
-			assert.equal(commitModal(tree), undefined);
 			assert.equal(pickBox(tree, "src/b.ts").props.checked, outcome?.committed === true);
 			assert.equal(rig.refreshes(), 1, "every host result or rejection refreshes the pane");
-			assert.ok(!tree.text.join("").includes(outcome?.error ?? "Bridge closed."), "commit errors are not stored in a pane note");
+			if (outcome?.committed) {
+				assert.equal(commitModal(tree), undefined);
+			} else {
+				const alert = () => modalTree(rig.render()).elements.find((el) => el.props.role === "alert");
+				assert.equal(modalTree(tree).elements.find((el) => el.type === "textarea").props.value, "Summary");
+				assert.equal(alert().props.children, outcome?.error ?? "The commit could not be checked. Refresh to see what happened.");
+				modalButton(tree, "Commit and push").props.onClick();
+				assert.equal(alert(), undefined, "a retry clears the previous error");
+				await new Promise((resolve) => setImmediate(resolve));
+				assert.ok(alert());
+				rig.message("New summary");
+				assert.equal(alert(), undefined, "editing clears the previous error");
+			}
 		}
 	});
 	await checkAsync("Commit dialog keys stay isolated from review, comment-send and window shortcuts", async () => {

@@ -20,6 +20,9 @@ contextBridge.exposeInMainWorld("grokCode", {
 	attention() {
 		return ipcRenderer.invoke("grok:attention");
 	},
+	accessibilitySupport() {
+		return ipcRenderer.invoke("grok:accessibility-support");
+	},
 	taskbar(state) {
 		return ipcRenderer.invoke("grok:taskbar", state);
 	},
@@ -79,8 +82,8 @@ contextBridge.exposeInMainWorld("grokCode", {
 	installGit() {
 		return ipcRenderer.invoke("grok:install-git");
 	},
-	customize(cwd) {
-		return ipcRenderer.invoke("grok:customize", cwd);
+	customize(cwd, skillsOnly) {
+		return ipcRenderer.invoke("grok:customize", cwd, skillsOnly);
 	},
 	skillExcerpt(cwd, skillPath) {
 		return ipcRenderer.invoke("grok:skill-excerpt", cwd, skillPath);
@@ -96,6 +99,36 @@ contextBridge.exposeInMainWorld("grokCode", {
 	},
 	signOut() {
 		return ipcRenderer.invoke("grok:sign-out");
+	},
+	signInStatus() {
+		return ipcRenderer.invoke("grok:sign-in-status");
+	},
+	saveSignIn(input, options) {
+		return ipcRenderer.invoke("grok:sign-in-save", input, options);
+	},
+	removeSignInKey() {
+		return ipcRenderer.invoke("grok:sign-in-remove-key");
+	},
+	cloudKeyStatus() {
+		return ipcRenderer.invoke("grok:cloud-key-status");
+	},
+	cloudKeySave(key) {
+		return ipcRenderer.invoke("grok:cloud-key-save", key);
+	},
+	cloudKeyRemove() {
+		return ipcRenderer.invoke("grok:cloud-key-remove");
+	},
+	cloudSetup(folder) {
+		return ipcRenderer.invoke("grok:cloud-setup", folder);
+	},
+	cloudSend(payload) {
+		return ipcRenderer.invoke("grok:cloud-send", payload);
+	},
+	cloudResume(payload) {
+		return ipcRenderer.invoke("grok:cloud-resume", payload);
+	},
+	cloudCancel(uiSessionId) {
+		return ipcRenderer.invoke("grok:cloud-cancel", uiSessionId);
 	},
 	devScripts(cwd) {
 		return ipcRenderer.invoke("grok:dev-scripts", cwd);
@@ -135,6 +168,12 @@ contextBridge.exposeInMainWorld("grokCode", {
 	},
 	scopedDiff(cwd, scope) {
 		return ipcRenderer.invoke("grok:scoped-diff", cwd, scope);
+	},
+	readChanges(request) {
+		return ipcRenderer.invoke("grok:read-changes", request);
+	},
+	stopChanges(id) {
+		return ipcRenderer.invoke("grok:stop-changes", id);
 	},
 	listCommits(cwd) {
 		return ipcRenderer.invoke("grok:list-commits", cwd);
@@ -244,6 +283,9 @@ contextBridge.exposeInMainWorld("grokCode", {
   listCliSessions(knownIds) {
     return ipcRenderer.invoke("grok:list-cli-sessions", knownIds);
   },
+	listCliProjectFolders() {
+		return ipcRenderer.invoke("grok:list-cli-project-folders");
+	},
   sessionLoops(uiSessionId, agentSessionId) {
     return ipcRenderer.invoke("grok:session-loops", uiSessionId, agentSessionId);
   },

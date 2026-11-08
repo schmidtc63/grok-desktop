@@ -48,12 +48,12 @@ const setup = [
 ];
 
 const theme = EditorView.theme({
-	"&": { backgroundColor: "var(--input)", color: "var(--text)", fontSize: "12px" },
+	"&": { backgroundColor: "var(--input)", color: "var(--text)", fontSize: "13px" },
 	"&.cm-focused": { outline: "none" },
-	".cm-scroller": { fontFamily: "Consolas, \"Cascadia Mono\", ui-monospace, Menlo, monospace", lineHeight: "19px", overflow: "auto" },
+	".cm-scroller": { fontFamily: "Consolas, \"Cascadia Mono\", ui-monospace, Menlo, monospace", lineHeight: "20px", overflow: "auto" },
 	".cm-content": { padding: "10px 0", caretColor: "var(--accent)" },
 	".cm-line": { padding: "0 10px" },
-	".cm-gutters": { backgroundColor: "var(--code)", color: "var(--faint)", borderRight: "1px solid var(--line)" },
+	".cm-gutters": { backgroundColor: "var(--code)", color: "var(--muted)", borderRight: "1px solid var(--line)" },
 	".cm-activeLine, .cm-activeLineGutter": { backgroundColor: "var(--hover)" },
 	".cm-selectionBackground, &.cm-focused .cm-selectionBackground, .cm-content ::selection": { backgroundColor: "color-mix(in srgb, var(--accent) 28%, transparent)" },
 	".cm-cursor, .cm-dropCursor": { borderLeftColor: "var(--accent)" },

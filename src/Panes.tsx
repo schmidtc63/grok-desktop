@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import { Icon, type IconName } from "./Icon";
 import { Markdown } from "./Markdown";
+import { PaneActions, type PaneLayoutControls } from "./PaneActions";
 import { type NumberedLine } from "./DiffPane";
 import { imageSrc, type ChatMessage, type Session, type ToolCard, type ToolDiff, type TranscriptView } from "./types";
 
@@ -213,17 +215,17 @@ const TOOL_LABELS: Record<string, string> = {
 	todos: "Update tasks",
 };
 
-const TOOL_GLYPHS: Record<string, string> = {
-	execute: "$",
-	command: "$",
-	read: "≡",
-	edit: "✎",
-	search: "⌕",
-	fetch: "↓",
-	network: "↓",
-	question: "?",
-	plan: "☰",
-	todos: "☑",
+const TOOL_ICONS: Partial<Record<string, IconName>> = {
+	execute: "terminal",
+	command: "terminal",
+	read: "list",
+	edit: "edit",
+	search: "search",
+	fetch: "arrow-down",
+	network: "arrow-down",
+	question: "help",
+	plan: "list",
+	todos: "check-square",
 };
 
 function shownPath(target: string, folder: string) {
@@ -306,8 +308,8 @@ export function splitRows(rows: NumberedLine[]): SplitRow[] {
 	return pairs;
 }
 
-function marked(cell: SplitCell) {
-	return `${cell.kind === "add" ? "+" : cell.kind === "del" ? "-" : " "}${cell.text}`;
+function editMarker(kind: NumberedLine["kind"]) {
+	return <span className="edit-marker">{kind === "add" ? "+" : kind === "del" ? "−" : ""}</span>;
 }
 
 export function EditDiff({ diff, all = false, view = "unified", onView, width = 0, onWidth }: { diff: ToolDiff; all?: boolean; view?: "unified" | "split"; onView?: (view: "unified" | "split") => void; width?: number; onWidth?: (width: number) => void }) {
@@ -341,15 +343,17 @@ export function EditDiff({ diff, all = false, view = "unified", onView, width = 
 							{[row.left, row.right].map((cell, side) => cell ? (
 								<div className={`edit-side dp-${cell.kind}`} key={side}>
 									<span className="dp-num">{cell.line ?? ""}</span>
-									<span className="dp-text">{marked(cell)}</span>
+									{editMarker(cell.kind)}
+									<span className="dp-text">{cell.text}</span>
 								</div>
-							) : <div className="edit-side edit-side-empty" key={side}><span className="dp-num" /><span className="dp-text" /></div>)}
+							) : <div className="edit-side edit-side-empty" key={side}><span className="dp-num" />{editMarker("context")}<span className="dp-text" /></div>)}
 						</div>
 					)) : shown.map((row, index) => (
 						<div className={`dp-line dp-${row.kind}`} key={index}>
 							<span className="dp-num">{row.oldLine ?? ""}</span>
 							<span className="dp-num">{row.newLine ?? ""}</span>
-							<span className="dp-text">{row.kind === "add" ? "+" : row.kind === "del" ? "-" : " "}{row.text}</span>
+							{editMarker(row.kind)}
+							<span className="dp-text">{row.text}</span>
 						</div>
 					))}
 				</div>
@@ -497,7 +501,7 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 				{toolId && (
 					<div className="actions">
 						<button type="button" onClick={() => m.decide(toolId, "deny")}>Deny</button>
-						{!toolId.startsWith("native-permission:") && tool.always && <button type="button" title={tool.always === "folder" ? "Allow this exact command in this folder from now on, in every session. Settings lists the commands you allowed." : tool.always === "site" ? "Allow browser access on this site for the rest of this conversation." : "Allow this tool for the rest of this conversation"} onClick={() => m.decide(toolId, "always")}>{tool.always === "folder" ? "Always allow in this folder" : tool.always === "site" ? "Allow on this site for this conversation" : "Allow for this conversation"}</button>}
+						{!toolId.startsWith("native-permission:") && tool.always && !tool.noAlways && <button type="button" title={tool.always === "folder" ? "Allow this exact command in this folder from now on, in every session. Settings lists the commands you allowed." : tool.always === "site" ? "Allow browser access on this site for the rest of this conversation." : "Allow this tool for the rest of this conversation"} onClick={() => m.decide(toolId, "always")}>{tool.always === "folder" ? "Always allow in this folder" : tool.always === "site" ? "Allow on this site for this conversation" : "Allow for this conversation"}</button>}
 						{!toolId.startsWith("native-permission:") && kind === "command" && tool.commandPrefix && <button type="button" title={`Allow "${tool.commandPrefix} …" with any arguments in this conversation. Some arguments make a tool run other programs. Ends when the conversation does.`} onClick={() => m.decide(toolId, "prefix")}>{`Allow ${tool.commandPrefix} commands`}</button>}
 						<button type="button" className="yes" onClick={() => m.decide(toolId, "allow")}>Allow</button>
 					</div>
@@ -518,7 +522,7 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 	}
 	const head = (
 		<>
-			<span className="tool-glyph" aria-hidden="true">{TOOL_GLYPHS[kind] ?? "•"}</span>
+			<Icon className="tool-glyph" name={TOOL_ICONS[kind] ?? "dot"} />
 			<span className="tool-label">{label}</span>
 			{kind === "command" && tool.readsOnly && <small className="meta" title="Usually only reads, but arguments can change that. Check them.">Reads only</small>}
 			{text && <span className="tool-text" title={text}>{text}</span>}
@@ -568,12 +572,14 @@ export function ToolGroup({ tools, m }: { tools: ToolCard[]; m: PaneModel }) {
 		counts.set(words[0], entry);
 	}
 	const summary = [...counts.values()].map(({ words, count }, index) => `${index ? words[0].toLowerCase() : words[0]} ${count} ${count === 1 ? words[1] : words[2]}`).join(", ");
-	const failed = tools.filter((tool) => /^(Failed|Denied)/.test(tool.detail)).length;
+	const denied = tools.filter((tool) => tool.detail.startsWith("Denied")).length;
+	const failed = tools.filter((tool) => tool.detail.startsWith("Failed")).length;
 	return (
 		<div className="tool-group">
 			<button type="button" className="tool-head" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-				<span className="tool-glyph" aria-hidden="true">{open ? "▾" : "▸"}</span>
+				<Icon className="tool-glyph" name={open ? "chevron-down" : "chevron-right"} />
 				<span className="tool-text">{summary}</span>
+				{denied > 0 && <span className="tool-status">{denied} denied</span>}
 				{failed > 0 && <span className="tool-status bad">{failed} failed</span>}
 			</button>
 			{open && <div className="tool-group-body">{tools.map((tool, index) => <ToolRow key={tool.id ?? `${tool.title}-${index}`} tool={tool} m={m} />)}</div>}
@@ -586,30 +592,41 @@ function Thought({ text, view }: { text: string; view: TranscriptView }) {
 	if (view === "normal") { return null; }
 	return (
 		<div className="thought">
-			<button type="button" className="thought-hd" aria-expanded={open} onClick={() => setOpen((value) => !value)}>{open ? "▾" : "▸"} Thinking</button>
+			<button type="button" className="thought-hd" aria-expanded={open} onClick={() => setOpen((value) => !value)}><Icon name={open ? "chevron-down" : "chevron-right"} /> Thinking</button>
 			{open && <div className="thought-bd">{text}</div>}
 		</div>
 	);
 }
 
 // Eight lines, then a fade, matches how Claude Desktop shows a long message.
-// The box is styles.css `.user-clip.clipped` max-height: calc(8 * 1.45em).
 export const USER_MESSAGE_LINES = 8;
-const USER_LINE_EM = 1.45;
 
-export function userClipBoxHeight(fontSizePx: number): number {
-	return USER_MESSAGE_LINES * USER_LINE_EM * fontSizePx;
+export function userClipBoxHeight(lineHeightPx: number): number {
+	return USER_MESSAGE_LINES * lineHeightPx;
 }
 
-// One pixel of slack: scrollHeight and the em max-height round apart, and a message that fills the box stays open.
+// Allow one pixel of rounding so a message that fills the box stays open.
 export function userClipOverflows(contentHeight: number, boxHeight: number): boolean {
 	return Number.isFinite(contentHeight) && Number.isFinite(boxHeight) && contentHeight > boxHeight + 1;
 }
 
 function readUserClipOverflow(node: HTMLElement): boolean {
 	if (typeof window.getComputedStyle !== "function") { return false; }
-	const fontSize = Number.parseFloat(window.getComputedStyle(node).fontSize);
-	return userClipOverflows(node.scrollHeight, userClipBoxHeight(fontSize));
+	const lineHeight = Number.parseFloat(window.getComputedStyle(node).lineHeight);
+	return userClipOverflows(node.scrollHeight, userClipBoxHeight(lineHeight));
+}
+
+export function AppNote({ children, folder = false }: { children: ReactNode; folder?: boolean }) {
+	return (
+		<div className="app-note" role="note">
+			<Icon name={folder ? "folder-unavailable" : "info"} />
+			<div className="app-note-body"><strong>Grok Code</strong>{children}</div>
+		</div>
+	);
+}
+
+function replyText(message: ChatMessage) {
+	return message.appNote && message.text.endsWith(message.appNote) ? message.text.slice(0, -message.appNote.length).trimEnd() : message.text;
 }
 
 function MessageBody({ message, m, readOnly = false, find = "" }: { message: ChatMessage; m: PaneModel; readOnly?: boolean; find?: string }) {
@@ -717,8 +734,8 @@ function MessageBody({ message, m, readOnly = false, find = "" }: { message: Cha
 				addTool(tool);
 			}
 		});
-	} else if (message.text) {
-		ordered.push(markdown(message.text, "text"));
+	} else if (replyText(message)) {
+		ordered.push(markdown(replyText(message), "text"));
 	}
 	tools.forEach((tool) => {
 		if (!tool.id || !placed.has(tool.id)) { addTool(tool); }
@@ -728,6 +745,7 @@ function MessageBody({ message, m, readOnly = false, find = "" }: { message: Cha
     <>
 			{message.thought && <Thought text={message.thought} view={m.view} />}
 			{message.pending && !message.text && !tools.length ? <div className="working"><span className="spinner" aria-hidden="true" />Working…</div> : ordered}
+			{message.appNote && <AppNote folder={/^(That folder is not on this computer:|That path is not a folder:)/.test(message.appNote)}>{markdown(message.appNote, "note")}</AppNote>}
 			{message.streaming && !message.pending && <div className="working small"><span className="spinner" aria-hidden="true" /></div>}
     </>
   );
@@ -740,7 +758,7 @@ export function TaskList({ todos }: { todos: GrokTodo[] }) {
 	return (
 		<div className="task-list" aria-label="Task list">
 			<button type="button" className="task-list-hd" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
-				{open ? "▾" : "▸"} Tasks <span className="meta">{done} of {todos.length}</span>
+				<Icon name={open ? "chevron-down" : "chevron-right"} /> Tasks <span className="meta">{done} of {todos.length}</span>
 			</button>
 			{open && (
 				<ul>
@@ -865,10 +883,10 @@ function Chat({ m }: { m: PaneModel }) {
 							if (event.key === "Enter") { event.preventDefault(); jump.current = true; setHit((value) => value + (event.shiftKey ? -1 : 1)); }
 						}}
 					/>
-					<span className="find-count">{hits ? `${(((hit % hits) + hits) % hits) + 1} of ${hits}` : find ? "No results" : ""}</span>
-					<button type="button" className="texty" aria-label="Previous match" disabled={!hits} onClick={() => { jump.current = true; setHit((value) => value - 1); }}>↑</button>
-					<button type="button" className="texty" aria-label="Next match" disabled={!hits} onClick={() => { jump.current = true; setHit((value) => value + 1); }}>↓</button>
-					<button type="button" className="texty" aria-label="Close find" onClick={() => { setFind(null); setHit(0); }}>×</button>
+					<span className="find-count" role="status">{hits ? `${(((hit % hits) + hits) % hits) + 1} of ${hits}` : find ? "No results" : ""}</span>
+					<button type="button" className="texty" aria-label="Previous match" disabled={!hits} onClick={() => { jump.current = true; setHit((value) => value - 1); }}><Icon name="arrow-up" /></button>
+					<button type="button" className="texty" aria-label="Next match" disabled={!hits} onClick={() => { jump.current = true; setHit((value) => value + 1); }}><Icon name="arrow-down" /></button>
+					<button type="button" className="texty" aria-label="Close find" onClick={() => { setFind(null); setHit(0); }}><Icon name="close" /></button>
 				</div>
 			)}
 			<div className="chat-scroll" ref={scroller} onScroll={(event) => {
@@ -882,15 +900,16 @@ function Chat({ m }: { m: PaneModel }) {
 					{m.messages.length === 0 && <p className="chat-empty">What should Grok work on in {m.session.project}?</p>}
 					{m.messages.map((message) => {
 						const time = messageTime(message);
+						const text = replyText(message);
 						return (
 							<article className={message.role === "user" ? "msg user" : "msg grok"} key={message.id} tabIndex={time ? 0 : undefined}>
 								<MessageBody message={message} m={m} find={find ?? ""} />
 								<div className="msg-foot">
 									{time && <time className="msg-time" dateTime={new Date(time.at).toISOString()} title={time.full}>{time.full}</time>}
-									{!message.pending && !message.streaming && message.text.trim() && (
+									{!message.pending && !message.streaming && text.trim() && (
 										<span className="msg-actions">
-											<button type="button" className="texty" onClick={() => m.copyText(message.text)}>Copy</button>
-											<button type="button" className="texty" onClick={() => m.quote(message.text)}>Quote</button>
+											<button type="button" className="texty" onClick={() => m.copyText(text)}>Copy</button>
+											<button type="button" className="texty" onClick={() => m.quote(text)}>Quote</button>
 											{message.role === "user" && message.point && message.point.agentSessionId === m.session.agentSessionId && !m.busy && <>
 												<button type="button" className="texty" onClick={() => m.rewind(message)}>Rewind</button>
 												<button type="button" className="texty" onClick={() => m.fork(message)}>Fork</button>
@@ -904,19 +923,15 @@ function Chat({ m }: { m: PaneModel }) {
 					<TaskList todos={m.todos} />
 				</div>
       </div>
-			{away && <button type="button" className="to-bottom" aria-label="Scroll to bottom" title="Scroll to bottom" onClick={() => scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" })}>↓</button>}
+			{away && <button type="button" className="to-bottom" aria-label="Scroll to bottom" title="Scroll to bottom" onClick={() => scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" })}><Icon name="arrow-down" /></button>}
     </section>
   );
 }
 
-function PaneClose({ onClose }: { onClose: () => void }) {
-	return <button type="button" className="pane-x" aria-label="Close pane" onClick={onClose}>×</button>;
-}
-
-function Plan({ m }: { m: PaneModel }) {
+function Plan({ m, layout }: { m: PaneModel; layout?: PaneLayoutControls }) {
   return (
     <section className="pane" aria-label="Plan">
-			<div className="pane-hd"><b>Plan</b><span className="spacer" /><PaneClose onClose={() => m.closePane("plan")} /></div>
+			<div className="pane-hd"><b>Plan</b><PaneActions name="Plan" layout={layout} onClose={() => m.closePane("plan")} /></div>
       <div className="pane-bd">
 				{!m.plan && !m.todos.length && <p className="note">Grok has not written a plan in this session yet.</p>}
 				{m.plan && <Markdown text={m.plan} onLink={m.openLink} onCopy={m.copyText} />}
@@ -926,7 +941,7 @@ function Plan({ m }: { m: PaneModel }) {
   );
 }
 
-function Tasks({ m }: { m: PaneModel }) {
+function Tasks({ m, layout }: { m: PaneModel; layout?: PaneLayoutControls }) {
 	const [openId, setOpenId] = useState("");
 	const [refresh, setRefresh] = useState(0);
 	const [output, setOutput] = useState<{ id: string; result?: Awaited<ReturnType<PaneModel["taskOutput"]>> }>({ id: "" });
@@ -957,7 +972,7 @@ function Tasks({ m }: { m: PaneModel }) {
 	const conversation = transcript.id === openId ? transcript.result : undefined;
   return (
     <section className="pane" aria-label="Background tasks">
-			<div className="pane-hd"><b>Background tasks</b><span className="spacer" /><PaneClose onClose={() => m.closePane("tasks")} /></div>
+			<div className="pane-hd"><b>Background tasks</b><PaneActions name="Background tasks" layout={layout} onClose={() => m.closePane("tasks")} /></div>
 			<div className="pane-bd">
 				{m.tasks.length === 0 && <p className="note">Nothing is running in the background.</p>}
 				{m.tasks.map((task) => (
@@ -1021,8 +1036,8 @@ export function SideLog({ messages, model }: { messages: ChatMessage[]; model: P
   );
 }
 
-export function PaneView({ id, model }: { id: "chat" | "plan" | "tasks"; model: PaneModel }) {
-	if (id === "plan") { return <Plan m={model} />; }
-	if (id === "tasks") { return <Tasks m={model} />; }
+export function PaneView({ id, model, layout }: { id: "chat" | "plan" | "tasks"; model: PaneModel; layout?: PaneLayoutControls }) {
+	if (id === "plan") { return <Plan m={model} layout={layout} />; }
+	if (id === "tasks") { return <Tasks m={model} layout={layout} />; }
 	return <Chat m={model} />;
 }

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { askConfirm, type ConfirmAsk } from "./confirm";
 import { connectorCatalog } from "./connector-catalog";
+import { Icon } from "./Icon";
 
 export type CustomizeView = "skills" | "connectors" | "plugins";
 type Skill = NonNullable<GrokInventory["skills"]>[number];
@@ -194,7 +195,7 @@ export function Customize({ view, folder, live, onRun, onViewChange }: {
 		<div className="ct-page">
 			<header className="ct-header"><h2>Skills and tools</h2><p className="meta">Manage what Grok loads for this folder.</p></header>
 			<div className="ct-tabs" role="tablist" aria-label="Skills and tools">
-				{([['skills', 'Skills', skills.length], ['connectors', 'Connectors', connectors.length], ['plugins', 'Plugins', installed.length + otherPlugins.length]] as const).map(([id, label, count]) => <button type="button" role="tab" aria-label={label} aria-selected={view === id} className={view === id ? "on" : ""} key={id} onClick={() => onViewChange?.(id)}>{label} ({count})</button>)}
+				{([['skills', 'Skills', inventory ? skills.length : "…"], ['connectors', 'Connectors', connectors.length], ['plugins', 'Plugins', installed.length + otherPlugins.length]] as const).map(([id, label, count]) => <button type="button" role="tab" aria-label={label} aria-selected={view === id} className={view === id ? "on" : ""} key={id} onClick={() => onViewChange?.(id)}>{label} ({count})</button>)}
 			</div>
 			{inventory?.trusted === false && <p className="note">Grok has not trusted this folder, so it skips the folder's own skills, MCP servers and hooks. <button type="button" className="texty" onClick={() => onRun("/hooks-trust")}>Trust it with /hooks-trust</button></p>}
 			{status}
@@ -207,7 +208,7 @@ export function Customize({ view, folder, live, onRun, onViewChange }: {
 					{inventory?.ok && !groups.length && <p className="meta">{filter ? "No matches." : `No ${view === "plugins" && pluginTab === "discover" ? "marketplace plugins" : view} found.`}</p>}
 					{groups.map((group) => {
 						const key = `${view}:${pluginTab}:${group.name}`;
-						return <section className="ct-group" key={group.name}><button type="button" className="ct-group-heading" aria-label={`Toggle ${group.name}`} aria-expanded={!collapsed[key]} onClick={() => setCollapsed((current) => ({ ...current, [key]: !current[key] }))}><span>{collapsed[key] ? "▸" : "▾"} {group.name}</span><span>{group.items.length}</span></button>
+						return <section className="ct-group" key={group.name}><button type="button" className="ct-group-heading" aria-label={`Toggle ${group.name}`} aria-expanded={!collapsed[key]} onClick={() => setCollapsed((current) => ({ ...current, [key]: !current[key] }))}><span><Icon name={collapsed[key] ? "chevron-right" : "chevron-down"} /> {group.name}</span><span>{group.items.length}</span></button>
 							{view === "plugins" && pluginTab === "installed" && group.name === "Claude Code" && <p className="meta">Loaded from Claude Code. Manage these plugins in Claude Code.</p>}
 							{!collapsed[key] && group.items.map((item) => <button type="button" className={selectedId === item.id ? "ct-item on" : "ct-item"} aria-label={`Details for ${item.name}`} aria-pressed={selectedId === item.id} key={item.id} onClick={() => setSelectedId(item.id)}><span className={item.enabled ? "ct-dot on" : "ct-dot"} role="img" aria-label={item.enabled ? "On" : "Off"} /><span><b>{item.name}</b><small>{item.description || "No description provided."}</small></span></button>)}
 						</section>;
@@ -226,9 +227,9 @@ export function Customize({ view, folder, live, onRun, onViewChange }: {
 						<form className="cz-form" aria-label="Connector settings" onSubmit={(event) => { event.preventDefault(); if (!server.name.trim() || !server.target.trim()) { return; } void apply({ action: "mcp-add", name: server.name, transport: server.transport, target: server.target, scope: server.scope, ...(remote ? { headers: server.extra } : { env: server.extra }) }).then((ok) => { if (ok) { setSheet(""); setServer((current) => ({ ...current, name: "", target: "", extra: "" })); setCatalogNote(""); } }); }}>
 							<label htmlFor="ct-name">Name</label><input id="ct-name" aria-label="Connector name" autoFocus value={server.name} onChange={(event) => setServer({ ...server, name: event.target.value })} />
 							<label htmlFor="ct-transport">Transport</label><select id="ct-transport" aria-label="Connector transport" value={server.transport} onChange={(event) => setServer({ ...server, transport: event.target.value as "stdio" | "http" | "sse" })}><option value="stdio">Local command (stdio)</option><option value="http">Remote server (HTTP)</option><option value="sse">Remote server (SSE)</option></select>
-							<label htmlFor="ct-target">{remote ? "Address" : "Command"}</label><input id="ct-target" aria-label="Connector target" value={server.target} onChange={(event) => setServer({ ...server, target: event.target.value })} />
-							<label htmlFor="ct-extra">{remote ? "Headers" : "Environment"}</label><textarea id="ct-extra" aria-label="Connector extras" rows={3} value={server.extra} placeholder={remote ? "Authorization: Bearer ${API_TOKEN}" : "GITHUB_TOKEN=${GITHUB_TOKEN}"} onChange={(event) => setServer({ ...server, extra: event.target.value })} />
-							<label htmlFor="ct-scope">Save in</label><select id="ct-scope" aria-label="Connector scope" value={server.scope} onChange={(event) => setServer({ ...server, scope: event.target.value as "user" | "project" })}><option value="user">Your Grok config (every folder)</option><option value="project">This project's .grok/config.toml</option></select><span /><button type="submit" className="texty" disabled={busy || !server.name.trim() || !server.target.trim()}>Add connector</button>
+							<label htmlFor="ct-target">{remote ? "Address" : "Command"}</label><input id="ct-target" value={server.target} onChange={(event) => setServer({ ...server, target: event.target.value })} />
+							<label htmlFor="ct-extra">{remote ? "Headers" : "Environment"}</label><textarea id="ct-extra" rows={3} value={server.extra} placeholder={remote ? "Authorization: Bearer ${API_TOKEN}" : "GITHUB_TOKEN=${GITHUB_TOKEN}"} onChange={(event) => setServer({ ...server, extra: event.target.value })} />
+							<label htmlFor="ct-scope">Save in</label><select id="ct-scope" value={server.scope} onChange={(event) => setServer({ ...server, scope: event.target.value as "user" | "project" })}><option value="user">Your Grok config (every folder)</option><option value="project">This project's .grok/config.toml</option></select><span /><button type="submit" className="texty" disabled={busy || !server.name.trim() || !server.target.trim()}>Add connector</button>
 						</form><p className="meta">One line per {remote ? "header" : "variable"}. Use ${"{NAME}"} references for secrets, especially in a shared project file.</p>
 					</>}
 				</>}

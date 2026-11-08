@@ -33,7 +33,8 @@ module.exports = async function checkCustomizeRenderer({ harness, button, textOf
 		marketplaces: [{ name: "community", source: "community/plugins" }, { name: "xai", source: "xai-org/grok-plugins" }],
 	};
 	const labelled = (app, label) => {
-		const node = app.node((item) => item.props["aria-label"] === label);
+		const visibleLabel = app.node((item) => item.type === "label" && item.props.htmlFor && textOf(item) === label);
+		const node = app.node((item) => item.props["aria-label"] === label || (visibleLabel && item.props.id === visibleLabel.props.htmlFor && !item.props["aria-label"]));
 		assert.ok(node, `Missing ${label}`);
 		return node;
 	};
@@ -60,6 +61,7 @@ module.exports = async function checkCustomizeRenderer({ harness, button, textOf
 		const props = { view, folder: "C:/project", live: [{ name: "github", source: "Personal", status: "connected" }], onRun: (text) => runs.push(text) };
 		props.onViewChange = (next) => { props.view = next; app.customizeView(props); };
 		app.customizeView(props);
+		if (view === "skills") { assert.equal(textOf(labelled(app, "Skills")), "Skills (…)"); }
 		await app.settle();
 		return { app, props, changes, excerpts, opened, runs };
 	}
@@ -142,8 +144,9 @@ module.exports = async function checkCustomizeRenderer({ harness, button, textOf
 	assert.equal(button(connectorApp, "Custom").props["aria-selected"], true);
 	assert.equal(labelled(connectorApp, "Connector name").props.value, github.id);
 	assert.equal(labelled(connectorApp, "Connector transport").props.value, github.transport);
-	assert.equal(labelled(connectorApp, "Connector target").props.value, github.target);
-	assert.equal(labelled(connectorApp, "Connector extras").props.value, github.extra);
+	assert.equal(labelled(connectorApp, "Address").props.value, github.target);
+	assert.equal(labelled(connectorApp, "Headers").props.value, github.extra);
+	assert.equal(labelled(connectorApp, "Save in").props.value, "user");
 	assert.equal(connector.changes.length, beforeAdd, "choosing a suggestion only fills the review form");
 	const connectorForm = connectorApp.node((item) => item.type === "form");
 	connectorForm.props.onSubmit({ preventDefault() {} });

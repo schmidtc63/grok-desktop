@@ -28,22 +28,31 @@ async function main() {
 	assert.equal((await exportMarkdown({ sessionId: "agent-1", file: "chat.md" })).error, "Choose a file to save.");
 
 	fs.writeFileSync(file, "old");
-	const saved = okRun("# Hello\n");
+	const fakeKey = `xai-${"A".repeat(80)}`;
+	const saved = okRun(`# Hello\n${fakeKey}\nxai-grok-cli\n`);
 	const wrote = await exportMarkdown({ sessionId: "agent-1", file, run: saved.run, command: "grok" });
 	assert.equal(wrote.ok, true);
 	assert.equal(wrote.path, file);
-	assert.equal(fs.readFileSync(file, "utf8"), "# Hello\n");
+	assert.ok(fs.readFileSync(file, "utf8") === "# Hello\n[redacted]\nxai-grok-cli\n", "Markdown masks a key and preserves ordinary text");
 	assert.deepEqual(saved.seen, [["grok", ["export", "agent-1"]]]);
 
 	fs.writeFileSync(file, "keep");
+	const errorPrefix = `${"a".repeat(288)} `;
 	const failed = await exportMarkdown({
 		sessionId: "agent-1",
 		file,
 		command: "grok",
-		run: async () => ({ code: 1, out: "", err: "error: session not found\n", truncated: false, timedOut: false, missing: false }),
+		run: async () => ({ code: 1, out: "", err: `error: ${errorPrefix}${fakeKey} end\n`, truncated: false, timedOut: false, missing: false }),
 	});
-	assert.equal(failed.error, "session not found");
-	assert.equal(fs.readFileSync(file, "utf8"), "keep", "a failed export leaves the chosen file alone");
+	assert.ok(failed.error === `${errorPrefix}[redacted] `, "Grok errors mask the whole key before shortening the message");
+	assert.ok(fs.readFileSync(file, "utf8") === "keep", "a failed export leaves the chosen file alone");
+	const clipped = await exportMarkdown({
+		sessionId: "agent-1",
+		file,
+		cwd: dir,
+		run: (_command, _args, cwd) => runExport(process.execPath, ["-e", "process.stderr.write('xai-' + 'A'.repeat(80) + ' '.repeat(3950)); process.exitCode = 1;"], cwd, 5000),
+	});
+	assert.ok(clipped.error === "Grok could not export this session.", "a clipped stderr line cannot expose a key suffix");
 
 	const missing = await exportMarkdown({
 		sessionId: "agent-1",
@@ -89,7 +98,7 @@ async function main() {
 	assert.equal(stalled.timedOut, true);
 
 	fs.rmSync(dir, { recursive: true, force: true });
-	console.log("PASS markdown export: name, overwrite, failure leaves the file, cancel, and a mocked grok run.");
+	console.log("PASS markdown export: name, overwrite, key masking in files and errors, failure leaves the file, cancel, and a mocked grok run.");
 }
 
 main().catch((error) => {

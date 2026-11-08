@@ -4,12 +4,16 @@ const path = require("path");
 const os = require("os");
 const { createHash } = require("crypto");
 const { folderProblem, killTree, OWN_GROUP } = require("./agent.cjs");
-const { readDiff, parseUnified, localFilterOff, FILTER_NOT_OFF } = require("./diff.cjs");
+const { readDiff, parseUnified, parseGitDiff: parseWorkingDiff, parseInventory, mergeFiles, untrackedHunk, checkRevertible, localFilterOff, FILTER_NOT_OFF } = require("./diff.cjs");
 
 const GIT_TIMEOUT = 20000;
 const SLOW_TIMEOUT = 60000;
 const MAX_BYTES = 180000;
 const MAX_FILES = 40;
+const CHANGE_LIST_BYTES = 2 * 1024 * 1024;
+const CHANGE_LIST_FILES = 5000;
+const FULL_DIFF_BYTES = 2 * 1024 * 1024;
+const FULL_DIFF_LINES = 6000;
 const NOT_REPO = "This folder is not a git checkout.";
 const GH_MISSING = "GitHub CLI (gh) is not installed.";
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/;
@@ -17,7 +21,8 @@ const SHA_PATTERN = /^[0-9a-f]{7,40}$/i;
 const EXCLUDE_LINE = ".grok/worktrees/";
 const committing = new Set();
 // A dirty-submodule check runs git status inside the submodule, which loads that submodule's own filters.
-const DIFF_ARGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short", "--ignore-submodules=dirty", "--relative", "--raw", "-z", "-p", "-U3"];
+const DIFF_READ_ARGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short", "--ignore-submodules=dirty", "--relative", "--raw", "-z"];
+const DIFF_ARGS = [...DIFF_READ_ARGS, "-p", "-U3"];
 const CHECK_STATES = { SUCCESS: "pass", FAILURE: "fail", ERROR: "fail", CANCELLED: "fail", TIMED_OUT: "fail", ACTION_REQUIRED: "fail", STARTUP_FAILURE: "fail", NEUTRAL: "skip", SKIPPED: "skip", STALE: "skip", IN_PROGRESS: "run" };
 
 function stop(child) {
@@ -35,6 +40,8 @@ function run(command, args, cwd, timeout, maxBytes = MAX_BYTES, options = {}) {
 		let err = "";
 		const chunks = [];
 		const result = (extra) => ({ code: -1, out: Buffer.concat(chunks).toString("utf8"), err, truncated: size > maxBytes, timedOut: false, missing: false, ...extra });
+		const signal = options.signal;
+		if (signal?.aborted) { resolve(result()); return; }
 		const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1", NO_COLOR: "1", GROK_CODE_EMPTY: "", GROK_CODE_FALSE: "false", ...options.env };
 		let child;
 		try {
@@ -51,12 +58,16 @@ function run(command, args, cwd, timeout, maxBytes = MAX_BYTES, options = {}) {
 			if (settled) { return; }
 			settled = true;
 			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
 			resolve(value);
 		};
+		const abort = () => { stop(child); finish(result()); };
+		signal?.addEventListener("abort", abort, { once: true });
 		child.on("error", (error) => {
 			finish(result({ err: error.message, missing: error.code === "ENOENT" }));
 		});
 		child.stdout.on("data", (buf) => {
+			if (settled || size > maxBytes) { return; }
 			size += buf.length;
 			if (size > maxBytes) {
 				stop(child);
@@ -118,12 +129,12 @@ async function currentBranch(cwd) {
 	return (await git(["branch", "--show-current"], cwd)).out.trim();
 }
 
-async function resolveBase(cwd) {
-	const remote = await git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], cwd);
+async function resolveBase(cwd, read = (args) => git(args, cwd)) {
+	const remote = await read(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]);
 	const name = remote.out.trim().replace(/^refs\/remotes\/origin\//, "");
 	if (remote.code === 0 && name) { return { name, ref: `refs/remotes/origin/${name}` }; }
 	for (const local of ["main", "master"]) {
-		if ((await git(["rev-parse", "--verify", "--quiet", `refs/heads/${local}`], cwd)).code === 0) { return { name: local, ref: `refs/heads/${local}` }; }
+		if ((await read(["rev-parse", "--verify", "--quiet", `refs/heads/${local}`])).code === 0) { return { name: local, ref: `refs/heads/${local}` }; }
 	}
 	return null;
 }
@@ -228,6 +239,115 @@ async function readScopedDiff(cwd, scope) {
 		files.push(file);
 	}
 	return { ok: true, repo: true, truncated, files };
+}
+
+function isChangePath(cwd, name) {
+	if (typeof name !== "string" || !name || name.includes("\0") || path.isAbsolute(name)) { return false; }
+	const relative = path.relative(cwd, path.resolve(cwd, name)).split(path.sep).join("/");
+	return relative === name && !relative.split("/").includes("..");
+}
+
+async function readChanges({ cwd, scope, file, from, full }, cancellation) {
+	if (scope !== "uncommitted" && scope !== "branch" && !(typeof scope === "string" && SHA_PATTERN.test(scope))) {
+		return { ok: false, error: "Choose uncommitted changes, this branch, or a commit." };
+	}
+	const problem = folderProblem(cwd);
+	if (problem) { return { ok: false, error: problem }; }
+	if ((file !== undefined && !isChangePath(cwd, file)) || (from !== undefined && (!file || !isChangePath(cwd, from)))) {
+		return { ok: false, error: "Choose a changed file in this folder." };
+	}
+	const deadline = AbortSignal.timeout(GIT_TIMEOUT);
+	const signal = cancellation ? AbortSignal.any([deadline, cancellation]) : deadline;
+	const timedOut = new Error("Git timed out.");
+	const read = async (args, maxBytes) => {
+		signal.throwIfAborted();
+		const result = await git(args, cwd, GIT_TIMEOUT, { maxBytes, signal });
+		signal.throwIfAborted();
+		if (result.timedOut) { throw timedOut; }
+		return result;
+	};
+	try {
+		const probe = await read(["rev-parse", "--is-inside-work-tree"]);
+		if (probe.missing) { return { ok: false, error: "Git is not available in this window." }; }
+		if (probe.code !== 0 || probe.out.trim() !== "true") { return { ok: true, repo: false, files: [] }; }
+		const filterOff = await localFilterOff(cwd, read);
+		if (filterOff === null) { return { ok: false, error: FILTER_NOT_OFF }; }
+		const globals = [...filterOff, "--literal-pathspecs", "-c", "core.quotepath=false"];
+		const diffArgs = file ? DIFF_ARGS : [...DIFF_READ_ARGS, "--numstat"];
+		const paths = file ? [...new Set([file, ...(from ? [from] : [])])] : [];
+		const maxBytes = file ? full === true ? FULL_DIFF_BYTES : MAX_BYTES : CHANGE_LIST_BYTES;
+		const working = scope === "uncommitted";
+		const branch = scope === "branch";
+		const diff = ["diff", ...diffArgs];
+		let commands;
+		if (working) {
+			commands = [diff, [...diff, "--cached"]];
+		} else if (branch) {
+			const base = await resolveBase(cwd, read);
+			if (!base) { return { ok: false, error: "No base branch was found." }; }
+			const merge = await read(["merge-base", base.ref, "HEAD"]);
+			if (merge.code !== 0) { return { ok: false, error: `This branch shares no history with ${base.name}.` }; }
+			commands = [[...diff, merge.out.trim()]];
+		} else {
+			const commit = await read(["rev-parse", "--verify", "--quiet", `${scope}^{commit}`]);
+			if (commit.code !== 0) { return { ok: false, error: "That commit was not found." }; }
+			commands = [["show", "--no-show-signature", "--format=", "--diff-merges=first-parent", ...diffArgs, commit.out.trim()]];
+		}
+		const [results, untracked] = await Promise.all([
+			Promise.all(commands.map((command) => read([...globals, ...command, "--", ...paths], maxBytes))),
+			working || branch ? read([...globals, "ls-files", "--others", "--exclude-standard", "-z", "--", ...paths], CHANGE_LIST_BYTES) : null,
+		]);
+		const listTooLarge = { ok: false, error: "There are too many changed files to list here." };
+		if (!file && (results.some((result) => result.truncated) || untracked?.truncated)) { return listTooLarge; }
+		const files = [];
+		let truncated = false;
+		for (const [index, result] of results.entries()) {
+			if (result.code !== 0 && !result.truncated) { return failure(result, "Git"); }
+			if (file) {
+				const parsed = parseWorkingDiff(result.out, index ? "Staged" : "", result.truncated, full === true ? FULL_DIFF_LINES : undefined);
+				truncated ||= parsed.truncated;
+				mergeFiles(files, parsed.files.filter((entry) => entry.path === file));
+			} else {
+				const entries = parseInventory(result.out);
+				if (entries.length > CHANGE_LIST_FILES) { return listTooLarge; }
+				mergeFiles(files, entries);
+				if (files.length > CHANGE_LIST_FILES) { return listTooLarge; }
+			}
+		}
+		if (untracked && untracked.code !== 0 && !untracked.truncated) { return failure(untracked, "Git"); }
+		if (!file) {
+			const byPath = new Set(files.map((entry) => entry.path));
+			for (const name of untracked?.out.split("\0").filter(Boolean) ?? []) {
+				if (name.endsWith("/") || byPath.has(name)) { continue; }
+				if (files.length === CHANGE_LIST_FILES) { return listTooLarge; }
+				files.push({ path: name, hunks: [] });
+				byPath.add(name);
+			}
+			return { ok: true, repo: true, files };
+		}
+		const folder = fs.realpathSync(cwd);
+		if (!files.length && untracked?.out.split("\0").includes(file)) {
+			const built = untrackedHunk(folder, path.resolve(folder, file), full === true ? FULL_DIFF_BYTES : undefined, full === true ? FULL_DIFF_LINES : undefined);
+			if (built) {
+				files.push({ path: file, additions: built.truncated ? undefined : built.additions, deletions: 0, hunks: [built.hunk] });
+				truncated ||= built.truncated === true;
+			}
+		}
+		if (!files.length) { return { ok: false, error: "This file's changes could not be read. Refresh the file list." }; }
+		if (truncated || !working) { for (const hunk of files[0].hunks) { delete hunk.revertible; } }
+		else { await checkRevertible(cwd, folder, files, read); }
+		if (truncated) {
+			files[0].truncated = true;
+			delete files[0].additions;
+			delete files[0].deletions;
+		}
+		assignIds(files);
+		return { ok: true, repo: true, files };
+	} catch (error) {
+		if (cancellation?.aborted) { return { ok: false, error: "Loading changes was stopped." }; }
+		if (deadline.aborted || error === timedOut) { return { ok: false, error: "Git timed out while loading changes." }; }
+		return { ok: false, error: "The changes could not be read." };
+	}
 }
 
 async function listCommits(cwd, limit = 30) {
@@ -540,4 +660,4 @@ function useBundledGit() {
 	if (dir && !(process.env.PATH || "").split(path.delimiter).includes(dir)) { process.env.PATH = `${process.env.PATH}${path.delimiter}${dir}`; }
 }
 
-module.exports = { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, commitFiles, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, run, git, bundledGitDir, useBundledGit };
+module.exports = { branchInfo, readScopedDiff, readChanges, listCommits, repoFiles, prStatus, prCreate, commitFiles, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, run, git, bundledGitDir, useBundledGit };

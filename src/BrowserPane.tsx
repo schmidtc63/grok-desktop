@@ -1,12 +1,18 @@
 import { createElement, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { cleanUrl, problemsPrompt, sanitizeProblem, type BrowserProblem, type BrowserProblemInput } from "./browserDiagnostics";
+import { Icon } from "./Icon";
+import { paneCloseButton, paneExpandButton, paneMenuButton, paneMoveItems, type PaneLayoutControls } from "./PaneActions";
+import { PopupMenu } from "./PopupMenu";
 
 export interface BrowserTab { id: string; url: string; title: string; problems?: BrowserProblem[] }
 
 export interface DevServer { script: string; command: string; running: boolean }
 
 export interface BrowserPaneProps {
+	layout?: PaneLayoutControls;
 	uiSessionId: string;
+	visible?: boolean;
+	reporting?: boolean;
 	controlEnabled: boolean;
 	controlStopped: boolean;
 	controlActivity?: { text: string; running?: boolean };
@@ -177,6 +183,7 @@ function tabLabel(tab: BrowserTab): string {
 
 export function BrowserPane(props: BrowserPaneProps) {
 	const { tabs, activeId, error, keepCookies, linksInBuiltIn, devServers, selectTick } = props;
+	const visible = props.visible !== false;
 	const latest = useRef(props);
 	const mounted = useRef(true);
 	const views = useRef<Record<string, WebviewElement>>({});
@@ -188,6 +195,7 @@ export function BrowserPane(props: BrowserPaneProps) {
 	const pick = useRef({ run: 0, tabId: "" });
 	const lastTick = useRef(selectTick);
 	const menuRoot = useRef<HTMLDivElement>(null);
+	const menuOpener = useRef<HTMLButtonElement | null>(null);
 	const addressRef = useRef<HTMLInputElement>(null);
 	const active = tabs.find((tab) => tab.id === activeId);
 	const activeUrl = active?.url ?? "";
@@ -196,6 +204,7 @@ export function BrowserPane(props: BrowserPaneProps) {
 	const [pickingId, setPickingId] = useState("");
 	const [problemsId, setProblemsId] = useState("");
 	const problemTab = tabs.find((tab) => tab.id === problemsId);
+	const hasRunningDevServer = devServers.some((server) => server.running);
 	const partition = keepCookies ? "persist:grok-code" : "temp:grok-code";
 
 	// A webview cannot change partition, so the key carries it; a fresh partition starts every tab again from its url.
@@ -209,14 +218,27 @@ export function BrowserPane(props: BrowserPaneProps) {
 	});
 	useLayoutEffect(() => {
 		mounted.current = true;
-		return () => { mounted.current = false; reportTabs(false); };
+		return () => {
+			mounted.current = false;
+			pick.current = { run: pick.current.run + 1, tabId: "" };
+			reportTabs(false);
+		};
 	}, [props.uiSessionId]);
-	useLayoutEffect(() => { reportTabs(); }, [props.uiSessionId, props.controlEnabled, tabs, activeId]);
+	useLayoutEffect(() => { reportTabs(); }, [props.uiSessionId, props.reporting, visible, props.controlEnabled, tabs, activeId]);
+	useLayoutEffect(() => {
+		if (!visible) { setMenu(""); }
+		const { run, tabId } = pick.current;
+		if (!tabId || (visible && tabId === activeId)) { return; }
+		pick.current = { run: run + 1, tabId: "" };
+		setPickingId("");
+		void attempt(() => views.current[tabId]?.executeJavaScript("window.__grokPickerStop?.()"), undefined)?.catch(() => {});
+	}, [visible, activeId]);
 
-	function reportTabs(visible = true) {
+	function reportTabs(show = latest.current.visible !== false) {
 		const current = latest.current;
-		if (!current.uiSessionId || (visible && !mounted.current)) { return; }
-		const guests = visible ? current.tabs.flatMap((tab) => {
+		// The host keeps one report per window. A retained background session must never replace it.
+		if (current.reporting === false || !current.uiSessionId || (show && !mounted.current)) { return; }
+		const guests = show ? current.tabs.flatMap((tab) => {
 			const view = views.current[tab.id];
 			const webContentsId = attempt(() => view?.getWebContentsId(), 0);
 			if (!Number.isInteger(webContentsId) || !webContentsId || webContentsId < 1) { return []; }
@@ -227,15 +249,18 @@ export function BrowserPane(props: BrowserPaneProps) {
 			const problems = (tab.problems ?? []).filter((entry) => origin && attempt(() => new URL(cleanUrl(entry.url || entry.source)).origin, "") === origin);
 			return [{ id: tab.id, webContentsId, url, problems: problemsPrompt(url, problems) }];
 		}) : [];
-		void window.grokCode?.browserTabs?.({ uiSessionId: current.uiSessionId, enabled: current.controlEnabled, visible, activeId: visible ? current.activeId : "", tabs: guests }).catch(() => {});
+		void window.grokCode?.browserTabs?.({ uiSessionId: current.uiSessionId, enabled: current.controlEnabled, visible: show, activeId: show ? current.activeId : "", tabs: guests }).catch(() => {});
 	}
 
-	useEffect(() => window.grokCode?.onBrowserProblem?.((problem) => {
-		const tab = latest.current.tabs.find((item) => attempt(() => views.current[item.id]?.getWebContentsId(), -1) === problem.webContentsId);
-		if (tab) {
-			latest.current.onProblem(tab.id, sanitizeProblem({ kind: "request", url: problem.url, message: problem.message, at: problem.at }));
-		}
-	}), []);
+	useEffect(() => {
+		if (!visible) { return; }
+		return window.grokCode?.onBrowserProblem?.((problem) => {
+			const tab = latest.current.tabs.find((item) => attempt(() => views.current[item.id]?.getWebContentsId(), -1) === problem.webContentsId);
+			if (tab) {
+				latest.current.onProblem(tab.id, sanitizeProblem({ kind: "request", url: problem.url, message: problem.message, at: problem.at }));
+			}
+		});
+	}, [visible]);
 
 	useEffect(() => {
 		if (document.activeElement !== addressRef.current) {
@@ -263,7 +288,7 @@ export function BrowserPane(props: BrowserPaneProps) {
 			return;
 		}
 		lastTick.current = selectTick;
-		if (selectTick <= 0) {
+		if (selectTick <= 0 || !visible) {
 			return;
 		}
 		const tabId = activeId;
@@ -275,11 +300,12 @@ export function BrowserPane(props: BrowserPaneProps) {
 		pick.current = { run, tabId };
 		setPickingId(tabId);
 		attempt(() => view.focus(), undefined);
+		const stillPicking = () => mounted.current && latest.current.visible !== false && latest.current.activeId === tabId && views.current[tabId] === view && run === pick.current.run;
 		Promise.resolve()
-			.then(() => view.executeJavaScript(PICKER_SCRIPT, true))
+			.then(() => stillPicking() ? view.executeJavaScript(PICKER_SCRIPT, true) : null)
 			.then((value) => {
 				const picked = asPick(value);
-				if (picked && run === pick.current.run) {
+				if (picked && stillPicking()) {
 					latest.current.onPicked({ url: attempt(() => view.getURL(), seen.current[tabId] ?? ""), ...picked });
 				}
 			})
@@ -290,7 +316,7 @@ export function BrowserPane(props: BrowserPaneProps) {
 					setPickingId("");
 				}
 			});
-	}, [selectTick]);
+	}, [selectTick, visible]);
 
 	useEffect(() => {
 		if (!menu) {
@@ -301,18 +327,11 @@ export function BrowserPane(props: BrowserPaneProps) {
 				setMenu("");
 			}
 		}
-		function escape(event: KeyboardEvent) {
-			if (event.key === "Escape") {
-				setMenu("");
-			}
-		}
 		document.addEventListener("mousedown", away);
 		document.addEventListener("focusin", away);
-		document.addEventListener("keydown", escape);
 		return () => {
 			document.removeEventListener("mousedown", away);
 			document.removeEventListener("focusin", away);
-			document.removeEventListener("keydown", escape);
 		};
 	}, [menu]);
 
@@ -405,65 +424,61 @@ export function BrowserPane(props: BrowserPaneProps) {
 
 	return (
 		<section className="pane bp-pane" aria-label="Browser">
-			<div className="pane-hd">
+			<div className="pane-hd" ref={menuRoot} onKeyDown={(event) => {
+				if (menu && event.key === "Escape") {
+					event.preventDefault();
+					event.stopPropagation();
+					setMenu("");
+				}
+			}}>
 				<b>Browser</b>
-				<span className="spacer" />
-				<div className="bp-menus" ref={menuRoot}>
-					<div className="bp-menu-wrap">
-						<button
-							className="bp-btn"
-							aria-haspopup="true"
-							aria-expanded={menu === "servers"}
-							onClick={() => setMenu(menu === "servers" ? "" : "servers")}
-						>
-							{devServers.some((server) => server.running) && <span className="bp-dot" role="img" aria-label="Running" />}
-							Dev servers
-						</button>
-						{menu === "servers" && (
-							<div className="bp-menu" role="group" aria-label="Dev servers">
-								{devServers.length === 0 && <p className="bp-empty">No dev scripts in package.json</p>}
-								{devServers.map((server) => (
-									<div className="bp-server" key={server.script}>
-										<span className="bp-server-name" title={server.command}>
-											{server.running && <span className="bp-dot" role="img" aria-label="Running" />}
-											{`${server.script} \u2014 ${server.command}`}
-										</span>
-										<button
-											className="texty"
-											aria-label={`${server.running ? "Stop" : "Start"} ${server.script}`}
-											onClick={() => (server.running ? props.onStopServer(server.script) : props.onStartServer(server.script))}
-										>
-											{server.running ? "Stop" : "Start"}
-										</button>
-									</div>
-								))}
-								{devServers.length > 0 && (
+				<div className="bp-menu-wrap">
+					<button
+						className="bp-btn"
+						aria-expanded={menu === "servers"}
+						onClick={(event) => { menuOpener.current = event.currentTarget; setMenu(menu === "servers" ? "" : "servers"); }}
+					>
+						{hasRunningDevServer && <span className="bp-dot" role="img" aria-label="Running" />}
+						Dev servers
+					</button>
+					{menu === "servers" && (
+						<PopupMenu className="bp-menu bp-server-menu" role="group" aria-label="Dev servers" opener={menuOpener.current} onDismiss={() => setMenu("")}>
+							{devServers.length === 0 && <p className="bp-empty">No dev scripts in package.json</p>}
+							{devServers.map((server) => (
+								<div className="bp-server" key={server.script}>
+									<span className="bp-server-name" title={server.command}>
+										{server.running && <span className="bp-dot" role="img" aria-label="Running" />}
+										{`${server.script} \u2014 ${server.command}`}
+									</span>
 									<button
-										className="bp-item"
-										disabled={!devServers.some((server) => server.running)}
-										onClick={() => {
-											props.onStopAll();
-											setMenu("");
-										}}
+										className="texty"
+										aria-label={`${server.running ? "Stop" : "Start"} ${server.script}`}
+										onClick={() => (server.running ? props.onStopServer(server.script) : props.onStartServer(server.script))}
 									>
-										Stop all
+										{server.running ? "Stop" : "Start"}
 									</button>
-								)}
-							</div>
-						)}
-					</div>
+								</div>
+							))}
+							{devServers.length > 0 && (
+								<button
+									className="bp-item"
+									disabled={!hasRunningDevServer}
+									onClick={() => {
+										props.onStopAll();
+										setMenu("");
+									}}
+								>
+									<span>Stop all{!hasRunningDevServer && <small className="menu-reason">No dev servers are running</small>}</span>
+								</button>
+							)}
+						</PopupMenu>
+					)}
+				</div>
+				<div className="pane-actions">
 					<div className="bp-menu-wrap">
-						<button
-							className="bp-icon"
-							aria-label="Browser menu"
-							aria-haspopup="true"
-							aria-expanded={menu === "more"}
-							onClick={() => setMenu(menu === "more" ? "" : "more")}
-						>
-							⋮
-						</button>
+						{paneMenuButton("Browser", menu === "more", (event) => { menuOpener.current = event.currentTarget; setMenu(menu === "more" ? "" : "more"); }, false)}
 						{menu === "more" && (
-							<div className="bp-menu" role="group" aria-label="Browser options">
+							<PopupMenu className="bp-menu" role="group" aria-label="Browser options" opener={menuOpener.current} onDismiss={() => setMenu("")}>
 								{props.controlEnabled && props.controlStopped && <button className="bp-item" onClick={() => { props.onResumeControl(); setMenu(""); }}>Let Grok use this browser</button>}
 								<label className="bp-item">
 									<input type="checkbox" checked={keepCookies} onChange={(event) => props.onKeepCookies(event.target.checked)} />
@@ -482,11 +497,13 @@ export function BrowserPane(props: BrowserPaneProps) {
 									<input type="checkbox" checked={linksInBuiltIn} onChange={(event) => props.onLinksInBuiltIn(event.target.checked)} />
 									Open links in built-in browser
 								</label>
-							</div>
+								{props.layout && <><hr />{paneMoveItems(props.layout, () => setMenu(""), false)}</>}
+							</PopupMenu>
 						)}
 					</div>
+					{props.layout && paneExpandButton("Browser", props.layout.expanded, () => { setMenu(""); props.layout?.onToggleExpand(); })}
+					{paneCloseButton(() => { setMenu(""); props.onClose(); })}
 				</div>
-				<button className="pane-x" aria-label="Close pane" onClick={props.onClose}>×</button>
 			</div>
 			{props.controlEnabled && props.controlActivity && <div className="bp-control" role="status">
 				<div><b>{props.controlActivity.text}</b><small>Stop blocks later actions. An already-sent action may still finish.</small></div>
@@ -506,10 +523,10 @@ export function BrowserPane(props: BrowserPaneProps) {
 						<button className="bp-problems-btn" aria-label={`Problems for ${tabLabel(tab)}`} aria-expanded={problemsId === tab.id} onClick={() => { props.onActivate(tab.id); setProblemsId(problemsId === tab.id ? "" : tab.id); }}>
 							Problems{tab.problems?.some((entry) => entry.kind !== "navigation") && <span className="bp-problem-count">{tab.problems.filter((entry) => entry.kind !== "navigation").reduce((count, entry) => count + entry.count, 0)}</span>}
 						</button>
-						<button className="bp-tab-x" aria-label="Close browser tab" onClick={() => props.onCloseTab(tab.id)}>×</button>
+						<button className="bp-tab-x" aria-label="Close browser tab" onClick={() => props.onCloseTab(tab.id)}><Icon name="close" /></button>
 					</div>
 				))}
-				<button className="bp-new" aria-label="New browser tab" onClick={props.onNewTab}>+</button>
+				<button className="bp-new" aria-label="New browser tab" onClick={props.onNewTab}><Icon name="plus" /></button>
 			</div>
 			{problemTab && (
 				<section className="bp-problems" aria-label="Browser problems">
@@ -524,9 +541,9 @@ export function BrowserPane(props: BrowserPaneProps) {
 				</section>
 			)}
 			<div className="bp-bar">
-				<button className="bp-icon" aria-label="Back" disabled={!activeUrl} onClick={() => go("back")}>←</button>
-				<button className="bp-icon" aria-label="Forward" disabled={!activeUrl} onClick={() => go("forward")}>→</button>
-				<button className="bp-icon" aria-label="Reload" disabled={!activeUrl} onClick={() => go("reload")}>↻</button>
+				<button className="bp-icon" aria-label="Back" disabled={!activeUrl} onClick={() => go("back")}><Icon name="arrow-left" /></button>
+				<button className="bp-icon" aria-label="Forward" disabled={!activeUrl} onClick={() => go("forward")}><Icon name="arrow-right" /></button>
+				<button className="bp-icon" aria-label="Reload" disabled={!activeUrl} onClick={() => go("reload")}><Icon name="reload" /></button>
 				<form
 					className="bp-addr"
 					onSubmit={(event) => {

@@ -69,12 +69,12 @@ function runGit(args, cwd, timeout = 8000, raw = false) {
   });
 }
 
-async function localFilterOff(cwd) {
+async function localFilterOff(cwd, read = (args) => runGit(args, cwd)) {
 	// Every key, matched here: in a UTF-8 locale (macOS, Linux) git's own --get-regexp "." skips a name that is not valid UTF-8,
 	// so that driver would stay on unseen.
-	const config = await runGit(["config", "--show-scope", "--name-only", "--list"], cwd);
+	const config = await read(["config", "--show-scope", "--name-only", "--list"]);
 	// A cut-off listing could miss a driver, so it is refused like a name that cannot be turned off.
-	if (config.truncated) { return null; }
+	if (config.code !== 0 || config.truncated) { return null; }
 	const names = new Set();
 	for (const line of config.out.split(/\r?\n/)) {
 		// The s flag lets "." match U+2028 and U+2029, which a driver name may hold.
@@ -115,10 +115,10 @@ function pairPath(text, separator) {
 	return Number.isInteger(half) && text.slice(half, half + separator.length) === separator && gitPath(text.slice(0, half)) === name ? name : "";
 }
 
-function parseNames(text) {
-	const parts = text.split("\0");
+function parseNames(parts) {
 	const names = [];
-	for (let index = 0; index < parts.length - 1;) {
+	let index = 0;
+	while (index < parts.length - 1 && parts[index].startsWith(":")) {
 		const header = parts[index++];
 		const fields = header.split(" ");
 		const status = fields.pop();
@@ -132,14 +132,14 @@ function parseNames(text) {
 			names.push({ path: first, status, mode: fields[0].slice(1), nextMode: fields[1], unmerged: header.startsWith("::") || status === "U" });
 		}
 	}
-	return names;
+	return { names, index };
 }
 
-function parseGitDiff(text, label, inputTruncated = false) {
+function parseGitDiff(text, label, inputTruncated = false, maxLines = MAX_LINES) {
 	const boundary = text.indexOf("\0\0");
-	const inventory = parseNames(boundary < 0 ? text : text.slice(0, boundary + 1));
+	const { names: inventory } = parseNames((boundary < 0 ? text : text.slice(0, boundary + 1)).split("\0"));
 	const unmerged = new Set(inventory.filter((change) => change.unmerged).map((change) => change.path));
-	const parsed = parseUnified(boundary < 0 ? "" : text.slice(boundary + 2), label, inventory.filter((change) => !unmerged.has(change.path)), inputTruncated);
+	const parsed = parseUnified(boundary < 0 ? "" : text.slice(boundary + 2), label, inventory.filter((change) => !unmerged.has(change.path)), inputTruncated, maxLines);
 	if (!label && !parsed.truncated) {
 		for (const change of inventory) {
 			if (change.status !== "M" || !["100644", "100755"].includes(change.mode) || !["100644", "100755"].includes(change.nextMode)) { continue; }
@@ -161,7 +161,7 @@ function hunkRange(loc) {
 	return found ? { oldStart: Number(found[1]), oldCount: Number(found[2] ?? 1), newStart: Number(found[3]), newCount: Number(found[4] ?? 1) } : null;
 }
 
-function parseUnified(text, label, inventory = [], inputTruncated = false) {
+function parseUnified(text, label, inventory = [], inputTruncated = false, maxLines = MAX_LINES) {
   const files = [];
 	const fingerprints = new Map();
   let file = null;
@@ -212,7 +212,7 @@ function parseUnified(text, label, inventory = [], inputTruncated = false) {
 			}
 		}
     if (line.startsWith("@@")) {
-      if (linesUsed >= MAX_LINES) {
+      if (linesUsed >= maxLines) {
         truncated = true;
         break;
       }
@@ -221,7 +221,7 @@ function parseUnified(text, label, inventory = [], inputTruncated = false) {
       continue;
     }
     if (!hunk || line.startsWith("\\")) continue;
-    if (linesUsed >= MAX_LINES) {
+    if (linesUsed >= maxLines) {
       truncated = true;
       break;
     }
@@ -273,11 +273,29 @@ function parseNumstat(text) {
 	return counts;
 }
 
+function parseInventory(text) {
+	const parts = text.split("\0");
+	const { names, index } = parseNames(parts);
+	const counts = parseNumstat(parts.slice(index).join("\0"));
+	const files = new Map();
+	for (const change of names) {
+		const { path, from } = change;
+		const previous = files.get(path);
+		files.set(path, {
+			path, ...(from || previous?.from ? { from: from || previous.from } : {}),
+			...counts.get(path), hunks: [], ...(change.unmerged || previous?.conflicted ? { conflicted: true } : {}),
+		});
+	}
+	return [...files.values()];
+}
+
 function mergeFiles(into, files) {
+	const byPath = new Map(into.map((file) => [file.path, file]));
   for (const file of files) {
-    const found = into.find((item) => item.path === file.path);
+    const found = byPath.get(file.path);
     if (!found) {
       into.push(file);
+			byPath.set(file.path, file);
       continue;
     }
 		// A staged rename with unstaged edits arrives twice; only the staged half knows the old path.
@@ -303,7 +321,7 @@ function assignIds(files) {
 
 function inside(root, candidate) {
   const relative = path.relative(root, candidate);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 function displayPath(toplevel, folder, gitRelative) {
@@ -313,7 +331,7 @@ function displayPath(toplevel, folder, gitRelative) {
   return relative.split(path.sep).join("/");
 }
 
-function untrackedHunk(folder, absolute) {
+function untrackedHunk(folder, absolute, maxBytes = MAX_UNTRACKED_BYTES, maxLines = 80) {
   let target = absolute;
   try {
     target = fs.realpathSync(absolute);
@@ -329,12 +347,22 @@ function untrackedHunk(folder, absolute) {
   }
   if (!stat.isFile()) return null;
   absolute = target;
-  if (stat.size > MAX_UNTRACKED_BYTES) {
-		return { additions: 0, hunk: { id: "", loc: "New file", reviewable: false, lines: [{ kind: "context", text: "This new file is too large to show here." }] } };
-  }
+	const tooLarge = () => ({ additions: 0, truncated: true, hunk: { id: "", loc: "New file", reviewable: false, lines: [{ kind: "context", text: "This new file is too large to show here." }] } });
+	if (stat.size > maxBytes) { return tooLarge(); }
 	let buf;
 	try {
-		buf = fs.readFileSync(absolute);
+		const descriptor = fs.openSync(absolute, "r");
+		try {
+			const buffer = Buffer.alloc(maxBytes + 1);
+			let size = 0;
+			while (size < buffer.length) {
+				const read = fs.readSync(descriptor, buffer, size, buffer.length - size, size);
+				if (!read) { break; }
+				size += read;
+			}
+			if (size > maxBytes) { return tooLarge(); }
+			buf = buffer.subarray(0, size);
+		} finally { fs.closeSync(descriptor); }
 	} catch {
 		return { additions: 0, hunk: { id: "", loc: "New file", reviewable: false, lines: [{ kind: "context", text: "This file could not be read." }] } };
 	}
@@ -344,10 +372,10 @@ function untrackedHunk(folder, absolute) {
   }
   const body = buf.toString("utf8").replace(/\n$/, "");
   const all = body.length ? body.split(/\r?\n/) : [];
-  const shown = all.slice(0, 80);
+  const shown = all.slice(0, maxLines);
   const lines = shown.map((text) => ({ kind: "add", text }));
   if (shown.length < all.length) lines.push({ kind: "context", text: "Further lines were left out." });
-	return { additions: shown.length, hunk: { id: fingerprint, loc: "New file", lines } };
+	return { additions: shown.length, truncated: shown.length < all.length, hunk: { id: fingerprint, loc: "New file", lines } };
 }
 
 async function readDiff(cwd) {
@@ -418,9 +446,15 @@ async function readDiff(cwd) {
     if (from) { entry.from = from; } else { delete entry.from; }
     visible.push(entry);
   }
-	const candidates = visible.filter((file) => file.hunks.some((hunk) => hunk.revertible));
+	await checkRevertible(cwd, folder, visible);
+  assignIds(visible);
+  return { ok: true, repo: true, truncated, files: visible };
+}
+
+async function checkRevertible(cwd, folder, files, read = (args) => runGit(args, cwd)) {
+	const candidates = files.filter((file) => file.hunks.some((hunk) => hunk.revertible));
 	if (candidates.length) {
-		const attributes = await runGit(["--literal-pathspecs", "check-attr", "-z", "filter", "--", ...candidates.map((file) => file.path)], cwd);
+		const attributes = await read(["--literal-pathspecs", "check-attr", "-z", "filter", "--", ...candidates.map((file) => file.path)]);
 		const values = attributes.out.split("\0");
 		const filtered = new Set();
 		for (let index = 0; index + 2 < values.length; index += 3) { if (!["unspecified", "unset"].includes(values[index + 2])) { filtered.add(values[index]); } }
@@ -434,8 +468,6 @@ async function readDiff(cwd) {
 			if (!supported) { for (const hunk of file.hunks) { delete hunk.revertible; } }
 		}
 	}
-  assignIds(visible);
-  return { ok: true, repo: true, truncated, files: visible };
 }
 
 function fileInside(root, candidate) {
@@ -506,7 +538,7 @@ async function revertHunk(cwd, relative, input) {
 	const attributes = await runGit(["--literal-pathspecs", "check-attr", "-z", "filter", "--", relative], cwd);
 	if (attributes.code !== 0 || attributes.truncated) { return { ok: false, error: "This file's Git attributes could not be checked." }; }
 	if (!["unspecified", "unset"].includes(attributes.out.split("\0")[2])) { return { ok: false, error: "This file uses a Git filter. Revert it from a terminal." }; }
-	const current = await readDiff(cwd);
+	const current = await require("./git.cjs").readChanges({ cwd, scope: "uncommitted", file: relative, full: true });
 	if (!current.ok) { return { ok: false, error: current.error }; }
 	const file = current.files?.find((entry) => entry.path === relative);
 	const hunk = file?.hunks.find((entry) => entry.revertible === true && entry.id === input.id && entry.loc === input.loc && entry.lines.length === input.lines.length && entry.lines.every((line, index) => line.kind === input.lines[index]?.kind && line.text === input.lines[index]?.text));
@@ -545,4 +577,4 @@ async function revertHunk(cwd, relative, input) {
 	return writeText(cwd, relative, text, working.version);
 }
 
-module.exports = { readDiff, parseUnified, revertFile, revertHunk, localFilterOff, FILTER_NOT_OFF };
+module.exports = { readDiff, parseUnified, parseGitDiff, parseInventory, mergeFiles, assignIds, untrackedHunk, checkRevertible, revertFile, revertHunk, localFilterOff, FILTER_NOT_OFF };

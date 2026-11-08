@@ -1,4 +1,4 @@
-const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Notification, powerMonitor, powerSaveBlocker, screen, session, shell, webContents } = require("electron");
+const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Notification, powerMonitor, powerSaveBlocker, safeStorage, screen, session, shell, webContents } = require("electron");
 const { spawn, spawnSync } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -29,10 +29,13 @@ app.setPath("userData", path.join(app.getPath("appData"), "grok-code"));
 app.setName("Codewomplers Grok Desktop");
 if (process.platform === "win32") app.setAppUserModelId("Grok.Code");
 const appIcon = nativeImage.createFromPath(path.join(__dirname, "..", "assets", "codewomplers-grok-desktop.png"));
-const { AgentHost, grokHome } = require("./agent.cjs");
+const { AgentHost, grokHome, probeGrok, setSignIn } = require("./agent.cjs");
+const { createSignIn, validKey } = require("./sign-in.cjs");
+const { redactKeys } = require("./redact.cjs");
+const { CloudHost, createCursorApi, createCursorKey } = require("./cloud.cjs");
 const { createBrowserAgent } = require("./browser-agent.cjs");
 const loops = require("./loops.cjs");
-const { readDiff, revertFile, revertHunk } = require("./diff.cjs");
+const { readDiff, revertFile, revertHunk, localFilterOff } = require("./diff.cjs");
 const git = require("./git.cjs");
 if (process.platform === "win32") { git.useBundledGit(); }
 const { TerminalHost } = require("./terminal.cjs");
@@ -43,11 +46,25 @@ const customize = require("./customize.cjs");
 const { chooseExport } = require("./export.cjs");
 const updates = require("./updates.cjs");
 const updateHelper = require("../scripts/update-helper.cjs");
+const signIn = createSignIn({ file: path.join(app.getPath("userData"), "sign-in.json"), safeStorage, platform: process.platform, fs });
+setSignIn(signIn);
 let pendingUpdate = null;
 let startingUpdate = false;
 
 const owners = new Map();
 const terminalOwners = new Map();
+const changeReads = new Map();
+const cloudOwners = new Map();
+const cursorKey = createCursorKey({ file: path.join(app.getPath("userData"), "cursor-key.json"), safeStorage, platform: process.platform, fs });
+const cursorApi = createCursorApi({ getKey: cursorKey.key });
+const cloudHost = new CloudHost((event) => {
+	const owner = cloudOwners.get(event.uiSessionId);
+	if (!owner || owner.turnId !== event.turnId) { return; }
+	if (event.type === "done" || event.type === "error") { cloudOwners.delete(event.uiSessionId); }
+	if (!owner.contents.isDestroyed()) { owner.contents.send("grok:event", event); }
+}, { api: cursorApi, getKey: cursorKey.key });
+let changingCursorKey = false;
+let cursorModels;
 let browserAgent;
 const host = new AgentHost((event) => {
 	// A turn Grok starts for a late steer belongs to the window that steered; with that window gone, it stops.
@@ -102,6 +119,9 @@ function broadcast(event) {
 		if (!win.isDestroyed() && !win.webContents.isDestroyed()) { win.webContents.send("grok:event", event); }
 	}
 }
+
+ipcMain.handle("grok:accessibility-support", () => app.isAccessibilitySupportEnabled?.() === true);
+app.on("accessibility-support-changed", (_event, active) => broadcast({ type: "accessibility-support-changed", active }));
 
 const appDir = path.resolve(__dirname, "..");
 const pageFile = path.join(appDir, "dist", "index.html");
@@ -235,6 +255,14 @@ function createWindow(uiSessionId) {
 		}, () => { asking = false; pendingUpdate = null; });
 	});
 	win.webContents.on("destroyed", stopOwnedTurn);
+	win.webContents.on("destroyed", () => {
+		for (const [id, owner] of cloudOwners) {
+			if (owner.contents === contents) {
+				cloudOwners.delete(id);
+				cloudHost.stop(id);
+			}
+		}
+	});
 	win.webContents.on("render-process-gone", stopOwnedTurn);
 	win.webContents.on("did-start-navigation", (details) => {
 		if (details.isMainFrame && !details.isSameDocument) {
@@ -307,6 +335,37 @@ ipcMain.handle("grok:cancel", (event, uiSessionId) => {
 	if (ownsTurn(event, uiSessionId)) {
 		host.cancel(uiSessionId);
 	}
+});
+
+function startCloudTurn(event, payload, resume) {
+	const { uiSessionId, turnId } = payload || {};
+	const contents = event.sender;
+	if (typeof uiSessionId !== "string" || !uiSessionId || typeof turnId !== "string" || !turnId || !BrowserWindow.fromWebContents(contents) || contents.isDestroyed()) {
+		return { ok: false, error: "Invalid Cloud session." };
+	}
+	if (changingCursorKey) { return { ok: false, error: "The Cursor key is changing. Try again in a moment." }; }
+	if (!cursorKey.status().keyReadable) { return { ok: false, error: "Add a readable Cursor key in Settings." }; }
+	const previous = cloudOwners.get(uiSessionId);
+	const live = cloudHost.turnOf(uiSessionId);
+	if (live && previous?.contents !== contents) { return { ok: false, error: "This session is running in another window." }; }
+	if (live && !resume) { return { ok: false, error: "This Cloud session already has a running turn." }; }
+	const owner = { contents, turnId };
+	cloudOwners.set(uiSessionId, owner);
+	const result = resume ? cloudHost.resume(payload) : cloudHost.send(payload);
+	if (!result.ok && cloudOwners.get(uiSessionId) === owner) {
+		if (live && previous) { cloudOwners.set(uiSessionId, previous); } else { cloudOwners.delete(uiSessionId); }
+	}
+	return result;
+}
+
+ipcMain.handle("grok:cloud-send", (event, payload) => startCloudTurn(event, payload, false));
+ipcMain.handle("grok:cloud-resume", (event, payload) => startCloudTurn(event, payload, true));
+ipcMain.handle("grok:cloud-cancel", (event, uiSessionId) => {
+	const owner = cloudOwners.get(uiSessionId);
+	if (!owner || owner.contents !== event.sender || owner.turnId !== cloudHost.turnOf(uiSessionId)) {
+		return { ok: false, error: "This Cloud turn belongs to another window or has ended." };
+	}
+	return cloudHost.cancel(uiSessionId);
 });
 
 ipcMain.handle("grok:stop-session", (_event, uiSessionId) => {
@@ -453,6 +512,26 @@ ipcMain.handle("grok:terminal-interrupt", (event, id) => (terminalOwners.get(id)
 
 ipcMain.handle("grok:branch-info", (_event, cwd) => git.branchInfo(cwd));
 ipcMain.handle("grok:scoped-diff", (_event, cwd, scope) => git.readScopedDiff(cwd, scope));
+ipcMain.handle("grok:read-changes", async ({ sender }, request) => {
+	if (typeof request?.id !== "string" || !/^[\w-]{1,128}$/.test(request.id)) { return { ok: false, error: "Choose a changes request to load." }; }
+	const previous = changeReads.get(sender);
+	if (previous?.id === request.id) { return { ok: false, error: "That changes request is already loading." }; }
+	previous?.controller.abort();
+	const current = { id: request.id, controller: new AbortController() };
+	const stop = () => current.controller.abort();
+	changeReads.set(sender, current);
+	sender.once("destroyed", stop);
+	try {
+		return await git.readChanges(request, current.controller.signal);
+	} finally {
+		sender.removeListener("destroyed", stop);
+		if (changeReads.get(sender) === current) { changeReads.delete(sender); }
+	}
+});
+ipcMain.handle("grok:stop-changes", ({ sender }, id) => {
+	const active = changeReads.get(sender);
+	if (active?.id === id) { active.controller.abort(); }
+});
 ipcMain.handle("grok:list-commits", (_event, cwd) => git.listCommits(cwd));
 ipcMain.handle("grok:pr-status", (_event, cwd, number) => git.prStatus(cwd, Number.isInteger(number) && number > 0 ? number : undefined));
 ipcMain.handle("grok:pr-create", (_event, cwd, expected) => git.prCreate(cwd, { expected: typeof expected === "string" ? expected : undefined }));
@@ -666,6 +745,7 @@ ipcMain.handle("grok:task-output", (_event, file) => usage.taskOutput(String(fil
 ipcMain.handle("grok:subagent-transcript", (_event, id) => usage.subagentTranscript(String(id || "")));
 ipcMain.handle("grok:recent-spend", () => usage.recentSpend());
 ipcMain.handle("grok:list-cli-sessions", (_event, knownIds) => usage.listCliSessions(knownIds));
+ipcMain.handle("grok:list-cli-project-folders", () => usage.listCliProjectFolders());
 ipcMain.handle("grok:session-loops", (_event, uiSessionId, agentSessionId) => {
 	if (host.procs.has(String(uiSessionId || ""))) { return { ok: true, live: true }; }
 	return loops.readSessionLoops(String(agentSessionId || ""), path.join(grokHome(), "sessions"));
@@ -682,7 +762,7 @@ ipcMain.handle("grok:install-grok", async () => {
 });
 ipcMain.handle("grok:update-grok-cli", () => customize.updateGrok());
 ipcMain.handle("grok:install-git", () => customize.installGit());
-ipcMain.handle("grok:customize", (_event, cwd) => customize.inventory(cwd));
+ipcMain.handle("grok:customize", (_event, cwd, skillsOnly) => customize.inventory(cwd, skillsOnly));
 ipcMain.handle("grok:skill-excerpt", (_event, cwd, skillPath) => customize.skillExcerpt(cwd, skillPath));
 ipcMain.handle("grok:customize-change", (_event, cwd, input) => customize.change(cwd, input));
 // Undefined until Grok first starts in this app; null after signing out.
@@ -702,11 +782,148 @@ ipcMain.handle("grok:inbound-result", (event, requestId, result) => {
 	}
 });
 ipcMain.handle("grok:billing", () => host.billing());
-ipcMain.handle("grok:sign-out", async () => {
-	if ([...host.turns.values()].some((turn) => !turn.finished)) { return { ok: false, error: "Grok is still answering. Press Stop or wait, then sign out." }; }
-	const result = await customize.signOut();
+let changingSignIn = false;
+async function changeSignIn(verb, action) {
+	if ([...host.turns.values()].some((turn) => !turn.finished)) { return { ok: false, error: `Grok is still answering. Press Stop or wait, then ${verb}.` }; }
+	if (changingSignIn) { return { ok: false, error: "Grok's sign-in is already changing. Wait, then try again." }; }
+	changingSignIn = true;
+	try { return await action(); }
+	catch { return { ok: false, error: "Couldn't finish changing Grok's sign-in. Check Settings and try again." }; }
+	finally { changingSignIn = false; }
+}
+
+async function signOutGrok() {
+	try {
+		const result = await customize.signOut();
+		if (result.ok) { return { ok: true }; }
+		if (typeof result.error === "string" && result.error) {
+			const envKey = process.env.XAI_API_KEY;
+			const message = envKey?.trim() ? result.error.replaceAll(envKey, "[redacted]") : result.error;
+			return { ok: false, error: redactKeys(message) };
+		}
+	} catch {}
+	return { ok: false, error: "Grok couldn't sign out. Try again." };
+}
+
+ipcMain.handle("grok:sign-in-status", () => signIn.status());
+ipcMain.handle("grok:sign-in-save", (_event, input, options) => changeSignIn("save", async () => {
+	const checked = signIn.check(input);
+	if (!checked.ok) { return checked; }
+	let changed = false;
+	try {
+		if (input.mode === "key") {
+			let probe;
+			try { probe = await probeGrok(); } catch {}
+			if (!probe?.ok) { return { ok: false, error: "Grok couldn't be checked, so nothing was saved. Try again." }; }
+			if (probe.signIn === "saved") {
+				if (options?.signOutConfirmed !== true) { return { ok: false, needsSignOut: true }; }
+				const logout = await signOutGrok();
+				if (!logout.ok) { return logout; }
+				changed = true;
+			}
+		}
+		const result = signIn.save(input);
+		changed = changed || result.ok;
+		return result;
+	} finally {
+		if (changed) { host.signInChanged(); }
+	}
+}));
+ipcMain.handle("grok:sign-in-remove-key", () => changeSignIn("remove the key", () => {
+	const result = signIn.removeKey();
+	if (result.ok) { host.signInChanged(); }
+	return result;
+}));
+ipcMain.handle("grok:sign-out", () => changeSignIn("sign out", async () => {
+	const status = signIn.status();
+	if (status.mode === "key" && status.hasKey) { return { ok: false, error: "API-key mode is on. Remove the key in Settings, or choose Grok sign-in." }; }
+	const result = await signOutGrok();
 	if (result.ok) { host.signedOut(); }
 	return result;
+}));
+
+async function changeCursorKey(action) {
+	if (changingCursorKey) { return { ok: false, error: "The Cursor key is already changing. Try again in a moment." }; }
+	if (cloudOwners.size) { return { ok: false, error: "A Cloud turn is still running. Stop it or wait before changing the Cursor key." }; }
+	changingCursorKey = true;
+	try {
+		const result = await action();
+		if (result.ok) {
+			cursorModels = undefined;
+			broadcast({ type: "cloud-key-changed" });
+		}
+		return result;
+	} catch { return { ok: false, error: "Couldn't change the Cursor key. Try again." }; }
+	finally { changingCursorKey = false; }
+}
+
+ipcMain.handle("grok:cloud-key-status", () => cursorKey.status());
+ipcMain.handle("grok:cloud-key-save", (_event, key) => changeCursorKey(async () => {
+	if (!validKey(key)) { return { ok: false, error: "Enter a Cursor key of 1 to 512 characters with no spaces." }; }
+	if (!cursorKey.status().keyring) { return { ok: false, error: "This computer has no keyring the app can use, so the Cursor key can't be saved." }; }
+	const checked = await createCursorApi({ getKey: () => key }).me();
+	if (!checked.ok) { return { ok: false, error: redactKeys(checked.error) }; }
+	const name = typeof checked.apiKeyName === "string" ? redactKeys(checked.apiKeyName).slice(0, 200) : "";
+	return cursorKey.save(key, name);
+}));
+ipcMain.handle("grok:cloud-key-remove", () => changeCursorKey(cursorKey.remove));
+
+function githubCloudUrl(value, bare = false) {
+	if (typeof value !== "string") { return ""; }
+	const url = bare && /^github\.com\//i.test(value) ? `https://${value}` : value;
+	const match = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([\w-]+)\/([\w.-]+?)(?:\.git)?\/?$/i.exec(url);
+	return match && match[2] !== "." && match[2] !== ".." ? `https://github.com/${match[1]}/${match[2]}` : "";
+}
+
+function cloudModels() {
+	if (!cursorModels) {
+		const pending = cursorApi.models().then((reply) => {
+			if (reply.ok && Array.isArray(reply.items)) { return { models: reply.items }; }
+			if (cursorModels === pending) { cursorModels = undefined; }
+			return { modelsError: redactKeys(reply.error || "Cursor didn't return its models.") };
+		});
+		cursorModels = pending;
+	}
+	return cursorModels;
+}
+
+async function cloudDirty(folder, options) {
+	const filters = await localFilterOff(folder);
+	if (filters === null) { return undefined; }
+	const status = await git.git([...filters, "--no-optional-locks", "status", "--porcelain", "--ignore-submodules=dirty"], folder, undefined, options);
+	if (status.code === 0 || status.truncated) { return !!status.out || status.truncated === true; }
+}
+
+ipcMain.handle("grok:cloud-setup", async (_event, folder) => {
+	if (typeof folder !== "string" || !path.isAbsolute(folder)) { return { ok: false, error: "Choose a local repository folder." }; }
+	const result = await git.git(["rev-parse", "--abbrev-ref", "@{u}"], folder);
+	const upstream = result.out.trim();
+	const slash = upstream.indexOf("/");
+	if (result.code !== 0 || slash < 1 || slash === upstream.length - 1) {
+		return { ok: false, error: "This branch isn't on GitHub. Push it, then check again." };
+	}
+	const remote = await git.git(["remote", "get-url", "--", upstream.slice(0, slash)], folder);
+	const repoUrl = remote.code === 0 ? githubCloudUrl(remote.out.trim()) : "";
+	if (!repoUrl) { return { ok: false, error: "Cloud sessions need a github.com remote." }; }
+	const options = { env: { GIT_NO_LAZY_FETCH: "1" } };
+	const [counts, dirty, repos, models] = await Promise.all([
+		git.git(["rev-list", "--left-right", "--count", "@{u}...HEAD"], folder, undefined, options),
+		cloudDirty(folder, options),
+		cursorApi.repositories(),
+		cloudModels(),
+	]);
+	const pair = counts.code === 0 ? /^(\d+)\s+(\d+)$/.exec(counts.out.trim()) : null;
+	const reachable = repos.ok && Array.isArray(repos.items)
+		? repos.items.some((item) => githubCloudUrl(item?.url, true).toLowerCase() === repoUrl.toLowerCase())
+		: null;
+	return {
+		ok: true, repoUrl, ref: upstream.slice(slash + 1), upstream,
+		...(pair ? { behind: Number(pair[1]), ahead: Number(pair[2]) } : {}),
+		dirty,
+		reachable,
+		...(reachable === null ? { error: redactKeys(repos.error || "Cursor didn't return its repositories.") } : {}),
+		...models,
+	};
 });
 // Read once by the preload: the folder a first session opens in.
 ipcMain.on("grok:home-dir", (event) => { event.returnValue = os.homedir(); });
@@ -929,6 +1146,8 @@ if (startupMarker) {
 
 // After every window has closed, so a quit that a window's unsaved-text question cancels leaves Grok running.
 app.on("will-quit", () => {
+	for (const id of cloudOwners.keys()) { cloudHost.stop(id); }
+	cloudOwners.clear();
 	terminals.closeAll();
 	void browserAgent.close();
 	inbound.close();

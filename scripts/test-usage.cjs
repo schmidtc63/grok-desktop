@@ -2,7 +2,7 @@ const assert = require("assert/strict");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { contextBreakdown, recentSpend, autoCompactPercent, taskOutput, subagentTranscript, listCliSessions, openCliSession } = require("../electron/usage.cjs");
+const { contextBreakdown, recentSpend, autoCompactPercent, taskOutput, subagentTranscript, listCliSessions, listCliProjectFolders, openCliSession } = require("../electron/usage.cjs");
 
 const tempBase = path.resolve(os.tmpdir(), process.env.CODEX_THREAD_ID || "grokcode-usage");
 fs.mkdirSync(tempBase, { recursive: true });
@@ -62,10 +62,20 @@ console.log("PASS autoCompactPercent: reads [session], defaults to 85");
 const outputRoot = path.join(root, "outputs");
 fs.mkdirSync(outputRoot);
 const log = path.join(outputRoot, "command.log");
+const fakeKey = `xai-${"a".repeat(80)}`;
 fs.writeFileSync(log, "first\nsecond\n");
 assert.deepEqual(taskOutput(log, outputRoot), { ok: true, text: "first\nsecond\n", truncated: false });
+fs.writeFileSync(log, `first\n${fakeKey}\n`);
+assert.equal(taskOutput(log, outputRoot).text === "first\n[redacted]\n", true, "task output masks key-shaped text");
 fs.writeFileSync(log, `prefix${"x".repeat(200 * 1024)}`);
 assert.deepEqual(taskOutput(log, outputRoot), { ok: true, text: "x".repeat(200 * 1024), truncated: true }, "only the last 200 KiB of output is returned");
+const logLimit = 200 * 1024;
+const head = "q".repeat(2048);
+const logSuffix = `\n${"z".repeat(logLimit - fakeKey.length + 29 - 1)}`;
+fs.writeFileSync(log, `${head}${fakeKey}${logSuffix}`);
+const maskedTail = taskOutput(log, outputRoot);
+assert.ok(maskedTail.ok && maskedTail.truncated, "truncation uses the original log limit");
+assert.ok(maskedTail.text === `${head}[redacted]${logSuffix}`.slice(-logLimit), "the log tail masks a key whose prefix is before the original cut");
 const outside = path.join(root, "outside.log");
 fs.writeFileSync(outside, "outside");
 const plainText = path.join(outputRoot, "note.txt");
@@ -107,12 +117,35 @@ for (const field of ["waiting", "questions", "plan", "point", "rawOutput"]) { as
 assert.equal(Object.hasOwn(work, "point"), false);
 assert.equal(subagentTranscript("../outside", root).ok, false);
 assert.equal(subagentTranscript(id, path.join(root, "missing")).ok, false, "unavailable session roots fail softly");
+fs.writeFileSync(transcriptFile, [textChunk("agent_message_chunk", `Key:\n${fakeKey.slice(0, 14)}`), textChunk("agent_message_chunk", fakeKey.slice(14))].join("\n"));
+assert.equal(subagentTranscript(id, root).messages[1].text === "Key:\n[redacted]", true, "replayed chunks are masked after joining");
 fs.writeFileSync(transcriptFile, [textChunk("agent_thought_chunk", "t".repeat(21000)), record({ sessionUpdate: "tool_call", toolCallId: "large", rawInput: { command: "c".repeat(5000) } }), record({ sessionUpdate: "tool_call_update", toolCallId: "large", status: "failed", content: [{ type: "content", content: { type: "text", text: "o".repeat(2000) } }] })].join("\n"));
 const clipped = subagentTranscript(id, root).messages[1];
 assert.equal(clipped.thought.length, 20000);
 assert.equal(clipped.tools[0].command.length, 4000);
 assert.equal(clipped.tools[0].output.length, 1500);
 assert.equal(clipped.tools[0].detail, "Failed");
+const redacted = "[redacted]";
+const prefix = (cap) => "z".repeat(cap - redacted.length);
+const across = (cap) => `${prefix(cap)}${fakeKey} after`;
+fs.writeFileSync(transcriptFile, [
+	textChunk("agent_thought_chunk", `${prefix(20000)}${fakeKey.slice(0, 14)}`),
+	textChunk("agent_thought_chunk", `${fakeKey.slice(14)} after`),
+	record({
+		sessionUpdate: "tool_call",
+		toolCallId: "straddle",
+		status: "completed",
+		_meta: { "x.ai/tool": { label: across(80) } },
+		rawInput: { description: across(300), command: across(4000) },
+		locations: [{ path: across(1000) }],
+		content: [{ type: "content", content: { type: "text", text: across(1500) } }],
+	}),
+].join("\n"));
+const maskedTranscript = subagentTranscript(id, root).messages[1];
+assert.ok(maskedTranscript.thought === `${prefix(20000)}${redacted}`, "joined thought is masked before cutting");
+for (const [field, cap] of [["label", 80], ["description", 300], ["command", 4000], ["path", 1000], ["output", 1500]]) {
+	assert.ok(maskedTranscript.tools[0][field] === `${prefix(cap)}${redacted}`, `tool ${field} is masked before cutting`);
+}
 fs.writeFileSync(transcriptFile, `${textChunk("agent_message_chunk", "head")}\n${"x".repeat(5 * 1024 * 1024)}\n${textChunk("agent_message_chunk", "tail")}\n`);
 const tail = subagentTranscript(id, root);
 assert.equal(tail.truncated, true);
@@ -161,6 +194,11 @@ fs.writeFileSync(path.join(bare, "chat_history.jsonl"), `${JSON.stringify(user("
 const bareListed = listCliSessions([], cliRoot).sessions.find((item) => item.folder === "C:/plain");
 assert.equal(bareListed.title, "CLI session", "a session without a summary still lists its folder");
 assert.equal(listCliSessions([], path.join(cliRoot, "missing")).ok, false);
+const titledId = "01a13333-4444-7555-8666-777788889999";
+const titled = plant(titledId, cliWork, { generated_title: across(80), info: { cwd: cliWork } }, [user("hi")]);
+assert.equal(listCliSessions([], cliRoot).sessions.find((item) => item.id === titledId).title, `${prefix(80)}${redacted}`, "a CLI title is masked before it is cut");
+assert.equal(openCliSession(titledId, cliRoot).session.title, `${prefix(80)}${redacted}`);
+fs.rmSync(titled, { recursive: true, force: true });
 const opened = openCliSession(newerId, cliRoot);
 assert.equal(opened.ok, true);
 assert.equal(opened.truncated, false);
@@ -175,6 +213,13 @@ assert.deepEqual(opened.messages, [
 const historyFile = path.join(cliRoot, encodeURIComponent(cliWork), newerId, "chat_history.jsonl");
 const before = fs.readFileSync(historyFile);
 assert.equal(fs.readFileSync(historyFile).equals(before), true);
+fs.writeFileSync(historyFile, `${JSON.stringify(assistant(`Key:\n${fakeKey}`))}\n`);
+assert.equal(openCliSession(newerId, cliRoot).messages[0].text === "Key:\n[redacted]", true, "imported CLI chat masks key-shaped text");
+const messageCap = 24;
+fs.writeFileSync(historyFile, `${JSON.stringify(assistant(across(messageCap)))}\n`);
+const maskedMessage = openCliSession(newerId, cliRoot, { messageCap });
+assert.ok(maskedMessage.truncated && maskedMessage.messages[0].text === `${prefix(messageCap)}${redacted}…`, "CLI message is masked before cutting");
+fs.writeFileSync(historyFile, before);
 const goneFolder = "C:/no/such/cli-folder";
 plant("01a15555-3333-7444-8555-666677778888", goneFolder, { info: { cwd: goneFolder }, generated_title: "Missing" }, [user("hi")]);
 const refused = openCliSession("01a15555-3333-7444-8555-666677778888", cliRoot);
@@ -191,6 +236,7 @@ fs.appendFileSync(path.join(wide, "chat_history.jsonl"), `${"x".repeat(80)}\n${J
 const tailed = openCliSession("01a14444-5555-7666-8777-888899990000", cliRoot, { fileLimit: 40 });
 assert.equal(tailed.truncated, true);
 assert.equal(tailed.messages.at(-1).text, "tail");
+assert.deepEqual(listCliProjectFolders(cliRoot), [], "first-run project suggestions omit temporary and missing CLI folders");
 fs.rmSync(cliRoot, { recursive: true, force: true });
 fs.rmSync(cliWork, { recursive: true, force: true });
 console.log("PASS CLI sessions: newest first, known ids left out, transcript without rules, missing folder refused");

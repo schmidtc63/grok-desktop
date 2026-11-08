@@ -5,7 +5,18 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { pathToFileURL } = require("url");
+const { redactKeys, redactDeep, heldTail } = require("./redact.cjs");
 const CLIENT_INFO = { name: "grok-code", version: require("../package.json").version };
+const grokSignIn = { mode: "grok" };
+let signInProvider = { grokEnv: () => ({}), status: () => grokSignIn };
+
+function setSignIn(provider) {
+	signInProvider = provider;
+}
+
+function signInStatus() {
+	return signInProvider.status();
+}
 
 function grokHome() {
 	return process.env.GROK_HOME || path.join(os.homedir(), ".grok");
@@ -206,7 +217,7 @@ function permissionMeta(mode) {
 // Only what the account menu shows; Grok's authenticate reply also carries ids and flags.
 function accountOf(auth, version) {
 	const meta = (auth && auth._meta) || {};
-	const text = (value) => (typeof value === "string" ? value.slice(0, 200) : "");
+	const text = (value) => (typeof value === "string" ? redactKeys(value).slice(0, 200) : "");
 	return { email: text(meta.email), plan: text(meta.subscription_tier), team: text(meta.team_name), version: text(version) };
 }
 
@@ -235,7 +246,7 @@ function lineCount(value) {
 }
 
 function clipText(value, size) {
-	const text = typeof value === "string" ? value : "";
+	const text = typeof value === "string" ? redactKeys(value) : "";
 	return text.length > size ? `${text.slice(0, size)}…` : text;
 }
 
@@ -261,13 +272,25 @@ function editDiffOf(kind, input) {
 	return {};
 }
 
-// Grok 1.0.77 lists cached_token or grok.com only, so an API key never shows up there. XAI_API_KEY is the fallback when no saved sign-in exists, and only the fact that it is set leaves this function.
-function signState(authMethods, apiKey) {
-	const saved = !Array.isArray(authMethods) || authMethods.some((method) => method && method.id === "cached_token");
-	const key = typeof apiKey === "string" && apiKey.trim() !== "";
-	if (saved) { return { signedIn: true, signIn: "saved", apiKey: key }; }
-	if (key) { return { signedIn: true, signIn: "key", apiKey: true }; }
-	return { signedIn: false, signIn: "none", apiKey: false };
+function hasEnvKey() {
+	return typeof process.env.XAI_API_KEY === "string" && process.env.XAI_API_KEY.trim() !== "";
+}
+
+// Grok lists xai.api_key when it accepts the environment key and has no saved sign-in.
+function signState(authMethods, envKey, status = grokSignIn) {
+	const keyMode = status.mode === "key";
+	const keySource = keyMode && status.keyReadable ? "app" : envKey ? "env" : "";
+	const keyUnreadable = keyMode && status.hasKey && !status.keyReadable;
+	const apiKey = Boolean(keySource);
+	const unreadable = keyUnreadable ? { keyUnreadable: true } : {};
+	if (!Array.isArray(authMethods)) { return { signedIn: true, signIn: "saved", apiKey, ...unreadable }; }
+	if (authMethods.some((method) => method && method.id === "cached_token")) {
+		return { signedIn: true, signIn: "saved", apiKey, ...unreadable, ...(keyMode ? { keyIgnored: true, ...(keySource ? { keySource } : {}) } : {}) };
+	}
+	if (apiKey && authMethods.some((method) => method && method.id === "xai.api_key")) {
+		return { signedIn: true, signIn: "key", apiKey, keySource, ...unreadable };
+	}
+	return { signedIn: false, signIn: "none", apiKey, ...unreadable, ...(apiKey ? { keyRejected: true, keySource } : {}) };
 }
 
 function probeGrok() {
@@ -284,7 +307,9 @@ function probeGrok() {
 			resolve(result);
 		};
 		try {
-			child = spawn(grokPath(), ["--permission-mode", "default", "agent", "--no-leader", "stdio"], { ...OWN_GROUP, cwd: os.homedir(), windowsHide: true, stdio: ["pipe", "pipe", "ignore"] });
+			const status = signInStatus();
+			const envKey = hasEnvKey();
+			child = spawn(grokPath(), ["--permission-mode", "default", "agent", "--no-leader", "stdio"], { ...OWN_GROUP, cwd: os.homedir(), env: { ...process.env, ...signInProvider.grokEnv() }, windowsHide: true, stdio: ["pipe", "pipe", "ignore"] });
 			const decoder = new StringDecoder("utf8");
 			let buffer = "";
 			child.stdout.on("data", (chunk) => {
@@ -299,7 +324,7 @@ function probeGrok() {
 					if (!reply || reply.id !== 1) { continue; }
 					const init = reply.result;
 					if (reply.error || !init || typeof init !== "object" || Array.isArray(init)) { finish(failed); return; }
-					finish({ ok: true, version: String((init._meta && init._meta.agentVersion) || "").slice(0, 40), ...signState(init.authMethods, process.env.XAI_API_KEY) });
+					finish({ ok: true, version: redactKeys(String((init._meta && init._meta.agentVersion) || "")).slice(0, 40), ...signState(init.authMethods, envKey, status) });
 					return;
 				}
 			});
@@ -330,7 +355,7 @@ function billingOnce() {
 		};
 		const send = (id, method, params) => child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
 		try {
-			child = spawn(grokPath(), ["--permission-mode", "default", "agent", "--no-leader", "stdio"], { ...OWN_GROUP, cwd: os.homedir(), windowsHide: true, stdio: ["pipe", "pipe", "ignore"] });
+			child = spawn(grokPath(), ["--permission-mode", "default", "agent", "--no-leader", "stdio"], { ...OWN_GROUP, cwd: os.homedir(), env: { ...process.env, ...signInProvider.grokEnv() }, windowsHide: true, stdio: ["pipe", "pipe", "ignore"] });
 			const decoder = new StringDecoder("utf8");
 			let buffer = "";
 			child.stdout.on("data", (chunk) => {
@@ -346,7 +371,7 @@ function billingOnce() {
 					if (reply.error) { finish(null); return; }
 					if (reply.id === 1) {
 						// Without a saved sign-in there is no subscription limit to read, and authenticate is not tried.
-						if (signState(reply.result && reply.result.authMethods, "").signIn !== "saved") { finish(null); return; }
+						if (signState(reply.result && reply.result.authMethods, false).signIn !== "saved") { finish(null); return; }
 						send(2, "authenticate", { methodId: "cached_token" });
 					} else if (reply.id === 2) {
 						send(3, "_x.ai/billing", {});
@@ -376,7 +401,7 @@ function limitOf(result) {
 		percent: typeof config.creditUsagePercent === "number" && Number.isFinite(config.creditUsagePercent) ? config.creditUsagePercent : null,
 		period: period.type === "USAGE_PERIOD_TYPE_WEEKLY" ? "weekly" : (period.type === "USAGE_PERIOD_TYPE_MONTHLY" ? "monthly" : ""),
 		resetsAt: typeof period.end === "string" && Number.isFinite(Date.parse(period.end)) ? period.end : "",
-		tier: typeof result.subscription_tier === "string" ? result.subscription_tier.slice(0, 60) : "",
+		tier: typeof result.subscription_tier === "string" ? redactKeys(result.subscription_tier).slice(0, 60) : "",
 	};
 }
 
@@ -529,8 +554,8 @@ function grokTask(task) {
 	const ms = (value) => Date.parse(String(value || "").replace(/(\.\d{3})\d+/, "$1")) || 0;
 	return {
 		id: String(task.task_id),
-		label: String(task.description || task.command || "Background command").slice(0, 200),
-		command: String(task.command || "").slice(0, 2000),
+		label: redactKeys(String(task.description || task.command || "Background command")).slice(0, 200),
+		command: redactKeys(String(task.command || "")).slice(0, 2000),
 		outputFile: String(task.output_file || "").slice(0, 1000),
 		kind: String(task.kind || ""),
 		status: String(task.status || ""),
@@ -579,8 +604,8 @@ function loopFromNotice(update, previous) {
 	if (durableRaw !== undefined && typeof durableRaw !== "boolean") { return null; }
 	const loop = {
 		id,
-		prompt: typeof promptRaw === "string" && promptRaw.trim() ? promptRaw.trim().slice(0, 200) : previous.prompt,
-		schedule: typeof scheduleRaw === "string" && scheduleRaw.trim() ? scheduleRaw.trim().slice(0, 200) : (previous && previous.schedule) || "",
+		prompt: typeof promptRaw === "string" && promptRaw.trim() ? redactKeys(promptRaw.trim()).slice(0, 200) : previous.prompt,
+		schedule: typeof scheduleRaw === "string" && scheduleRaw.trim() ? redactKeys(scheduleRaw.trim()).slice(0, 200) : (previous && previous.schedule) || "",
 		nextFireAt: nextRaw !== undefined ? nextRaw : (previous && previous.nextFireAt) || "",
 	};
 	if (typeof durableRaw === "boolean") { loop.durable = durableRaw; }
@@ -602,7 +627,7 @@ function extScheduled(msg) {
 
 class AgentHost {
 	constructor(emit, { idleMs = IDLE_MS, chunkMs = 30, rulesFile = null, browserServer = null } = {}) {
-		this.send = emit;
+		this.send = (event) => emit(redactDeep(event));
 		// Where saved command rules live; a function, so the window's data folder is read only when first needed. None keeps them in memory.
 		this.rulesFile = rulesFile;
 		this.browserServer = browserServer;
@@ -610,7 +635,7 @@ class AgentHost {
 		// Send held text before any other event for the session, preserving transcript order.
 		this.emit = (event) => {
 			if (event && event.uiSessionId) { this.flushText(event.uiSessionId); }
-			emit(event);
+			this.send(event);
 		};
 		this.chunkMs = chunkMs;
 		this.heldText = new Map();
@@ -663,18 +688,31 @@ class AgentHost {
 	emitTurn(turn, event) {
 		const full = { ...event, uiSessionId: turn.uiSessionId, turnId: turn.turnId };
 		if (!this.chunkMs || (full.type !== "chunk" && full.type !== "thought")) { this.emit(full); return; }
-		const held = this.heldText.get(turn.uiSessionId);
-		if (held && held.event.type === full.type && held.event.turnId === full.turnId) { held.event.text += full.text; return; }
-		this.flushText(turn.uiSessionId);
-		this.heldText.set(turn.uiSessionId, { event: full, timer: setTimeout(() => this.flushText(turn.uiSessionId), this.chunkMs) });
+		let held = this.heldText.get(turn.uiSessionId);
+		if (held && held.event.type === full.type && held.event.turnId === full.turnId) {
+			held.event.text += full.text;
+		} else {
+			this.flushText(turn.uiSessionId);
+			held = { event: full, timer: null };
+			this.heldText.set(turn.uiSessionId, held);
+		}
+		if (held.timer === null) { held.timer = setTimeout(() => this.flushText(turn.uiSessionId, false), this.chunkMs); }
 	}
 
-	flushText(uiSessionId) {
+	flushText(uiSessionId, force = true) {
 		const held = this.heldText.get(uiSessionId);
 		if (!held) { return; }
-		this.heldText.delete(uiSessionId);
 		clearTimeout(held.timer);
-		this.send(held.event);
+		held.timer = null;
+		// A timed batch can stop in the middle of a key. Keep its candidate tail until more text arrives.
+		const [text, tail] = force ? [held.event.text, ""] : heldTail(held.event.text);
+		if (!tail) {
+			this.heldText.delete(uiSessionId);
+			this.send(held.event);
+			return;
+		}
+		held.event.text = tail;
+		if (text) { this.send({ ...held.event, text }); }
 	}
 
 	checkTurn(turn) {
@@ -721,7 +759,7 @@ class AgentHost {
 			return { ok: true, agentSessionId: session.sessionId, ...(promptIndex != null ? { promptIndex } : {}) };
     } catch (error) {
 			if (this.turns.get(turn.uiSessionId) === turn && turn.promptId == null) { this.turns.delete(turn.uiSessionId); }
-			return { ok: false, error: error.message || "Grok could not start.", ...(error.lostSession ? { lostSession: true } : {}) };
+			return { ok: false, error: redactKeys(error.message || "Grok could not start."), ...(error.lostSession ? { lostSession: true } : {}) };
     }
   }
 
@@ -739,12 +777,12 @@ class AgentHost {
 		let warning = "";
 		if (input.decision === "prefix") {
 			const prefix = gate.kind === "command" && !gate.permission && gate.scope ? commandInfo(gate.command).prefix : "";
-			if (!prefix) { return { ok: false, error: "This command cannot be allowed by prefix." }; }
+			if (!prefix || redactKeys(prefix) !== prefix) { return { ok: false, error: "This command cannot be allowed by prefix." }; }
 			const keys = this.always.get(gate.scope) || new Set();
 			keys.add(`prefix:${prefix}`);
 			this.always.set(gate.scope, keys);
 		}
-		if (input.decision === "always") {
+		if (input.decision === "always" && !gate.noAlways) {
 			const key = alwaysKey(gate.kind, gate.rawName || gate.toolName, gate.command, gate.toolInput);
 			if (key.startsWith("command:") && gate.folder) {
 				warning = this.saveRule(gate.folder, key.slice("command:".length));
@@ -918,7 +956,7 @@ class AgentHost {
 		try {
 			const result = await this.request(proc, "_x.ai/suggestPrompt", { sessionId: session.sessionId, generation }).promise;
 			if (proc.lost || this.procs.get(uiSessionId) !== proc || this.sessions.get(uiSessionId) !== session || session.proc !== proc || this.turns.has(uiSessionId) || proc.promptGeneration !== promptGeneration) { return ""; }
-			return result && result.generation === generation && typeof result.suggestion === "string" ? result.suggestion.replace(/\s+/g, " ").trim().slice(0, 500) : "";
+			return result && result.generation === generation && typeof result.suggestion === "string" ? redactKeys(result.suggestion).replace(/\s+/g, " ").trim().slice(0, 500) : "";
 		} catch {
 			return "";
 		}
@@ -1174,6 +1212,8 @@ class AgentHost {
 
 	start(input, permission) {
 		const browser = !!input.browser && !input.uiSessionId.startsWith("side-");
+		const status = signInStatus();
+		const envKey = hasEnvKey();
     const child = spawn(grokPath(), [
       "--permission-mode",
       "default",
@@ -1191,7 +1231,7 @@ class AgentHost {
       env: { ...process.env, GROK_PROMPT_SUGGESTIONS: "1", ...(browser ? {
 				NO_PROXY: `${process.env.NO_PROXY || process.env.no_proxy || ""},127.0.0.1,localhost`,
 				no_proxy: `${process.env.no_proxy || process.env.NO_PROXY || ""},127.0.0.1,localhost`,
-			} : {}) },
+			} : {}), ...signInProvider.grokEnv() },
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -1218,6 +1258,9 @@ class AgentHost {
     }).promise
 			.then((init) => {
 				version = init && init._meta && init._meta.agentVersion;
+				const sign = signState(init && init.authMethods, envKey, status);
+				if (sign.keyUnreadable) { throw new Error("The saved API key can't be read on this computer. Enter it again in Settings."); }
+				if (sign.keyRejected) { throw new Error("Grok rejected the API key, or couldn't reach xAI to check it. Check the key in Settings."); }
 				return this.request(proc, "authenticate", { methodId: "cached_token" }).promise;
 			})
       .then((auth) => {
@@ -1237,6 +1280,14 @@ class AgentHost {
 		this.account = null;
 		this.emit({ type: "account", account: null });
 		for (const proc of [...this.procs.values()]) { this.stopProc(proc, "Signed out."); }
+	}
+
+	signInChanged() {
+		this.account = null;
+		this.limitProbe = null;
+		this.emit({ type: "account", account: null });
+		for (const proc of [...this.procs.values()]) { this.stopProc(proc, "Sign-in changed."); }
+		this.emit({ type: "sign-in-changed" });
 	}
 
 	stopProc(proc, message, sync = false) {
@@ -1520,7 +1571,7 @@ class AgentHost {
 		if (msg.method === "_x.ai/session/interjection") {
 			const params = msg.params || {};
 			const turn = this.turnFor(proc, params.sessionId);
-			if (turn && typeof params.text === "string" && params.text.trim()) { this.emitTurn(turn, { type: "steer", text: params.text.slice(0, 100000) }); }
+			if (turn && typeof params.text === "string" && params.text.trim()) { this.emitTurn(turn, { type: "steer", text: redactKeys(params.text).slice(0, 100000) }); }
 			if (msg.id != null) { this.reply(proc, msg.id, null); }
 			return;
 		}
@@ -1541,7 +1592,7 @@ class AgentHost {
 				this.emit({ type: "subagent", uiSessionId: proc.uiSessionId, subagent: {
 					id: String(update.subagent_id),
 					childSessionId: String(update.child_session_id || ""),
-					label: String(update.description || "").slice(0, 200),
+					label: redactKeys(String(update.description || "")).slice(0, 200),
 					agentType: String(update.subagent_type || ""),
 					model: String(update.model || ""),
 					status: update.sessionUpdate === "subagent_spawned" ? "running" : String(update.status || "completed"),
@@ -1609,7 +1660,7 @@ class AgentHost {
 			const session = this.sessions.get(proc.uiSessionId);
 			const turn = this.turnFor(proc, sessionId);
 			const main = (session && session.proc === proc && session.sessionId === sessionId) || (turn && turn.agentSessionId === sessionId);
-			const title = update.title.replace(/\s+/g, " ").trim().slice(0, 120);
+			const title = redactKeys(update.title).replace(/\s+/g, " ").trim().slice(0, 120);
 			if (main && title && !proc.lost && this.procs.get(proc.uiSessionId) === proc && !proc.parents.has(sessionId)) { this.emit({ type: "title", uiSessionId: proc.uiSessionId, title }); }
 			return;
 		}
@@ -1670,6 +1721,8 @@ class AgentHost {
 		const command = params.toolInput && typeof params.toolInput.command === "string" ? params.toolInput.command : "";
 		const info = kind === "command" ? commandInfo(command) : null;
 		const key = alwaysKey(kind, toolName, command, params.toolInput);
+		const noAlways = redactKeys(command) !== command || redactKeys(key) !== key;
+		const prefix = info && info.prefix;
 		const saved = key.startsWith("command:") && (this.savedRules().get(pathKey(turn.cwd)) || { commands: [] }).commands.includes(key.slice("command:".length));
 		const grants = this.always.get(ruleScope(turn)) || new Set();
 		const prefixAllowed = info && info.prefixes.length > 0 && info.prefixes.every((prefix) => grants.has(`prefix:${prefix}`));
@@ -1692,12 +1745,14 @@ class AgentHost {
 			folder: turn.cwd,
 			// What Always allow would remember: this exact command in this folder, or this tool for this conversation.
 			always: key.startsWith("command:") ? "folder" : key ? "conversation" : "",
+			noAlways,
 			turnId: turn.turnId,
 			toolName,
 			kind,
 			summary: summaryOf(toolName, params.toolInput),
 			...(command ? { command } : {}),
-			...(info ? { readsOnly: info.readsOnly, ...(info.prefix ? { commandPrefix: info.prefix } : {}) } : {}),
+			...(info ? { readsOnly: info.readsOnly } : {}),
+			...(prefix && redactKeys(prefix) === prefix ? { commandPrefix: prefix } : {}),
 			...inputOf(params.toolInput),
 			...editDiffOf(kind, params.toolInput),
 			detail: "Waiting for you",
@@ -1761,6 +1816,7 @@ class AgentHost {
 				...(gate.input ? { input: gate.input } : {}),
 				...(gate.diff ? { diff: gate.diff } : {}),
 				...(gate.always ? { always: gate.always } : {}),
+				...(gate.noAlways ? { noAlways: true } : {}),
 				waiting: true,
 				...(gate.questions ? { questions: gate.questions } : {}),
 				...(gate.plan !== undefined ? { plan: gate.plan } : {}),
@@ -1980,18 +2036,18 @@ class AgentHost {
 	}
 
 	processFailure(message, stderr) {
-		const diagnostic = stderr.replace(/\x1b\[[0-9;]*m/g, "")
+		const diagnostic = redactKeys(stderr.replace(/\x1b\[[0-9;]*m/g, ""))
 			.replace(/(authorization["']?\s*:\s*(?:(?:bearer|basic)\s+)?|(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|\S+)/gi, "$1[redacted]")
-			.replace(/\b(?:xai-|sk-)[A-Za-z0-9_-]+\b/g, "[redacted]")
+			.replace(/\bsk-[A-Za-z0-9_-]+\b/g, "[redacted]")
 			.trim().split(/\r?\n/).filter(Boolean).slice(-3).join(" ");
-		return diagnostic ? `${message} ${diagnostic.slice(-300)}` : message;
+		return diagnostic ? `${redactKeys(message)} ${diagnostic.slice(-300)}` : redactKeys(message);
 	}
 
   clip(message) {
-    const text = typeof message === "string" ? message.trim() : "";
+    const text = typeof message === "string" ? redactKeys(message.trim()) : "";
     if (!text) return "Grok rejected the request.";
     return text.length > 300 ? text.slice(0, 300) : text;
   }
 }
 
-module.exports = { AgentHost, folderProblem, resolvedEditPath, killTree, OWN_GROUP, grokHome, grokPath, accountOf, probeGrok, commandInfo };
+module.exports = { AgentHost, folderProblem, resolvedEditPath, killTree, OWN_GROUP, grokHome, grokPath, accountOf, probeGrok, commandInfo, setSignIn, signInStatus };

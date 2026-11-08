@@ -7,7 +7,7 @@ const { createRequire } = require("module");
 const { EventEmitter } = require("events");
 const { execFileSync, spawn } = require("child_process");
 const { readDiff, revertHunk, FILTER_NOT_OFF } = require("../electron/diff.cjs");
-const { branchInfo, readScopedDiff, listCommits, repoFiles, prStatus, prCreate, commitFiles, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, bundledGitDir } = require("../electron/git.cjs");
+const { branchInfo, readScopedDiff, readChanges, listCommits, repoFiles, prStatus, prCreate, commitFiles, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, bundledGitDir } = require("../electron/git.cjs");
 
 // Never let gh resolve a real GitHub repository from the environment; the temp origin is a local bare repo.
 delete process.env.GH_REPO;
@@ -178,6 +178,16 @@ async function checkTruncatedDiffCounts() {
 	write("m-renamed name.txt", "edited after the rename was staged\n", folder);
 	const editedRename = await readDiff(folder);
 	assert.equal(editedRename.files.find((file) => file.path === "m-renamed name.txt").from, "m-rename.txt", "a staged rename with unstaged edits keeps its old path");
+	const changes = { cwd: folder, scope: "uncommitted" };
+	const renameList = await readChanges(changes);
+	assert.equal(renameList.ok, true);
+	const rename = renameList.files.find((file) => file.path === "m-renamed name.txt");
+	assert.equal(rename.from, "m-rename.txt");
+	assert.deepEqual(counts(renameList, "m-renamed name.txt"), [2, 21]);
+	assert.deepEqual(counts(renameList, "n-binary.bin"), [undefined, undefined]);
+	const renamePatch = await readChanges({ ...changes, file: rename.path, from: rename.from });
+	assert.deepEqual(paths(renamePatch), [rename.path]);
+	assert.equal(renamePatch.files[0].from, rename.from);
 	console.log("PASS diff counts: NUL-delimited rename paths retain counts and binary counts stay absent");
 
 	reset();
@@ -190,6 +200,27 @@ async function checkTruncatedDiffCounts() {
 	assert.deepEqual(counts(mixed, "a-large.txt"), [1800, 0]);
 	assert.ok(mixed.files.find((file) => file.path === "a-large.txt").hunks.some((hunk) => hunk.loc.startsWith("Staged ")));
 	console.log("PASS diff counts: staged and unstaged truncated runs add their complete counts");
+
+	for (let index = 0; index < 42; index++) { write(`later-${index}.txt`, "+literal\n".repeat(100), folder); }
+	const inventory = await readChanges(changes);
+	assert.equal(inventory.ok, true);
+	assert.equal(inventory.files.length, 43);
+	assert.ok(inventory.files.every((file) => file.hunks.length === 0), "inventory carries no patch bodies");
+	assert.deepEqual(counts(inventory, "a-large.txt"), [1800, 0]);
+	const late = await readChanges({ ...changes, file: "later-9.txt", full: true });
+	assert.deepEqual(paths(late), ["later-9.txt"]);
+	assert.equal(late.files[0].hunks[0].lines.length, 100);
+	assert.equal(late.files[0].hunks[0].lines[0].text, "+literal");
+	const preview = await readChanges({ ...changes, file: "a-large.txt" });
+	assert.equal(preview.files[0].truncated, true);
+	assert.equal(preview.files[0].additions, undefined, "a preview cannot replace the inventory count with a partial count");
+	const full = await readChanges({ ...changes, file: "a-large.txt", full: true });
+	assert.equal(full.files[0].truncated, undefined);
+	assert.deepEqual(counts(full, "a-large.txt"), [1800, 0]);
+	const complete = full.files[0].hunks.find((hunk) => hunk.revertible);
+	assert.ok(complete, "the full working hunk is revertible");
+	assert.equal((await revertHunk(folder, "a-large.txt", complete)).ok, true, "the host revalidates a hunk beyond the old preview limit");
+	console.log("PASS progressive changes: full inventory, literal text, bounded previews, later files and full-hunk revalidation");
 }
 
 function checkBundledGitDir() {
@@ -592,6 +623,21 @@ async function main() {
 	assert.deepEqual(paths(single), ["feature.txt"]);
 	assert.deepEqual(single.files[0].hunks[0].lines, [{ kind: "add", text: "feature" }]);
 	console.log("PASS readScopedDiff sha: only that commit's change");
+	for (const [scope, expected] of [["uncommitted", uncommitted], ["branch", branch], [featureSha, single]]) {
+		const listing = await readChanges({ cwd: repo, scope });
+		assert.equal(listing.ok, true, listing.error);
+		assert.deepEqual(paths(listing), paths(expected));
+	}
+	const nested = path.join(repo, "nested");
+	fs.mkdirSync(nested);
+	write(" [test].txt", "literal\n", nested);
+	assert.deepEqual(paths(await readChanges({ cwd: nested, scope: "branch" })), [" [test].txt"]);
+	const nestedPatch = await readChanges({ cwd: nested, scope: "branch", file: " [test].txt" });
+	assert.deepEqual(paths(nestedPatch), [" [test].txt"]);
+	assert.equal((await readChanges({ cwd: nested, scope: "branch", file: "../keep.txt" })).ok, false);
+	fs.unlinkSync(path.join(nested, " [test].txt"));
+	fs.rmdirSync(nested);
+	console.log("PASS progressive changes scopes: uncommitted, branch, commit and literal paths relative to the session folder");
 
 	for (const scope of ["nope", "", undefined, "zzzzzzz", "abc12", "--all", "HEAD"]) {
 		const rejected = await readScopedDiff(repo, scope);

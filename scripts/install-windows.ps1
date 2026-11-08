@@ -48,6 +48,10 @@ function Install-GrokDesktop {
 			if ($previous) { Move-Item -LiteralPath $previous -Destination $dest }
 			throw "The app couldn't be moved into ${dest}: $($_.Exception.Message)"
 		}
+		# Keep Setup.exe's uninstaller, so its Apps and Features entry still works.
+		if ($previous) {
+			Get-ChildItem -LiteralPath $previous -Filter "unins???.*" -File | Copy-Item -Destination $dest
+		}
 		$shortcutPath = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Codewomplers Grok Desktop.lnk"
 		$shell = New-Object -ComObject WScript.Shell
 		$shortcut = $shell.CreateShortcut($shortcutPath)

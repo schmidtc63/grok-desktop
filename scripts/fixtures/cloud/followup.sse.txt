@@ -1,0 +1,62 @@
+event: status
+data: {"runId":"run-00000000-0000-0000-0000-000000000008","status":"FINISHED"}
+
+id: 1794066123705-0
+event: interaction_update
+data: {"type":"step-started","stepId":425}
+
+id: 1794066123720-0
+event: interaction_update
+data: {"type":"user-message-appended","userMessage":{"type":"user_message","session_id":"run-00000000-0000-0000-0000-000000000008","text":"Reply with the single word OK. Do not change any files."}}
+
+id: 1794066124877-0
+event: thinking
+data: {"text":"The"}
+
+id: 1794066124877-0
+event: interaction_update
+data: {"type":"thinking-delta","text":"The"}
+
+id: 1794066125016-0
+event: thinking
+data: {"text":" user wants me to reply with the single word OK and not change any files."}
+
+id: 1794066125016-0
+event: interaction_update
+data: {"type":"thinking-delta","text":" user wants me to reply with the single word OK and not change any files."}
+
+id: 1794066125020-0
+event: interaction_update
+data: {"type":"token-delta","tokens":19}
+
+id: 1794066125029-0
+event: interaction_update
+data: {"type":"thinking-completed","thinkingDurationMs":154}
+
+id: 1794066125034-0
+event: assistant
+data: {"text":"OK"}
+
+id: 1794066125034-0
+event: interaction_update
+data: {"type":"text-delta","text":"OK"}
+
+id: 1794066125236-0
+event: interaction_update
+data: {"type":"turn-ended"}
+
+id: 1794066125239-0
+event: interaction_update
+data: {"type":"step-completed","stepId":425,"stepDurationMs":1530}
+
+event: status
+data: {"runId":"run-00000000-0000-0000-0000-000000000008","status":"FINISHED"}
+
+id: 1794066127072-0
+event: result
+data: {"runId":"run-00000000-0000-0000-0000-000000000008","status":"FINISHED","text":"OK","durationMs":3778,"git":{"branches":[{"repoUrl":"https://github.com/sample-org/sample-repo"}]}}
+
+id: 1794066127072-0
+event: done
+data: {}
+

@@ -3,7 +3,8 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { folderProblem, grokHome, grokPath, probeGrok } = require("./agent.cjs");
+const { folderProblem, grokHome, grokPath, probeGrok, signInStatus } = require("./agent.cjs");
+const { redactDeep } = require("./redact.cjs");
 const { run } = require("./git.cjs");
 
 const LIST_TIMEOUT = 30000;
@@ -75,8 +76,8 @@ function connectorSettings(item) {
 	return { transport, target, command, args, env: names(item.env, /^[A-Za-z_][A-Za-z0-9_]{0,127}$/), headers: names(item.headers, /^[A-Za-z0-9-]{1,128}$/) };
 }
 
-function shape({ inspect, servers, plugins, marketplaces, config }) {
-	const skills = (inspect.skills || []).map((skill) => ({
+function shapeSkills(inspect) {
+	return (inspect.skills || []).map((skill) => ({
 		name: String(skill.name || ""),
 		command: skill.userInvocable === false ? "" : `/${skill.invocableAs || skill.name}`,
 		description: String(skill.description || ""),
@@ -84,6 +85,10 @@ function shape({ inspect, servers, plugins, marketplaces, config }) {
 		path: String((skill.source && skill.source.path) || ""),
 		disabled: !!skill.disabled,
 	})).filter((skill) => skill.name);
+}
+
+function shape({ inspect, servers, plugins, marketplaces, config }) {
+	const skills = shapeSkills(inspect);
 
 	const rows = new Map();
 	for (const item of servers) {
@@ -140,7 +145,7 @@ function failure(result, what) {
 	return (lastLine(result.err) || lastLine(result.out) || `${what} failed.`).replace(/^error:\s*/i, "").slice(0, 300);
 }
 
-async function inventory(cwd) {
+async function inventory(cwd, skillsOnly) {
 	const problem = folderProblem(cwd);
 	if (problem) { return { ok: false, error: problem }; }
 	const grok = grokPath();
@@ -156,6 +161,7 @@ async function inventory(cwd) {
 	try {
 		// One at a time: run together they wait on each other's locks (8 s instead of 1 s on Grok 1.0.70).
 		const inspect = await read(["inspect", "--json"]);
+		if (skillsOnly === true) { return { ok: true, skills: shapeSkills(inspect) }; }
 		const servers = await read(["mcp", "list", "--json"]);
 		const plugins = await read(["plugin", "list", "--json", "--available"]);
 		const marketplaces = await read(["plugin", "marketplace", "list", "--json"]);
@@ -347,7 +353,7 @@ function networkOf(env, exists, home) {
 	};
 }
 
-function readinessOf({ grok, git, gh, ghAuth, platform, grokAt, update, inspect, home, env, certExists }) {
+function readinessOf({ grok, git, gh, ghAuth, platform, grokAt, update, inspect, home, env, certExists, signInMode }) {
 	const result = {
 		grok: grok.ok ? {
 			ok: true,
@@ -355,12 +361,17 @@ function readinessOf({ grok, git, gh, ghAuth, platform, grokAt, update, inspect,
 			signedIn: grok.signedIn,
 			...(grok.signIn === "saved" || grok.signIn === "key" || grok.signIn === "none" ? { signIn: grok.signIn } : {}),
 			...(grok.apiKey === true ? { apiKey: true } : {}),
+			...(grok.keySource === "app" || grok.keySource === "env" ? { keySource: grok.keySource } : {}),
+			...(grok.keyIgnored === true ? { keyIgnored: true } : {}),
+			...(grok.keyUnreadable === true ? { keyUnreadable: true } : {}),
+			...(grok.keyRejected === true ? { keyRejected: true } : {}),
 		} : { ok: false, error: grok.error },
 		git: { ok: git.code === 0 },
 		gh: gh.code === 0 ? { ok: true, signedIn: !!ghAuth && ghAuth.code === 0 } : { ok: false },
 		install: platform === "win32" ? GROK_INSTALL.win32 : GROK_INSTALL.other,
 		platform,
 	};
+	if (signInMode === "key" || signInMode === "grok") { result.grok.signInMode = signInMode; }
 	if (grok.ok && grokAt) { result.grok.at = { source: grokAt.source, path: tilde(grokAt.path, home) }; }
 	if (update) {
 		result.grok.update = { checked: false };
@@ -388,7 +399,7 @@ function readinessOf({ grok, git, gh, ghAuth, platform, grokAt, update, inspect,
 		} catch { /* no readable config result */ }
 	}
 	result.network = networkOf(env, certExists, home);
-	return result;
+	return redactDeep(result);
 }
 
 // x.ai's installer calls exit on errors, so it runs as its own process. Pure: tests assert this and never run it.
@@ -431,7 +442,7 @@ async function readiness(folder, full) {
 		update = await run(grokFile, ["update", "--check", "--json"], home, 20000);
 		inspect = await run(grokFile, ["inspect", "--json"], folderProblem(folder) ? home : folder, LIST_TIMEOUT, LIST_BYTES);
 	}
-	return readinessOf({ grok, git, gh, ghAuth, platform: process.platform, grokAt: { source, path: grokFile }, update, inspect, home, env: process.env, certExists: (file) => fs.existsSync(file) });
+	return readinessOf({ grok, git, gh, ghAuth, platform: process.platform, grokAt: { source, path: grokFile }, update, inspect, home, env: process.env, certExists: (file) => fs.existsSync(file), signInMode: signInStatus().mode });
 }
 
 module.exports = { inventory, skillExcerpt, change, changeArgs, signOut, shape, tomlList, words, readiness, readinessOf, tilde, installArgs, installGrok, updateGrok, installGit };

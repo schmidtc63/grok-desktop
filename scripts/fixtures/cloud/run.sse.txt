@@ -1,0 +1,2614 @@
+event: status
+data: {"runId":"run-00000000-0000-0000-0000-000000000001","status":"FINISHED"}
+
+id: 1794066014043-0
+event: interaction_update
+data: {"type":"step-started","stepId":0}
+
+id: 1794066014059-0
+event: interaction_update
+data: {"type":"user-message-appended","userMessage":{"type":"user_message","session_id":"run-00000000-0000-0000-0000-000000000001","text":"What do you know about this repository?"}}
+
+id: 1794066015141-0
+event: thinking
+data: {"text":"The"}
+
+id: 1794066015141-0
+event: interaction_update
+data: {"type":"thinking-delta","text":"The"}
+
+id: 1794066015250-0
+event: thinking
+data: {"text":" user wants to"}
+
+id: 1794066015250-0
+event: interaction_update
+data: {"type":"thinking-delta","text":" user wants to"}
+
+id: 1794066015254-0
+event: interaction_update
+data: {"type":"token-delta","tokens":4}
+
+id: 1794066015282-0
+event: thinking
+data: {"text":" know"}
+
+id: 1794066015282-0
+event: interaction_update
+data: {"type":"thinking-delta","text":" know"}
+
+id: 1794066015299-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066015597-0
+event: thinking
+data: {"text":" about this repository.\n\nI'll explore the codebase to understand what this repository is."}
+
+id: 1794066015597-0
+event: interaction_update
+data: {"type":"thinking-delta","text":" about this repository.\n\nI'll explore the codebase to understand what this repository is."}
+
+id: 1794066015600-0
+event: interaction_update
+data: {"type":"token-delta","tokens":22}
+
+id: 1794066015603-0
+event: interaction_update
+data: {"type":"thinking-completed","thinkingDurationMs":465}
+
+id: 1794066015607-0
+event: assistant
+data: {"text":"I'll"}
+
+id: 1794066015607-0
+event: interaction_update
+data: {"type":"text-delta","text":"I'll"}
+
+id: 1794066015609-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066015615-0
+event: assistant
+data: {"text":" look"}
+
+id: 1794066015615-0
+event: interaction_update
+data: {"type":"text-delta","text":" look"}
+
+id: 1794066015618-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066015621-0
+event: assistant
+data: {"text":" through"}
+
+id: 1794066015621-0
+event: interaction_update
+data: {"type":"text-delta","text":" through"}
+
+id: 1794066015623-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066015626-0
+event: assistant
+data: {"text":" the"}
+
+id: 1794066015626-0
+event: interaction_update
+data: {"type":"text-delta","text":" the"}
+
+id: 1794066015629-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066015632-0
+event: assistant
+data: {"text":" repository"}
+
+id: 1794066015632-0
+event: interaction_update
+data: {"type":"text-delta","text":" repository"}
+
+id: 1794066015634-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066015637-0
+event: assistant
+data: {"text":" structure"}
+
+id: 1794066015637-0
+event: interaction_update
+data: {"type":"text-delta","text":" structure"}
+
+id: 1794066015640-0
+event: interaction_update
+data: {"type":"token-delta","tokens":3}
+
+id: 1794066015642-0
+event: assistant
+data: {"text":" and"}
+
+id: 1794066015642-0
+event: interaction_update
+data: {"type":"text-delta","text":" and"}
+
+id: 1794066015648-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066015651-0
+event: assistant
+data: {"text":" its"}
+
+id: 1794066015651-0
+event: interaction_update
+data: {"type":"text-delta","text":" its"}
+
+id: 1794066015658-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066015661-0
+event: assistant
+data: {"text":" main"}
+
+id: 1794066015661-0
+event: interaction_update
+data: {"type":"text-delta","text":" main"}
+
+id: 1794066015664-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066015667-0
+event: assistant
+data: {"text":" docs"}
+
+id: 1794066015667-0
+event: interaction_update
+data: {"type":"text-delta","text":" docs"}
+
+id: 1794066015669-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066015672-0
+event: assistant
+data: {"text":" so"}
+
+id: 1794066015672-0
+event: interaction_update
+data: {"type":"text-delta","text":" so"}
+
+id: 1794066015675-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066015678-0
+event: assistant
+data: {"text":" I"}
+
+id: 1794066015678-0
+event: interaction_update
+data: {"type":"text-delta","text":" I"}
+
+id: 1794066015681-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066015684-0
+event: assistant
+data: {"text":" can"}
+
+id: 1794066015684-0
+event: interaction_update
+data: {"type":"text-delta","text":" can"}
+
+id: 1794066015687-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066015695-0
+event: assistant
+data: {"text":" give"}
+
+id: 1794066015695-0
+event: interaction_update
+data: {"type":"text-delta","text":" give"}
+
+id: 1794066015697-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066015708-0
+event: assistant
+data: {"text":" you"}
+
+id: 1794066015708-0
+event: interaction_update
+data: {"type":"text-delta","text":" you"}
+
+id: 1794066015711-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066015713-0
+event: assistant
+data: {"text":" a"}
+
+id: 1794066015713-0
+event: interaction_update
+data: {"type":"text-delta","text":" a"}
+
+id: 1794066015716-0
+event: assistant
+data: {"text":" concrete"}
+
+id: 1794066015716-0
+event: interaction_update
+data: {"type":"text-delta","text":" concrete"}
+
+id: 1794066015719-0
+event: interaction_update
+data: {"type":"token-delta","tokens":3}
+
+id: 1794066015722-0
+event: assistant
+data: {"text":" picture"}
+
+id: 1794066015722-0
+event: interaction_update
+data: {"type":"text-delta","text":" picture"}
+
+id: 1794066015724-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066015727-0
+event: assistant
+data: {"text":" of"}
+
+id: 1794066015727-0
+event: interaction_update
+data: {"type":"text-delta","text":" of"}
+
+id: 1794066015731-0
+event: assistant
+data: {"text":" what"}
+
+id: 1794066015731-0
+event: interaction_update
+data: {"type":"text-delta","text":" what"}
+
+id: 1794066015747-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066015754-0
+event: assistant
+data: {"text":" it"}
+
+id: 1794066015754-0
+event: interaction_update
+data: {"type":"text-delta","text":" it"}
+
+id: 1794066015757-0
+event: assistant
+data: {"text":" contains"}
+
+id: 1794066015757-0
+event: interaction_update
+data: {"type":"text-delta","text":" contains"}
+
+id: 1794066015760-0
+event: interaction_update
+data: {"type":"token-delta","tokens":3}
+
+id: 1794066015763-0
+event: assistant
+data: {"text":"."}
+
+id: 1794066015763-0
+event: interaction_update
+data: {"type":"text-delta","text":"."}
+
+id: 1794066015769-0
+event: interaction_update
+data: {"type":"token-delta","tokens":6}
+
+id: 1794066015773-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000002-0\nfc_00000000-0000-0000-0000-000000000003_0","name":"file_search","status":"running"}
+
+id: 1794066015775-0
+event: interaction_update
+data: {"type":"token-delta","tokens":8}
+
+id: 1794066015776-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000002-0\nfc_00000000-0000-0000-0000-000000000003_0","name":"file_search","status":"running","args":{"globPattern":"README*"}}
+
+id: 1794066015776-0
+event: interaction_update
+data: {"type":"tool-call-started","callId":"call-00000000-0000-0000-0000-000000000002-0\nfc_00000000-0000-0000-0000-000000000003_0","toolCall":{"type":"glob","args":{"globPattern":"README*"}},"modelCallId":"00000000-0000-0000-0000-000000000004-1-8msv"}
+
+id: 1794066015778-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000002-1\nfc_00000000-0000-0000-0000-000000000003_1","name":"file_search","status":"running"}
+
+id: 1794066015780-0
+event: interaction_update
+data: {"type":"token-delta","tokens":6}
+
+id: 1794066015783-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000002-1\nfc_00000000-0000-0000-0000-000000000003_1","name":"file_search","status":"running","args":{"globPattern":"package.json"}}
+
+id: 1794066015783-0
+event: interaction_update
+data: {"type":"tool-call-started","callId":"call-00000000-0000-0000-0000-000000000002-1\nfc_00000000-0000-0000-0000-000000000003_1","toolCall":{"type":"glob","args":{"globPattern":"package.json"}},"modelCallId":"00000000-0000-0000-0000-000000000004-1-8msv"}
+
+id: 1794066015784-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000002-2\nfc_00000000-0000-0000-0000-000000000003_2","name":"file_search","status":"running"}
+
+id: 1794066015789-0
+event: interaction_update
+data: {"type":"token-delta","tokens":54}
+
+id: 1794066015792-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000002-2\nfc_00000000-0000-0000-0000-000000000003_2","name":"file_search","status":"running","args":{"globPattern":"*.md"}}
+
+id: 1794066015792-0
+event: interaction_update
+data: {"type":"tool-call-started","callId":"call-00000000-0000-0000-0000-000000000002-2\nfc_00000000-0000-0000-0000-000000000003_2","toolCall":{"type":"glob","args":{"globPattern":"*.md"}},"modelCallId":"00000000-0000-0000-0000-000000000004-1-8msv"}
+
+id: 1794066015795-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000002-3\nfc_00000000-0000-0000-0000-000000000003_3","name":"run_terminal_cmd","status":"running","args":{"command":"ls -la && git rev-parse --show-toplevel 2>/dev/null; git remote -v 2>/dev/null; git log --oneline -15 2>/dev/null; git status -sb 2>/dev/null","timeout":600000,"toolCallId":"call-00000000-0000-0000-0000-000000000002-3\nfc_00000000-0000-0000-0000-000000000003_3","simpleCommands":["ls","git","git","git","git"],"hasOutputRedirect":true,"parsingResult":{"executableCommands":[{"name":"ls","args":[{"type":"word","value":"-la"}],"fullText":"ls -la"},{"name":"git","args":[{"type":"word","value":"rev-parse"},{"type":"word","value":"--show-toplevel"}],"fullText":"git rev-parse --show-toplevel"},{"name":"git","args":[{"type":"word","value":"remote"},{"type":"word","value":"-v"}],"fullText":"git remote -v"},{"name":"git","args":[{"type":"word","value":"log"},{"type":"word","value":"--oneline"},{"type":"number","value":"-15"}],"fullText":"git log --oneline -15"},{"name":"git","args":[{"type":"word","value":"status"},{"type":"word","value":"-sb"}],"fullText":"git status -sb"}],"hasRedirects":true,"allRedirectsAreDevNull":true,"redirects":[{"operator":">","destinationFds":[2],"targetNodeType":"word","targetText":"/dev/null"},{"operator":">","destinationFds":[2],"targetNodeType":"word","targetText":"/dev/null"},{"operator":">","destinationFds":[2],"targetNodeType":"word","targetText":"/dev/null"},{"operator":">","destinationFds":[2],"targetNodeType":"word","targetText":"/dev/null"}]},"fileOutputThresholdBytes":"40000","timeoutBehavior":"TIMEOUT_BEHAVIOR_BACKGROUND","hardTimeout":86400000,"description":"List repo root, remotes, and recent commits","closeStdin":true,"conversationId":"bc-00000000-0000-0000-0000-000000000005","requestId":"00000000-0000-0000-0000-000000000004"}}
+
+id: 1794066015795-0
+event: interaction_update
+data: {"type":"tool-call-started","callId":"call-00000000-0000-0000-0000-000000000002-3\nfc_00000000-0000-0000-0000-000000000003_3","toolCall":{"type":"shell","args":{"command":"ls -la && git rev-parse --show-toplevel 2>/dev/null; git remote -v 2>/dev/null; git log --oneline -15 2>/dev/null; git status -sb 2>/dev/null","timeout":600000}},"modelCallId":"00000000-0000-0000-0000-000000000004-1-8msv"}
+
+id: 1794066015807-0
+event: interaction_update
+data: {"type":"tool-requests-listed","callCount":4}
+
+id: 1794066016072-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000002-0\nfc_00000000-0000-0000-0000-000000000003_0","name":"file_search","status":"completed","args":{"globPattern":"README*"},"result":{"success":{"pattern":"README*","files":["./README.md"],"totalFiles":1}}}
+
+id: 1794066016072-0
+event: interaction_update
+data: {"type":"tool-call-completed","callId":"call-00000000-0000-0000-0000-000000000002-0\nfc_00000000-0000-0000-0000-000000000003_0","toolCall":{"type":"glob","args":{"globPattern":"README*"},"result":{"status":"success","value":{"files":["./README.md"],"totalFiles":1,"clientTruncated":false,"ripgrepTruncated":false}}},"modelCallId":"00000000-0000-0000-0000-000000000004-1-8msv"}
+
+id: 1794066016074-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000002-1\nfc_00000000-0000-0000-0000-000000000003_1","name":"file_search","status":"completed","args":{"globPattern":"package.json"},"result":{"success":{"pattern":"package.json"}}}
+
+id: 1794066016074-0
+event: interaction_update
+data: {"type":"tool-call-completed","callId":"call-00000000-0000-0000-0000-000000000002-1\nfc_00000000-0000-0000-0000-000000000003_1","toolCall":{"type":"glob","args":{"globPattern":"package.json"},"result":{"status":"success","value":{"files":[],"totalFiles":0,"clientTruncated":false,"ripgrepTruncated":false}}},"modelCallId":"00000000-0000-0000-0000-000000000004-1-8msv"}
+
+id: 1794066016075-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000002-2\nfc_00000000-0000-0000-0000-000000000003_2","name":"file_search","status":"completed","args":{"globPattern":"*.md"},"result":{"success":{"pattern":"*.md","files":["./README.md"],"totalFiles":1}}}
+
+id: 1794066016075-0
+event: interaction_update
+data: {"type":"tool-call-completed","callId":"call-00000000-0000-0000-0000-000000000002-2\nfc_00000000-0000-0000-0000-000000000003_2","toolCall":{"type":"glob","args":{"globPattern":"*.md"},"result":{"status":"success","value":{"files":["./README.md"],"totalFiles":1,"clientTruncated":false,"ripgrepTruncated":false}}},"modelCallId":"00000000-0000-0000-0000-000000000004-1-8msv"}
+
+id: 1794066016079-0
+event: interaction_update
+data: {"type":"token-delta","tokens":13}
+
+id: 1794066016081-0
+event: interaction_update
+data: {"type":"token-delta","tokens":9}
+
+id: 1794066016081-1
+event: interaction_update
+data: {"type":"token-delta","tokens":13}
+
+id: 1794066016437-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000002-3\nfc_00000000-0000-0000-0000-000000000003_3","name":"run_terminal_cmd","status":"completed","args":{"command":"ls -la && git rev-parse --show-toplevel 2>/dev/null; git remote -v 2>/dev/null; git log --oneline -15 2>/dev/null; git status -sb 2>/dev/null","timeout":600000,"toolCallId":"call-00000000-0000-0000-0000-000000000002-3\nfc_00000000-0000-0000-0000-000000000003_3","simpleCommands":["ls","git","git","git","git"],"hasOutputRedirect":true,"parsingResult":{"executableCommands":[{"name":"ls","args":[{"type":"word","value":"-la"}],"fullText":"ls -la"},{"name":"git","args":[{"type":"word","value":"rev-parse"},{"type":"word","value":"--show-toplevel"}],"fullText":"git rev-parse --show-toplevel"},{"name":"git","args":[{"type":"word","value":"remote"},{"type":"word","value":"-v"}],"fullText":"git remote -v"},{"name":"git","args":[{"type":"word","value":"log"},{"type":"word","value":"--oneline"},{"type":"number","value":"-15"}],"fullText":"git log --oneline -15"},{"name":"git","args":[{"type":"word","value":"status"},{"type":"word","value":"-sb"}],"fullText":"git status -sb"}],"hasRedirects":true,"allRedirectsAreDevNull":true,"redirects":[{"operator":">","destinationFds":[2],"targetNodeType":"word","targetText":"/dev/null"},{"operator":">","destinationFds":[2],"targetNodeType":"word","targetText":"/dev/null"},{"operator":">","destinationFds":[2],"targetNodeType":"word","targetText":"/dev/null"},{"operator":">","destinationFds":[2],"targetNodeType":"word","targetText":"/dev/null"}]},"fileOutputThresholdBytes":"40000","timeoutBehavior":"TIMEOUT_BEHAVIOR_BACKGROUND","hardTimeout":86400000,"description":"List repo root, remotes, and recent commits","closeStdin":true,"conversationId":"bc-00000000-0000-0000-0000-000000000005","requestId":"00000000-0000-0000-0000-000000000004"},"result":{"success":{"command":"ls -la && git rev-parse --show-toplevel 2>/dev/null; git remote -v 2>/dev/null; git log --oneline -15 2>/dev/null; git status -sb 2>/dev/null","stdout":"total 20\ndrwxr-xr-x   3 ubuntu ubuntu 4096 Nov  7 15:39 .\ndrwxr-xr-x. 25 root   root   4096 Nov  7 15:40 ..\ndrwxr-xr-x   8 ubuntu ubuntu 4096 Nov  7 15:40 .git\n-rw-r--r--   1 ubuntu ubuntu   80 Nov  7 15:39 greet.js\n-rw-r--r--   1 ubuntu ubuntu   98 Nov  7 15:39 README.md\n/workspace\norigin\thttps://x-access-token:[REDACTED]@github.com/sample-org/sample-repo (fetch)\norigin\thttps://x-access-token:[REDACTED]@github.com/sample-org/sample-repo (push)\nf000001 Add greet.js for the cloud agent spike\nf000002 Initial commit\n## main...origin/main\n","executionTime":639,"interleavedOutput":"total 20\ndrwxr-xr-x   3 ubuntu ubuntu 4096 Nov  7 15:39 .\ndrwxr-xr-x. 25 root   root   4096 Nov  7 15:40 ..\ndrwxr-xr-x   8 ubuntu ubuntu 4096 Nov  7 15:40 .git\n-rw-r--r--   1 ubuntu ubuntu   80 Nov  7 15:39 greet.js\n-rw-r--r--   1 ubuntu ubuntu   98 Nov  7 15:39 README.md\n/workspace\norigin\thttps://x-access-token:[REDACTED]@github.com/sample-org/sample-repo (fetch)\norigin\thttps://x-access-token:[REDACTED]@github.com/sample-org/sample-repo (push)\nf000001 Add greet.js for the cloud agent spike\nf000002 Initial commit\n## main...origin/main\n","localExecutionTimeMs":100},"isBackground":false}}
+
+id: 1794066016437-0
+event: interaction_update
+data: {"type":"tool-call-completed","callId":"call-00000000-0000-0000-0000-000000000002-3\nfc_00000000-0000-0000-0000-000000000003_3","toolCall":{"type":"shell","args":{"command":"ls -la && git rev-parse --show-toplevel 2>/dev/null; git remote -v 2>/dev/null; git log --oneline -15 2>/dev/null; git status -sb 2>/dev/null","timeout":600000},"result":{"status":"success","value":{"exitCode":0,"signal":"","stdout":"total 20\ndrwxr-xr-x   3 ubuntu ubuntu 4096 Nov  7 15:39 .\ndrwxr-xr-x. 25 root   root   4096 Nov  7 15:40 ..\ndrwxr-xr-x   8 ubuntu ubuntu 4096 Nov  7 15:40 .git\n-rw-r--r--   1 ubuntu ubuntu   80 Nov  7 15:39 greet.js\n-rw-r--r--   1 ubuntu ubuntu   98 Nov  7 15:39 README.md\n/workspace\norigin\thttps://x-access-token:[REDACTED]@github.com/sample-org/sample-repo (fetch)\norigin\thttps://x-access-token:[REDACTED]@github.com/sample-org/sample-repo (push)\nf000001 Add greet.js for the cloud agent spike\nf000002 Initial commit\n## main...origin/main\n","stderr":"","executionTime":639}}},"modelCallId":"00000000-0000-0000-0000-000000000004-1-8msv"}
+
+id: 1794066016441-0
+event: interaction_update
+data: {"type":"token-delta","tokens":168}
+
+id: 1794066017506-0
+event: thinking
+data: {"text":"This"}
+
+id: 1794066017506-0
+event: interaction_update
+data: {"type":"thinking-delta","text":"This"}
+
+id: 1794066017508-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066017669-0
+event: thinking
+data: {"text":" is a very small repository.\n\nI'll read the files."}
+
+id: 1794066017669-0
+event: interaction_update
+data: {"type":"thinking-delta","text":" is a very small repository.\n\nI'll read the files."}
+
+id: 1794066017672-0
+event: interaction_update
+data: {"type":"token-delta","tokens":12}
+
+id: 1794066017692-0
+event: interaction_update
+data: {"type":"thinking-completed","thinkingDurationMs":186}
+
+id: 1794066017708-0
+event: interaction_update
+data: {"type":"token-delta","tokens":8}
+
+id: 1794066017712-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000006-4\nfc_00000000-0000-0000-0000-000000000007_0","name":"read_file","status":"running","args":{"path":"/workspace/README.md"}}
+
+id: 1794066017712-0
+event: interaction_update
+data: {"type":"tool-call-started","callId":"call-00000000-0000-0000-0000-000000000006-4\nfc_00000000-0000-0000-0000-000000000007_0","toolCall":{"type":"read","args":{"path":"/workspace/README.md"}},"modelCallId":"00000000-0000-0000-0000-000000000004-2-lw0a"}
+
+id: 1794066017714-0
+event: interaction_update
+data: {"type":"token-delta","tokens":7}
+
+id: 1794066017718-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000006-5\nfc_00000000-0000-0000-0000-000000000007_1","name":"read_file","status":"running","args":{"path":"/workspace/greet.js"}}
+
+id: 1794066017718-0
+event: interaction_update
+data: {"type":"tool-call-started","callId":"call-00000000-0000-0000-0000-000000000006-5\nfc_00000000-0000-0000-0000-000000000007_1","toolCall":{"type":"read","args":{"path":"/workspace/greet.js"}},"modelCallId":"00000000-0000-0000-0000-000000000004-2-lw0a"}
+
+id: 1794066017720-0
+event: interaction_update
+data: {"type":"token-delta","tokens":48}
+
+id: 1794066017727-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000006-6\nfc_00000000-0000-0000-0000-000000000007_2","name":"run_terminal_cmd","status":"running","args":{"command":"git log --format='%h %an %ad %s' --date=short && echo '---' && git show --stat f000001 && echo '---' && git show --stat f000002","timeout":600000,"toolCallId":"call-00000000-0000-0000-0000-000000000006-6\nfc_00000000-0000-0000-0000-000000000007_2","simpleCommands":["git","echo","git","echo","git"],"parsingResult":{"executableCommands":[{"name":"git","args":[{"type":"word","value":"log"},{"type":"concatenation","value":"--format='%h %an %ad %s'"},{"type":"word","value":"--date=short"}],"fullText":"git log --format='%h %an %ad %s' --date=short"},{"name":"echo","args":[{"type":"raw_string","value":"'---'"}],"fullText":"echo '---'"},{"name":"git","args":[{"type":"word","value":"show"},{"type":"word","value":"--stat"},{"type":"word","value":"f000001"}],"fullText":"git show --stat f000001"},{"name":"echo","args":[{"type":"raw_string","value":"'---'"}],"fullText":"echo '---'"},{"name":"git","args":[{"type":"word","value":"show"},{"type":"word","value":"--stat"},{"type":"word","value":"f000002"}],"fullText":"git show --stat f000002"}]},"fileOutputThresholdBytes":"40000","timeoutBehavior":"TIMEOUT_BEHAVIOR_BACKGROUND","hardTimeout":86400000,"description":"Show commit history and file stats","closeStdin":true,"conversationId":"bc-00000000-0000-0000-0000-000000000005","requestId":"00000000-0000-0000-0000-000000000004"}}
+
+id: 1794066017727-0
+event: interaction_update
+data: {"type":"tool-call-started","callId":"call-00000000-0000-0000-0000-000000000006-6\nfc_00000000-0000-0000-0000-000000000007_2","toolCall":{"type":"shell","args":{"command":"git log --format='%h %an %ad %s' --date=short && echo '---' && git show --stat f000001 && echo '---' && git show --stat f000002","timeout":600000}},"modelCallId":"00000000-0000-0000-0000-000000000004-2-lw0a"}
+
+id: 1794066017732-0
+event: interaction_update
+data: {"type":"tool-requests-listed","callCount":3}
+
+id: 1794066017880-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000006-4\nfc_00000000-0000-0000-0000-000000000007_0","name":"read_file","status":"completed","args":{"path":"/workspace/README.md"},"result":{"success":{"content":"# sample-repo\nThrowaway repository for testing Cursor cloud agents from Codewomplers Grok Desktop\n","totalLines":3,"fileSize":98,"path":"/workspace/README.md","readRange":{"startLine":1,"endLine":3}}}}
+
+id: 1794066017880-0
+event: interaction_update
+data: {"type":"tool-call-completed","callId":"call-00000000-0000-0000-0000-000000000006-4\nfc_00000000-0000-0000-0000-000000000007_0","toolCall":{"type":"read","args":{"path":"/workspace/README.md"},"result":{"status":"success","value":{"content":"# sample-repo\nThrowaway repository for testing Cursor cloud agents from Codewomplers Grok Desktop\n","totalLines":3,"fileSize":98}}},"modelCallId":"00000000-0000-0000-0000-000000000004-2-lw0a"}
+
+id: 1794066017882-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000006-5\nfc_00000000-0000-0000-0000-000000000007_1","name":"read_file","status":"completed","args":{"path":"/workspace/greet.js"},"result":{"success":{"content":"function greet(name) {\n\treturn `Hello, ${name}`;\n}\n\nmodule.exports = { greet };\n","totalLines":6,"fileSize":80,"path":"/workspace/greet.js","readRange":{"startLine":1,"endLine":6}}}}
+
+id: 1794066017882-0
+event: interaction_update
+data: {"type":"tool-call-completed","callId":"call-00000000-0000-0000-0000-000000000006-5\nfc_00000000-0000-0000-0000-000000000007_1","toolCall":{"type":"read","args":{"path":"/workspace/greet.js"},"result":{"status":"success","value":{"content":"function greet(name) {\n\treturn `Hello, ${name}`;\n}\n\nmodule.exports = { greet };\n","totalLines":6,"fileSize":80}}},"modelCallId":"00000000-0000-0000-0000-000000000004-2-lw0a"}
+
+id: 1794066017884-0
+event: interaction_update
+data: {"type":"token-delta","tokens":25}
+
+id: 1794066017886-0
+event: interaction_update
+data: {"type":"token-delta","tokens":20}
+
+id: 1794066018013-0
+event: tool_call
+data: {"callId":"call-00000000-0000-0000-0000-000000000006-6\nfc_00000000-0000-0000-0000-000000000007_2","name":"run_terminal_cmd","status":"completed","args":{"command":"git log --format='%h %an %ad %s' --date=short && echo '---' && git show --stat f000001 && echo '---' && git show --stat f000002","timeout":600000,"toolCallId":"call-00000000-0000-0000-0000-000000000006-6\nfc_00000000-0000-0000-0000-000000000007_2","simpleCommands":["git","echo","git","echo","git"],"parsingResult":{"executableCommands":[{"name":"git","args":[{"type":"word","value":"log"},{"type":"concatenation","value":"--format='%h %an %ad %s'"},{"type":"word","value":"--date=short"}],"fullText":"git log --format='%h %an %ad %s' --date=short"},{"name":"echo","args":[{"type":"raw_string","value":"'---'"}],"fullText":"echo '---'"},{"name":"git","args":[{"type":"word","value":"show"},{"type":"word","value":"--stat"},{"type":"word","value":"f000001"}],"fullText":"git show --stat f000001"},{"name":"echo","args":[{"type":"raw_string","value":"'---'"}],"fullText":"echo '---'"},{"name":"git","args":[{"type":"word","value":"show"},{"type":"word","value":"--stat"},{"type":"word","value":"f000002"}],"fullText":"git show --stat f000002"}]},"fileOutputThresholdBytes":"40000","timeoutBehavior":"TIMEOUT_BEHAVIOR_BACKGROUND","hardTimeout":86400000,"description":"Show commit history and file stats","closeStdin":true,"conversationId":"bc-00000000-0000-0000-0000-000000000005","requestId":"00000000-0000-0000-0000-000000000004"},"result":{"success":{"command":"git log --format='%h %an %ad %s' --date=short && echo '---' && git show --stat f000001 && echo '---' && git show --stat f000002","stdout":"f000001 Avery example 2026-11-07 Add greet.js for the cloud agent spike\nf000002 sample-org 2026-11-07 Initial commit\n---\ncommit f000001000000000000000000000000000000000\nAuthor: Avery example <user1xx@example.test>\nDate:   Sat Nov 7 07:28:32 2026 -0800\n\n    Add greet.js for the cloud agent spike\n\n greet.js | 5 +++++\n 1 file changed, 5 insertions(+)\n---\ncommit f000002000000000000000000000000000000000\nAuthor: sample-org <user1xx@example.test>\nDate:   Sat Nov 7 07:28:22 2026 -0800\n\n    Initial commit\n\n README.md | 2 ++\n 1 file changed, 2 insertions(+)\n","executionTime":268,"interleavedOutput":"f000001 Avery example 2026-11-07 Add greet.js for the cloud agent spike\nf000002 sample-org 2026-11-07 Initial commit\n---\ncommit f000001000000000000000000000000000000000\nAuthor: Avery example <user1xx@example.test>\nDate:   Sat Nov 7 07:28:32 2026 -0800\n\n    Add greet.js for the cloud agent spike\n\n greet.js | 5 +++++\n 1 file changed, 5 insertions(+)\n---\ncommit f000002000000000000000000000000000000000\nAuthor: sample-org <user1xx@example.test>\nDate:   Sat Nov 7 07:28:22 2026 -0800\n\n    Initial commit\n\n README.md | 2 ++\n 1 file changed, 2 insertions(+)\n","localExecutionTimeMs":89},"isBackground":false}}
+
+id: 1794066018013-0
+event: interaction_update
+data: {"type":"tool-call-completed","callId":"call-00000000-0000-0000-0000-000000000006-6\nfc_00000000-0000-0000-0000-000000000007_2","toolCall":{"type":"shell","args":{"command":"git log --format='%h %an %ad %s' --date=short && echo '---' && git show --stat f000001 && echo '---' && git show --stat f000002","timeout":600000},"result":{"status":"success","value":{"exitCode":0,"signal":"","stdout":"f000001 Avery example 2026-11-07 Add greet.js for the cloud agent spike\nf000002 sample-org 2026-11-07 Initial commit\n---\ncommit f000001000000000000000000000000000000000\nAuthor: Avery example <user1xx@example.test>\nDate:   Sat Nov 7 07:28:32 2026 -0800\n\n    Add greet.js for the cloud agent spike\n\n greet.js | 5 +++++\n 1 file changed, 5 insertions(+)\n---\ncommit f000002000000000000000000000000000000000\nAuthor: sample-org <user1xx@example.test>\nDate:   Sat Nov 7 07:28:22 2026 -0800\n\n    Initial commit\n\n README.md | 2 ++\n 1 file changed, 2 insertions(+)\n","stderr":"","executionTime":268}}},"modelCallId":"00000000-0000-0000-0000-000000000004-2-lw0a"}
+
+id: 1794066018017-0
+event: interaction_update
+data: {"type":"token-delta","tokens":170}
+
+id: 1794066019590-0
+event: thinking
+data: {"text":"I"}
+
+id: 1794066019590-0
+event: interaction_update
+data: {"type":"thinking-delta","text":"I"}
+
+id: 1794066019673-0
+event: thinking
+data: {"text":" have a clear picture."}
+
+id: 1794066019673-0
+event: interaction_update
+data: {"type":"thinking-delta","text":" have a clear picture."}
+
+id: 1794066019678-0
+event: interaction_update
+data: {"type":"token-delta","tokens":5}
+
+id: 1794066019809-0
+event: thinking
+data: {"text":" This"}
+
+id: 1794066019809-0
+event: interaction_update
+data: {"type":"thinking-delta","text":" This"}
+
+id: 1794066019821-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066019890-0
+event: thinking
+data: {"text":" is"}
+
+id: 1794066019890-0
+event: interaction_update
+data: {"type":"thinking-delta","text":" is"}
+
+id: 1794066019939-0
+event: thinking
+data: {"text":" a"}
+
+id: 1794066019939-0
+event: interaction_update
+data: {"type":"thinking-delta","text":" a"}
+
+id: 1794066019942-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066019973-0
+event: thinking
+data: {"text":" tiny"}
+
+id: 1794066019973-0
+event: interaction_update
+data: {"type":"thinking-delta","text":" tiny"}
+
+id: 1794066019975-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020336-0
+event: thinking
+data: {"text":" throwaway repo.\n\nThe repository is sample-org/sample-repo. I will answer based on what I found in the repo, not speculation."}
+
+id: 1794066020336-0
+event: interaction_update
+data: {"type":"thinking-delta","text":" throwaway repo.\n\nThe repository is sample-org/sample-repo. I will answer based on what I found in the repo, not speculation."}
+
+id: 1794066020339-0
+event: interaction_update
+data: {"type":"token-delta","tokens":31}
+
+id: 1794066020370-0
+event: interaction_update
+data: {"type":"thinking-completed","thinkingDurationMs":781}
+
+id: 1794066020376-0
+event: assistant
+data: {"text":"**"}
+
+id: 1794066020376-0
+event: interaction_update
+data: {"type":"text-delta","text":"**"}
+
+id: 1794066020401-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020407-0
+event: assistant
+data: {"text":"sampl"}
+
+id: 1794066020407-0
+event: interaction_update
+data: {"type":"text-delta","text":"sampl"}
+
+id: 1794066020410-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020415-0
+event: assistant
+data: {"text":"e"}
+
+id: 1794066020415-0
+event: interaction_update
+data: {"type":"text-delta","text":"e"}
+
+id: 1794066020418-0
+event: assistant
+data: {"text":"-repo"}
+
+id: 1794066020418-0
+event: interaction_update
+data: {"type":"text-delta","text":"-repo"}
+
+id: 1794066020421-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066020424-0
+event: assistant
+data: {"text":"**"}
+
+id: 1794066020424-0
+event: interaction_update
+data: {"type":"text-delta","text":"**"}
+
+id: 1794066020428-0
+event: assistant
+data: {"text":" is"}
+
+id: 1794066020428-0
+event: interaction_update
+data: {"type":"text-delta","text":" is"}
+
+id: 1794066020431-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020435-0
+event: assistant
+data: {"text":" a"}
+
+id: 1794066020435-0
+event: interaction_update
+data: {"type":"text-delta","text":" a"}
+
+id: 1794066020450-0
+event: assistant
+data: {"text":" tiny"}
+
+id: 1794066020450-0
+event: interaction_update
+data: {"type":"text-delta","text":" tiny"}
+
+id: 1794066020458-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066020461-0
+event: assistant
+data: {"text":" throw"}
+
+id: 1794066020461-0
+event: interaction_update
+data: {"type":"text-delta","text":" throw"}
+
+id: 1794066020464-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020467-0
+event: assistant
+data: {"text":"away"}
+
+id: 1794066020467-0
+event: interaction_update
+data: {"type":"text-delta","text":"away"}
+
+id: 1794066020470-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020473-0
+event: assistant
+data: {"text":" repository"}
+
+id: 1794066020473-0
+event: interaction_update
+data: {"type":"text-delta","text":" repository"}
+
+id: 1794066020476-0
+event: interaction_update
+data: {"type":"token-delta","tokens":3}
+
+id: 1794066020479-0
+event: assistant
+data: {"text":" at"}
+
+id: 1794066020479-0
+event: interaction_update
+data: {"type":"text-delta","text":" at"}
+
+id: 1794066020488-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020492-0
+event: assistant
+data: {"text":" `"}
+
+id: 1794066020492-0
+event: interaction_update
+data: {"type":"text-delta","text":" `"}
+
+id: 1794066020495-0
+event: assistant
+data: {"text":"sam"}
+
+id: 1794066020495-0
+event: interaction_update
+data: {"type":"text-delta","text":"sam"}
+
+id: 1794066020498-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020500-0
+event: assistant
+data: {"text":"ple"}
+
+id: 1794066020500-0
+event: interaction_update
+data: {"type":"text-delta","text":"ple"}
+
+id: 1794066020503-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020508-0
+event: assistant
+data: {"text":"-o"}
+
+id: 1794066020508-0
+event: interaction_update
+data: {"type":"text-delta","text":"-o"}
+
+id: 1794066020511-0
+event: assistant
+data: {"text":"rg"}
+
+id: 1794066020511-0
+event: interaction_update
+data: {"type":"text-delta","text":"rg"}
+
+id: 1794066020514-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020516-0
+event: assistant
+data: {"text":"/"}
+
+id: 1794066020516-0
+event: interaction_update
+data: {"type":"text-delta","text":"/"}
+
+id: 1794066020519-0
+event: assistant
+data: {"text":"sampl"}
+
+id: 1794066020519-0
+event: interaction_update
+data: {"type":"text-delta","text":"sampl"}
+
+id: 1794066020522-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020528-0
+event: assistant
+data: {"text":"e"}
+
+id: 1794066020528-0
+event: interaction_update
+data: {"type":"text-delta","text":"e"}
+
+id: 1794066020536-0
+event: assistant
+data: {"text":"-repo"}
+
+id: 1794066020536-0
+event: interaction_update
+data: {"type":"text-delta","text":"-repo"}
+
+id: 1794066020539-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066020542-0
+event: assistant
+data: {"text":"`,"}
+
+id: 1794066020542-0
+event: interaction_update
+data: {"type":"text-delta","text":"`,"}
+
+id: 1794066020548-0
+event: assistant
+data: {"text":" created"}
+
+id: 1794066020548-0
+event: interaction_update
+data: {"type":"text-delta","text":" created"}
+
+id: 1794066020551-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066020558-0
+event: assistant
+data: {"text":" today"}
+
+id: 1794066020558-0
+event: interaction_update
+data: {"type":"text-delta","text":" today"}
+
+id: 1794066020561-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066020564-0
+event: assistant
+data: {"text":" to"}
+
+id: 1794066020564-0
+event: interaction_update
+data: {"type":"text-delta","text":" to"}
+
+id: 1794066020566-0
+event: assistant
+data: {"text":" test"}
+
+id: 1794066020566-0
+event: interaction_update
+data: {"type":"text-delta","text":" test"}
+
+id: 1794066020570-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066020587-0
+event: assistant
+data: {"text":" Cursor"}
+
+id: 1794066020587-0
+event: interaction_update
+data: {"type":"text-delta","text":" Cursor"}
+
+id: 1794066020590-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020593-0
+event: assistant
+data: {"text":" cloud"}
+
+id: 1794066020593-0
+event: interaction_update
+data: {"type":"text-delta","text":" cloud"}
+
+id: 1794066020598-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066020601-0
+event: assistant
+data: {"text":" agents"}
+
+id: 1794066020601-0
+event: interaction_update
+data: {"type":"text-delta","text":" agents"}
+
+id: 1794066020604-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066020608-0
+event: assistant
+data: {"text":" from"}
+
+id: 1794066020608-0
+event: interaction_update
+data: {"type":"text-delta","text":" from"}
+
+id: 1794066020611-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020618-0
+event: assistant
+data: {"text":" Code"}
+
+id: 1794066020618-0
+event: interaction_update
+data: {"type":"text-delta","text":" Code"}
+
+id: 1794066020622-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020624-0
+event: assistant
+data: {"text":"wom"}
+
+id: 1794066020624-0
+event: interaction_update
+data: {"type":"text-delta","text":"wom"}
+
+id: 1794066020627-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020637-0
+event: assistant
+data: {"text":"plers"}
+
+id: 1794066020637-0
+event: interaction_update
+data: {"type":"text-delta","text":"plers"}
+
+id: 1794066020641-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020645-0
+event: assistant
+data: {"text":" G"}
+
+id: 1794066020645-0
+event: interaction_update
+data: {"type":"text-delta","text":" G"}
+
+id: 1794066020648-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020651-0
+event: assistant
+data: {"text":"rok"}
+
+id: 1794066020651-0
+event: interaction_update
+data: {"type":"text-delta","text":"rok"}
+
+id: 1794066020654-0
+event: assistant
+data: {"text":" Desktop"}
+
+id: 1794066020654-0
+event: interaction_update
+data: {"type":"text-delta","text":" Desktop"}
+
+id: 1794066020658-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066020661-0
+event: assistant
+data: {"text":".\n\n"}
+
+id: 1794066020661-0
+event: interaction_update
+data: {"type":"text-delta","text":".\n\n"}
+
+id: 1794066020663-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020667-0
+event: assistant
+data: {"text":"It"}
+
+id: 1794066020667-0
+event: interaction_update
+data: {"type":"text-delta","text":"It"}
+
+id: 1794066020670-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020674-0
+event: assistant
+data: {"text":" sits"}
+
+id: 1794066020674-0
+event: interaction_update
+data: {"type":"text-delta","text":" sits"}
+
+id: 1794066020677-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020680-0
+event: assistant
+data: {"text":" on"}
+
+id: 1794066020680-0
+event: interaction_update
+data: {"type":"text-delta","text":" on"}
+
+id: 1794066020687-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020691-0
+event: assistant
+data: {"text":" `"}
+
+id: 1794066020691-0
+event: interaction_update
+data: {"type":"text-delta","text":" `"}
+
+id: 1794066020694-0
+event: assistant
+data: {"text":"main"}
+
+id: 1794066020694-0
+event: interaction_update
+data: {"type":"text-delta","text":"main"}
+
+id: 1794066020697-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020700-0
+event: assistant
+data: {"text":"`,"}
+
+id: 1794066020700-0
+event: interaction_update
+data: {"type":"text-delta","text":"`,"}
+
+id: 1794066020708-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020718-0
+event: assistant
+data: {"text":" in"}
+
+id: 1794066020718-0
+event: interaction_update
+data: {"type":"text-delta","text":" in"}
+
+id: 1794066020722-0
+event: assistant
+data: {"text":" sync"}
+
+id: 1794066020722-0
+event: interaction_update
+data: {"type":"text-delta","text":" sync"}
+
+id: 1794066020725-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066020728-0
+event: assistant
+data: {"text":" with"}
+
+id: 1794066020728-0
+event: interaction_update
+data: {"type":"text-delta","text":" with"}
+
+id: 1794066020738-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020741-0
+event: assistant
+data: {"text":" `"}
+
+id: 1794066020741-0
+event: interaction_update
+data: {"type":"text-delta","text":" `"}
+
+id: 1794066020748-0
+event: assistant
+data: {"text":"origin"}
+
+id: 1794066020748-0
+event: interaction_update
+data: {"type":"text-delta","text":"origin"}
+
+id: 1794066020751-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066020754-0
+event: assistant
+data: {"text":"/"}
+
+id: 1794066020754-0
+event: interaction_update
+data: {"type":"text-delta","text":"/"}
+
+id: 1794066020758-0
+event: assistant
+data: {"text":"main"}
+
+id: 1794066020758-0
+event: interaction_update
+data: {"type":"text-delta","text":"main"}
+
+id: 1794066020761-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020764-0
+event: assistant
+data: {"text":"`,"}
+
+id: 1794066020764-0
+event: interaction_update
+data: {"type":"text-delta","text":"`,"}
+
+id: 1794066020767-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020771-0
+event: assistant
+data: {"text":" and"}
+
+id: 1794066020771-0
+event: interaction_update
+data: {"type":"text-delta","text":" and"}
+
+id: 1794066020778-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020781-0
+event: assistant
+data: {"text":" has"}
+
+id: 1794066020781-0
+event: interaction_update
+data: {"type":"text-delta","text":" has"}
+
+id: 1794066020788-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020791-0
+event: assistant
+data: {"text":" two"}
+
+id: 1794066020791-0
+event: interaction_update
+data: {"type":"text-delta","text":" two"}
+
+id: 1794066020798-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020801-0
+event: assistant
+data: {"text":" commits"}
+
+id: 1794066020801-0
+event: interaction_update
+data: {"type":"text-delta","text":" commits"}
+
+id: 1794066020804-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066020807-0
+event: assistant
+data: {"text":" from"}
+
+id: 1794066020807-0
+event: interaction_update
+data: {"type":"text-delta","text":" from"}
+
+id: 1794066020810-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020818-0
+event: assistant
+data: {"text":" today"}
+
+id: 1794066020818-0
+event: interaction_update
+data: {"type":"text-delta","text":" today"}
+
+id: 1794066020821-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020828-0
+event: assistant
+data: {"text":":\n\n"}
+
+id: 1794066020828-0
+event: interaction_update
+data: {"type":"text-delta","text":":\n\n"}
+
+id: 1794066020843-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020847-0
+event: assistant
+data: {"text":"1"}
+
+id: 1794066020847-0
+event: interaction_update
+data: {"type":"text-delta","text":"1"}
+
+id: 1794066020850-0
+event: assistant
+data: {"text":"."}
+
+id: 1794066020850-0
+event: interaction_update
+data: {"type":"text-delta","text":"."}
+
+id: 1794066020853-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020856-0
+event: assistant
+data: {"text":" **"}
+
+id: 1794066020856-0
+event: interaction_update
+data: {"type":"text-delta","text":" **"}
+
+id: 1794066020859-0
+event: assistant
+data: {"text":"Initial"}
+
+id: 1794066020859-0
+event: interaction_update
+data: {"type":"text-delta","text":"Initial"}
+
+id: 1794066020868-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066020871-0
+event: assistant
+data: {"text":" commit"}
+
+id: 1794066020871-0
+event: interaction_update
+data: {"type":"text-delta","text":" commit"}
+
+id: 1794066020874-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066020878-0
+event: assistant
+data: {"text":"**"}
+
+id: 1794066020878-0
+event: interaction_update
+data: {"type":"text-delta","text":"**"}
+
+id: 1794066020882-0
+event: assistant
+data: {"text":" (`"}
+
+id: 1794066020882-0
+event: interaction_update
+data: {"type":"text-delta","text":" (`"}
+
+id: 1794066020885-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020888-0
+event: assistant
+data: {"text":"f"}
+
+id: 1794066020888-0
+event: interaction_update
+data: {"type":"text-delta","text":"f"}
+
+id: 1794066020896-0
+event: assistant
+data: {"text":"0"}
+
+id: 1794066020896-0
+event: interaction_update
+data: {"type":"text-delta","text":"0"}
+
+id: 1794066020899-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020902-0
+event: assistant
+data: {"text":"000"}
+
+id: 1794066020902-0
+event: interaction_update
+data: {"type":"text-delta","text":"000"}
+
+id: 1794066020905-0
+event: assistant
+data: {"text":"0"}
+
+id: 1794066020905-0
+event: interaction_update
+data: {"type":"text-delta","text":"0"}
+
+id: 1794066020908-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020911-0
+event: assistant
+data: {"text":"2"}
+
+id: 1794066020911-0
+event: interaction_update
+data: {"type":"text-delta","text":"2"}
+
+id: 1794066020915-0
+event: assistant
+data: {"text":"`)"}
+
+id: 1794066020915-0
+event: interaction_update
+data: {"type":"text-delta","text":"`)"}
+
+id: 1794066020918-0
+event: assistant
+data: {"text":" —"}
+
+id: 1794066020918-0
+event: interaction_update
+data: {"type":"text-delta","text":" —"}
+
+id: 1794066020928-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020933-0
+event: assistant
+data: {"text":" adds"}
+
+id: 1794066020933-0
+event: interaction_update
+data: {"type":"text-delta","text":" adds"}
+
+id: 1794066020935-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020938-0
+event: assistant
+data: {"text":" `"}
+
+id: 1794066020938-0
+event: interaction_update
+data: {"type":"text-delta","text":" `"}
+
+id: 1794066020942-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020948-0
+event: assistant
+data: {"text":"README"}
+
+id: 1794066020948-0
+event: interaction_update
+data: {"type":"text-delta","text":"README"}
+
+id: 1794066020952-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020956-0
+event: assistant
+data: {"text":".md"}
+
+id: 1794066020956-0
+event: interaction_update
+data: {"type":"text-delta","text":".md"}
+
+id: 1794066020958-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020961-0
+event: assistant
+data: {"text":"`,"}
+
+id: 1794066020961-0
+event: interaction_update
+data: {"type":"text-delta","text":"`,"}
+
+id: 1794066020965-0
+event: assistant
+data: {"text":" which"}
+
+id: 1794066020965-0
+event: interaction_update
+data: {"type":"text-delta","text":" which"}
+
+id: 1794066020968-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066020971-0
+event: assistant
+data: {"text":" says"}
+
+id: 1794066020971-0
+event: interaction_update
+data: {"type":"text-delta","text":" says"}
+
+id: 1794066020978-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020981-0
+event: assistant
+data: {"text":" the"}
+
+id: 1794066020981-0
+event: interaction_update
+data: {"type":"text-delta","text":" the"}
+
+id: 1794066020983-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066020986-0
+event: assistant
+data: {"text":" repo"}
+
+id: 1794066020986-0
+event: interaction_update
+data: {"type":"text-delta","text":" repo"}
+
+id: 1794066020989-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021013-0
+event: assistant
+data: {"text":" is"}
+
+id: 1794066021013-0
+event: interaction_update
+data: {"type":"text-delta","text":" is"}
+
+id: 1794066021017-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021042-0
+event: assistant
+data: {"text":" a"}
+
+id: 1794066021042-0
+event: interaction_update
+data: {"type":"text-delta","text":" a"}
+
+id: 1794066021045-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021048-0
+event: assistant
+data: {"text":" throw"}
+
+id: 1794066021048-0
+event: interaction_update
+data: {"type":"text-delta","text":" throw"}
+
+id: 1794066021051-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021056-0
+event: assistant
+data: {"text":"away"}
+
+id: 1794066021056-0
+event: interaction_update
+data: {"type":"text-delta","text":"away"}
+
+id: 1794066021059-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021067-0
+event: assistant
+data: {"text":" for"}
+
+id: 1794066021067-0
+event: interaction_update
+data: {"type":"text-delta","text":" for"}
+
+id: 1794066021070-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021073-0
+event: assistant
+data: {"text":" testing"}
+
+id: 1794066021073-0
+event: interaction_update
+data: {"type":"text-delta","text":" testing"}
+
+id: 1794066021076-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021079-0
+event: assistant
+data: {"text":" Cursor"}
+
+id: 1794066021079-0
+event: interaction_update
+data: {"type":"text-delta","text":" Cursor"}
+
+id: 1794066021088-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021091-0
+event: assistant
+data: {"text":" cloud"}
+
+id: 1794066021091-0
+event: interaction_update
+data: {"type":"text-delta","text":" cloud"}
+
+id: 1794066021094-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021110-0
+event: assistant
+data: {"text":" agents"}
+
+id: 1794066021110-0
+event: interaction_update
+data: {"type":"text-delta","text":" agents"}
+
+id: 1794066021113-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021116-0
+event: assistant
+data: {"text":".\n"}
+
+id: 1794066021116-0
+event: interaction_update
+data: {"type":"text-delta","text":".\n"}
+
+id: 1794066021119-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021122-0
+event: assistant
+data: {"text":"2"}
+
+id: 1794066021122-0
+event: interaction_update
+data: {"type":"text-delta","text":"2"}
+
+id: 1794066021126-0
+event: assistant
+data: {"text":"."}
+
+id: 1794066021126-0
+event: interaction_update
+data: {"type":"text-delta","text":"."}
+
+id: 1794066021129-0
+event: assistant
+data: {"text":" **"}
+
+id: 1794066021129-0
+event: interaction_update
+data: {"type":"text-delta","text":" **"}
+
+id: 1794066021138-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021142-0
+event: assistant
+data: {"text":"Add"}
+
+id: 1794066021142-0
+event: interaction_update
+data: {"type":"text-delta","text":"Add"}
+
+id: 1794066021144-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021147-0
+event: assistant
+data: {"text":" greet"}
+
+id: 1794066021147-0
+event: interaction_update
+data: {"type":"text-delta","text":" greet"}
+
+id: 1794066021150-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021153-0
+event: assistant
+data: {"text":".js"}
+
+id: 1794066021153-0
+event: interaction_update
+data: {"type":"text-delta","text":".js"}
+
+id: 1794066021155-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021158-0
+event: assistant
+data: {"text":"**"}
+
+id: 1794066021158-0
+event: interaction_update
+data: {"type":"text-delta","text":"**"}
+
+id: 1794066021166-0
+event: assistant
+data: {"text":" (`"}
+
+id: 1794066021166-0
+event: interaction_update
+data: {"type":"text-delta","text":" (`"}
+
+id: 1794066021169-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021172-0
+event: assistant
+data: {"text":"f"}
+
+id: 1794066021172-0
+event: interaction_update
+data: {"type":"text-delta","text":"f"}
+
+id: 1794066021175-0
+event: assistant
+data: {"text":"0"}
+
+id: 1794066021175-0
+event: interaction_update
+data: {"type":"text-delta","text":"0"}
+
+id: 1794066021178-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021181-0
+event: assistant
+data: {"text":"0"}
+
+id: 1794066021181-0
+event: interaction_update
+data: {"type":"text-delta","text":"0"}
+
+id: 1794066021188-0
+event: assistant
+data: {"text":"00"}
+
+id: 1794066021188-0
+event: interaction_update
+data: {"type":"text-delta","text":"00"}
+
+id: 1794066021191-0
+event: assistant
+data: {"text":"01"}
+
+id: 1794066021191-0
+event: interaction_update
+data: {"type":"text-delta","text":"01"}
+
+id: 1794066021194-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021197-0
+event: assistant
+data: {"text":"`,"}
+
+id: 1794066021197-0
+event: interaction_update
+data: {"type":"text-delta","text":"`,"}
+
+id: 1794066021213-0
+event: assistant
+data: {"text":" Avery"}
+
+id: 1794066021213-0
+event: interaction_update
+data: {"type":"text-delta","text":" Avery"}
+
+id: 1794066021218-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021221-0
+event: assistant
+data: {"text":" example"}
+
+id: 1794066021221-0
+event: interaction_update
+data: {"type":"text-delta","text":" example"}
+
+id: 1794066021228-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021231-0
+event: assistant
+data: {"text":")"}
+
+id: 1794066021231-0
+event: interaction_update
+data: {"type":"text-delta","text":")"}
+
+id: 1794066021234-0
+event: assistant
+data: {"text":" —"}
+
+id: 1794066021234-0
+event: interaction_update
+data: {"type":"text-delta","text":" —"}
+
+id: 1794066021237-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021249-0
+event: assistant
+data: {"text":" adds"}
+
+id: 1794066021249-0
+event: interaction_update
+data: {"type":"text-delta","text":" adds"}
+
+id: 1794066021252-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021255-0
+event: assistant
+data: {"text":" a"}
+
+id: 1794066021255-0
+event: interaction_update
+data: {"type":"text-delta","text":" a"}
+
+id: 1794066021258-0
+event: assistant
+data: {"text":" five"}
+
+id: 1794066021258-0
+event: interaction_update
+data: {"type":"text-delta","text":" five"}
+
+id: 1794066021261-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021264-0
+event: assistant
+data: {"text":"-"}
+
+id: 1794066021264-0
+event: interaction_update
+data: {"type":"text-delta","text":"-"}
+
+id: 1794066021267-0
+event: assistant
+data: {"text":"line"}
+
+id: 1794066021267-0
+event: interaction_update
+data: {"type":"text-delta","text":"line"}
+
+id: 1794066021270-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021273-0
+event: assistant
+data: {"text":" Common"}
+
+id: 1794066021273-0
+event: interaction_update
+data: {"type":"text-delta","text":" Common"}
+
+id: 1794066021278-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021281-0
+event: assistant
+data: {"text":"JS"}
+
+id: 1794066021281-0
+event: interaction_update
+data: {"type":"text-delta","text":"JS"}
+
+id: 1794066021284-0
+event: assistant
+data: {"text":" module"}
+
+id: 1794066021284-0
+event: interaction_update
+data: {"type":"text-delta","text":" module"}
+
+id: 1794066021288-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021291-0
+event: assistant
+data: {"text":".\n\n"}
+
+id: 1794066021291-0
+event: interaction_update
+data: {"type":"text-delta","text":".\n\n"}
+
+id: 1794066021298-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021301-0
+event: assistant
+data: {"text":"`"}
+
+id: 1794066021301-0
+event: interaction_update
+data: {"type":"text-delta","text":"`"}
+
+id: 1794066021304-0
+event: assistant
+data: {"text":"gre"}
+
+id: 1794066021304-0
+event: interaction_update
+data: {"type":"text-delta","text":"gre"}
+
+id: 1794066021307-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021311-0
+event: assistant
+data: {"text":"et"}
+
+id: 1794066021311-0
+event: interaction_update
+data: {"type":"text-delta","text":"et"}
+
+id: 1794066021314-0
+event: assistant
+data: {"text":".js"}
+
+id: 1794066021314-0
+event: interaction_update
+data: {"type":"text-delta","text":".js"}
+
+id: 1794066021317-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021319-0
+event: assistant
+data: {"text":"`"}
+
+id: 1794066021319-0
+event: interaction_update
+data: {"type":"text-delta","text":"`"}
+
+id: 1794066021328-0
+event: assistant
+data: {"text":" exports"}
+
+id: 1794066021328-0
+event: interaction_update
+data: {"type":"text-delta","text":" exports"}
+
+id: 1794066021331-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021334-0
+event: assistant
+data: {"text":" one"}
+
+id: 1794066021334-0
+event: interaction_update
+data: {"type":"text-delta","text":" one"}
+
+id: 1794066021337-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021346-0
+event: assistant
+data: {"text":" function"}
+
+id: 1794066021346-0
+event: interaction_update
+data: {"type":"text-delta","text":" function"}
+
+id: 1794066021349-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021352-0
+event: assistant
+data: {"text":":\n\n"}
+
+id: 1794066021352-0
+event: interaction_update
+data: {"type":"text-delta","text":":\n\n"}
+
+id: 1794066021358-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021361-0
+event: assistant
+data: {"text":"```"}
+
+id: 1794066021361-0
+event: interaction_update
+data: {"type":"text-delta","text":"```"}
+
+id: 1794066021368-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021378-0
+event: assistant
+data: {"text":"1"}
+
+id: 1794066021378-0
+event: interaction_update
+data: {"type":"text-delta","text":"1"}
+
+id: 1794066021381-0
+event: assistant
+data: {"text":":"}
+
+id: 1794066021381-0
+event: interaction_update
+data: {"type":"text-delta","text":":"}
+
+id: 1794066021388-0
+event: assistant
+data: {"text":"5"}
+
+id: 1794066021388-0
+event: interaction_update
+data: {"type":"text-delta","text":"5"}
+
+id: 1794066021391-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021394-0
+event: assistant
+data: {"text":":"}
+
+id: 1794066021394-0
+event: interaction_update
+data: {"type":"text-delta","text":":"}
+
+id: 1794066021397-0
+event: assistant
+data: {"text":"gre"}
+
+id: 1794066021397-0
+event: interaction_update
+data: {"type":"text-delta","text":"gre"}
+
+id: 1794066021400-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021408-0
+event: assistant
+data: {"text":"et"}
+
+id: 1794066021408-0
+event: interaction_update
+data: {"type":"text-delta","text":"et"}
+
+id: 1794066021411-0
+event: assistant
+data: {"text":".js"}
+
+id: 1794066021411-0
+event: interaction_update
+data: {"type":"text-delta","text":".js"}
+
+id: 1794066021415-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021418-0
+event: assistant
+data: {"text":"\n"}
+
+id: 1794066021418-0
+event: interaction_update
+data: {"type":"text-delta","text":"\n"}
+
+id: 1794066021421-0
+event: assistant
+data: {"text":"function"}
+
+id: 1794066021421-0
+event: interaction_update
+data: {"type":"text-delta","text":"function"}
+
+id: 1794066021425-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021428-0
+event: assistant
+data: {"text":" greet"}
+
+id: 1794066021428-0
+event: interaction_update
+data: {"type":"text-delta","text":" greet"}
+
+id: 1794066021430-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021438-0
+event: assistant
+data: {"text":"("}
+
+id: 1794066021438-0
+event: interaction_update
+data: {"type":"text-delta","text":"("}
+
+id: 1794066021441-0
+event: assistant
+data: {"text":"name"}
+
+id: 1794066021441-0
+event: interaction_update
+data: {"type":"text-delta","text":"name"}
+
+id: 1794066021444-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021447-0
+event: assistant
+data: {"text":")"}
+
+id: 1794066021447-0
+event: interaction_update
+data: {"type":"text-delta","text":")"}
+
+id: 1794066021450-0
+event: assistant
+data: {"text":" {\n"}
+
+id: 1794066021450-0
+event: interaction_update
+data: {"type":"text-delta","text":" {\n"}
+
+id: 1794066021467-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021476-0
+event: assistant
+data: {"text":"\t"}
+
+id: 1794066021476-0
+event: interaction_update
+data: {"type":"text-delta","text":"\t"}
+
+id: 1794066021479-0
+event: assistant
+data: {"text":"return"}
+
+id: 1794066021479-0
+event: interaction_update
+data: {"type":"text-delta","text":"return"}
+
+id: 1794066021497-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021500-0
+event: assistant
+data: {"text":" `"}
+
+id: 1794066021500-0
+event: interaction_update
+data: {"type":"text-delta","text":" `"}
+
+id: 1794066021503-0
+event: assistant
+data: {"text":"Hello"}
+
+id: 1794066021503-0
+event: interaction_update
+data: {"type":"text-delta","text":"Hello"}
+
+id: 1794066021507-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021510-0
+event: assistant
+data: {"text":","}
+
+id: 1794066021510-0
+event: interaction_update
+data: {"type":"text-delta","text":","}
+
+id: 1794066021518-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021521-0
+event: assistant
+data: {"text":" ${"}
+
+id: 1794066021521-0
+event: interaction_update
+data: {"type":"text-delta","text":" ${"}
+
+id: 1794066021528-0
+event: assistant
+data: {"text":"name"}
+
+id: 1794066021528-0
+event: interaction_update
+data: {"type":"text-delta","text":"name"}
+
+id: 1794066021531-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021539-0
+event: assistant
+data: {"text":"}`;"}
+
+id: 1794066021539-0
+event: interaction_update
+data: {"type":"text-delta","text":"}`;"}
+
+id: 1794066021544-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021548-0
+event: assistant
+data: {"text":"\n"}
+
+id: 1794066021548-0
+event: interaction_update
+data: {"type":"text-delta","text":"\n"}
+
+id: 1794066021551-0
+event: assistant
+data: {"text":"}\n\n"}
+
+id: 1794066021551-0
+event: interaction_update
+data: {"type":"text-delta","text":"}\n\n"}
+
+id: 1794066021558-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021561-0
+event: assistant
+data: {"text":"module"}
+
+id: 1794066021561-0
+event: interaction_update
+data: {"type":"text-delta","text":"module"}
+
+id: 1794066021564-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021567-0
+event: assistant
+data: {"text":"."}
+
+id: 1794066021567-0
+event: interaction_update
+data: {"type":"text-delta","text":"."}
+
+id: 1794066021569-0
+event: assistant
+data: {"text":"exports"}
+
+id: 1794066021569-0
+event: interaction_update
+data: {"type":"text-delta","text":"exports"}
+
+id: 1794066021572-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021578-0
+event: assistant
+data: {"text":" ="}
+
+id: 1794066021578-0
+event: interaction_update
+data: {"type":"text-delta","text":" ="}
+
+id: 1794066021581-0
+event: assistant
+data: {"text":" {"}
+
+id: 1794066021581-0
+event: interaction_update
+data: {"type":"text-delta","text":" {"}
+
+id: 1794066021589-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021610-0
+event: assistant
+data: {"text":" greet"}
+
+id: 1794066021610-0
+event: interaction_update
+data: {"type":"text-delta","text":" greet"}
+
+id: 1794066021613-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021616-0
+event: assistant
+data: {"text":" };\n"}
+
+id: 1794066021616-0
+event: interaction_update
+data: {"type":"text-delta","text":" };\n"}
+
+id: 1794066021619-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021628-0
+event: assistant
+data: {"text":"```"}
+
+id: 1794066021628-0
+event: interaction_update
+data: {"type":"text-delta","text":"```"}
+
+id: 1794066021630-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021633-0
+event: assistant
+data: {"text":"\n\n"}
+
+id: 1794066021633-0
+event: interaction_update
+data: {"type":"text-delta","text":"\n\n"}
+
+id: 1794066021636-0
+event: assistant
+data: {"text":"There"}
+
+id: 1794066021636-0
+event: interaction_update
+data: {"type":"text-delta","text":"There"}
+
+id: 1794066021639-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021646-0
+event: assistant
+data: {"text":" is"}
+
+id: 1794066021646-0
+event: interaction_update
+data: {"type":"text-delta","text":" is"}
+
+id: 1794066021649-0
+event: assistant
+data: {"text":" no"}
+
+id: 1794066021649-0
+event: interaction_update
+data: {"type":"text-delta","text":" no"}
+
+id: 1794066021658-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021661-0
+event: assistant
+data: {"text":" package"}
+
+id: 1794066021661-0
+event: interaction_update
+data: {"type":"text-delta","text":" package"}
+
+id: 1794066021666-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021668-0
+event: assistant
+data: {"text":" manifest"}
+
+id: 1794066021668-0
+event: interaction_update
+data: {"type":"text-delta","text":" manifest"}
+
+id: 1794066021671-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021674-0
+event: assistant
+data: {"text":","}
+
+id: 1794066021674-0
+event: interaction_update
+data: {"type":"text-delta","text":","}
+
+id: 1794066021678-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021681-0
+event: assistant
+data: {"text":" tests"}
+
+id: 1794066021681-0
+event: interaction_update
+data: {"type":"text-delta","text":" tests"}
+
+id: 1794066021684-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021687-0
+event: assistant
+data: {"text":","}
+
+id: 1794066021687-0
+event: interaction_update
+data: {"type":"text-delta","text":","}
+
+id: 1794066021690-0
+event: assistant
+data: {"text":" build"}
+
+id: 1794066021690-0
+event: interaction_update
+data: {"type":"text-delta","text":" build"}
+
+id: 1794066021693-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021698-0
+event: assistant
+data: {"text":" config"}
+
+id: 1794066021698-0
+event: interaction_update
+data: {"type":"text-delta","text":" config"}
+
+id: 1794066021701-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021703-0
+event: assistant
+data: {"text":","}
+
+id: 1794066021703-0
+event: interaction_update
+data: {"type":"text-delta","text":","}
+
+id: 1794066021706-0
+event: assistant
+data: {"text":" or"}
+
+id: 1794066021706-0
+event: interaction_update
+data: {"type":"text-delta","text":" or"}
+
+id: 1794066021709-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021718-0
+event: assistant
+data: {"text":" other"}
+
+id: 1794066021718-0
+event: interaction_update
+data: {"type":"text-delta","text":" other"}
+
+id: 1794066021721-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021724-0
+event: assistant
+data: {"text":" application"}
+
+id: 1794066021724-0
+event: interaction_update
+data: {"type":"text-delta","text":" application"}
+
+id: 1794066021726-0
+event: interaction_update
+data: {"type":"token-delta","tokens":3}
+
+id: 1794066021736-0
+event: assistant
+data: {"text":" code"}
+
+id: 1794066021736-0
+event: interaction_update
+data: {"type":"text-delta","text":" code"}
+
+id: 1794066021739-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021742-0
+event: assistant
+data: {"text":"."}
+
+id: 1794066021742-0
+event: interaction_update
+data: {"type":"text-delta","text":"."}
+
+id: 1794066021745-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021748-0
+event: assistant
+data: {"text":" The"}
+
+id: 1794066021748-0
+event: interaction_update
+data: {"type":"text-delta","text":" The"}
+
+id: 1794066021751-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021758-0
+event: assistant
+data: {"text":" working"}
+
+id: 1794066021758-0
+event: interaction_update
+data: {"type":"text-delta","text":" working"}
+
+id: 1794066021761-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1794066021768-0
+event: assistant
+data: {"text":" tree"}
+
+id: 1794066021768-0
+event: interaction_update
+data: {"type":"text-delta","text":" tree"}
+
+id: 1794066021771-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021778-0
+event: assistant
+data: {"text":" is"}
+
+id: 1794066021778-0
+event: interaction_update
+data: {"type":"text-delta","text":" is"}
+
+id: 1794066021781-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021784-0
+event: assistant
+data: {"text":" clean"}
+
+id: 1794066021784-0
+event: interaction_update
+data: {"type":"text-delta","text":" clean"}
+
+id: 1794066021789-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1794066021793-0
+event: assistant
+data: {"text":"."}
+
+id: 1794066021793-0
+event: interaction_update
+data: {"type":"text-delta","text":"."}
+
+id: 1794066021940-0
+event: interaction_update
+data: {"type":"turn-ended"}
+
+id: 1794066021943-0
+event: interaction_update
+data: {"type":"step-completed","stepId":0,"stepDurationMs":7896}
+
+event: status
+data: {"runId":"run-00000000-0000-0000-0000-000000000001","status":"FINISHED"}
+
+id: 1794066023098-0
+event: result
+data: {"runId":"run-00000000-0000-0000-0000-000000000001","status":"FINISHED","text":"**sample-repo** is a tiny throwaway repository at `sample-org/sample-repo`, created today to test Cursor cloud agents from Codewomplers Grok Desktop.\n\nIt sits on `main`, in sync with `origin/main`, and has two commits from today:\n\n1. **Initial commit** (`f000002`) — adds `README.md`, which says the repo is a throwaway for testing Cursor cloud agents.\n2. **Add greet.js** (`f000001`, Avery example) — adds a five-line CommonJS module.\n\n`greet.js` exports one function:\n\n```1:5:greet.js\nfunction greet(name) {\n\treturn `Hello, ${name}`;\n}\n\nmodule.exports = { greet };\n```\n\nThere is no package manifest, tests, build config, or other application code. The working tree is clean.","durationMs":27936,"git":{"branches":[{"repoUrl":"https://github.com/sample-org/sample-repo"}]}}
+
+id: 1794066023098-0
+event: done
+data: {}
+

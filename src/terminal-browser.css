@@ -1,7 +1,5 @@
 /* Terminal pane (tp-) and Browser pane (bp-). Load after styles.css. */
 
-.tp-pane .pane-x,
-.bp-pane .pane-x,
 .tp-new,
 .bp-new,
 .bp-icon,
@@ -14,8 +12,6 @@
 	padding: 2px 7px;
 	line-height: 1.4;
 }
-.tp-pane .pane-x:hover,
-.bp-pane .pane-x:hover,
 .tp-new:hover,
 .bp-new:hover,
 .bp-icon:hover:not(:disabled),
@@ -102,7 +98,7 @@
 	background: var(--code);
 	color: var(--code-text);
 	font-family: Consolas, "Cascadia Mono", ui-monospace, Menlo, monospace;
-	font-size: 12.5px;
+	font-size: 13px;
 	line-height: 1.45;
 	white-space: pre-wrap;
 	overflow-wrap: anywhere;
@@ -121,12 +117,12 @@
 	padding: 7px 10px;
 	color: var(--text);
 	font-family: Consolas, "Cascadia Mono", ui-monospace, Menlo, monospace;
-	font-size: 12.5px;
+	font-size: 13px;
+	line-height: 1.45;
 }
 .tp-row input:disabled { color: var(--faint); }
 
 /* Browser header menus */
-.bp-menus { display: flex; align-items: center; gap: 4px; }
 .bp-menu-wrap { position: relative; }
 .bp-btn {
 	display: flex;
@@ -154,6 +150,8 @@
 	box-shadow: var(--shadow);
 	color: var(--text);
 }
+.bp-server-menu { left: 0; right: auto; }
+.bp-menu hr { width: 100%; border: 0; border-top: 1px solid var(--line); }
 .bp-item {
 	display: flex;
 	align-items: center;
@@ -167,7 +165,9 @@
 	cursor: pointer;
 }
 .bp-item:hover:not(:disabled) { background: var(--hover); }
-.bp-item:disabled { color: var(--faint); cursor: default; }
+.bp-item:has(input:checked) { font-weight: 650; }
+.bp-item:has(input:focus-visible) { background: var(--hover); }
+.bp-item:disabled { color: var(--muted); cursor: default; }
 .bp-empty { margin: 4px 8px; color: var(--muted); }
 .bp-server {
 	display: flex;
@@ -236,11 +236,11 @@
 	font-size: 11px;
 }
 .bp-problems-btn:hover, .bp-problems-btn[aria-expanded="true"] { background: var(--hover); color: var(--text); }
-.bp-problem-count { border-radius: 10px; padding: 0 5px; background: var(--red); color: white; }
+.bp-problem-count { border-radius: 10px; padding: 0 5px; background: var(--red); color: var(--bg); }
 .bp-problems { flex: 0 1 auto; max-height: 45%; overflow: auto; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 12px; }
 .bp-problems-hd { display: flex; align-items: center; gap: 6px; }
 .bp-problems ul { padding-left: 18px; margin: 6px 0 0; }
-.bp-problems li { overflow-wrap: anywhere; margin: 4px 0; }
+.bp-problems li { overflow-wrap: anywhere; margin: 4px 0; font-size: 13px; line-height: 20px; }
 .bp-control { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--panel-2); border-bottom: 1px solid var(--line); }
 .bp-control > div { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .bp-control small { display: block; color: var(--muted); font-size: 11px; }

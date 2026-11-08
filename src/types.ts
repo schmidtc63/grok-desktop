@@ -36,8 +36,43 @@ export interface ProjectSeed {
   environment: Environment;
 }
 
+export interface CursorParam { id: string; value: string }
+
+export interface CursorVariant {
+	params: CursorParam[];
+	displayName?: string;
+	isDefault?: boolean;
+	isMaxMode?: boolean;
+}
+
+export interface CursorModel {
+	id: string;
+	displayName: string;
+	parameters?: { id: string; displayName?: string; values: { value: string; displayName?: string }[] }[];
+	variants: CursorVariant[];
+}
+
+export function validMachineName(value: unknown): value is string {
+	return typeof value === "string" && /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9_-])?$/.test(value);
+}
+
+export interface CloudRecord {
+	repoUrl: string;
+	ref: string;
+	model: { id: string; params: CursorParam[] };
+	autoCreatePR: boolean;
+	machine?: string;
+	agentId?: string;
+	runId?: string;
+	turnId?: string;
+	active?: boolean;
+	branch?: string;
+	prUrl?: string;
+}
+
 export interface Session {
   id: string;
+	parentId?: string;
   title: string;
 	titleAuto?: boolean;
   project: string;
@@ -45,6 +80,9 @@ export interface Session {
   branch: string;
   worktree: string;
   environment: Environment;
+	cloud?: CloudRecord;
+	cloudMachineDraft?: string;
+	cloudModelLabel?: string;
   status: SessionStatus;
   detail: string;
   when: string;
@@ -87,6 +125,7 @@ export interface ToolCard {
 	plan?: string;
 	todos?: GrokTodo[];
 	always?: "folder" | "conversation" | "site";
+	noAlways?: boolean;
 	commandPrefix?: string;
 	readsOnly?: boolean;
 }
@@ -101,6 +140,7 @@ export interface ChatMessage {
   id: string;
   role: "user" | "grok";
   text: string;
+	appNote?: string;
 	at?: number;
   thought?: string;
   tools?: ToolCard[];

@@ -53,11 +53,14 @@
 .dp-checks li span:first-child { min-width: 60px; }
 .dp-pass { color: var(--green); }
 .dp-fail { color: var(--red); }
-.dp-run { color: var(--amber); }
+.dp-run { color: var(--warning-text); }
 .dp-wait { color: var(--muted); }
-.dp-skip { color: var(--faint); }
+.dp-skip { color: var(--muted); }
 .dp-stat { flex-shrink: 0; }
 .dp-commit { display: flex; gap: 8px; margin-bottom: 8px; }
+.dp-load { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 8px; color: var(--muted); font-size: 12px; }
+.dp-load > .note { margin: 0; }
+.dp-file-page { position: sticky; top: 0; z-index: 1; background: var(--panel); padding-bottom: 4px; }
 .dp-adds { color: var(--green); }
 .dp-dels { color: var(--red); }
 .dp-hunk {
@@ -90,17 +93,21 @@
 	display: grid;
 	grid-template-columns: 40px 40px 20px minmax(0, 1fr);
 	font-family: Consolas, "Cascadia Mono", ui-monospace, Menlo, monospace;
-	font-size: 12px;
-	line-height: 18px;
+	font-size: 13px;
+	line-height: 20px;
 }
+.dp-hunk .dp-line { grid-template-columns: 40px 40px 20px 16px minmax(0, 1fr); }
+.dp-marker { text-align: center; font-weight: 700; user-select: none; }
 .dp-num {
-	color: var(--faint);
+	color: var(--muted);
 	text-align: right;
 	padding-right: 6px;
 	user-select: none;
 }
 .dp-act { display: flex; align-items: center; justify-content: center; }
 .dp-plus {
+	display: grid;
+	place-items: center;
 	width: 16px;
 	height: 16px;
 	padding: 0;
@@ -108,18 +115,16 @@
 	border-radius: 4px;
 	background: var(--accent);
 	color: var(--accent-ink);
-	font-weight: 700;
-	line-height: 16px;
 	opacity: 0;
 }
 .dp-line:hover .dp-plus, .dp-plus:focus-visible { opacity: 1; }
 .dp-text { white-space: pre-wrap; overflow-wrap: anywhere; padding-right: 8px; }
 .dp-add { background: color-mix(in srgb, var(--green) 12%, transparent); }
-.dp-add .dp-text { color: var(--add-text); }
+.dp-add .dp-text, .dp-add .dp-marker { color: var(--add-text); }
 .dp-del { background: color-mix(in srgb, var(--red) 12%, transparent); }
-.dp-del .dp-text { color: var(--del-text); }
+.dp-del .dp-text, .dp-del .dp-marker { color: var(--del-text); }
 .dp-context .dp-text { color: var(--muted); }
-.dp-note, .dp-compose { margin: 4px 8px 6px 100px; }
+.dp-note, .dp-compose { margin: 4px 8px 6px 116px; }
 .dp-note {
 	display: flex;
 	align-items: flex-start;
@@ -157,6 +162,7 @@
 .dp-viewed-toggle { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
 .dp-viewed { color: var(--green); }
 .dp-progress { margin: 0 0 6px; }
+.dp-include-all { display: flex; align-items: center; gap: 8px; margin: 0 0 6px; color: var(--muted); font-size: 12px; }
 .dp-file { display: flex; align-items: center; gap: 8px; }
 .dp-file .file-row { flex: 1; min-width: 0; }
 .dp-pick { flex: none; width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
@@ -166,6 +172,7 @@
 .dp-side .dp-files { flex: none; max-height: 40%; overflow: auto; }
 .dp-side .dp-body { flex: 1; min-height: 120px; overflow: auto; }
 .dp-side .dp-nav { position: sticky; top: 0; z-index: 1; background: var(--panel); padding-bottom: 6px; margin-bottom: 2px; }
+.dp-side .dp-nav-path { display: none; }
 .pane.dp-review .pane-bd { display: flex; flex-direction: column; overflow: hidden; }
 .pane.dp-review .dp-split { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(200px, 28%) minmax(0, 1fr); gap: 12px; }
 .pane.dp-review .dp-files, .pane.dp-review .dp-body { overflow: auto; min-height: 0; }
@@ -174,7 +181,7 @@
 
 /* Files pane: fp- prefix */
 .pane.fp-expanded { position: fixed; inset: 24px; z-index: 20; box-shadow: var(--shadow); }
-.pane.fp-expanded .fp-list { max-height: 20vh; }
+.pane:is(.fp-expanded, .fp-review) .fp-list { max-height: 20vh; }
 .fp-backdrop { position: fixed; inset: 0; z-index: 19; background: rgba(0, 0, 0, 0.45); }
 .fp-body { display: flex; flex-direction: column; gap: 8px; }
 .fp-body > .note, .fp-body > .meta { margin: 0; }
@@ -184,7 +191,6 @@
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
-.fp-check { color: var(--blue); }
 .fp-conflict {
 	display: flex;
 	align-items: center;

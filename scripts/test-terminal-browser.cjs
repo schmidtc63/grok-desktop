@@ -51,6 +51,9 @@ function load(name, globals = {}) {
 		if (id === "@xterm/xterm") { return globals.xterm || { Terminal: class {} }; }
 		if (id === "@xterm/addon-fit") { return globals.fitAddon || { FitAddon: class {} }; }
 		if (id === "@xterm/xterm/css/xterm.css") { return {}; }
+		if (id === "./Icon") { return load("Icon.tsx", globals); }
+		if (id === "./PaneActions") { return load("PaneActions.tsx", globals); }
+		if (id === "./PopupMenu") { return load("PopupMenu.tsx", globals); }
 		if (id === "./data") {
 			return load("data.ts", globals);
 		}
@@ -144,6 +147,7 @@ function renderTerminal(running = true) {
 	const tree = terminal.TerminalPane({
 		tabs: [{ id: "one", title: "one", cwd: "C:\\one", running: true, output: "" }, { id: "two", title: "two", cwd: "C:\\two", running, output: "" }],
 		activeId: "two",
+		terminalScreenReader: false,
 		onActivate() {},
 		onNew() {},
 		onCloseTab() {},
@@ -355,7 +359,7 @@ function browserHarness() {
 		assert.equal(await newer, null);
 		assert.equal(listeners.size, 0);
 	});
-	await check("native terminal forwards raw input, fits, appends capped output, follows theme and disposes", () => {
+	await check("native terminal forwards raw input, fits, appends output, follows theme and accessibility, and disposes", async () => {
 		const instances = [];
 		const resizes = [];
 		const inputs = [];
@@ -364,6 +368,7 @@ function browserHarness() {
 		const schemeListeners = new Map();
 		let background = "#100f0d";
 		let foreground = "#e7e1d6";
+		let accessibilityListener;
 		class FakeTerminal {
 			constructor(options) { this.options = options; this.writes = []; this.cols = 80; this.rows = 24; instances.push(this); }
 			loadAddon(addon) { addon.term = this; }
@@ -392,30 +397,51 @@ function browserHarness() {
 			ResizeObserver: FakeResizeObserver, MutationObserver: FakeMutationObserver,
 			document: { documentElement: {} },
 			window: {
+				grokCode: {
+					accessibilitySupport: async () => true,
+					onEvent: (listener) => { accessibilityListener = listener; return () => { accessibilityListener = undefined; }; },
+				},
 				getComputedStyle: () => ({ getPropertyValue: (name) => name === "--code" ? background : foreground }),
 				matchMedia: () => ({ addEventListener: (name, callback) => schemeListeners.set(name, callback), removeEventListener: (name, callback) => { if (schemeListeners.get(name) === callback) { schemeListeners.delete(name); } } }),
 			},
 		});
-		const pane = TerminalPane({ tabs: [{ id: "native", title: "Shell", cwd: "C:/project", running: true, backend: "pty", output: "ABCDEF", received: 6 }], activeId: "native", onInput: (...args) => inputs.push(args), onResize: (...args) => resizes.push(args), onActivate() {}, onNew() {}, onCloseTab() {}, onInterrupt() {}, onClose() {} });
-		assert.equal(findNode(pane, (node) => node.type === "form"), null, "native tabs have no line-input form");
-		const native = findNode(pane, (node) => typeof node.type === "function" && node.type.name === "NativeTerminal");
-		assert.ok(native);
-		const props = { ...native.props };
-		const element = { clientWidth: 1000, clientHeight: 600 };
-		const state = { cursor: 0, values: [], effects: [] };
-		const render = () => {
+		const paneProps = { tabs: [{ id: "native", title: "Shell", cwd: "C:/project", running: true, backend: "pty", output: "ABCDEF", received: 6 }], activeId: "native", terminalScreenReader: false, onInput: (...args) => inputs.push(args), onResize: (...args) => resizes.push(args), onActivate() {}, onNew() {}, onCloseTab() {}, onInterrupt() {}, onClose() {} };
+		const renderWithHooks = (state, component, props, element) => {
 			hooks = state;
 			state.cursor = 0;
 			state.effects = [];
 			try {
-				const tree = native.type(props);
-				tree.props.ref.current = element;
+				const tree = component(props);
+				if (element) { tree.props.ref.current = element; }
 				for (const effect of state.effects) { effect(); }
 				return tree;
 			} finally { hooks = undefined; }
 		};
+		const paneState = { values: [] };
+		const renderPane = () => renderWithHooks(paneState, TerminalPane, paneProps);
+		const findNative = (pane) => findNode(pane, (node) => typeof node.type === "function" && node.type.name === "NativeTerminal");
+		const pane = renderPane();
+		assert.equal(findNode(pane, (node) => node.type === "form"), null, "native tabs have no line-input form");
+		assert.equal(findNative(pane), null, "xterm waits for the initial accessibility snapshot");
+		await Promise.resolve();
+		const native = findNative(renderPane());
+		const props = { ...native.props };
+		const element = { clientWidth: 1000, clientHeight: 600 };
+		const state = { values: [] };
+		const render = () => renderWithHooks(state, native.type, props, element);
 		render();
 		const term = instances[0];
+		assert.equal(term.options.fontSize, 13);
+		assert.equal(term.options.lineHeight, 1.45);
+		assert.equal(term.options.screenReaderMode, true, "system detection enables support at construction");
+		accessibilityListener({ type: "accessibility-support-changed", active: false });
+		props.screenReaderMode = findNative(renderPane()).props.screenReaderMode;
+		render();
+		assert.equal(term.options.screenReaderMode, false, "the system can turn off support");
+		paneProps.terminalScreenReader = true;
+		props.screenReaderMode = findNative(renderPane()).props.screenReaderMode;
+		render();
+		assert.equal(term.options.screenReaderMode, true, "the setting enables support without detection");
 		assert.equal(term.options.scrollback, 5000);
 		assert.equal(term.focused, true);
 		assert.deepEqual(resizes, [["native", 100, 30]]);
@@ -427,7 +453,7 @@ function browserHarness() {
 		props.onResize = (...args) => resizes.push(["updated", ...args]);
 		render();
 		render();
-		assert.equal(instances.length, 1, "output and callback changes do not recreate xterm");
+		assert.equal(instances.length, 1, "output, accessibility and callback changes do not recreate xterm");
 		assert.deepEqual(term.writes, ["ABCDEF", "GH"], "received preserves new suffixes when the stored buffer is capped");
 		term.input("x");
 		assert.deepEqual(inputs.at(-1), ["updated", "native", "x"]);
@@ -443,6 +469,8 @@ function browserHarness() {
 		assert.equal(term.options.theme.cursor, foreground);
 		assert.equal(schemeListeners.has("change"), true);
 		for (const value of state.values) { value?.cleanup?.(); }
+		for (const value of paneState.values) { value?.cleanup?.(); }
+		assert.equal(accessibilityListener, undefined);
 		assert.equal(resizeObservers[0].disconnected, true);
 		assert.equal(appearanceObservers[0].disconnected, true);
 		assert.equal(schemeListeners.size, 0);
@@ -468,7 +496,7 @@ function browserHarness() {
 		findNode(banner, (node) => node.type === "button" && node.props.children === "Stop").props.onClick();
 		assert.equal(browser.stops(), 1);
 		tree = browser.render();
-		findNode(tree, (node) => node.props["aria-label"] === "Browser menu").props.onClick();
+		findNode(tree, (node) => node.props["aria-label"] === "Browser menu").props.onClick({ currentTarget: {} });
 		tree = browser.render();
 		findNode(tree, (node) => node.type === "button" && node.props.children === "Let Grok use this browser").props.onClick();
 		assert.equal(browser.resumes(), 1);
@@ -478,6 +506,50 @@ function browserHarness() {
 		browser.unmount();
 		assert.equal(browser.reports.at(-1).visible, false);
 		assert.deepEqual(browser.reports.at(-1).tabs, []);
+	});
+	await check("hiding Browser retains guests, withdraws access and cancels the picker", async () => {
+		const browser = browserHarness();
+		const view = browser.views.get("one");
+		const picks = [];
+		const scripts = [];
+		let resolvePick;
+		view.executeJavaScript = (script) => {
+			scripts.push(script);
+			if (script === PICKER_SCRIPT) { return new Promise((resolve) => { resolvePick = resolve; }); }
+			return Promise.resolve(null);
+		};
+		browser.props.onPicked = (pick) => picks.push(pick);
+		const webviews = () => findNodes(browser.render(), (node) => node.type === "webview").map((node) => node.props.ref);
+		const original = webviews();
+		browser.props.selectTick += 1;
+		browser.render();
+		await Promise.resolve();
+		assert.deepEqual(scripts, [PICKER_SCRIPT]);
+		browser.props.visible = false;
+		assert.deepEqual(webviews(), original, "the same webviews remain mounted while hidden");
+		assert.equal(browser.reports.at(-1).visible, false);
+		assert.deepEqual(browser.reports.at(-1).tabs, []);
+		assert.deepEqual(scripts, [PICKER_SCRIPT, "window.__grokPickerStop?.()"]);
+		view.url = "https://one.test/next";
+		view.emit("did-navigate");
+		assert.equal(browser.props.tabs[0].url, "https://one.test/next", "hidden navigation stays with its guest");
+		assert.equal(browser.reports.at(-1).visible, false);
+		resolvePick({ selector: "#stale", html: "<p>stale</p>", text: "stale" });
+		browser.props.selectTick += 1;
+		browser.render();
+		browser.props.visible = true;
+		assert.deepEqual(webviews(), original);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(picks, [], "a hidden pick cannot append to the prompt later");
+		assert.equal(scripts.length, 2, "a picker request made while hidden cannot replay on show");
+		assert.equal(browser.reports.at(-1).tabs[0].webContentsId, 10);
+		browser.props.reporting = false;
+		browser.props.visible = false;
+		const reports = browser.reports.length;
+		browser.render();
+		view.emit("dom-ready");
+		browser.unmount();
+		assert.equal(browser.reports.length, reports, "a retained background guest cannot replace the window's report");
 	});
 	await check("browser agent Problems contain only the current live origin while the UI keeps earlier history", () => {
 		const browser = browserHarness();

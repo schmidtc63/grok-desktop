@@ -283,17 +283,17 @@ async function main() {
 	large = (await readDiff(root)).files.find((file) => file.path === "large.txt");
 	assert.equal(large.hunks[0].reviewable, false);
 	write("unreadable.txt", "unreadable fixture\n");
-	const originalRead = fs.readFileSync;
+	const originalOpen = fs.openSync;
 	try {
-		fs.readFileSync = (file, options) => {
+		fs.openSync = (file, ...args) => {
 			if (file === path.join(root, "unreadable.txt")) { throw Object.assign(new Error("Injected unreadable file"), { code: "EACCES" }); }
-			return originalRead(file, options);
+			return originalOpen(file, ...args);
 		};
 		const unreadable = (await readDiff(root)).files.find((file) => file.path === "unreadable.txt");
 		assert.equal(unreadable.hunks[0].reviewable, false);
 		assert.match(unreadable.hunks[0].lines[0].text, /could not be read/);
 	} finally {
-		fs.readFileSync = originalRead;
+		fs.openSync = originalOpen;
 	}
 	const conflictRoot = path.join(root, "codex-conflict");
 	fs.mkdirSync(conflictRoot);

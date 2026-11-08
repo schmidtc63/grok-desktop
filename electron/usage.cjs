@@ -1,8 +1,10 @@
 // Context breakdown and recent spend, read from the files Grok keeps for each session under ~/.grok/sessions.
 // ponytail: these are Grok's internal files, not a documented interface; any change there makes both reads fail soft.
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { grokHome } = require("./agent.cjs");
+const { redactDeep, redactKeys } = require("./redact.cjs");
 
 // Measured on a Grok 1.0.70 session: 92k characters of stored context were 25.2k tokens.
 const CHARS_PER_TOKEN = 3.7;
@@ -97,14 +99,14 @@ function recentSpend(now = Date.now(), root = sessionsRoot()) {
 	return { ok: true, usd: ticks / 1e10 };
 }
 
-function readTail(file, limit) {
+function readTail(file, limit, lookbehind = 0) {
 	const handle = fs.openSync(file, "r");
 	try {
 		const size = fs.fstatSync(handle).size;
-		const start = Math.max(0, size - limit);
+		const start = Math.max(0, size - limit - lookbehind);
 		const buffer = Buffer.alloc(size - start);
 		const read = fs.readSync(handle, buffer, 0, buffer.length, start);
-		return { text: buffer.subarray(0, read).toString("utf8"), truncated: start > 0 };
+		return { text: buffer.subarray(0, read).toString("utf8"), truncated: size > limit };
 	} finally {
 		fs.closeSync(handle);
 	}
@@ -115,7 +117,8 @@ function taskOutput(file, root = sessionsRoot()) {
 		const base = fs.realpathSync(root);
 		const real = fs.realpathSync(String(file || ""));
 		if (!real.toLowerCase().startsWith(`${base.toLowerCase()}${path.sep}`) || path.extname(real).toLowerCase() !== ".log") { return { ok: false, error: "That output is not available." }; }
-		return { ok: true, ...readTail(real, outputLimit) };
+		const { text, truncated } = readTail(real, outputLimit, 1024);
+		return { ok: true, text: redactKeys(text).slice(-outputLimit), truncated };
 	} catch {
 		return { ok: false, error: "Grok's output file for that command is gone." };
 	}
@@ -140,7 +143,7 @@ function subagentTranscript(childSessionId, root = sessionsRoot()) {
 			if (!update || (params.sessionId && String(params.sessionId).toLowerCase() !== String(childSessionId).toLowerCase())) { continue; }
 			const text = update.content && typeof update.content.text === "string" ? update.content.text : "";
 			if (update.sessionUpdate === "user_message_chunk") { prompt.text += text; }
-			if (update.sessionUpdate === "agent_thought_chunk") { work.thought = (work.thought + text).slice(0, 20000); }
+			if (update.sessionUpdate === "agent_thought_chunk") { work.thought += text; }
 			if (update.sessionUpdate === "agent_message_chunk" && text) {
 				work.text += text;
 				const previous = work.parts[work.parts.length - 1];
@@ -159,19 +162,20 @@ function subagentTranscript(childSessionId, root = sessionsRoot()) {
 			if (update.kind) { card.kind = String(update.kind); }
 			if (update.title) { card.title = String(update.title); }
 			const meta = update._meta && update._meta["x.ai/tool"];
-			if (meta && typeof meta.label === "string" && meta.label.trim()) { card.label = meta.label.slice(0, 80); }
+			if (meta && typeof meta.label === "string" && meta.label.trim()) { card.label = redactKeys(meta.label).slice(0, 80); }
 			const input = update.rawInput && typeof update.rawInput === "object" ? update.rawInput : {};
-			if (typeof input.description === "string" && input.description.trim()) { card.description = input.description.slice(0, 300); }
-			if (typeof input.command === "string" && input.command.trim()) { card.command = input.command.slice(0, 4000); }
+			if (typeof input.description === "string" && input.description.trim()) { card.description = redactKeys(input.description).slice(0, 300); }
+			if (typeof input.command === "string" && input.command.trim()) { card.command = redactKeys(input.command).slice(0, 4000); }
 			const location = Array.isArray(update.locations) && update.locations[0] && update.locations[0].path;
 			const target = location || input.target_file || input.file_path || input.target_directory || input.path;
-			if (typeof target === "string" && target.trim()) { card.path = target.slice(0, 1000); }
+			if (typeof target === "string" && target.trim()) { card.path = redactKeys(target).slice(0, 1000); }
 			if (update.status === "completed") { card.detail = "Ran"; } else if (update.status === "failed") { card.detail = "Failed"; }
 			const content = Array.isArray(update.content) ? update.content : [];
 			const output = content.map((part) => part && part.type === "content" && part.content && typeof part.content.text === "string" ? part.content.text : "").filter(Boolean).join("\n");
-			if (output.trim()) { card.output = output.slice(0, 1500); }
+			if (output.trim()) { card.output = redactKeys(output).slice(0, 1500); }
 		}
-		return { ok: true, messages: [prompt, work], truncated: tail.truncated };
+		work.thought = redactKeys(work.thought).slice(0, 20000);
+		return redactDeep({ ok: true, messages: [prompt, work], truncated: tail.truncated });
 	} catch {
 		return { ok: false, error: "Grok's record of this subagent could not be read." };
 	}
@@ -213,7 +217,7 @@ function personText(entry) {
 
 function cliTitle(summary) {
 	const raw = typeof summary.generated_title === "string" && summary.generated_title.trim() ? summary.generated_title : (typeof summary.session_summary === "string" ? summary.session_summary : "");
-	return raw.replace(/[\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 80) || "CLI session";
+	return redactKeys(raw.replace(/[\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim()).slice(0, 80) || "CLI session";
 }
 
 function activeAt(summary, file) {
@@ -246,11 +250,35 @@ function listCliSessions(knownIds = [], root = sessionsRoot()) {
 			if (!fs.existsSync(history)) { continue; }
 			seen.add(id.toLowerCase());
 			const summary = readSummary(folder);
-			sessions.push({ id, title: cliTitle(summary), folder: cwdOf(folder, summary), lastActive: activeAt(summary, history) });
+			sessions.push({ id, title: redactKeys(cliTitle(summary)), folder: cwdOf(folder, summary), lastActive: activeAt(summary, history) });
 		}
 	}
 	sessions.sort((a, b) => b.lastActive - a.lastActive || a.title.localeCompare(b.title));
 	return { ok: true, sessions };
+}
+
+function listCliProjectFolders(root = sessionsRoot(), temporary = os.tmpdir()) {
+	const { sessions = [] } = listCliSessions([], root);
+	const folders = [];
+	const seen = new Set();
+	const temporaryPart = /(?:^|[\\/])(?:tmp|temp)(?:[\\/]|$)/i;
+	let tempRoot = temporary;
+	try { tempRoot = fs.realpathSync(temporary); } catch { /* The configured temp root may not exist. */ }
+	for (const { folder } of sessions) {
+		if (!path.isAbsolute(folder) || temporaryPart.test(folder)) { continue; }
+		try {
+			const real = fs.realpathSync(folder);
+			if (temporaryPart.test(real)) { continue; }
+			const relative = path.relative(tempRoot, real);
+			if (!relative || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))) { continue; }
+			const key = process.platform === "win32" ? real.toLowerCase() : real;
+			if (seen.has(key) || real === path.parse(real).root || !path.relative(os.homedir(), real) || !fs.statSync(real).isDirectory()) { continue; }
+			seen.add(key);
+			folders.push(folder);
+			if (folders.length === 5) { break; }
+		} catch { /* Session folders can have moved since the CLI last opened them. */ }
+	}
+	return folders;
 }
 
 function historyText(file, fileLimit) {
@@ -284,7 +312,7 @@ function openCliSession(agentSessionId, root = sessionsRoot(), limits = {}) {
 		try { entry = JSON.parse(line); } catch { continue; }
 		const role = entry.type === "user" ? "user" : entry.type === "assistant" ? "grok" : "";
 		if (!role) { continue; }
-		let text = role === "user" ? personText(entry) : messageText(entry.content).trim();
+		let text = redactKeys(role === "user" ? personText(entry) : messageText(entry.content).trim());
 		if (!text) { continue; }
 		if (text.length > messageCap) { text = `${text.slice(0, messageCap)}…`; truncated = true; }
 		messages.push({ role, text });
@@ -298,12 +326,12 @@ function openCliSession(agentSessionId, root = sessionsRoot(), limits = {}) {
 	const branch = typeof summary.head_branch === "string" ? summary.head_branch.replace(/[\u0000-\u001f]/g, "").trim().slice(0, 80) : "";
 	const model = typeof summary.current_model_id === "string" && /^[A-Za-z0-9._-]{1,80}$/.test(summary.current_model_id) ? summary.current_model_id : "";
 	const effort = CLI_EFFORTS.has(summary.reasoning_effort) ? summary.reasoning_effort : "";
-	return {
+	return redactDeep({
 		ok: true,
 		truncated,
 		session: { id: String(agentSessionId), title: cliTitle(summary), folder: cwd, branch, model, effort, lastActive: activeAt(summary, path.join(folder, "chat_history.jsonl")) },
 		messages,
-	};
+	});
 }
 
-module.exports = { contextBreakdown, recentSpend, autoCompactPercent, taskOutput, subagentTranscript, listCliSessions, openCliSession };
+module.exports = { contextBreakdown, recentSpend, autoCompactPercent, taskOutput, subagentTranscript, listCliSessions, listCliProjectFolders, openCliSession };

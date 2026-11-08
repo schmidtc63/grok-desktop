@@ -1,6 +1,6 @@
 {
   "name": "grok-code",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "private": true,
   "license": "MIT",
   "description": "Codewomplers Grok Desktop: an unofficial desktop app for the Grok CLI on Windows, macOS and Linux.",
@@ -13,7 +13,7 @@
     "predesktop": "node scripts/update-helper.cjs --busy",
     "desktop": "vite build && node scripts/windows-name.mjs && electron .",
     "typecheck": "tsc --noEmit",
-    "test": "node scripts/test-agent.cjs && node scripts/test-browser-page.cjs && node scripts/test-browser-agent.cjs && node scripts/test-files.cjs && node scripts/test-main.cjs && node scripts/test-renderer.cjs && node scripts/test-sidebar.cjs && node scripts/test-git.cjs && node scripts/test-prwatch.cjs && node scripts/test-terminal.cjs && node scripts/test-diff-files.cjs && node scripts/test-terminal-browser.cjs && node scripts/test-usage.cjs && node scripts/test-customize.cjs && node scripts/test-updates.cjs && node scripts/test-update-helper.cjs && node scripts/test-inbound.cjs && node scripts/test-export.cjs"
+    "test": "node scripts/test-agent.cjs && node scripts/test-browser-page.cjs && node scripts/test-browser-agent.cjs && node scripts/test-files.cjs && node scripts/test-sign-in.cjs && node scripts/test-cloud.cjs && node scripts/test-main.cjs && node scripts/test-renderer.cjs && node scripts/test-sidebar.cjs && node scripts/test-git.cjs && node scripts/test-prwatch.cjs && node scripts/test-terminal.cjs && node scripts/test-diff-files.cjs && node scripts/test-terminal-browser.cjs && node scripts/test-usage.cjs && node scripts/test-customize.cjs && node scripts/test-updates.cjs && node scripts/test-update-helper.cjs && node scripts/test-inbound.cjs && node scripts/test-export.cjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.4",

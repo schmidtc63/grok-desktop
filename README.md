@@ -35,7 +35,7 @@ Save reusable composer text from the **+** menu, insert it at the cursor with **
 - The Grok CLI, signed in. On Windows and macOS the app's setup check installs it. If it is installed somewhere else, set `GROK_PATH` to its full executable path.
 - GitHub CLI (`gh`), optional, for pull-request features. Sign in with `gh auth login` to use them.
 
-An API key can stand in for `grok login`. Set `XAI_API_KEY` in the environment this app starts with: a user environment variable, or the terminal you launch the app from. The setup check says when that key is in use and never shows the key. A saved sign-in still wins while it exists.
+An xAI API key can stand in for `grok login`. Choose **xAI API key** under **Settings > General > Sign-in**. The key is encrypted with the system keyring and never shown. Saving it signs out of Grok first, after asking, because a saved sign-in wins over a key. You can instead set `XAI_API_KEY` in the environment this app starts with: a user environment variable, or the terminal you launch the app from. The setup check says when a key is in use.
 
 Behind a proxy, set `HTTPS_PROXY` or `HTTP_PROXY`, and `NO_PROXY` for hosts that bypass it. A company certificate can be named in `NODE_EXTRA_CA_CERTS`. The app passes these through to Grok. The setup check shows the proxy's scheme, host and port, without a user name or password, and whether the certificate file is there.
 
@@ -166,6 +166,14 @@ sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
 ```
 
 Don't start the app with `--no-sandbox`: its Browser pane loads web pages.
+
+## Cloud sessions
+
+A session can also run through Cursor's Cloud Agents API instead of the Grok CLI. Choose the **Cloud** environment in the New session form. The agent runs on Cursor's computers, on the folder's GitHub repository and branch.
+
+It needs a Cursor plan with cloud agents, the repository connected to Cursor, and a Cursor API key in **Settings > General > Cursor cloud**. The key is encrypted with the system keyring. Cloud sessions use your Cursor credit. They start from what's on GitHub, so uncommitted changes and unpushed commits aren't included. There are no approval cards: the agent works on its own and can push a branch. **Open a pull request** is a per-session switch, off by default.
+
+**My machines** runs a Cloud session on a computer you own. Choose **My machine** under **Run on**. The form shows the commands that clone the repository and start Cursor's worker, and **Settings > General > My machines** has the install and sign-in steps. The agent works with that computer's files, tools and sign-ins and can change anything its user can, so only use computers you trust and give the worker its own clone. It is told to work on a branch of its own and not to push, so its commits stay in that clone.
 
 ## Terminal
 

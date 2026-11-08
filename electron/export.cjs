@@ -4,6 +4,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { grokPath, killTree, OWN_GROUP } = require("./agent.cjs");
+const { redactKeys } = require("./redact.cjs");
 
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const TIMEOUT = 120000;
@@ -26,6 +27,7 @@ function runExport(command, args, cwd, timeout = TIMEOUT, maxBytes = MAX_BYTES) 
 		let size = 0;
 		let truncated = false;
 		let err = "";
+		let errStartsMidLine = false;
 		let timer;
 		const chunks = [];
 		let child;
@@ -33,6 +35,11 @@ function runExport(command, args, cwd, timeout = TIMEOUT, maxBytes = MAX_BYTES) 
 			if (settled) { return; }
 			settled = true;
 			clearTimeout(timer);
+			if (errStartsMidLine) {
+				// The truncated first line might start inside a key, past the prefix redaction needs.
+				const nextLine = err.indexOf("\n");
+				err = nextLine === -1 ? "" : err.slice(nextLine + 1);
+			}
 			resolve({ code: -1, out: Buffer.concat(chunks).toString("utf8"), err, truncated, timedOut: false, missing: false, ...extra });
 		};
 		try {
@@ -56,7 +63,14 @@ function runExport(command, args, cwd, timeout = TIMEOUT, maxBytes = MAX_BYTES) 
 			}
 			chunks.push(buf);
 		});
-		child.stderr.on("data", (buf) => { err = `${err}${buf.toString("utf8")}`.slice(-4000); });
+		child.stderr.on("data", (buf) => {
+			err += buf.toString("utf8");
+			if (err.length > 4000) {
+				const first = err.length - 4000;
+				errStartsMidLine = err[first - 1] !== "\n";
+				err = err.slice(first);
+			}
+		});
 		child.on("close", (code) => finish({ code: code === null ? -1 : code, truncated }));
 	});
 }
@@ -74,10 +88,10 @@ async function exportMarkdown({ sessionId, file, run = runExport, command = grok
 	if (result.truncated) { return { ok: false, error: "That transcript is too large to export." }; }
 	if (result.code !== 0) {
 		const reason = lastLine(result.err) || lastLine(result.out) || "Grok could not export this session.";
-		return { ok: false, error: reason.replace(/^error:\s*/i, "").slice(0, 300) };
+		return { ok: false, error: redactKeys(reason.replace(/^error:\s*/i, "")).slice(0, 300) };
 	}
 	try {
-		await fs.promises.writeFile(file, result.out);
+		await fs.promises.writeFile(file, redactKeys(result.out));
 	} catch (error) {
 		return { ok: false, error: (error && error.message ? error.message : "That file could not be saved.").slice(0, 300) };
 	}

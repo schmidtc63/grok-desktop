@@ -188,6 +188,14 @@ assert.equal(dumped.includes(password), false, "a proxy password never reaches t
 assert.equal(dumped.includes("proxyuser"), false);
 assert.equal(dumped.includes(apiKey), false, "the API key value never reaches the setup result");
 assert.equal(dumped.includes("SECRET"), false);
+const signIn = readinessOf({ ...ready, signInMode: "key", grok: {
+	...ready.grok, signIn: "none", signedIn: false, apiKey: true, keySource: "app",
+	keyIgnored: true, keyUnreadable: true, keyRejected: true, key: apiKey,
+} }).grok;
+assert.deepEqual(signIn, {
+	ok: true, version: ready.grok.version, signedIn: false, signIn: "none", apiKey: true,
+	signInMode: "key", keySource: "app", keyIgnored: true, keyUnreadable: true, keyRejected: true,
+});
 console.log("PASS readiness network: proxy credentials stripped, blank API key dropped, certificate path only");
 
 async function checkReadinessCalls() {
@@ -201,8 +209,9 @@ async function checkReadinessCalls() {
 			require: (name) => {
 				if (name === "os") { return { homedir: () => home }; }
 				if (name === "./agent.cjs") {
-					return { grokPath: () => grokFile, folderProblem: (folder) => folder === "C:/project" ? "" : "Invalid folder", probeGrok: async () => { calls.push(["probe"]); return grok; } };
+					return { grokPath: () => grokFile, folderProblem: (folder) => folder === "C:/project" ? "" : "Invalid folder", probeGrok: async () => { calls.push(["probe"]); return grok; }, signInStatus: () => ({ mode: "grok" }) };
 				}
+				if (name === "./redact.cjs") { return require("../electron/redact.cjs"); }
 				if (name === "./git.cjs") {
 					return { run: async (command, args, cwd, timeout, maxBytes) => {
 						calls.push([command, [...args], cwd, timeout, maxBytes]);
@@ -270,6 +279,7 @@ async function checkSkillExcerpts() {
 		module: loaded, Buffer, URL, process: { platform: "win32", env: {} },
 		require(name) {
 			if (name === "./agent.cjs") { return { folderProblem: (value) => value === cwd ? "" : "Invalid folder", grokPath: () => "fake-grok" }; }
+			if (name === "./redact.cjs") { return require("../electron/redact.cjs"); }
 			if (name === "./git.cjs") {
 				return { run: async (command, args, folderArg, timeout, maxBytes) => {
 					calls.push([command, [...args], folderArg, timeout, maxBytes]);
@@ -288,6 +298,11 @@ async function checkSkillExcerpts() {
 			return require(name);
 		},
 	});
+	const skillsOnly = await loaded.exports.inventory(cwd, true);
+	assert.equal(skillsOnly.ok, true);
+	assert.equal(skillsOnly.skills[0].command, "/one");
+	assert.equal(calls.length, 1, "slash grouping inspects skills without loading connectors or plugins");
+	assert.deepEqual(calls.pop(), ["fake-grok", ["inspect", "--json"], cwd, 30000, 8 * 1024 * 1024]);
 	const excerpt = loaded.exports.skillExcerpt;
 	let answer = await excerpt(cwd, skillFile);
 	assert.equal(answer.ok, true);

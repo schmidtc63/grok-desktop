@@ -1,3 +1,7 @@
+function keySignInLabel(grok: GrokReadiness["grok"]): string {
+	return grok.keySource === "app" || (grok.keySource !== "env" && grok.signInMode === "key") ? "API key (saved in this app)" : "API key (XAI_API_KEY)";
+}
+
 export function supportReport(result: GrokReadiness): string {
 	const lines: string[] = [];
 	const { app, grok, config, git, gh } = result;
@@ -9,10 +13,11 @@ export function supportReport(result: GrokReadiness): string {
 		if (grok.ok) {
 			lines.push([`Grok${grok.version ? ` ${grok.version}` : ""}`, grok.update?.channel ? `${grok.update.channel} channel` : "", grok.at ? `runs from ${grok.at.path} (${grok.at.source})` : ""].filter(Boolean).join(", "));
 			if (grok.update) { lines.push(`Grok update: ${!grok.update.checked ? "not checked" : grok.update.available ? `${grok.update.latest ? `${grok.update.latest} ` : ""}available` : "up to date"}`); }
-			if (grok.signIn === "key") { lines.push("Grok sign-in: API key (XAI_API_KEY is set)"); }
-			else if (grok.signIn === "saved") { lines.push(`Grok sign-in: saved sign-in${grok.apiKey === true ? "; an API key is also set" : ""}`); }
+			if (grok.signInMode === "key" || grok.signIn === "key") { lines.push(`Grok sign-in: ${keySignInLabel(grok)}`); }
+			else if (grok.signIn === "saved") { lines.push("Grok sign-in: saved sign-in"); }
 			else if (grok.signIn === "none" || grok.signedIn === false) { lines.push("Grok sign-in: not signed in"); }
 			else if (grok.signedIn === true) { lines.push("Grok sign-in: signed in"); }
+			else if (grok.signInMode === "grok") { lines.push("Grok sign-in: Grok sign-in"); }
 		} else {
 			lines.push(`Grok: not installed${grok.error ? ` (${grok.error})` : ""}`);
 		}
@@ -31,7 +36,11 @@ export function supportReport(result: GrokReadiness): string {
 	return lines.join("\n");
 }
 
-export function Setup({ result, checking, onCheck, onCopy, onClose, onInstallGrok, onInstallGit, onUpdateGrok, installing }: {
+function focusSetupSheet(sheet: HTMLDivElement | null) {
+	sheet?.focus({ preventScroll: true });
+}
+
+export function Setup({ result, checking, onCheck, onCopy, onClose, onInstallGrok, onInstallGit, onUpdateGrok, onOpenSignIn, installing }: {
 	result?: GrokReadiness;
 	checking: boolean;
 	onCheck: () => void;
@@ -40,13 +49,15 @@ export function Setup({ result, checking, onCheck, onCopy, onClose, onInstallGro
 	onInstallGrok: () => void;
 	onInstallGit: () => void;
 	onUpdateGrok: () => void;
+	onOpenSignIn?: () => void;
 	installing: "" | "grok" | "git" | "update";
 }) {
 	// Grok 1.0.77 warns that `hooks` and `privacy` are unrecognized while it still loads them, so the sheet shows only files it can't parse; the report keeps the warnings.
 	const broken = result?.config?.files?.filter((file) => file.broken) ?? [];
+	const keyMode = result?.grok.signInMode === "key";
 	return (
 		<div className="overlay" onClick={onClose}>
-			<div className="sheet setup-sheet" role="dialog" aria-modal="true" aria-label="Set up Grok" onClick={(event) => event.stopPropagation()}>
+			<div ref={focusSetupSheet} tabIndex={-1} className="sheet setup-sheet" role="dialog" aria-modal="true" aria-label="Set up Grok" onClick={(event) => event.stopPropagation()}>
 				<h2>Set up Grok</h2>
 				{checking && <p className="meta" role="status">Checking setup…</p>}
 				{result && (
@@ -72,15 +83,17 @@ export function Setup({ result, checking, onCheck, onCopy, onClose, onInstallGro
 								</>
 							)}
 						</div>
-						{result.grok.ok && (
+						{(result.grok.ok || keyMode) && (
 							<div className="setup-row">
 								<h3>Sign-in</h3>
-								{result.grok.signIn === "key" ? <p className="result">Grok is signed in with an API key from XAI_API_KEY. The key is not shown.</p> : result.grok.signedIn ? (
-									<>
-										<p className="result">Grok is signed in{result.grok.signIn === "saved" ? " with a saved sign-in" : ""}.</p>
-										{result.grok.apiKey === true && <p className="note">XAI_API_KEY is also set. Grok uses the saved sign-in while it exists.</p>}
-									</>
-								) : (
+								{result.grok.signIn === "key" && <p className="result">{keySignInLabel(result.grok)}</p>}
+								{result.grok.signIn !== "key" && result.grok.signedIn && <p className="result">Grok is signed in{result.grok.signIn === "saved" ? " with a saved sign-in" : ""}.</p>}
+								{result.grok.keyIgnored && <p className="note">The API key isn't used while a Grok sign-in is saved.</p>}
+								{result.grok.keyUnreadable && <p className="note">The saved API key can't be read. Enter it again in Settings.</p>}
+								{result.grok.keyRejected && <p className="note">Grok rejected the API key, or couldn't reach xAI to check it.</p>}
+								{!keyMode && result.grok.signIn === "saved" && result.grok.apiKey === true && <p className="note">XAI_API_KEY is also set. Grok uses the saved sign-in while it exists.</p>}
+								{keyMode && onOpenSignIn && (!result.grok.signedIn || result.grok.keyIgnored || result.grok.keyUnreadable || result.grok.keyRejected) && <button type="button" onClick={onOpenSignIn}>Open sign-in settings</button>}
+								{!keyMode && result.grok.signIn !== "key" && !result.grok.signedIn && (
 									<>
 										<p className="note">Grok is not signed in.</p>
 										<pre className="tool-code">grok login</pre>

@@ -9,6 +9,7 @@ const imageFile = path.join(root, "test-image.png");
 const handlers = new Map();
 const windows = [];
 const browserCalls = [];
+const changeReads = new Map();
 const browserAgentApi = {
 	server: async () => ({ type: "http", name: "browser_pane", url: "http://127.0.0.1:12345/mcp", headers: [] }),
 	setTabs: (...args) => { browserCalls.push(["tabs", ...args]); return { ok: true }; },
@@ -21,6 +22,70 @@ let host;
 let terminals;
 let written;
 let grokLogouts = 0;
+const signInCalls = [];
+let signInProbe = async () => ({ ok: true, signIn: "none" });
+let signInCheck = { ok: true };
+let signInSave = { ok: true };
+let signInRemove = { ok: true };
+let signInState = { mode: "grok", hasKey: false, keyReadable: false, keyring: true };
+let logoutResult = { ok: true };
+let installedSignIn;
+const signInApi = {
+	check() { signInCalls.push("check"); return signInCheck; },
+	save() { signInCalls.push("save"); return signInSave; },
+	removeKey() { signInCalls.push("remove"); return signInRemove; },
+	status() { return signInState; },
+};
+const signInAgent = {
+	setSignIn(provider) { installedSignIn = provider; },
+	probeGrok() { signInCalls.push("probe"); return signInProbe(); },
+};
+const signInFactory = { createSignIn: () => signInApi, validKey: require("../electron/sign-in.cjs").validKey };
+let cloudHost;
+let cloudKey = "";
+let cloudKeyName = "";
+let cloudModelRequests = 0;
+let cloudRepos = { ok: true, items: [{ url: "https://github.com/sample-org/sample-repo" }] };
+const cloudApi = {
+	CloudHost: class {
+		constructor(emit) { cloudHost = this; this.emit = emit; this.turns = new Map(); this.stopped = []; }
+		turnOf(id) { return this.turns.get(id); }
+		send({ uiSessionId, turnId }) {
+			this.turns.set(uiSessionId, turnId);
+			this.emit({ uiSessionId, turnId, type: "chunk", text: "Cloud reply" });
+			return { ok: true };
+		}
+		resume(input) { return this.send(input); }
+		cancel(id) {
+			const turnId = this.turns.get(id);
+			this.turns.delete(id);
+			this.emit({ uiSessionId: id, turnId, type: "done", stopReason: "cancelled" });
+			return { ok: true };
+		}
+		stop(id) { this.stopped.push(id); this.turns.delete(id); }
+	},
+	createCursorKey: () => ({
+		key: () => cloudKey,
+		status: () => ({ hasKey: !!cloudKey, keyReadable: !!cloudKey, keyring: true, name: cloudKeyName }),
+		save: (key, name) => { cloudKey = key; cloudKeyName = name; return { ok: true }; },
+		remove: () => { cloudKey = ""; cloudKeyName = ""; return { ok: true }; },
+	}),
+	createCursorApi: ({ getKey }) => ({
+		me: async () => getKey() === "test-not-a-key" ? { ok: true, apiKeyName: "Sample key" } : { ok: false, error: "Cursor rejected the key." },
+		repositories: async () => cloudRepos,
+		models: async () => { cloudModelRequests += 1; return { ok: true, items: [{ id: "default" }] }; },
+	}),
+};
+
+async function cloudGit(args) {
+	const output = {
+		"rev-parse --abbrev-ref @{u}": "fork/topic/part\n",
+		"remote get-url -- fork": "ssh://git@github.com/Sample-Org/Sample-Repo.git\n",
+		"rev-list --left-right --count @{u}...HEAD": "3\t2\n",
+		"--no-optional-locks status --porcelain --ignore-submodules=dirty": "?? new-file\n",
+	};
+	return Object.hasOwn(output, args.join(" ")) ? { code: 0, out: output[args.join(" ")] } : { code: 1, out: "" };
+}
 let readinessChecks = 0;
 const readinessCalls = [];
 let grokUpdates = 0;
@@ -110,6 +175,7 @@ class TestHost {
 	steer(id, text) { this.steered.push([id, text]); return { ok: true }; }
 	kill() {}
 	signedOut() { this.signOuts = (this.signOuts || 0) + 1; }
+	signInChanged() { signInCalls.push("changed"); }
 }
 
 class TestTerminals {
@@ -136,6 +202,8 @@ app.dock = { setBadge: (badge) => windowsDockBadges.push(badge) };
 app.commandLine = { switches: [], appendSwitch(...args) { this.switches.push(args); } };
 app.setPath = () => {};
 app.getVersion = () => "0.1.0";
+let accessibilitySupport = false;
+app.isAccessibilitySupportEnabled = () => accessibilitySupport;
 app.isPackaged = false;
 app.setName = () => {};
 app.setAppUserModelId = () => {};
@@ -228,6 +296,7 @@ const mainContext = {
 	process: Object.create(process, { platform: { value: "win32" }, versions: { value: { ...process.versions, electron: "45.0.0" } } }),
 	URL,
 	Buffer,
+	AbortController,
 	require(name) {
 		if (name === "electron") { return electron; }
 		if (name === "fs") {
@@ -265,15 +334,29 @@ const mainContext = {
 				},
 			};
 		}
-		if (name === "./agent.cjs") { return { AgentHost: TestHost, grokHome: () => path.join(root, "no-such-grok") }; }
+		if (name === "./agent.cjs") { return { AgentHost: TestHost, grokHome: () => path.join(root, "no-such-grok"), ...signInAgent }; }
+		if (name === "./sign-in.cjs") { return signInFactory; }
+		if (name === "./cloud.cjs") { return cloudApi; }
+		if (name === "./redact.cjs") { return require("../electron/redact.cjs"); }
 		if (name === "./browser-agent.cjs") { return { createBrowserAgent: () => browserAgentApi }; }
 		if (name === "./loops.cjs") { return require("../electron/loops.cjs"); }
 		if (name === "./updates.cjs") { return updateApi; }
 		if (name === "../scripts/update-helper.cjs") { return helperApi; }
-		if (name === "./git.cjs") { return { useBundledGit() {}, prStatus: (...args) => { written = args; return { ok: true }; }, prCreate: (...args) => { written = args; return { ok: true }; }, commitFiles: (...args) => { written = args; return { ok: true }; }, prMergeWhenReady: (...args) => { written = args; return { ok: true }; }, restoreWorktree: (...args) => { written = args; return { ok: true }; } }; }
+		if (name === "./git.cjs") {
+			return {
+				git: cloudGit,
+				useBundledGit() {},
+				readChanges: (request, signal) => new Promise((finish) => changeReads.set(request.id, { signal, finish })),
+				prStatus: (...args) => { written = args; return { ok: true }; },
+				prCreate: (...args) => { written = args; return { ok: true }; },
+				commitFiles: (...args) => { written = args; return { ok: true }; },
+				prMergeWhenReady: (...args) => { written = args; return { ok: true }; },
+				restoreWorktree: (...args) => { written = args; return { ok: true }; },
+			};
+		}
 		if (name === "./usage.cjs") { return { taskOutput: (...args) => { written = args; return { ok: true, text: "task output" }; }, subagentTranscript: (...args) => { written = args; return { ok: true, messages: [] }; } }; }
-		if (name === "./diff.cjs") { return { revertHunk: (...args) => { written = args; return { ok: true }; } }; }
-		if (name === "./customize.cjs") { return { signOut: async () => { grokLogouts += 1; return { ok: true }; }, readiness: async (...args) => { readinessChecks += 1; readinessCalls.push(args); return { grok: { ok: true, signedIn: true } }; }, updateGrok: async () => { grokUpdates += 1; return { ok: true }; } }; }
+		if (name === "./diff.cjs") { return { localFilterOff: async () => [], revertHunk: (...args) => { written = args; return { ok: true }; } }; }
+		if (name === "./customize.cjs") { return { signOut: async () => { grokLogouts += 1; signInCalls.push("logout"); return logoutResult; }, readiness: async (...args) => { readinessChecks += 1; readinessCalls.push(args); return { grok: { ok: true, signedIn: true } }; }, updateGrok: async () => { grokUpdates += 1; return { ok: true }; } }; }
 		if (name === "./terminal.cjs") { return { TerminalHost: TestTerminals }; }
 		if (name === "./files.cjs") {
 			return { DEFAULT_APP_EXT: require("../electron/files.cjs").DEFAULT_APP_EXT, readImage: (...args) => { written = args; return { ok: true, dataUrl: "data:image/png;base64,AA==" }; }, writeText: (...args) => { written = args; return { ok: true }; }, locateFile: (cwd, file) => file === "missing" ? { ok: false, error: "Missing file." } : { ok: true, target: path.join(cwd, file === "disguised.pdf" ? "tool.exe" : file) } };
@@ -285,6 +368,119 @@ const mainContext = {
 };
 vm.runInNewContext(fs.readFileSync(path.join(root, "electron/main.cjs"), "utf8"), mainContext);
 process.argv = launchArgs;
+
+async function checkSignInIpc(event, running) {
+	assert.equal(installedSignIn, signInApi, "the main process installs its sign-in provider");
+	const save = handlers.get("grok:sign-in-save");
+	const remove = handlers.get("grok:sign-in-remove-key");
+	const logout = handlers.get("grok:sign-out");
+	const status = handlers.get("grok:sign-in-status");
+	const input = { mode: "key" };
+	const confirmed = { signOutConfirmed: true };
+	const assertCalls = (...expected) => assert.deepEqual(signInCalls.splice(0), expected);
+	signInCalls.length = 0;
+	host.turns.set("first", running);
+	assert.match((await save(event, input)).error, /still answering.*save/);
+	assert.match((await remove(event)).error, /still answering.*remove the key/);
+	assertCalls();
+	host.turns.set("first", { ...running, finished: true });
+
+	signInCheck = { ok: false, error: "Invalid choice." };
+	assert.equal((await save(event, input, confirmed)).error, "Invalid choice.");
+	assertCalls("check");
+	signInCheck = { ok: true };
+	signInProbe = async () => ({ ok: false, error: "Probe detail should stay in main." });
+	assert.equal((await save(event, input, confirmed)).error, "Grok couldn't be checked, so nothing was saved. Try again.");
+	assertCalls("check", "probe");
+	signInProbe = async () => ({ ok: true, signIn: "saved" });
+	assert.deepEqual({ ...await save(event, input) }, { ok: false, needsSignOut: true });
+	assertCalls("check", "probe");
+
+	const fakeKey = `xai-${"A".repeat(80)}`;
+	logoutResult = { ok: false, error: `Unable to sign out: ${fakeKey}` };
+	const refused = await save(event, input, confirmed);
+	assert.ok(!JSON.stringify(refused).includes(fakeKey), "failed logout never returns the key");
+	assert.deepEqual({ ...refused }, { ok: false, error: "Unable to sign out: [redacted]" });
+	assertCalls("check", "probe", "logout");
+	logoutResult = { ok: true };
+	signInSave = { ok: false, error: "Profile write failed." };
+	assert.equal((await save(event, input, confirmed)).error, "Profile write failed.");
+	assertCalls("check", "probe", "logout", "save", "changed");
+	signInSave = { ok: true };
+
+	signInState = { mode: "key", hasKey: true, keyReadable: true, keyring: true };
+	assert.deepEqual(status(), signInState);
+	assert.match((await logout()).error, /API-key mode is on/);
+	assertCalls();
+	let finishProbe;
+	signInProbe = () => new Promise((resolve) => { finishProbe = resolve; });
+	const saving = save(event, input);
+	assertCalls("check", "probe");
+	assert.match((await remove(event)).error, /already changing/);
+	assert.match((await save(event, { mode: "grok" })).error, /already changing/);
+	assert.match((await logout()).error, /already changing/);
+	assertCalls();
+	finishProbe({ ok: true, signIn: "key" });
+	assert.equal((await saving).ok, true);
+	assertCalls("save", "changed");
+	signInRemove = { ok: false, error: "Removal failed." };
+	assert.equal((await remove(event)).ok, false);
+	assertCalls("remove");
+	signInRemove = { ok: true };
+	assert.equal((await remove(event)).ok, true);
+	assertCalls("remove", "changed");
+	signInState = { mode: "grok", hasKey: false, keyReadable: false, keyring: true };
+	console.log("PASS sign-in IPC: busy turns, fresh probes, confirmed logout, partial failure invalidation and cross-window exclusion");
+}
+
+async function checkCloudIpc(first, second) {
+	const [status, save, remove, setup, send, resume, cancel] = ["key-status", "key-save", "key-remove", "setup", "send", "resume", "cancel"].map((name) => handlers.get(`grok:cloud-${name}`));
+	assert.ok([status, save, remove, setup, send, resume, cancel].every((handler) => typeof handler === "function"));
+	const originalSends = [first.sender.send, second.sender.send];
+	const sent = [[], []];
+	first.sender.send = (_channel, event) => sent[0].push(event);
+	second.sender.send = (_channel, event) => sent[1].push(event);
+	try {
+		assert.equal((await save(first, "not-accepted")).ok, false);
+		assert.equal(status().hasKey, false);
+		assert.equal((await save(first, "test-not-a-key")).ok, true);
+		assert.deepEqual(status(), { hasKey: true, keyReadable: true, keyring: true, name: "Sample key" });
+		assert.equal(sent[0].at(-1).type, "cloud-key-changed");
+		assert.equal(sent[1].at(-1).type, "cloud-key-changed");
+		const found = await setup(first, root);
+		assert.equal(found.repoUrl, "https://github.com/Sample-Org/Sample-Repo");
+		assert.equal(found.ref, "topic/part");
+		assert.equal(found.upstream, "fork/topic/part");
+		assert.deepEqual([found.behind, found.ahead, found.dirty, found.reachable], [3, 2, true, true]);
+		cloudRepos = { ok: true, items: [] };
+		assert.equal((await setup(first, root)).reachable, false);
+		cloudRepos = { ok: false, error: "Check failed." };
+		const unavailable = await setup(first, root);
+		assert.equal(unavailable.reachable, null);
+		assert.equal(unavailable.error, "Check failed.");
+		assert.equal(cloudModelRequests, 1, "models are cached while repository access is checked again");
+
+		const input = { uiSessionId: "cloud-session", turnId: "cloud-turn" };
+		assert.equal(send(first, input).ok, true);
+		assert.equal(sent[0].at(-1).text, "Cloud reply");
+		assert.equal(sent[1].at(-1).type, "cloud-key-changed", "cloud events only go to the owning window");
+		assert.equal(resume(second, input).ok, false);
+		assert.equal(cancel(second, input.uiSessionId).ok, false);
+		assert.equal((await remove(first)).ok, false, "a live turn keeps its account credentials");
+		assert.equal(resume(first, input).ok, true, "the same webContents can resume");
+		assert.equal(cancel(first, input.uiSessionId).ok, true);
+		assert.equal(sent[0].at(-1).stopReason, "cancelled");
+		assert.equal(cancel(first, input.uiSessionId).ok, false);
+		assert.equal(send(second, input).ok, true);
+		second.sender.emit("destroyed");
+		assert.deepEqual(cloudHost.stopped, [input.uiSessionId]);
+		assert.equal(resume(first, input).ok, true, "an owner can resume after the other window closes");
+		assert.equal(cancel(first, input.uiSessionId).ok, true);
+		assert.equal((await remove(first)).ok, true);
+		assert.equal(status().hasKey, false);
+	} finally { [first.sender.send, second.sender.send] = originalSends; }
+	console.log("PASS cloud IPC: key verification, upstream setup, model cache, owner-only events, resume, cancel and close");
+}
 
 async function main() {
 	assert.equal(process.env.NoDefaultCurrentDirectoryInExePath, "1");
@@ -415,6 +611,17 @@ async function main() {
 	terminals.emit({ type: "terminal-data", id: firstTerminal, data: "private terminal output" });
 	assert.equal(terminalDelivery[0].length, 1);
 	assert.equal(terminalDelivery[1].length, 0, "terminal output stays in its owning window");
+	terminalDelivery[0].length = 0;
+	for (const active of [true, false]) {
+		accessibilitySupport = active;
+		assert.equal(handlers.get("grok:accessibility-support")(), active);
+		app.emit("accessibility-support-changed", {}, active);
+		for (const delivery of terminalDelivery) {
+			const [channel, event] = delivery.shift();
+			assert.equal(channel, "grok:event");
+			assert.deepEqual({ ...event }, { type: "accessibility-support-changed", active });
+		}
+	}
 	[first.sender.send, second.sender.send] = terminalSenders;
 	assert.equal(handlers.get("grok:terminal-open")(first, { cwd: "" }).ok, false);
 	const endedTerminal = handlers.get("grok:terminal-open")(first, { cwd: root }).id;
@@ -451,6 +658,8 @@ async function main() {
 	assert.equal((await handlers.get("grok:sign-out")()).ok, true);
 	assert.equal(grokLogouts, 1);
 	assert.equal(host.signOuts, 1, "a signed-out Grok is stopped so the next message signs in again");
+	await checkSignInIpc(first, running);
+	await checkCloudIpc(first, second);
 	host.turns.set("first", running);
 	assert.equal(handlers.get("grok:steer")(second, "first", "New direction").ok, false, "another window cannot steer the running turn");
 	assert.deepEqual(host.steered, []);
@@ -544,6 +753,8 @@ async function main() {
 	});
 	assert.equal(api.homeDir, require("node:os").homedir(), "the first session's folder comes from this computer, not a fixed path");
 	assert.equal(api.platform, "darwin", "the renderer learns the platform from the preload");
+	api.accessibilitySupport();
+	assert.deepEqual(written, ["grok:accessibility-support"]);
 	api.browserTabs(browserReport);
 	assert.deepEqual(written, ["grok:browser-tabs", browserReport]);
 	api.browserStop("first");
@@ -569,6 +780,22 @@ async function main() {
 	assert.deepEqual(written, ["grok:readiness", setupRequest], "the preload forwards the full setup request");
 	api.updateGrokCli();
 	assert.deepEqual(written, ["grok:update-grok-cli"]);
+	api.signInStatus();
+	assert.deepEqual(written, ["grok:sign-in-status"]);
+	const profileInput = { mode: "key" };
+	const profileOptions = { signOutConfirmed: true };
+	api.saveSignIn(profileInput, profileOptions);
+	assert.deepEqual(written, ["grok:sign-in-save", profileInput, profileOptions]);
+	api.removeSignInKey();
+	assert.deepEqual(written, ["grok:sign-in-remove-key"]);
+	const cloudInput = { uiSessionId: "cloud-session", turnId: "turn" };
+	for (const [method, channel, args] of [
+		["cloudKeyStatus", "key-status", []], ["cloudKeySave", "key-save", ["test-not-a-key"]], ["cloudKeyRemove", "key-remove", []],
+		["cloudSetup", "setup", [root]], ["cloudSend", "send", [cloudInput]], ["cloudResume", "resume", [cloudInput]], ["cloudCancel", "cancel", [cloudInput.uiSessionId]],
+	]) {
+		api[method](...args);
+		assert.ok(written.length === args.length + 1 && written[0] === `grok:cloud-${channel}` && args.every((arg, index) => written[index + 1] === arg), `${method} forwards its arguments`);
+	}
 	api.updateCheck(true);
 	assert.deepEqual(written, ["grok:update-check", true]);
 	api.updatePrepare("v0.2.0");
@@ -642,6 +869,28 @@ async function main() {
 	api.prStatus("folder");
 	assert.deepEqual(written, ["grok:pr-status", "folder", undefined]);
 	console.log("PASS PR status IPC: valid selector forwarding, invalid selector defaults and preload arguments");
+	const changeRequest = { id: "old", cwd: root, scope: "uncommitted", file: "sample.txt", full: true };
+	api.readChanges(changeRequest);
+	assert.deepEqual(written, ["grok:read-changes", changeRequest]);
+	api.stopChanges(changeRequest.id);
+	assert.deepEqual(written, ["grok:stop-changes", "old"]);
+	const readChanges = handlers.get("grok:read-changes");
+	const stopChanges = handlers.get("grok:stop-changes");
+	const changeSender = { sender: new EventEmitter() };
+	const previousRead = readChanges(changeSender, changeRequest);
+	stopChanges({ sender: new EventEmitter() }, "old");
+	assert.equal(changeReads.get("old").signal.aborted, false, "other windows cannot stop a read");
+	const replacementRead = readChanges(changeSender, { ...changeRequest, id: "new" });
+	assert.equal(changeReads.get("old").signal.aborted, true);
+	changeReads.get("old").finish({ ok: false });
+	await previousRead;
+	stopChanges(changeSender, "old");
+	assert.equal(changeReads.get("new").signal.aborted, false, "an old cancellation cannot stop its replacement");
+	stopChanges(changeSender, "new");
+	assert.equal(changeReads.get("new").signal.aborted, true, "a late old completion leaves the replacement stoppable");
+	changeReads.get("new").finish({ ok: false });
+	await replacementRead;
+	console.log("PASS Changes IPC: stop is sender-owned and replacements ignore late completions");
 	api.restoreWorktree("worktree", "grok/topic");
 	assert.deepEqual(written, ["grok:restore-worktree", "worktree", "grok/topic"]);
 	api.stopSession("gone");
@@ -949,7 +1198,10 @@ async function main() {
 		require(name) {
 			if (name === "child_process") { return macChildProcess; }
 			if (name === "electron") { return { ...electron, app: secondCopy, ipcMain: { handle: (name, handler) => macHandlers.set(name, handler), on: () => {} } }; }
-			if (name === "./agent.cjs") { return { AgentHost: TestHost, grokHome: () => path.join(root, "no-such-grok") }; }
+			if (name === "./agent.cjs") { return { AgentHost: TestHost, grokHome: () => path.join(root, "no-such-grok"), ...signInAgent }; }
+			if (name === "./sign-in.cjs") { return signInFactory; }
+			if (name === "./cloud.cjs") { return cloudApi; }
+			if (name === "./redact.cjs") { return require("../electron/redact.cjs"); }
 			if (name === "./browser-agent.cjs") { return { createBrowserAgent: () => browserAgentApi }; }
 			if (name === "./loops.cjs") { return require("../electron/loops.cjs"); }
 			if (name === "./updates.cjs") { return updateApi; }

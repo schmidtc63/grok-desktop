@@ -2,8 +2,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Markdown } from "./Markdown";
 import { modKey } from "./data";
 import { CodeEditorLoader as CodeEditor } from "./CodeEditorLoader";
+import { Icon } from "./Icon";
+import { paneCloseButton, paneExpandButton, paneMenuButton, paneMenuSpot, paneMoveItems, type PaneLayoutControls, type PaneMenuSpot } from "./PaneActions";
+import { PopupMenu } from "./PopupMenu";
 
 export interface FilesPaneProps {
+	layout?: PaneLayoutControls;
 	files: { status: "loading" | "ready" | "error"; error?: string; files: string[]; truncated?: boolean } | undefined;
 	file: string;
 	docKey: string;
@@ -28,7 +32,6 @@ export interface FilesPaneProps {
 	onClose: () => void;
 }
 
-type Spot = { top: number; left: number };
 type ImagePreview = { key: string; dataUrl?: string; bytes?: number; width?: number; height?: number; error?: string };
 
 const AUTO_SAVE_MS = 800;
@@ -50,14 +53,15 @@ export function fromFile(file: string, href: string): string {
 }
 
 export function FilesPane(props: FilesPaneProps) {
-	const { files, file, docKey, fileTypes, onSelectFile, line, lineTick, open, draft, readOnly, autoSave, onAutoSave, onEdit, onSave, onCancel, conflict, onOverride, onDiscard, onClearRecovery, onFileMenu, onLink, onClose } = props;
-	const [menu, setMenu] = useState<Spot | null>(null);
+	const { layout, files, file, docKey, fileTypes, onSelectFile, line, lineTick, open, draft, readOnly, autoSave, onAutoSave, onEdit, onSave, onCancel, conflict, onOverride, onDiscard, onClearRecovery, onFileMenu, onLink, onClose } = props;
+	const [menu, setMenu] = useState<PaneMenuSpot | null>(null);
 	const [filter, setFilter] = useState(``);
 	const [previewChoice, setPreview] = useState<{ key: string; on: boolean } | null>(null);
 	const [image, setImage] = useState<ImagePreview | null>(null);
 	const [openError, setOpenError] = useState<{ key: string; error: string } | null>(null);
 	const [picked, setPicked] = useState<Record<string, string>>({});
-	const [expanded, setExpanded] = useState(false);
+	const [localExpanded, setExpanded] = useState(false);
+	const expanded = layout?.expanded ?? localExpanded;
 	const paneRef = useRef<HTMLElement>(null);
 	const saveRef = useRef(onSave);
 	const target = useRef<{ tick: number; file: string } | null>(null);
@@ -132,7 +136,7 @@ export function FilesPane(props: FilesPaneProps) {
 	}, [raster, cwd, file, imageKey]);
 
 	useEffect(() => {
-		if (expanded) { paneRef.current?.focus(); }
+		if (expanded && !layout) { paneRef.current?.focus(); }
 	}, [expanded]);
 
 	// Flush a pending auto save before the pane loses this file, so the last edits are not dropped with the timer.
@@ -161,18 +165,20 @@ export function FilesPane(props: FilesPaneProps) {
 
 	return (
 		<>
-		{expanded && <div className="fp-backdrop" aria-hidden="true" onClick={() => setExpanded(false)} />}
+		{expanded && !layout && <div className="fp-backdrop" aria-hidden="true" onClick={() => setExpanded(false)} />}
 		<section
 			ref={paneRef}
-			className={expanded ? "pane fp-expanded" : "pane"}
+			className={expanded ? (layout ? "pane fp-review" : "pane fp-expanded") : "pane"}
 			aria-label="Files"
 			tabIndex={expanded ? -1 : undefined}
 			onKeyDown={(event) => {
 				if (event.key === `Escape` && menu) {
+					event.preventDefault();
+					event.stopPropagation();
 					setMenu(null);
 					return;
 				}
-				if (event.key === `Escape` && expanded && !event.defaultPrevented) {
+				if (!layout && event.key === `Escape` && expanded && !event.defaultPrevented) {
 					setExpanded(false);
 					return;
 				}
@@ -187,7 +193,6 @@ export function FilesPane(props: FilesPaneProps) {
 			<div className="pane-hd">
 				<b>Files</b>
 				{file && <span className="fp-name" title={file}>{file}</span>}
-				<span className="spacer" />
 				{autoSave && saving && <span className="meta">Saving…</span>}
 				{previewable && ready && <button className={`texty`} aria-pressed={!preview} onClick={() => setPreview({ key: previewKey, on: !preview })}>{preview ? `Edit` : `Preview`}</button>}
 				{!autoSave && (
@@ -196,22 +201,22 @@ export function FilesPane(props: FilesPaneProps) {
 						<button className="texty" disabled={!dirty || saving} onClick={onCancel}>Cancel</button>
 					</>
 				)}
-				<button className="icon-btn" aria-label={expanded ? `Return Files to the side` : `Pop out Files`} title={expanded ? `Return to the side (Esc)` : `Pop out`} aria-pressed={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? `⤡` : `⤢`}</button>
-				<button className="icon-btn" aria-label="Files menu" aria-haspopup="menu" onClick={(event) => {
-					const rect = event.currentTarget.getBoundingClientRect();
-					setMenu({ top: rect.bottom + 4, left: Math.min(Math.max(8, rect.right - 200), window.innerWidth - 208) });
-				}}>⋮</button>
-				<button className="pane-x" aria-label="Close pane" onClick={() => { flush(); onClose(); }}>×</button>
+				<div className="pane-actions">
+					{paneMenuButton("Files", !!menu, (event) => setMenu(menu ? null : paneMenuSpot(event.currentTarget)))}
+					{paneExpandButton("Files", expanded, layout?.onToggleExpand ?? (() => setExpanded((value) => !value)), layout ? undefined : "Pop out Files")}
+					{paneCloseButton(() => { flush(); onClose(); })}
+				</div>
 			</div>
 			{menu && (
 				<>
-					<button className="menu-back" aria-label="Close menu" onClick={() => setMenu(null)} />
-					<div className="row-pop" role="menu" aria-label="Files menu" style={{ top: menu.top, left: menu.left }}>
-						<button className={autoSave ? `check-row on` : `check-row`} role="menuitemcheckbox" aria-checked={autoSave} onClick={() => { setMenu(null); onAutoSave(!autoSave); }}>
+					<button className="menu-back" aria-label="Close menu" tabIndex={-1} onClick={() => setMenu(null)} />
+					<PopupMenu className="row-pop" aria-label="Files menu" style={{ top: menu.top, left: menu.left }} opener={menu.opener} onDismiss={() => setMenu(null)}>
+						<button role="menuitemcheckbox" aria-checked={autoSave} onClick={() => { setMenu(null); onAutoSave(!autoSave); }}>
+							{autoSave && <Icon name="check" className="menu-check" />}
 							<span>Auto save</span>
-							{autoSave && <span className="fp-check">✓</span>}
 						</button>
-					</div>
+						{layout && <><hr />{paneMoveItems(layout, () => setMenu(null))}</>}
+					</PopupMenu>
 				</>
 			)}
 			<div className="pane-bd fp-body">
