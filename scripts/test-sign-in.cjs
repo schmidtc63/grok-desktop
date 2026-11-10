@@ -49,6 +49,11 @@ try {
 		assert.ok(result.error.includes("Set XAI_API_KEY") && !result.error.includes(fakeKey));
 	}
 	assert.equal(provider("linux").status().keyring, true);
+	let keychainChecks = 0;
+	const mac = provider("darwin", { isEncryptionAvailable: () => { keychainChecks++; return true; } });
+	checkStatus(mac, { mode: "grok", hasKey: false, keyReadable: false, keyring: true });
+	assert.equal(mac.check({ mode: "key", key: fakeKey }).ok, true);
+	assert.equal(keychainChecks + decryptions, 0, "macOS status and validation leave the keychain alone until a secret is saved or read");
 	assert.equal(encryptions, 0);
 	assert.equal(fs.existsSync(file), false, "refusals leave no profile file");
 	assert.equal(signIn.check({ mode: "key", key: fakeKey }).ok, true);

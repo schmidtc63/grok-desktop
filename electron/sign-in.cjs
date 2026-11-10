@@ -9,6 +9,9 @@ function validKey(key) {
 
 // ponytail: use synchronous safeStorage so Grok spawns stay synchronous. Move to async storage when spawn preparation can await it.
 function keyringAvailable(safeStorage, platform) {
+	// macOS always has a keychain, and asking opens it: an ad hoc signed update would then wait behind a keychain password prompt before its window opens.
+	// So only a real save or read of a stored secret touches it.
+	if (platform === "darwin") { return true; }
 	try {
 		if (!safeStorage.isEncryptionAvailable()) { return false; }
 		if (platform !== "linux") { return true; }
