@@ -9,8 +9,10 @@ const files = (folder, relative = "") => fs.readdirSync(path.join(folder, relati
 	const file = path.join(relative, entry.name);
 	return entry.isDirectory() ? files(folder, file) : [file.split(path.sep).join("/")];
 });
+// npm_config_build_from_source makes node-pty's install delete every prebuild (the release workflow's Linux job); the Windows and macOS jobs run these checks.
+const prebuilt = fs.existsSync(path.resolve(__dirname, "../node_modules/node-pty/prebuilds"));
 try {
-	for (const [platform, arch] of [["win32", "x64"], ["darwin", "arm64"], ["darwin", "x64"]]) {
+	for (const [platform, arch] of prebuilt ? [["win32", "x64"], ["darwin", "arm64"], ["darwin", "x64"]] : []) {
 		const app = path.join(root, `${platform}-${arch}`);
 		const target = packageNodePty(app, platform, arch);
 		const copied = files(target);
@@ -30,7 +32,7 @@ try {
 		for (const file of copied) { assert.deepEqual(fs.readFileSync(path.join(target, file)), fs.readFileSync(path.join(installed, file)), file); }
 		assert.throws(() => packageNodePty(app, platform, arch), /already exists/, "an existing package is never overwritten");
 	}
-	console.log("PASS terminal packaging: installed Windows/Mac runtimes keep only matching prebuilds and all helper files");
+	console.log(prebuilt ? "PASS terminal packaging: installed Windows/Mac runtimes keep only matching prebuilds and all helper files" : "SKIP terminal packaging of Windows/Mac runtimes: node-pty was built from source, so it has no prebuilds");
 
 	const source = path.join(root, "linux-source");
 	fs.mkdirSync(source);
