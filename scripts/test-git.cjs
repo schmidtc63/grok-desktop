@@ -7,7 +7,7 @@ const { createRequire } = require("module");
 const { EventEmitter } = require("events");
 const { execFileSync, spawn } = require("child_process");
 const { readDiff, revertHunk, FILTER_NOT_OFF } = require("../electron/diff.cjs");
-const { branchInfo, readScopedDiff, readChanges, listCommits, repoFiles, prStatus, prCreate, commitFiles, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, bundledGitDir } = require("../electron/git.cjs");
+const { branchInfo, readScopedDiff, readChanges, listCommits, repoFiles, prStatus, prCreate, commitFiles, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, gitSecuritySnapshot, bundledGitDir } = require("../electron/git.cjs");
 
 // Never let gh resolve a real GitHub repository from the environment; the temp origin is a local bare repo.
 delete process.env.GH_REPO;
@@ -20,6 +20,8 @@ fs.mkdirSync(tempBase, { recursive: true });
 const root = fs.mkdtempSync(path.join(tempBase, "git-"));
 const origin = path.join(root, "origin.git");
 const repo = path.join(root, "repo");
+const prRepositoryData = { id: "repository-id", nameWithOwner: "owner/repo", url: "https://github.com/owner/repo", defaultBranchRef: { name: "main" } };
+const prRepositoryJson = JSON.stringify(prRepositoryData);
 
 function git(args, cwd = repo) {
 	return execFileSync("git", args, { cwd, windowsHide: true, encoding: "utf8", stdio: "pipe" });
@@ -38,7 +40,7 @@ function paths(snapshot) {
 	return snapshot.files.map((file) => file.path).sort();
 }
 
-function stubGitHub(reply) {
+function stubGitHub(reply, beforeGit) {
 	const calls = [];
 	const file = path.resolve(__dirname, "../electron/git.cjs");
 	const localRequire = createRequire(file);
@@ -48,14 +50,14 @@ function stubGitHub(reply) {
 		require(name) {
 			if (name !== "child_process") { return localRequire(name); }
 			return { spawn(command, args, options) {
-				if (command !== "gh") { return spawn(command, args, options); }
+				if (command !== "gh") { beforeGit?.(args); return spawn(command, args, options); }
 				calls.push(args);
 				const child = new EventEmitter();
 				child.stdout = new EventEmitter();
 				child.stderr = new EventEmitter();
 				child.kill = () => {};
 				process.nextTick(() => {
-					const result = reply(args);
+					const result = reply(args, options);
 					if (result.out) { child.stdout.emit("data", Buffer.from(result.out)); }
 					if (result.err) { child.stderr.emit("data", Buffer.from(result.err)); }
 					child.emit("close", result.code ?? 0);
@@ -254,7 +256,110 @@ async function checkDirectCommits() {
 	const hook = (folder, name, body) => fs.writeFileSync(path.join(folder, ".git", "hooks", name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
 	const head = (folder) => git(["rev-parse", "HEAD"], folder).trim();
 	const changed = (folder) => git(["show", "--pretty=format:", "--name-only", "HEAD"], folder).trim().split(/\r?\n/).sort();
+	const sandboxGit = create("sandbox-git");
+	const sandboxOrigin = path.join(root, "sandbox-origin.git");
+	git(["init", "--quiet", "--bare", sandboxOrigin], root);
+	git(["remote", "add", "origin", sandboxOrigin], sandboxGit);
+	const commitEvents = ["pre-commit", "prepare-commit-msg", "commit-msg", "post-commit", "reference-transaction", "pre-push"];
+	const sandboxMarker = (event, source) => path.join(root, `sandbox-${event}-${source}`).replace(/\\/g, "/");
+	for (const event of [...commitEvents, "post-checkout"]) {
+		hook(sandboxGit, event, `printf ran >> '${sandboxMarker(event, "file")}'`);
+		git(["config", `hook.sandbox-${event}.command`, `printf ran >> '${sandboxMarker(event, "config")}'`], sandboxGit);
+		git(["config", `hook.sandbox-${event}.event`, event], sandboxGit);
+	}
+	let configuredHooks = false;
+	try { configuredHooks = git(["hook", "list", "pre-commit"], sandboxGit).split(/\r?\n/).includes("sandbox-pre-commit"); } catch {}
+	const assertHooks = (events, expected) => {
+		for (const event of events) {
+			assert.equal(fs.existsSync(sandboxMarker(event, "file")), expected, `file ${event}`);
+			assert.equal(fs.existsSync(sandboxMarker(event, "config")), expected && configuredHooks, `config ${event}`);
+			fs.rmSync(sandboxMarker(event, "file"), { force: true });
+			fs.rmSync(sandboxMarker(event, "config"), { force: true });
+		}
+	};
+	for (const hooks of [false, true]) {
+		write("a.txt", `Commit with hooks ${hooks}\n`, sandboxGit);
+		const upstreamChanges = [];
+		const result = await commitFiles(sandboxGit, { paths: ["a.txt"], message: "Local sandbox commit", push: true, hooks, onUpstream: (branch) => upstreamChanges.push(branch) });
+		assert.equal(result.ok, true, JSON.stringify(result));
+		assert.deepEqual(upstreamChanges, hooks ? [] : ["main"], "only the first push establishes the branch's upstream");
+		assert.equal(git(["rev-parse", "refs/heads/main"], sandboxOrigin).trim(), head(sandboxGit));
+		assertHooks(commitEvents, hooks);
+	}
+	git(["switch", "--quiet", "-c", "sandbox-pr"], sandboxGit);
+	assertHooks(["post-checkout", "reference-transaction"], true);
+	const pr = stubGitHub((args) => ({ out: args[0] === "repo" ? prRepositoryJson : "https://example.invalid/pull/1\n" }));
+	const sandboxSubfolder = path.join(sandboxGit, "nested");
+	fs.mkdirSync(sandboxSubfolder);
+	const beforePush = await gitSecuritySnapshot(sandboxGit, true);
+	for (const hooks of [false, true]) {
+		const result = await pr.api.prCreate(sandboxSubfolder, { title: "Local test", hooks });
+		assert.equal(result.ok, true, JSON.stringify(result));
+		assertHooks(["pre-push"], hooks);
+	}
+	const afterPush = await gitSecuritySnapshot(sandboxGit, true);
+	assert.notEqual(afterPush.config, beforePush.config);
+	assert.equal(beforePush.upstream("sandbox-pr").established, false);
+	assert.deepEqual(afterPush.upstream("sandbox-pr"), { config: beforePush.upstream("sandbox-pr").config, established: true });
+	assert.deepEqual((await gitSecuritySnapshot(sandboxSubfolder, true)).upstream("sandbox-pr"), afterPush.upstream("sandbox-pr"), "a subfolder session recognizes the same upstream settings as the repository root");
+	git(["config", "branch.sandbox-pr.pushRemote", "changed"], sandboxGit);
+	assert.notEqual((await gitSecuritySnapshot(sandboxGit, true)).upstream("sandbox-pr").config, afterPush.upstream("sandbox-pr").config);
+	git(["config", "--unset", "branch.sandbox-pr.pushRemote"], sandboxGit);
+	let sandboxTree;
+	for (const hooks of [false, true]) {
+		sandboxTree = await addWorktree(sandboxGit, { name: `hooks-${hooks}`, prefix: "grok", hooks });
+		assert.equal(sandboxTree.ok, true, JSON.stringify(sandboxTree));
+		assertHooks(["post-checkout"], hooks);
+		assert.equal((await removeWorktree(sandboxGit, sandboxTree.folder, { branch: sandboxTree.branch })).ok, true);
+		const restored = await restoreWorktree(sandboxTree.folder, sandboxTree.branch, (_cwd, add) => add(hooks));
+		assert.equal(restored.ok, true, JSON.stringify(restored));
+		assertHooks(["post-checkout"], hooks);
+	}
+	console.log("PASS sandbox Git options: Commit and push, Create PR push, Add worktree and Restore worktree switch file and configured hooks on or off");
+
+	git(["config", "extensions.worktreeConfig", "true"], sandboxGit);
+	git(["config", "--worktree", "core.hooksPath", "custom-hooks"], sandboxTree.folder);
+	const snapshotFolder = path.join(sandboxTree.folder, "nested");
+	const customHooks = path.join(sandboxTree.folder, "custom-hooks");
+	fs.mkdirSync(snapshotFolder);
+	fs.mkdirSync(customHooks);
+	const snapshot = async () => {
+		const result = await gitSecuritySnapshot(snapshotFolder);
+		assert.equal(result.ok, true, JSON.stringify(result));
+		assert.match(result.config, /^[0-9a-f]{64}$/);
+		assert.match(result.hooks, /^[0-9a-f]{64}$/);
+		return result;
+	};
+	let prior = await snapshot();
+	assert.deepEqual(await snapshot(), prior, "an unchanged linked worktree gives the same digests");
+	const assertSnapshotChange = async (field) => {
+		const next = await snapshot();
+		assert.notEqual(next[field], prior[field], `changed ${field}`);
+		assert.equal(next[field === "config" ? "hooks" : "config"], prior[field === "config" ? "hooks" : "config"]);
+		prior = next;
+	};
+	fs.appendFileSync(path.join(sandboxGit, ".git", "config"), "\n# Common configuration changed\n");
+	await assertSnapshotChange("config");
+	git(["config", "--worktree", "review.worktree", "changed"], sandboxTree.folder);
+	await assertSnapshotChange("config");
+	const included = path.join(root, "sandbox-included.gitconfig");
+	git(["config", "--file", included, "review.included", "initial"], sandboxGit);
+	git(["config", "--worktree", "include.path", included], sandboxTree.folder);
+	prior = await snapshot();
+	git(["config", "--file", included, "review.included", "changed"], sandboxGit);
+	await assertSnapshotChange("config");
+	hook(sandboxGit, "pre-commit", "printf changed");
+	await assertSnapshotChange("hooks");
+	write("pre-commit", "#!/bin/sh\nexit 0\n", customHooks);
+	await assertSnapshotChange("hooks");
+	fs.truncateSync(path.join(customHooks, "pre-commit"), 9 * 1024 * 1024);
+	assert.equal((await gitSecuritySnapshot(snapshotFolder)).ok, false, "oversized hooks produce an unavailable snapshot");
+	console.log("PASS sandbox Git snapshots detect common, worktree and included config plus default and configured hooks");
+
 	const partial = create("commit-partial", { "a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n", "staged.txt": "staged\n" });
+	const noChanges = await commitFiles(partial, { paths: ["a.txt"], message: "Nothing changed" });
+	assert.equal(noChanges.ok, false);
+	assert.match(noChanges.error, /^nothing to commit\b/);
 	for (const file of ["a.txt", "b.txt", "c.txt", "staged.txt"]) { write(file, "changed\n", partial); }
 	git(["add", "staged.txt"], partial);
 	const selected = await commitFiles(partial, { paths: ["a.txt", "b.txt"], message: "Selected files\n\nDetails", expected: "main" });
@@ -264,6 +369,30 @@ async function checkDirectCommits() {
 	assert.equal(git(["status", "--porcelain"], partial), " M c.txt\nM  staged.txt\n");
 	assert.match(selected.message, /2 other changed files are not in this commit\.$/);
 	console.log("PASS direct commit: selected working files only, other staged and unstaged changes preserved");
+
+	const conflict = create("commit-conflict", { "sub/a.txt": "base\n", ".gitattributes": "sub/a.txt conflict-marker-size=5\n" });
+	const sub = path.join(conflict, "sub");
+	write("a.txt", "stashed\n", sub);
+	git(["stash", "push", "--quiet"], conflict);
+	write("a.txt", "upstream\n", sub);
+	git(["commit", "-qam", "Upstream"], conflict);
+	assert.throws(() => git(["stash", "pop", "--quiet"], conflict));
+	const conflictHead = head(conflict);
+	const indexConflict = git(["ls-files", "--unmerged"], conflict);
+	assert.ok(indexConflict.includes("sub/a.txt"));
+	assert.match(fs.readFileSync(path.join(sub, "a.txt"), "utf8"), /^<{5} /);
+	const resolveCommit = { paths: ["a.txt"], message: "Resolve conflict" };
+	assert.deepEqual(await commitFiles(sub, resolveCommit), { ok: false, error: "Resolve the conflict markers in a.txt before committing." });
+	assert.equal(head(conflict), conflictHead);
+	assert.equal(git(["ls-files", "--unmerged"], conflict), indexConflict);
+	write("a.txt", "<<<<<\r\nresolved with one leftover marker\r\n", sub);
+	assert.match((await commitFiles(sub, resolveCommit)).error, /Resolve the conflict markers/);
+	write("a.txt", "resolved by hand\n", sub);
+	assert.equal((await commitFiles(sub, resolveCommit)).ok, true);
+	assert.equal(git(["show", "HEAD:sub/a.txt"], conflict), "resolved by hand\n");
+	write("a.txt", "<<<<< Example\nfirst\n=====\nsecond\n>>>>> Example\n", sub);
+	assert.equal((await commitFiles(sub, { ...resolveCommit, message: "Document conflict markers" })).ok, true);
+	console.log("PASS direct commit checks markers on unmerged files, preserves the index when blocked, and allows resolutions and literal examples");
 
 	const renamed = create("commit-rename", { "old.ts": "rename\n", "gone.txt": "gone\n" });
 	git(["mv", "old.ts", "new.ts"], renamed);
@@ -291,6 +420,108 @@ async function checkDirectCommits() {
 	assert.equal(head(recreated), recreatedHead);
 	assert.equal(git(["status", "--porcelain"], recreated), recreatedStatus);
 	console.log("PASS direct commit: untracked additions, renames and deletions; on-disk staged deletions refused without mutation");
+
+	const mode = (folder, file, ref = "HEAD") => git(["ls-tree", ref, "--", file], folder).split(" ")[0];
+	const executable = create("commit-executable", { "sub/add.sh": "add\n", "sub/drop.sh": "drop\n", "other.txt": "other\n" });
+	git(["config", "core.fileMode", "false"], executable);
+	git(["update-index", "--chmod=+x", "sub/drop.sh"], executable);
+	git(["commit", "-qm", "Executable fixture"], executable);
+	write("other.txt", "staged only\n", executable);
+	git(["add", "other.txt"], executable);
+	git(["update-index", "--chmod=+x", "sub/add.sh"], executable);
+	git(["update-index", "--chmod=-x", "sub/drop.sh"], executable);
+	write("mode-identity", "[committer]\n\tname = Active branch committer\n", path.join(executable, ".git"));
+	git(["config", "includeIf.onbranch:main.path", "mode-identity"], executable);
+	hook(executable, "prepare-commit-msg", `printf '\\nPrepared once\\n' >> "$1"`);
+	hook(executable, "post-commit", "git rev-parse HEAD >> .git/mode-heads");
+	const modeRemote = path.join(root, "mode-origin.git");
+	git(["init", "--quiet", "--bare", modeRemote], root);
+	git(["remote", "add", "origin", modeRemote], executable);
+	const execSub = path.join(executable, "sub");
+	const chmod = await commitFiles(execSub, { paths: ["add.sh", "drop.sh"], message: "Keep both executable changes", push: true });
+	assert.equal(chmod.ok, true, JSON.stringify(chmod));
+	assert.equal(mode(executable, "sub/add.sh"), "100755");
+	assert.equal(mode(executable, "sub/drop.sh"), "100644");
+	assert.equal(git(["status", "--porcelain"], executable), "M  other.txt\n");
+	assert.equal(git(["show", "HEAD:other.txt"], executable), "other\n");
+	assert.equal(git(["log", "-1", "--format=%an <%ae>%n%B"], executable).trim(), "GrokCode test <test@example.invalid>\nKeep both executable changes\n\nPrepared once");
+	assert.equal(git(["rev-parse", "refs/heads/main"], modeRemote).trim(), head(executable));
+	const [initialModeCommit, ...extraHookRuns] = fs.readFileSync(path.join(executable, ".git", "mode-heads"), "utf8").trim().split(/\r?\n/);
+	assert.notEqual(initialModeCommit, head(executable), "the commit without the flags was not the one pushed");
+	const identity = "--format=%an <%ae>%n%aI%n%cn <%ce>%n%B";
+	assert.equal(git(["log", "-1", "--format=%cn"], executable).trim(), "Active branch committer");
+	assert.equal(git(["log", "-1", identity], executable), git(["log", "-1", identity, initialModeCommit], executable));
+	assert.deepEqual(extraHookRuns, [], "only the first commit runs the post-commit hook");
+	git(["mv", "sub/add.sh", "sub/renamed script.sh"], executable);
+	write("renamed script.sh", "edited after renaming\n", execSub);
+	const modeRename = await commitFiles(execSub, { paths: ["add.sh", "renamed script.sh"], message: "Rename executable" });
+	assert.equal(modeRename.ok, true, JSON.stringify(modeRename));
+	assert.equal(mode(executable, "sub/renamed script.sh"), "100755");
+	assert.equal(git(["show", "HEAD:sub/renamed script.sh"], executable), "edited after renaming\n");
+	assert.equal(git(["status", "--porcelain"], executable), "M  other.txt\n");
+	git(["mv", "sub/renamed script.sh", "sub/non-executable.sh"], executable);
+	git(["update-index", "--chmod=-x", "sub/non-executable.sh"], executable);
+	const nonExecutable = await commitFiles(execSub, { paths: ["renamed script.sh", "non-executable.sh"], message: "Rename and remove executable mode" });
+	assert.equal(nonExecutable.ok, true, JSON.stringify(nonExecutable));
+	assert.equal(mode(executable, "sub/non-executable.sh"), "100644");
+	assert.equal(git(["status", "--porcelain"], executable), "M  other.txt\n");
+	console.log("PASS direct commit retains both mode flips and renames, preserves unrelated stages and pushes the corrected commit");
+
+	const modeFailure = create("commit-executable-failed");
+	git(["config", "core.fileMode", "false"], modeFailure);
+	git(["remote", "add", "origin", modeRemote], modeFailure);
+	git(["update-index", "--chmod=+x", "a.txt"], modeFailure);
+	hook(modeFailure, "post-commit", "touch .git/refs/heads/main.lock");
+	const pushedMode = git(["rev-parse", "refs/heads/main"], modeRemote);
+	const failedMode = await commitFiles(modeFailure, { paths: ["a.txt"], message: "Keep mode if the index can be written", push: true });
+	assert.equal(failedMode.ok, false);
+	assert.equal(failedMode.committed, true);
+	assert.ok(head(modeFailure).startsWith(failedMode.sha));
+	assert.match(failedMode.error, /staged executable modes could not be included/);
+	assert.equal(mode(modeFailure, "a.txt"), "100644");
+	assert.equal(git(["rev-parse", "refs/heads/main"], modeRemote), pushedMode, "the uncorrected commit was never pushed");
+	const movedMode = create("commit-executable-moved");
+	git(["config", "core.fileMode", "false"], movedMode);
+	git(["remote", "add", "origin", modeRemote], movedMode);
+	git(["update-index", "--chmod=+x", "a.txt"], movedMode);
+	const originalHead = head(movedMode);
+	hook(movedMode, "post-commit", "git rev-parse HEAD > .git/mode-head\ngit reset --soft HEAD^");
+	const movedResult = await commitFiles(movedMode, { paths: ["a.txt"], message: "Leave the moved HEAD alone", push: true });
+	const first = fs.readFileSync(path.join(movedMode, ".git", "mode-head"), "utf8").trim();
+	assert.equal(movedResult.ok, false);
+	assert.equal(movedResult.committed, true);
+	assert.ok(first.startsWith(movedResult.sha));
+	assert.match(movedResult.error, /checkout changed after committing/);
+	assert.equal(head(movedMode), originalHead);
+	assert.equal(mode(movedMode, "a.txt", first), "100644");
+	assert.equal(git(["rev-parse", "refs/heads/main"], modeRemote), pushedMode);
+	console.log("PASS blocked amend and moved HEAD report the commit without the flag and withhold the push");
+	const race = create("commit-executable-race");
+	git(["config", "core.fileMode", "false"], race);
+	git(["remote", "add", "origin", modeRemote], race);
+	git(["update-index", "--chmod=+x", "a.txt"], race);
+	let concurrent;
+	const raced = stubGitHub(() => { throw new Error("GitHub is not part of this commit"); }, (args) => {
+		assert.ok(!args.includes("push"), "a losing correction never starts a push");
+		if (!args.includes("update-ref") || !args.includes("refs/heads/main")) { return; }
+		write("concurrent.txt", "Independently committed content\n", race);
+		git(["add", "concurrent.txt"], race);
+		git(["commit", "-qm", "Concurrent actor commit"], race);
+		concurrent = head(race);
+	});
+	const racedResult = await raced.api.commitFiles(race, Object.assign(Object.create(null), { paths: ["a.txt"], message: "Keep executable mode", push: true }));
+	assert.ok(concurrent, `another commit landed immediately before the ref update: ${JSON.stringify(racedResult)}`);
+	assert.equal(racedResult.ok, false);
+	assert.equal(racedResult.committed, true);
+	assert.match(racedResult.error, /staged executable modes could not be included/);
+	assert.equal(head(race), concurrent);
+	assert.equal(git(["show", "HEAD:concurrent.txt"], race), "Independently committed content\n");
+	assert.equal(git(["status", "--porcelain"], race), "");
+	const original = git(["rev-parse", "HEAD^"], race).trim();
+	assert.ok(original.startsWith(racedResult.sha));
+	assert.equal(mode(race, "a.txt", original), "100644");
+	assert.equal(git(["rev-parse", "refs/heads/main"], modeRemote), pushedMode);
+	console.log("PASS atomic mode correction keeps a concurrent commit and withholds the push");
 
 	const refused = create("commit-hook-refused");
 	write("new.txt", "new\n", refused);
@@ -469,6 +700,11 @@ async function checkHunkReverts() {
 	console.log("PASS hunk revert selection: either of two hunks restores alone and index bytes stay unchanged");
 
 	const crlfBase = base.replace(/\n/g, "\r\n");
+	const endings = create("hunk-line-endings-only", { "sample.txt": base });
+	write("sample.txt", crlfBase, endings);
+	assert.deepEqual(await revertHunk(endings, "sample.txt", (await hunks(endings))[0]), { ok: false, error: "This change cannot be reverted on its own. Use Revert file instead." });
+	assert.equal(fs.readFileSync(path.join(endings, "sample.txt"), "utf8"), crlfBase);
+	console.log("PASS hunk revert reports a no-op for line-ending-only changes");
 	const crlf = create("hunk-crlf", { "sample.txt": crlfBase }, "true");
 	assert.equal(git(["show", ":sample.txt"], crlf).includes("\r"), false, "autocrlf stores LF in the index");
 	write("sample.txt", crlfBase.replace("line 04", "first edit").replace("line 25", "second edit"), crlf);
@@ -575,7 +811,157 @@ async function checkHunkReverts() {
 	console.log("PASS hunk revert eligibility: staged, untracked, binary, truncated and submodule hunks cannot opt themselves in");
 }
 
+async function checkPrHeads() {
+	const folder = path.join(root, "pr-heads");
+	const remoteFolder = path.join(root, "pr-heads-origin's.git");
+	git(["init", "--quiet", "-b", "main", folder], root);
+	git(["init", "--quiet", "--bare", remoteFolder], root);
+	git(["config", "user.name", "GrokCode test"], folder);
+	git(["config", "user.email", "test@example.invalid"], folder);
+	git(["remote", "add", "origin", remoteFolder], folder);
+	git(["remote", "add", "upstream", remoteFolder], folder);
+	git(["remote", "add", "grok-pr-target", remoteFolder], folder);
+	write("data.txt", "base\n", folder);
+	git(["add", "--all"], folder);
+	git(["commit", "--quiet", "--no-gpg-sign", "-m", "Base"], folder);
+	const initial = git(["rev-parse", "HEAD"], folder).trim();
+	write("data.txt", "upstream base\n", folder);
+	git(["commit", "--quiet", "--no-gpg-sign", "-am", "Already upstream"], folder);
+	const remoteBase = git(["rev-parse", "HEAD"], folder).trim();
+	for (const name of ["main", "release"]) { git(["update-ref", `refs/remotes/upstream/${name}`, remoteBase], folder); }
+	git(["switch", "--quiet", "-c", "pinned-feature"], folder);
+	git(["update-ref", "refs/heads/main", initial], folder);
+	write("data.txt", "first\n", folder);
+	git(["add", "--all"], folder);
+	git(["commit", "--quiet", "--no-gpg-sign", "-m", "First subject", "-m", "First body"], folder);
+	git(["tag", "pinned-feature", initial], folder);
+	git(["update-ref", "refs/remotes/origin/main", git(["rev-parse", "HEAD"], folder).trim()], folder);
+	const included = path.join(root, "pr-conditional-config");
+	fs.writeFileSync(included, "[review]\n\tconditional = retained\n");
+	git(["config", `includeIf.gitdir:${path.join(folder, ".git").replace(/\\/g, "/")}.path`, included], folder);
+	const inheritedParameters = process.env.GIT_CONFIG_PARAMETERS;
+	const quotedRemote = `'${remoteFolder.replace(/'/g, "'\\''")}'`;
+	process.env.GIT_CONFIG_PARAMETERS = `${inheritedParameters || ""} 'remote.origin.url'=${quotedRemote} 'remote.upstream.url'=${quotedRemote} 'remote.upstream.gh-resolved'='base' 'review.commandScope'='retained'`.trim();
+	let baseRepository;
+	let headRepository;
+	let fetchRepository;
+	let baseFetch;
+	let pushTarget;
+	const configure = (host, headName, target, fetch = `https://${host}/team/project.git`) => {
+		baseRepository = { id: "base-id", nameWithOwner: "team/project", url: `https://${host}/team/project`, defaultBranchRef: { name: "main" } };
+		headRepository = { ...baseRepository, id: headName === "team/project" ? "base-id" : "fork-id", nameWithOwner: headName, url: `https://${host}/${headName}` };
+		fetchRepository = headRepository.id === baseRepository.id ? baseRepository : { ...baseRepository, id: "fetch-id", nameWithOwner: "fetcher/project", url: `https://${host}/fetcher/project` };
+		baseFetch = fetch;
+		pushTarget = target;
+		git(["config", "test.pr-push", target], folder);
+		git(["config", "test.pr-remotes", `upstream\t${fetch} (fetch)\norigin\t${target} (fetch)`], folder);
+	};
+	const field = (args, name) => args.find((arg) => arg.startsWith(`${name}=`))?.slice(name.length + 1);
+	const metadataReads = [];
+	const client = (createReply) => stubGitHub((args, options) => {
+		if (args[0] === "repo") {
+			if (args.includes("defaultBranchRef")) { return { out: "main\n" }; }
+			let answer = baseRepository;
+			if (options.env.GH_REPO === "") {
+				const listed = execFileSync("git", ["config", "--null", "--get-regexp", "^remote\\..*\\.(url|gh-resolved)$"], { cwd: folder, env: options.env, encoding: "utf8", windowsHide: true });
+				const remotes = new Map();
+				for (const record of listed.split("\0").filter(Boolean)) {
+					const split = record.indexOf("\n");
+					const key = /^remote\.(.*)\.(url|gh-resolved)$/.exec(record.slice(0, split));
+					if (!key) { continue; }
+					const remote = remotes.get(key[1]) || {};
+					const value = record.slice(split + 1);
+					// Git before 2.46 keeps the first URL when later entries are empty.
+					if (key[2] === "url" && value && !remote.url) { remote.url = value; }
+					if (key[2] === "gh-resolved") { remote.resolved = value; }
+					remotes.set(key[1], remote);
+				}
+				const selected = [...remotes].find(([, entry]) => entry.resolved === "base");
+				const target = selected?.[1].url;
+				const nativeRemotes = execFileSync("git", ["remote", "-v"], { cwd: folder, env: options.env, encoding: "utf8", windowsHide: true });
+				metadataReads.push({
+					target,
+					nativeTarget: nativeRemotes.split(/\r?\n/).includes(`${selected?.[0]}\t${target} (fetch)`),
+					conditional: execFileSync("git", ["config", "--get", "review.conditional"], { cwd: folder, env: options.env, encoding: "utf8", windowsHide: true }).trim(),
+					commandScope: execFileSync("git", ["config", "--get", "review.commandScope"], { cwd: folder, env: options.env, encoding: "utf8", windowsHide: true }).trim(),
+				});
+				answer = target === baseFetch ? baseRepository : target === pushTarget ? headRepository : fetchRepository;
+			}
+			return { out: JSON.stringify(answer) };
+		}
+		if (args.includes("--paginate")) { return { out: "" }; }
+		if (createReply !== undefined) { return typeof createReply === "function" ? createReply(args) : createReply; }
+		const selected = args.includes("--head") ? args[args.indexOf("--head") + 1]
+			: `${(field(args, "headRepository") === "fork-id" ? headRepository : fetchRepository).nameWithOwner.split("/")[0]}:${field(args, "branch")}`;
+		return { out: `https://example.invalid/pull/25?head=${selected}\n` };
+	}, (args) => {
+		const at = args.indexOf("remote");
+		if (at < 0) { return; }
+		if (args[at + 1] === "get-url") { args.splice(at, args.length - at, "config", "--get", "test.pr-push"); }
+		if (args[at + 1] === "-v") { args.splice(at, args.length - at, "config", "--get", "test.pr-remotes"); }
+	});
+	configure("github.com", "team/project", remoteFolder);
+	const lateSwitch = client((args) => {
+		git(["switch", "--quiet", "main"], folder);
+		const selected = args.includes("--head") ? args[args.indexOf("--head") + 1] : git(["branch", "--show-current"], folder).trim();
+		return { out: `https://example.invalid/pull/25?head=${selected}\n` };
+	});
+	const lateResult = await lateSwitch.api.prCreate(folder, {});
+	assert.equal(lateResult.ok, true, JSON.stringify(lateResult));
+	assert.equal(lateResult.url, "https://example.invalid/pull/25?head=pinned-feature");
+	const sameArgs = lateSwitch.calls.find((args) => args[0] === "pr");
+	assert.equal(sameArgs[sameArgs.indexOf("--repo") + 1], baseRepository.url);
+	assert.equal(sameArgs[sameArgs.indexOf("--base") + 1], "main");
+	assert.equal(field(sameArgs, "--title"), "First subject");
+	assert.equal(field(sameArgs, "--body"), "First body");
+	git(["switch", "--quiet", "pinned-feature"], folder);
+	console.log("PASS prCreate pinned head: a late checkout switch and matching tag preserve the pushed branch, repository and generated single-commit title/body");
+
+	configure("github.com", "contributor/project", "https://github.com/contributor/project.git");
+	const userFork = client();
+	const forkResult = await userFork.api.prCreate(folder, {});
+	assert.equal(forkResult.ok, true);
+	assert.equal(forkResult.url, "https://example.invalid/pull/25?head=contributor:pinned-feature", "Git 2.39's additive URLs must not substitute the fetch repository for the push destination");
+	const userCreate = userFork.calls.find((args) => args[0] === "pr");
+	assert.equal(userCreate[userCreate.indexOf("--head") + 1], "contributor:pinned-feature", "Git 2.39's additive URL behavior cannot substitute the fetch repository for the push destination");
+	assert.equal(field(userCreate, "--title"), "First subject", "a stale local base cannot add commits already in the remote base");
+	assert.equal(field(userCreate, "--body"), "First body");
+	git(["branch", "-D", "main"], folder);
+	const missingLocalBase = client();
+	assert.equal((await missingLocalBase.api.prCreate(folder, {})).ok, true, "a fork PR uses its remote base when the local base branch is missing");
+	assert.equal(field(missingLocalBase.calls.find((args) => args[0] === "pr"), "--title"), "First subject");
+	write("data.txt", "second\n", folder);
+	git(["add", "--all"], folder);
+	git(["commit", "--quiet", "--no-gpg-sign", "-m", "Second subject", "-m", "Second body"], folder);
+	configure("enterprise.invalid:8443", "contributor/project", "git@enterprise-work:contributor/project.git", "git@enterprise-work:team/project.git");
+	git(["config", "branch.pinned-feature.gh-merge-base", "release"], folder);
+	const enterpriseFork = client();
+	assert.equal((await enterpriseFork.api.prCreate(folder, { draft: true })).ok, true);
+	const enterpriseCreate = enterpriseFork.calls.find((args) => args[0] === "pr");
+	assert.equal(enterpriseCreate[enterpriseCreate.indexOf("--repo") + 1], baseRepository.url);
+	assert.equal(enterpriseCreate[enterpriseCreate.indexOf("--head") + 1], "contributor:pinned-feature");
+	assert.equal(enterpriseCreate[enterpriseCreate.indexOf("--base") + 1], "release");
+	assert.equal(field(enterpriseCreate, "--title"), "pinned feature");
+	assert.equal(field(enterpriseCreate, "--body"), "- **First subject**\n- **Second subject**\n");
+	assert.equal(enterpriseCreate.includes("--draft"), true);
+	const explicit = client();
+	assert.equal((await explicit.api.prCreate(folder, { title: "Chosen title", body: "Chosen body", draft: true })).ok, true);
+	const explicitCreate = explicit.calls.find((args) => args[0] === "pr");
+	assert.equal(field(explicitCreate, "--title"), "Chosen title");
+	assert.equal(field(explicitCreate, "--body"), "Chosen body");
+	assert.equal(explicitCreate.includes("--draft"), true);
+	const duplicate = client({ code: 1, err: "A pull request already exists: https://example.invalid/pull/24\n" });
+	assert.equal((await duplicate.api.prCreate(folder, { title: "Chosen" })).url, "https://example.invalid/pull/24");
+	const emptyUrl = client({ out: "null\n" });
+	assert.equal((await emptyUrl.api.prCreate(folder, { title: "Chosen" })).ok, false);
+	assert.equal(metadataReads.every((entry) => entry.conditional === "retained" && entry.commandScope === "retained"), true, "native repository lookup preserves conditional and inherited Git configuration");
+	assert.equal(metadataReads.every((entry) => entry.nativeTarget), true, "gh's native remote listing includes the marked target alongside the original remotes");
+	if (inheritedParameters === undefined) { delete process.env.GIT_CONFIG_PARAMETERS; } else { process.env.GIT_CONFIG_PARAMETERS = inheritedParameters; }
+	console.log("PASS prCreate forks: Git 2.39 URL semantics, distinct push/fetch repositories, stale or missing local base, SSH aliases, enterprise hosts, title/body, draft and URL results");
+}
+
 async function main() {
+	await checkPrHeads();
 	await checkHunkReverts();
 	await checkDirectCommits();
 	checkBundledGitDir();
@@ -603,6 +989,10 @@ async function main() {
 	assert.deepEqual(info, { ok: true, repo: true, branch: "feature", base: "main", ahead: 1, behind: 0, upstream: null });
 	assert.deepEqual(await branchInfo(origin), { ok: true, repo: false });
 	console.log("PASS branchInfo: feature branch, origin/HEAD base main, ahead 1; a folder with no work tree reports repo:false");
+	git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/missing"]);
+	assert.deepEqual(await branchInfo(repo), info, "a missing origin/HEAD target falls back to local main");
+	assert.deepEqual(paths(await readScopedDiff(repo, "branch")), ["feature.txt", "keep.txt", "untracked.txt"]);
+	git(["remote", "set-head", "origin", "main"]);
 
 	const uncommitted = await readScopedDiff(repo, "uncommitted");
 	assert.equal(uncommitted.ok, true);
@@ -670,6 +1060,50 @@ async function main() {
 	assert.ok(!git(["status", "--porcelain"]).includes(".grok"));
 	console.log("PASS addWorktree: folder and branch created; info/exclude line written once; .gitignore untouched");
 
+	const infoDir = path.join(repo, ".git", "info");
+	const savedInfo = `${infoDir}-saved`;
+	const outsideInfo = path.join(root, "outside-info");
+	const rejectedExclude = { ok: false, error: "Git info/exclude must be a regular file inside the repository's Git folder." };
+	const excludeTest = { name: "unsafe-exclude", prefix: "grok" };
+	fs.mkdirSync(outsideInfo);
+	write("exclude", "# outside the Git folder\n", outsideInfo);
+	fs.renameSync(infoDir, savedInfo);
+	fs.symlinkSync(outsideInfo, infoDir, process.platform === "win32" ? "junction" : "dir");
+	assert.deepEqual(await addWorktree(repo, excludeTest), rejectedExclude);
+	assert.equal(fs.readFileSync(path.join(outsideInfo, "exclude"), "utf8"), "# outside the Git folder\n");
+	fs.unlinkSync(infoDir);
+	fs.renameSync(savedInfo, infoDir);
+	console.log("PASS addWorktree: refuses an info directory that resolves outside the Git folder");
+
+	const excludePath = path.join(infoDir, "exclude");
+	const savedExclude = `${excludePath}-saved`;
+	fs.renameSync(excludePath, savedExclude);
+	let symlinkCreated = false;
+	try {
+		fs.symlinkSync(savedExclude, excludePath, "file");
+		symlinkCreated = true;
+	} catch (error) {
+		if (process.platform !== "win32" || error.code !== "EPERM") { throw error; }
+		console.log("SKIP addWorktree: file symlink creation requires Windows developer mode or elevation");
+	}
+	if (symlinkCreated) {
+		assert.deepEqual(await addWorktree(repo, excludeTest), rejectedExclude);
+		fs.unlinkSync(excludePath);
+		console.log("PASS addWorktree: refuses an exclude symlink even inside the Git folder");
+	}
+	fs.renameSync(savedExclude, excludePath);
+
+	const hardlinkTarget = path.join(outsideInfo, "hardlink-target");
+	fs.writeFileSync(hardlinkTarget, "# shared file outside the Git folder\n");
+	fs.renameSync(excludePath, savedExclude);
+	fs.linkSync(hardlinkTarget, excludePath);
+	assert.equal(fs.statSync(excludePath).nlink, 2);
+	assert.deepEqual(await addWorktree(repo, excludeTest), { ok: false, error: "Git info/exclude has more than one link and cannot be updated safely." });
+	assert.equal(fs.readFileSync(hardlinkTarget, "utf8"), "# shared file outside the Git folder\n");
+	fs.unlinkSync(excludePath);
+	fs.renameSync(savedExclude, excludePath);
+	console.log("PASS addWorktree: refuses a hardlinked exclude without modifying the shared file");
+
 	for (const bad of [{ name: "bad name", prefix: "grok" }, { name: "-x", prefix: "grok" }, { name: "ok", prefix: "a/b" }, { name: "x".repeat(41), prefix: "grok" }, { prefix: "grok" }, null]) {
 		const rejected = await addWorktree(repo, bad);
 		assert.equal(rejected.ok, false, JSON.stringify(bad));
@@ -686,13 +1120,29 @@ async function main() {
 	assert.deepEqual(await removeWorktree(one.folder, one.folder), { ok: false, dirty: true, error: "This worktree has uncommitted changes." }, "a worktree session can start from its own folder");
 	assert.deepEqual(await removeWorktree(one.folder, one.folder, { force: true }), { ok: true, dirty: true }, "git runs from the main checkout, so the session's own worktree is removed");
 	assert.equal(fs.existsSync(one.folder), false);
-	assert.deepEqual(await removeWorktree(repo, two.folder), { ok: true, dirty: false });
+	assert.deepEqual(await removeWorktree(repo, two.folder), { ok: false, dirty: true, error: "The session branch could not be verified." });
+	assert.deepEqual(await removeWorktree(repo, two.folder, { branch: two.branch, beforeRemove: () => false }), { ok: false, skipped: true });
+	assert.equal(fs.existsSync(two.folder), true, "cancelled automatic removal leaves a clean worktree intact");
+	assert.deepEqual(await removeWorktree(repo, two.folder, { branch: two.branch }), { ok: true, dirty: false });
 	assert.equal(fs.existsSync(two.folder), false);
 	const restored = await restoreWorktree(two.folder, two.branch);
 	assert.equal(restored.ok, true, JSON.stringify(restored));
 	assert.equal(fs.existsSync(two.folder), true);
 	assert.equal(git(["branch", "--show-current"], two.folder).trim(), two.branch);
 	assert.equal((await restoreWorktree(two.folder, two.branch)).ok, true, "an archived worktree left on disk can be reopened");
+	const wrongBranch = { ok: false, dirty: true, error: "This worktree is not on its session branch." };
+	git(["switch", "--quiet", "--detach"], two.folder);
+	git(["commit", "--quiet", "--allow-empty", "--no-gpg-sign", "-m", "Detached work"], two.folder);
+	const detachedHead = git(["rev-parse", "HEAD"], two.folder);
+	assert.deepEqual(await removeWorktree(repo, two.folder, { branch: two.branch }), wrongBranch);
+	assert.equal((await restoreWorktree(two.folder, two.branch)).ok, true);
+	assert.equal(git(["rev-parse", "HEAD"], two.folder), detachedHead, "unarchive reuses the surviving detached HEAD");
+	git(["switch", "--quiet", "-c", "switched-worktree"], two.folder);
+	assert.deepEqual(await removeWorktree(two.folder, two.folder, { branch: two.branch }), wrongBranch);
+	assert.equal((await restoreWorktree(two.folder, two.branch)).ok, true);
+	assert.equal(git(["branch", "--show-current"], two.folder).trim(), "switched-worktree", "unarchive reuses the surviving branch");
+	git(["switch", "--quiet", two.branch], two.folder);
+	console.log("PASS archive and restore preserve clean worktrees on detached HEAD or another branch");
 	assert.ok(path.resolve(two.folder).startsWith(`${path.resolve(root)}${path.sep}`));
 	for (const entry of fs.readdirSync(two.folder)) {
 		fs.rmSync(path.join(two.folder, entry), { recursive: true, force: true });
@@ -705,7 +1155,10 @@ async function main() {
 	assert.equal(recovered.ok, true, JSON.stringify(recovered));
 	assert.equal(fs.existsSync(path.join(two.folder, ".git")), true, "a half-deleted worktree regains its git link");
 	assert.equal((await branchInfo(two.folder)).branch, two.branch, "a restored worktree uses the session branch");
-	assert.equal((await removeWorktree(repo, two.folder)).ok, true);
+	fs.rmSync(two.folder, { recursive: true, force: true });
+	assert.equal((await restoreWorktree(two.folder, two.branch)).ok, true, "a missing folder with a stale registration is restored");
+	assert.equal(git(["branch", "--show-current"], two.folder).trim(), two.branch);
+	assert.equal((await removeWorktree(repo, two.folder, { branch: two.branch })).ok, true);
 	git(["branch", "-D", two.branch]);
 	assert.equal((await restoreWorktree(two.folder, two.branch)).ok, false, "a deleted branch is not replaced with a new one");
 	assert.equal(fs.existsSync(two.folder), false);
@@ -725,7 +1178,7 @@ async function main() {
 	fs.rmSync(path.join(ignoredTree.folder, ".env"));
 	fs.mkdirSync(path.join(ignoredTree.folder, "node_modules"));
 	write("node_modules/cache", "regenerable\n", ignoredTree.folder);
-	assert.deepEqual(await removeWorktree(repo, ignoredTree.folder), { ok: true, dirty: false });
+	assert.deepEqual(await removeWorktree(repo, ignoredTree.folder, { branch: ignoredTree.branch }), { ok: true, dirty: false });
 	console.log("PASS ignored archive files: .env blocks removal and is named; node_modules alone is removed");
 
 	const prAnswer = {
@@ -763,13 +1216,15 @@ async function main() {
 	assert.equal((await staleHead.api.prCreate(repo, { title: "Test", expected: "other" })).error, "The checkout changed to feature. Refresh, then create the pull request again.");
 	assert.equal(git(["ls-remote", "origin", "refs/heads/feature"]).trim(), "", "a stale displayed branch is not pushed");
 	for (const [reply, error] of [
-		[{ out: "feature\n" }, "Switch to a branch before creating a pull request."],
+		[{ out: JSON.stringify({ ...prRepositoryData, defaultBranchRef: { name: "feature" } }) }, "Switch to a branch before creating a pull request."],
 		[{ code: 1, err: "error: repository unavailable\n" }, "repository unavailable"],
-		[{ out: "" }, "GitHub did not say which branch is the default, so nothing was pushed."],
+		[{ code: 4, err: "To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n" }, "To get started with GitHub CLI, please run:  gh auth login"],
+		[{ out: JSON.stringify({ ...prRepositoryData, defaultBranchRef: null }) }, "GitHub did not say which branch is the default, so nothing was pushed."],
+		[{ out: "" }, "GitHub did not return the repository details."],
 	]) {
 		const guarded = stubGitHub(() => reply);
 		assert.equal((await guarded.api.prCreate(repo, { title: "Test" })).error, error);
-		assert.equal(JSON.stringify(guarded.calls), JSON.stringify([["repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"]]));
+		assert.equal(JSON.stringify(guarded.calls), JSON.stringify([["repo", "view", "--json", "id,nameWithOwner,url,defaultBranchRef"]]));
 		assert.equal(git(["ls-remote", "origin", "refs/heads/feature"]).trim(), "", "the default branch check refuses before pushing");
 	}
 	console.log("PASS prCreate: stale displayed heads, the remote default branch, and missing or failed default-branch answers refuse before push");
@@ -777,7 +1232,7 @@ async function main() {
 	const prePushHook = path.join(repo, ".git", "hooks", "pre-push");
 	fs.writeFileSync(prePushHook, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
 	const rejectedPush = stubGitHub((args) => {
-		if (args[0] === "repo") { return { out: "main\n" }; }
+		if (args[0] === "repo") { return { out: prRepositoryJson }; }
 		throw new Error("gh pr create must not run after a rejected push");
 	});
 	assert.equal((await rejectedPush.api.prCreate(repo, { title: "Test" })).ok, false);
@@ -792,7 +1247,7 @@ async function main() {
 	assert.equal(git(["ls-remote", "origin", "refs/heads/feature"]).trim(), "", "prCreate cannot identify a GitHub default branch, so nothing is pushed");
 	console.log("PASS prStatus/prCreate/prMergeWhenReady: clean ok:false against a non-GitHub remote; nothing pushed");
 
-	const createSuccess = stubGitHub((args) => ({ out: args[0] === "repo" ? "main\n" : "https://example.invalid/pull/12\n" }));
+	const createSuccess = stubGitHub((args) => ({ out: args[0] === "repo" ? prRepositoryJson : "https://example.invalid/pull/12\n" }));
 	const created = await createSuccess.api.prCreate(repo, { title: "Test" });
 	assert.equal(created.ok, true);
 	assert.equal(git(["rev-parse", "--verify", "refs/heads/feature"], origin).trim(), featureSha, "prCreate pushed the branch to the local origin");
@@ -800,27 +1255,52 @@ async function main() {
 	assert.equal(fs.existsSync(prePushMarker), true, "Create PR runs the successful pre-push hook");
 	fs.rmSync(prePushHook);
 	console.log("PASS prCreate: pre-push hooks can refuse the push and run on a successful push");
-	const createFailure = stubGitHub((args) => (args[0] === "repo" ? { out: "main\n" } : { code: 1, err: "error: a pull request could not be created\nmore details\n" }));
+
+	git(["switch", "--quiet", "-c", "checked-pr"]);
+	git(["tag", "checked-pr"]);
+	const displayedHead = git(["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+	assert.equal(displayedHead, "heads/checked-pr", "a matching tag causes the renderer's branch name to be qualified");
+	const racedCreate = stubGitHub((args, options) => {
+		if (args[0] !== "repo") { return { out: "https://example.invalid/pull/13\n" }; }
+		if (options.env.GH_REPO !== "") { git(["switch", "--quiet", "-c", "other-pr"]); }
+		return { out: prRepositoryJson };
+	});
+	const racedPr = await racedCreate.api.prCreate(repo, { title: "Test", expected: displayedHead });
+	assert.equal(racedPr.ok, true, JSON.stringify(racedPr));
+	const racedArgs = racedCreate.calls.find((args) => args[0] === "pr");
+	assert.equal(racedArgs[racedArgs.indexOf("--head") + 1], "checked-pr");
+	assert.equal(git(["rev-parse", "--verify", "refs/heads/checked-pr"], origin).trim(), featureSha);
+	assert.equal(git(["ls-remote", "origin", "refs/heads/other-pr"]).trim(), "");
+	git(["switch", "--quiet", "feature"]);
+	console.log("PASS prCreate: a checkout change during the GitHub lookup pushes and opens only the checked branch");
+
+	const createFailure = stubGitHub((args) => (args[0] === "repo" ? { out: prRepositoryJson } : { code: 1, err: "error: a pull request could not be created\nmore details\n" }));
 	const failed = await createFailure.api.prCreate(repo, { title: "Test" });
 	assert.equal(failed.error, "The branch was pushed, but the pull request was not created: a pull request could not be created");
 	git(["remote", "remove", "origin"]);
-	assert.equal((await createSuccess.api.prCreate(repo, { title: "Test" })).error, "'origin' does not appear to be a git repository");
+	const noOrigin = await createSuccess.api.prCreate(repo, { title: "Test" });
+	assert.equal(noOrigin.ok, false);
+	assert.match(noOrigin.error, /origin/);
 	git(["remote", "add", "origin", origin]);
 	console.log("PASS prCreate: uncommitted files are named by count; post-push failure says pushed; push failure shows the fatal line");
 
-	const mergeStub = (allowed, view) => stubGitHub((args) => ({ out: args[0] === "repo" ? JSON.stringify(allowed) : args[1] === "view" ? JSON.stringify(view) : "" }));
+	const mergeStub = (allowed, view, after) => stubGitHub((args) => {
+		if (args.at(-1) === "state,autoMergeRequest") { return after; }
+		return { out: args[0] === "repo" ? JSON.stringify(allowed) : args[1] === "view" ? JSON.stringify(view) : "" };
+	});
 	for (const [allowed, method] of [
 		[{ squashMergeAllowed: true, mergeCommitAllowed: true, rebaseMergeAllowed: true }, "--squash"],
 		[{ squashMergeAllowed: false, mergeCommitAllowed: true, rebaseMergeAllowed: true }, "--merge"],
 		[{ squashMergeAllowed: false, mergeCommitAllowed: false, rebaseMergeAllowed: true }, "--rebase"],
 		[{ squashMergeAllowed: false, mergeCommitAllowed: false, rebaseMergeAllowed: false }, null],
 	]) {
-		const stub = mergeStub(allowed, { state: "OPEN", mergeStateStatus: "BLOCKED" });
+		const stub = mergeStub(allowed, { state: "OPEN", mergeStateStatus: "BLOCKED" }, { out: JSON.stringify({ state: "OPEN", autoMergeRequest: {} }) });
 		const result = await stub.api.prMergeWhenReady(repo, 42);
 		if (method) {
 			assert.equal(result.ok, true);
 			assert.equal(JSON.stringify(stub.calls[1]), JSON.stringify(["pr", "view", "42", "--json", "state,mergeStateStatus"]));
 			assert.equal(JSON.stringify(stub.calls[2]), JSON.stringify(["pr", "merge", "42", "--auto", method]));
+			assert.equal(JSON.stringify(stub.calls[3]), JSON.stringify(["pr", "view", "42", "--json", "state,autoMergeRequest"]));
 			assert.match(result.message, /^Auto-merge is on/, "GitHub waits on BLOCKED, so gh turns on auto-merge");
 		} else {
 			assert.equal(result.error, "This repository allows no merge method the app can use.");
@@ -833,8 +1313,8 @@ async function main() {
 	}
 	console.log("PASS prMergeWhenReady: selects PR 42 and prefers squash, then merge, then rebase; refuses invalid selectors or no methods");
 
-	const mergeWith = async (view) => {
-		const stub = mergeStub({ squashMergeAllowed: true }, view);
+	const mergeWith = async (view, after = { out: '{"state":"MERGED"}' }) => {
+		const stub = mergeStub({ squashMergeAllowed: true }, view, after);
 		const result = await stub.api.prMergeWhenReady(repo, 42);
 		return { result: { ...result }, merges: stub.calls.filter((args) => args[1] === "merge").map((args) => args.join(" ")) };
 	};
@@ -847,10 +1327,13 @@ async function main() {
 	}
 	assert.deepEqual(await mergeWith({ state: "MERGED", mergeStateStatus: "CLEAN" }), { result: { ok: false, error: "This pull request is not open." }, merges: [] });
 	assert.deepEqual(await mergeWith({ state: "OPEN", mergeStateStatus: "HAS_HOOKS" }), { result: { ok: true, message: "Merged." }, merges: ["pr merge 42 --auto --squash"] });
+	for (const after of [{ out: '{"state":"OPEN","autoMergeRequest":null}' }, { out: "invalid" }, { code: 1, err: "Status unavailable" }]) {
+		assert.deepEqual(await mergeWith({ state: "OPEN", mergeStateStatus: "CLEAN" }, after), { result: { ok: true, message: "Merge command completed. Refresh to check the pull request." }, merges: ["pr merge 42 --auto --squash"] });
+	}
 	const autoMergeOff = "GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)";
 	const refused = stubGitHub((args) => (args[1] === "merge" ? { code: 1, err: `${autoMergeOff}\n` } : { out: JSON.stringify(args[0] === "repo" ? { squashMergeAllowed: true } : { state: "OPEN", mergeStateStatus: "BLOCKED" }) }));
 	assert.deepEqual({ ...await refused.api.prMergeWhenReady(repo, 42) }, { ok: false, error: autoMergeOff });
-	console.log("PASS prMergeWhenReady: auto-merge only when GitHub waits (BLOCKED), Merged. on CLEAN or HAS_HOOKS; refuses UNSTABLE, other or missing merge states and a closed or merged pull request; a failed merge shows gh's error line");
+	console.log("PASS prMergeWhenReady: reports auto-merge or Merged from the follow-up state, stays neutral when unconfirmed, and preserves the existing merge guards");
 
 	const ghDirs = (process.env.PATH || "").split(path.delimiter).filter((dir) => dir && fs.existsSync(path.join(dir, process.platform === "win32" ? "gh.exe" : "gh")));
 	const savedPath = process.env.PATH;

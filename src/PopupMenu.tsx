@@ -18,6 +18,26 @@ export function PopupMenu({ className, role = "menu", onDismiss, opener, focusOn
 
 	useLayoutEffect(() => {
 		const menu = root.current;
+		const view = menu?.ownerDocument.defaultView;
+		if (!menu || !view || !menu.matches(".row-pop, .pop")) { return; }
+		const fromBottom = menu.classList.contains("up") || props.style?.bottom != null;
+		const margin = fromBottom ? "marginBottom" : "marginTop";
+		const fit = () => {
+			menu.style[margin] = "";
+			const { top, bottom } = menu.getBoundingClientRect();
+			const offset = Math.max(8 - top, Math.min(0, view.innerHeight - 8 - bottom));
+			if (offset) { menu.style[margin] = `${fromBottom ? -offset : offset}px`; }
+		};
+		fit();
+		view.addEventListener("resize", fit);
+		return () => {
+			view.removeEventListener("resize", fit);
+			menu.style[margin] = "";
+		};
+	}, [className, props.children, props.style?.top, props.style?.bottom]);
+
+	useLayoutEffect(() => {
+		const menu = root.current;
 		if (!menu) { return; }
 		const doc = menu.ownerDocument;
 		const previous = opener ?? doc.activeElement as HTMLElement | null;

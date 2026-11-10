@@ -69,7 +69,7 @@ function runGit(args, cwd, timeout = 8000, raw = false) {
   });
 }
 
-async function localFilterOff(cwd, read = (args) => runGit(args, cwd)) {
+async function localFilterOff(cwd, read = (args) => runGit(args, cwd), approvedDrivers) {
 	// Every key, matched here: in a UTF-8 locale (macOS, Linux) git's own --get-regexp "." skips a name that is not valid UTF-8,
 	// so that driver would stay on unseen.
 	const config = await read(["config", "--show-scope", "--name-only", "--list"]);
@@ -78,13 +78,14 @@ async function localFilterOff(cwd, read = (args) => runGit(args, cwd)) {
 	const names = new Set();
 	for (const line of config.out.split(/\r?\n/)) {
 		// The s flag lets "." match U+2028 and U+2029, which a driver name may hold.
-		const found = /^(?:local|worktree)\s+filter\.(.*)\.(?:clean|smudge|process)$/s.exec(line);
-		if (found) { names.add(found[1]); }
+		const found = /^(\S+)\s+filter\.(.*)\.(?:clean|smudge|process)$/s.exec(line);
+		if (found && (approvedDrivers || ["local", "worktree"].includes(found[1]))) { names.add(found[2]); }
 	}
 	// A name that is not valid UTF-8 decodes with U+FFFD, so --config-env would name a different driver.
 	if ([...names].some((name) => name.includes("\uFFFD"))) { return null; }
 	// `-c` splits at the first "=", so a driver named "a=b" would stay on; --config-env splits at the last.
-	return [...names].flatMap((name) => [
+	// A sandbox file revert disables every scope's drivers except those approved for its target.
+	return [...names].filter((name) => !approvedDrivers?.has(name)).flatMap((name) => [
 		`--config-env=filter.${name}.clean=GROK_CODE_EMPTY`,
 		`--config-env=filter.${name}.smudge=GROK_CODE_EMPTY`,
 		`--config-env=filter.${name}.process=GROK_CODE_EMPTY`,
@@ -475,7 +476,33 @@ function fileInside(root, candidate) {
   return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
-async function revertFile(cwd, relative) {
+async function revertFilterState(cwd, file) {
+	const args = ["-z", "--all", "--", file];
+	const read = (extra = []) => runGit(["--literal-pathspecs", "check-attr", ...extra, ...args], cwd);
+	const working = await read();
+	// Restoring .gitattributes can make Git read the replacement from the index during checkout.
+	const head = path.basename(file) === ".gitattributes" ? await read(["--source=HEAD"]) : null;
+	if (working.code !== 0 || working.truncated || head?.truncated || (head && ![0, 129].includes(head.code))) { return null; }
+	const filters = [working, head].map((result) => {
+		const values = (result?.out ?? "").split("\0");
+		for (let index = 0; index + 2 < values.length; index += 3) {
+			if (values[index + 1] === "filter") { return values[index + 2]; }
+		}
+		return null;
+	});
+	const unknown = head?.code === 129;
+	if (!unknown && filters.every((filter) => filter === null)) { return { needsApproval: false }; }
+	const config = await runGit(["config", "--null", "--get-regexp", "^filter\\."], cwd, 8000, true);
+	if (config.truncated || ![0, 1].includes(config.code)) { return null; }
+	// Git prints both -filter and filter=unset as "unset".
+	const programs = config.out.split("\0").filter((entry) => /\.(?:clean|smudge|process)\n[\s\S]/.test(entry));
+	if (unknown && programs.length > 0) { return null; }
+	const needsApproval = filters.some((filter) => filter !== null && filter !== "unset")
+		|| (filters.includes("unset") && programs.some((entry) => entry.startsWith("filter.unset.")));
+	return { needsApproval, drivers: filters.filter((filter) => filter !== null), signature: JSON.stringify(filters), config: config.bytes };
+}
+
+async function revertFile(cwd, relative, confirmFilter) {
   const problem = folderProblem(cwd);
   if (problem) return { ok: false, error: problem };
   if (typeof relative !== "string" || !relative.trim() || /[\0\r\n]/.test(relative)) {
@@ -512,16 +539,32 @@ async function revertFile(cwd, relative) {
   if (!gitRelative || gitRelative.startsWith("..") || path.isAbsolute(gitRelative)) {
     return { ok: false, error: "That file is not in this folder." };
   }
-	const tracked = await runGit(["--literal-pathspecs", "ls-tree", "--name-only", "-z", "HEAD", "--", gitRelative], toplevel);
+	const tracked = await runGit(["--literal-pathspecs", "ls-tree", "-r", "--name-only", "-z", "HEAD", "--", gitRelative], toplevel);
 	if (tracked.code !== 0 || !tracked.out.split("\0").includes(gitRelative)) {
 		return { ok: false, error: "This file is new. Revert does not delete it." };
+	}
+	let filterOff = [];
+	if (confirmFilter) {
+		let approvedDrivers = new Set();
+		const before = await revertFilterState(toplevel, gitRelative);
+		if (!before) { return { ok: false, error: "This file's Git filter could not be checked." }; }
+		if (before.needsApproval) {
+			if (!await confirmFilter()) { return { ok: false, error: "Revert cancelled." }; }
+			const after = await revertFilterState(toplevel, gitRelative);
+			if (!after?.needsApproval || before.signature !== after.signature || !before.config.equals(after.config)) {
+				return { ok: false, error: "Git filter settings changed while you were confirming. Try reverting again." };
+			}
+			approvedDrivers = new Set(after.drivers);
+		}
+		filterOff = await localFilterOff(toplevel, undefined, approvedDrivers);
+		if (filterOff === null) { return { ok: false, error: FILTER_NOT_OFF }; }
 	}
 	try {
 		if (!fileInside(fs.realpathSync(folder), resolvedEditPath(absolute))) { return { ok: false, error: "That file is not in this folder." }; }
 	} catch {
 		return { ok: false, error: "That file is not in this folder." };
 	}
-	const restored = await runGit(["--literal-pathspecs", "restore", "--source=HEAD", "--staged", "--worktree", "--", gitRelative], toplevel, 60000);
+	const restored = await runGit([...filterOff, "--literal-pathspecs", "restore", "--source=HEAD", "--staged", "--worktree", "--", gitRelative], toplevel, 60000);
 	if (restored.truncated) { return { ok: false, error: "Git took too long and was stopped. The file may be partly restored; check it before trying again." }; }
   if (restored.code !== 0) return { ok: false, error: "That file could not be restored." };
   return { ok: true };
@@ -574,6 +617,7 @@ async function revertHunk(cwd, relative, input) {
 		if (line.kind !== "del") { newAt++; }
 	}
 	const text = `${now.slice(0, start).map((line) => line.raw).join("")}${replacement.join("")}${now.slice(newAt).map((line) => line.raw).join("")}`;
+	if (text === working.text) { return { ok: false, error: "This change cannot be reverted on its own. Use Revert file instead." }; }
 	return writeText(cwd, relative, text, working.version);
 }
 

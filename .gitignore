@@ -6,3 +6,4 @@ out
 /node_modules.update-old
 /dist.update-old
 /*.update-trash-*
+/docs/session-artifacts

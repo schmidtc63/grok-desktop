@@ -4,6 +4,7 @@ const os = require("os");
 const path = require("path");
 const vm = require("vm");
 const { EventEmitter } = require("events");
+const { spawnSync } = require("child_process");
 const { folderProblem } = require("../electron/agent.cjs");
 const source = fs.readFileSync(path.join(__dirname, "../electron/terminal.cjs"), "utf8");
 
@@ -55,12 +56,11 @@ function checkOutputBatching() {
 	};
 	vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../electron/terminal.cjs"), "utf8"), sandbox, { filename: "terminal.cjs" });
 	const batching = new sandbox.module.exports.TerminalHost((event) => batched.push(event), { flushMs: 30 });
-	const makeTab = (id) => { const tab = { id, history: "", done: false }; batching.tabs.set(id, tab); return tab; };
+	const makeTab = (id) => { const tab = { id, done: false }; batching.tabs.set(id, tab); return tab; };
 	const last = makeTab("last");
 	batching.output(last, "one");
 	batching.output(last, "two");
 	assert.deepEqual(batched, []);
-	assert.equal(last.history, "onetwo", "history is immediately available while events wait");
 	batching.finish(last, 0);
 	assert.deepEqual(JSON.parse(JSON.stringify(batched)), [{ type: "terminal-data", id: "last", data: "onetwo" }, { type: "terminal-exit", id: "last", code: 0 }]);
 	assert.equal(timers.size, 0, "exit flushes and clears the pending timer");
@@ -174,7 +174,6 @@ function checkPty() {
 		child.data("\x1b[31mone");
 		child.data("two\x1b[0m");
 		assert.deepEqual(run.events, []);
-		assert.equal(run.host.history(opened.id), "\x1b[31monetwo\x1b[0m", "ANSI sequences stay in the history");
 		const timer = [...run.timers.values()][0];
 		assert.equal(timer.ms, 30);
 		timer.callback();
@@ -203,8 +202,6 @@ async function checkPtyLifecycle() {
 	assert.deepEqual(plain(await run.host.interrupt(first.id)), { ok: true, stopped: 1 });
 	assert.equal(child.writes.at(-1), "\x03", "interrupt reaches the foreground program as Ctrl+C");
 	assert.equal(child.killCalls, 0, "interrupt does not close the terminal");
-	run.host.output(run.host.tabs.get(first.id), "x".repeat(450000));
-	assert.equal(run.host.history(first.id).length, 200000, "scrollback stays bounded");
 	run.host.close(first.id);
 	assert.equal(child.killCalls, 1);
 	assert.equal(run.host.list().length, 0);
@@ -222,7 +219,7 @@ async function checkPtyLifecycle() {
 	failed.ptys[0].emit("error", new Error("native stream error"));
 	assert.equal(failed.ptys[0].killCalls, 1, "a native stream error also releases its PTY");
 	assert.equal(failed.host.list().length, 0);
-	console.log("PASS PTY interrupt, bounded history, Close/closeAll, tab limit and idempotent native cleanup");
+	console.log("PASS PTY interrupt, Close/closeAll, tab limit and idempotent native cleanup");
 }
 
 function checkBounds() {
@@ -264,14 +261,15 @@ async function checkPipeFallback() {
 		run.host.write(opened.id, "one\ntwo");
 		assert.equal(child.writes.at(-1), platform === "win32" ? "one\ntwo\n\n" : "one\ntwo\n");
 		assert.equal(run.host.resize(opened.id, 80, 24).ok, true);
+		const beforeOutput = run.events.length;
 		const bytes = Buffer.from("héllo");
 		child.stdout.emit("data", bytes.subarray(0, 2));
 		child.stdout.emit("data", bytes.subarray(2));
-		assert.ok(run.host.history(opened.id).includes("héllo"), "pipe fallback keeps UTF-8 decoding");
+		assert.equal(run.events.slice(beforeOutput).map((event) => event.data).join(""), "héllo", "pipe fallback keeps UTF-8 decoding across chunks");
 		if (platform !== "win32") {
 			assert.equal(run.spawns[0].options.detached, true);
 			child.stdout.emit("data", Buffer.from("bash: no job control in this shell\n"));
-			assert.equal(run.host.history(opened.id).includes("no job control"), false);
+			assert.equal(run.events.some((event) => event.data?.includes("no job control")), false);
 			const pending = run.host.interrupt(opened.id);
 			const query = run.spawns.at(-1);
 			assert.equal(query.command, "pgrep");
@@ -305,7 +303,27 @@ async function checkPipeFallback() {
 	console.log("PASS missing-native fallback warning, buffered pipe input, UTF-8, shell state/interrupt and process-tree cleanup");
 }
 
+function checkPtyHelperInstall() {
+	const { scripts } = JSON.parse(fs.readFileSync(path.join(__dirname, "../package.json"), "utf8"));
+	assert.equal(scripts.postinstall, "node scripts/fix-node-pty-helper.cjs");
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "grok-pty-helper-"));
+	try {
+		const helper = path.join(root, "node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper");
+		fs.mkdirSync(path.dirname(helper), { recursive: true });
+		fs.writeFileSync(helper, "");
+		fs.chmodSync(helper, 0o444);
+		const run = spawnSync(process.execPath, [path.join(__dirname, "fix-node-pty-helper.cjs")], { cwd: root, encoding: "utf8" });
+		assert.equal(run.status, 0, run.stderr);
+		// Windows has no execute bit, so there the script shows it reached the file by making it writable.
+		assert.equal(fs.statSync(helper).mode & 0o777, process.platform === "win32" ? 0o666 : 0o755);
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+	console.log("PASS npm install makes node-pty's macOS helper executable and skips a prebuild that isn't there");
+}
+
 async function main() {
+	checkPtyHelperInstall();
 	checkTerminalShell();
 	checkOutputBatching();
 	checkPty();

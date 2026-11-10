@@ -7,6 +7,9 @@ import { chooseVariant, defaultVariant, sameCloudParams } from "./cloud-models";
 import { askConfirm, setConfirmHost, type PendingConfirm } from "./confirm";
 import { DiffPane, type DiffComment, type PrInfo } from "./DiffPane";
 import { FilesPane } from "./FilesPane";
+import { GrokBotView } from "./GrokBotView";
+import { GrokBotWindow } from "./GrokBotWindow";
+import { useGrokBot } from "./grok-bot";
 import { Icon, type IconName } from "./Icon";
 import type { PaneLayoutControls } from "./PaneActions";
 import { AppNote, PaneView, SideLog, type BackgroundTask, type EditorDraft, type FolderFiles, type OpenFile, type PaneModel } from "./Panes";
@@ -15,11 +18,16 @@ import { prAlertText, prFixPrompt, prWatchStep } from "./prWatch";
 import { redactKeys } from "./redact";
 import { SessionRail } from "./SessionRail";
 import { Setup } from "./Setup";
-import { DEFAULT_SETTINGS, normalizeCursorMachines, readSettings, settingsKey, SettingsPage, type AppSettings, type SettingsTab } from "./Settings";
+import { sandboxActive, sandboxChanging, sandboxChipLabel, sandboxFor, sandboxProfileChanging, sandboxWanted } from "./sandbox";
+import { SandboxSettings } from "./SandboxSettings";
+import { RoutinesPage } from "./Routines";
+import { DEFAULT_SETTINGS, normalizeCursorMachines, readSettings, settingsKey, SettingsPage, WORKTREE_ARCHIVE_NOTE, type AppSettings, type SettingsTab } from "./Settings";
 import { Sidebar } from "./Sidebar";
+import { readSidebarSections, readSidebarView, sidebarSessionIds } from "./sidebar-order";
 import { SavedPromptPicker } from "./SavedPromptPicker";
 import { insertSavedPrompt, MAX_PROMPT_TEXT, MAX_SAVED_PROMPTS, promptNameError } from "./saved-prompts";
 import { TerminalPane, type TerminalTab } from "./TerminalPane";
+import { applyUiConfig, uiConfigCss, type UiTheme } from "./ui-config";
 import {
 	EFFORT_DETAIL,
 	EFFORTS,
@@ -68,6 +76,8 @@ type CommandGroup = typeof COMMAND_GROUPS[number];
 const accountKey = "grok-code.account.v1";
 const SIDE_BUSY = "The side chat is still answering. Wait for it to finish.";
 const CLOUD_ATTACHMENTS = "Cloud sessions can't take attachments yet.";
+const WINDOWS_SANDBOX_WORKTREE = "Worktree sessions can't run in a sandbox on Windows yet. Turn Sandbox off to use one.";
+const WINDOWS_WORKTREE_SANDBOX = "Worktree sessions can't run in a sandbox on Windows yet. Turn Worktree off to use one.";
 const MACHINE_REF_ERROR = "A machine session can't use this branch name. Switch the folder to a branch whose name has only letters, digits, dots, dashes, underscores and slashes.";
 const CLOUD_APP_COMMANDS = new Set(["config", "status", "info", "new", "rename", "delete", "copy", "find", "transcript", "expand", "model", "cd", "resume", "help", "theme"]);
 const VIEWS: TranscriptView[] = ["normal", "thinking", "verbose"];
@@ -115,8 +125,9 @@ interface History {
 	queued?: Record<string, Queued[]>;
 	attachments?: Record<string, string[]>;
 	backgroundWork?: BackgroundWork;
-	newSessionDraft?: { session: Session; useWorktree: boolean; text: string };
+	newSessionDraft?: { session: Session; useWorktree: boolean; text: string; attachments?: string[] };
 	deleted: string[];
+	allDeleted?: string[];
 }
 
 interface Queued {
@@ -131,7 +142,12 @@ interface TurnTarget {
 	replyId: string;
 	turnId: string;
 	where: "main" | "side";
+	background?: boolean;
+	finished?: boolean;
+	toolIds?: Set<string>;
 	awaitingReplay?: boolean;
+	hasReply?: boolean;
+	announcedWaiting?: Set<string>;
 }
 
 function maskDisplay<T extends object>(value: T, ...fields: (keyof T)[]): T {
@@ -159,15 +175,22 @@ function maskChat(message: ChatMessage): ChatMessage {
 	};
 }
 
-function readHistory(): History | null {
+function deletionIds(value: unknown): string[] {
+	return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
+}
+
+function readHistory(onInvalid?: (raw: string) => void, includeEmpty = false): History | null {
+	let raw: string | null = null;
 	try {
-		const value = JSON.parse(localStorage.getItem(historyKey) ?? "null");
-		if (!value || !Array.isArray(value.sessions)) { return null; }
-		if (value.sessions.some((item: Session) => !item || typeof item.id !== "string" || typeof item.folder !== "string")) { return null; }
+		raw = localStorage.getItem(historyKey);
+		if (raw === null) { return null; }
+		const value = JSON.parse(raw);
+		if (!value || !Array.isArray(value.sessions) || value.sessions.some((item: Session) => !item || typeof item.id !== "string" || typeof item.folder !== "string")) { throw new Error("Invalid chat history."); }
 		const draft = value.newSessionDraft;
-		const newSessionDraft = draft && typeof draft.text === "string" && draft.text && typeof draft.session?.id === "string" && typeof draft.session?.folder === "string" ? draft : undefined;
-		if (!value.sessions.length && !newSessionDraft) { return null; }
-		const modes = Object.fromEntries(Object.entries(value.modes ?? {}).map(([id, mode]) => [id, mapMode(String(mode)) ?? "Always-approve"]));
+		const draftAttachments = Array.isArray(draft?.attachments) ? draft.attachments.filter((file: unknown) => typeof file === "string") : [];
+		const newSessionDraft = draft && typeof draft.text === "string" && (draft.text || draftAttachments.length) && typeof draft.session?.id === "string" && typeof draft.session?.folder === "string" ? { ...draft, attachments: draftAttachments.length ? draftAttachments : undefined } : undefined;
+		if (!includeEmpty && !value.sessions.length && !newSessionDraft) { return null; }
+		const modes = Object.fromEntries(Object.entries(value.modes ?? {}).map(([id, mode]) => [id, mapMode(String(mode)) ?? "Normal"]));
 		const prePlan = Object.fromEntries(Object.entries(value.prePlan ?? {}).map(([id, mode]) => [id, mapMode(String(mode)) ?? "Normal"]).filter(([, mode]) => mode !== "Plan"));
 		const queued: Record<string, Queued[]> = {};
 		for (const [id, items] of Object.entries(value.queued ?? {})) {
@@ -188,8 +211,9 @@ function readHistory(): History | null {
 		}
 		const extraChats = Object.fromEntries(Object.entries<ChatMessage[]>(value.extraChats ?? {}).map(([id, messages]) => [id, messages.map(maskChat)]));
 		const sessions = (value.sessions as Session[]).map((session) => maskDisplay(session, "title", "detail"));
-		return { sessions, extraChats, modes, prePlan, editorDrafts: value.editorDrafts ?? {}, composerDrafts: value.composerDrafts ?? {}, queued, attachments, backgroundWork, newSessionDraft, deleted: Array.isArray(value.deleted) ? value.deleted : [] };
+		return { sessions, extraChats, modes, prePlan, editorDrafts: value.editorDrafts ?? {}, composerDrafts: value.composerDrafts ?? {}, queued, attachments, backgroundWork, newSessionDraft, deleted: deletionIds(value.deleted), allDeleted: deletionIds(value.allDeleted) };
 	} catch {
+		if (raw !== null) { onInvalid?.(raw); }
 		return null;
 	}
 }
@@ -205,8 +229,35 @@ function replyWithNote(message: ChatMessage, note: string, separator = "\n"): Ch
 	return { ...message, pending: false, streaming: false, text: `${message.text}${message.text ? separator : ""}${appNote}`, appNote };
 }
 
+function withTool(message: ChatMessage, incoming: GrokToolEvent): ChatMessage {
+	const tools = message.tools ? [...message.tools] : [];
+	const toolIndex = tools.findIndex((tool) => tool.id && tool.id === incoming.id);
+	let parts = message.parts;
+	if (toolIndex >= 0) {
+		const previous = tools[toolIndex];
+		tools[toolIndex] = {
+			...previous,
+			...incoming,
+			kind: incoming.kind || previous.kind,
+			title: incoming.title || previous.title,
+			detail: incoming.detail || previous.detail,
+			summary: incoming.summary ?? previous.summary,
+			waiting: incoming.waiting ?? previous.waiting,
+		};
+	} else {
+		tools.push({
+			...incoming,
+			kind: incoming.kind || "tool",
+			title: incoming.title || "Tool",
+			detail: incoming.detail || "Not run",
+		});
+		if (incoming.id) { parts = [...(message.parts ?? []), { kind: "tool", id: incoming.id }]; }
+	}
+	return { ...message, pending: false, tools, parts };
+}
+
 function restoredChats(store: Record<string, ChatMessage[]>, sessions: Session[] = []) {
-	const clouds = new Map(sessions.filter((item) => item.environment === "Cloud").map((item) => [item.id, item]));
+	const byId = new Map(sessions.map((item) => [item.id, item]));
 	return Object.fromEntries(Object.entries(store).map(([id, messages]) => [id, messages.map((message): ChatMessage => {
 		const legacyNote = message.role === "grok" ? /(?:^|\n)((?:That folder is not on this computer:|That path is not a folder:|Grok exited\.|Interrupted when this window closed\.)[^\n]*)$/.exec(message.text)?.[1] : undefined;
 		const appNote = typeof message.appNote === "string" ? message.appNote : legacyNote;
@@ -214,8 +265,8 @@ function restoredChats(store: Record<string, ChatMessage[]>, sessions: Session[]
 		const parts = legacyNote && !message.appNote && lastPart?.kind === "text" && lastPart.text.trim() === legacyNote ? message.parts?.slice(0, -1) : message.parts;
 		const restored = { ...message, appNote, parts, pending: false, streaming: false };
 		const interrupted = message.pending || message.streaming;
-		const session = clouds.get(id);
-		if (session) {
+		const session = byId.get(id);
+		if (session?.environment === "Cloud") {
 			const active = session.cloud?.active && message.id === `grok-${session.cloud.turnId}`;
 			if (!interrupted || active || message.role !== "grok") { return restored; }
 			const warning = "Interrupted when this window closed. The Cloud agent may have started; check [Cursor agents](https://cursor.com/agents) before sending again.";
@@ -223,7 +274,13 @@ function restoredChats(store: Record<string, ChatMessage[]>, sessions: Session[]
 		}
 		return {
 			...(interrupted ? replyWithNote(restored, INTERRUPTED_NOTE) : restored),
-			tools: message.tools?.map((tool) => tool.waiting ? { ...tool, waiting: false, detail: "Approval closed with the previous window." } : tool),
+			tools: message.tools?.map((tool) => {
+				const legacyBackground = (tool.kind === "command" || tool.kind === "execute") && /^\[bg\]\s/.test(tool.title);
+				if (session?.environment === "Local" && tool.detail === "Running" && (tool.backgroundTask || legacyBackground)) {
+					return { ...tool, detail: "Stopped", waiting: false };
+				}
+				return tool.waiting ? { ...tool, waiting: false, detail: "Approval closed with the previous window." } : tool;
+			}),
 		};
 	})]));
 }
@@ -293,6 +350,50 @@ function keptDrafts(store: History["editorDrafts"], gone: Set<string>) {
 // Named so a save that works again can clear them.
 const HISTORY_FULL = "Chat history is full and is not being saved. Delete old sessions to free space.";
 const HISTORY_FAILED = "Chat history could not be saved on this computer.";
+const HISTORY_UNREADABLE = "Saved chat history could not be read. The damaged copy was kept.";
+const COLD_CHAT_UNREADABLE = "An older chat could not be read and looks empty. Close and reopen the app before continuing it.";
+// A save blocks the window for about 11 ms per million characters, and at 52.4M localStorage refuses it and no chat saves.
+const HISTORY_MOVE_ABOVE = 10_000_000;
+const HISTORY_MOVE_TO = 5_000_000;
+
+// A chat moved out of the history value has its own file. undefined means no file, null means a file that can't be read.
+function coldChat(id: string): ChatMessage[] | null | undefined {
+	const text = window.grokCode?.readColdChat?.(id);
+	if (text === undefined || text === null) { return undefined; }
+	try {
+		const messages: unknown = text === false ? null : JSON.parse(text);
+		return Array.isArray(messages) ? messages.map(maskChat) : null;
+	} catch {
+		return null;
+	}
+}
+
+// Moves chats to their own files, in the order given, until enough has left the value. A chat whose file can't be written stays.
+function moveChats(chats: Record<string, ChatMessage[]>, ids: string[], excess: number) {
+	const write = window.grokCode?.writeColdChat;
+	if (!write) { return false; }
+	let left = excess;
+	let moved = false;
+	for (const id of ids) {
+		if (left <= 0) { break; }
+		const text = JSON.stringify(chats[id]);
+		if (write(id, text)) {
+			delete chats[id];
+			left -= text.length;
+			moved = true;
+		}
+	}
+	return moved;
+}
+
+// The session to show when none is chosen. A routine's run comes last: its row is tucked away in the sidebar, and opening it would clear its unread dot.
+function firstOpen(list: Session[]) {
+	return list.find((item) => !item.archived && !item.routineId) ?? list.find((item) => !item.archived);
+}
+
+function sandboxGitSession(session: Session) {
+	return session.environment === "Local" && (sandboxWanted(session) || !!session.sandbox);
+}
 
 function newSession(seed?: Partial<ProjectSeed>, parentId?: string): Session {
 	const folder = seed?.folder ?? window.grokCode?.homeDir ?? "";
@@ -399,19 +500,24 @@ function limitLine(limit: GrokLimit) {
 }
 
 export function App() {
+	const [pasteHistory] = useState(() => {
+		try { return { raw: localStorage.getItem(historyKey), backup: localStorage.getItem("grok-code.history.bad") }; } catch { return undefined; }
+	});
 	const [history] = useState(readHistory);
 	const [settings, setSettings] = useState<AppSettings>(readSettings);
+	const [uiPreviewTheme, setUiPreviewTheme] = useState<UiTheme | null>(null);
 	const [sessions, setSessions] = useState<Session[]>(() => history?.sessions.map((item) => ({ ...item, status: "idle" })) ?? [newSession({ folder: "" })]);
 	const firstSessionId = useRef(history ? null : sessions[0].id);
 	const [activeId, setActiveId] = useState(() => {
 		const requested = new URLSearchParams(window.location?.search ?? "").get("session");
-		return history?.sessions.find((item) => item.id === requested)?.id ?? history?.sessions.find((item) => !item.archived)?.id ?? "";
+		return history?.sessions.find((item) => item.id === requested)?.id ?? firstOpen(history?.sessions ?? [])?.id ?? "";
 	});
 	// A fresh id each time, so two windows that both restore the form cannot send into one session.
 	// A window opened for one session shows that session and leaves the form to the others.
 	const [restoredForm] = useState<Session | null>(() => (history?.newSessionDraft && !new URLSearchParams(window.location?.search ?? "").get("session") ? { ...history.newSessionDraft.session, id: `new-${crypto.randomUUID()}` } : null));
 	const [pending, setPending] = useState<Session | null>(() => restoredForm ?? (history ? null : sessions[0]));
 	const [useWorktree, setUseWorktree] = useState(history?.newSessionDraft?.useWorktree ?? false);
+	const [sandboxPicker, setSandboxPicker] = useState("");
 	const [cliProjectFolders, setCliProjectFolders] = useState<string[]>([]);
 	const [panes, setPanes] = useState<SidePaneId[]>([]);
 	const [focusedPane, setFocusedPane] = useState<SidePaneId | null>(null);
@@ -425,7 +531,10 @@ export function App() {
 		...Object.fromEntries(Object.entries(history?.composerDrafts ?? {}).filter(([id, text]) => typeof text === "string" && sessions.some((item) => item.id === id))),
 		...(restoredForm && history?.newSessionDraft ? { [restoredForm.id]: history.newSessionDraft.text } : {}),
 	}));
-	const [attachments, setAttachmentsState] = useState<Record<string, string[]>>(() => Object.fromEntries(Object.entries(history?.attachments ?? {}).filter(([id]) => sessions.some((item) => item.id === id))));
+	const [attachments, setAttachmentsState] = useState<Record<string, string[]>>(() => ({
+		...Object.fromEntries(Object.entries(history?.attachments ?? {}).filter(([id]) => sessions.some((item) => item.id === id))),
+		...(restoredForm && history?.newSessionDraft?.attachments?.length ? { [restoredForm.id]: history.newSessionDraft.attachments } : {}),
+	}));
 	const [contextPicks, setContextPicks] = useState<Record<string, ContextPick[]>>({});
 	const [queued, setQueuedState] = useState<Record<string, Queued[]>>(() => Object.fromEntries(Object.entries(history?.queued ?? {}).filter(([id]) => sessions.some((item) => item.id === id))));
 	const [held, setHeld] = useState<Record<string, boolean>>(() => Object.fromEntries(Object.keys(queued).map((id) => [id, true])));
@@ -453,7 +562,7 @@ export function App() {
 	const [promptLibrary, setPromptLibrary] = useState<{ mode: "save" | "insert"; sessionId: string; text: string; start: number; end: number } | null>(null);
 	const [sideTexts, setSideTexts] = useState<Record<string, string>>({});
 	const [sideChats, setSideChats] = useState<Record<string, ChatMessage[]>>({});
-	const [sideAgents, setSideAgents] = useState<Record<string, string>>({});
+	const [sideAgents, setSideAgents] = useState<Record<string, { agentSessionId: string; sandbox?: GrokSandboxChoice }>>({});
 	const sideSeen = useRef<Record<string, string>>({});
 	const [notices, setNotices] = useState<Notice[]>([]);
 	const noticeId = useRef(0);
@@ -470,17 +579,24 @@ export function App() {
 		const api = window.grokCode;
 		if (!info || !api?.updatePrepare) { return; }
 		try {
+			setNotice("Preparing the update. You can keep working.", true);
 			const prepared = await api.updatePrepare(info.tag);
+			if (prepared.busy) {
+				setNotice("The update is still being prepared.", true);
+				return;
+			}
 			if (prepared.ok && prepared.ready) {
-				const yes = await askConfirm({ title: `Update to version ${info.latest}?`, body: [prepared.notes?.slice(0, 1500), "The app closes, updates and opens again by itself. This takes a minute or two, longer if Electron itself changed. Running Grok replies and terminals stop."].filter(Boolean).join("\n\n"), ok: "Update and restart" });
+				// Cancel takes the focus: this dialog can appear while the user is typing, and Enter must not close the app.
+				const yes = await askConfirm({ title: `Update to version ${info.latest}?`, body: [prepared.notes?.slice(0, 1500), "The app closes to update and usually reopens when the update finishes. This can take a few minutes, especially if Electron changed. Running Grok replies and terminals stop.", prepared.asksPassword ? "Linux asks for your password after the app closes." : ""].filter(Boolean).join("\n\n"), ok: "Update and restart", danger: true });
 				if (yes && api.updateStart) {
 					const result = await api.updateStart(info.tag);
 					if (!result.ok) { setNotice(result.error || "The update could not start."); }
 				}
 			} else {
-				// An installed copy updates by running its install command again; a source copy updates with git.
+				// An installed copy that can't update itself runs its install command again, or on Linux gets the release page; a source copy updates with git.
 				const where = prepared.steps?.includes("install-windows.ps1") ? "PowerShell" : "Terminal";
-				const how = prepared.steps ? `Quit the app, then run this in ${where}:\n${prepared.steps}` : "Quit the app, then in its folder run: git pull, npm install, npm run desktop";
+				const command = prepared.steps ? `Quit the app, then run this in ${where}:\n${prepared.steps}` : "Quit the app, then in its folder run: git pull, npm install, npm run desktop";
+				const how = prepared.steps?.startsWith("https://") ? `Quit the app, then install the new package from the release page:\n${prepared.steps}` : command;
 				const yes = await askConfirm({ title: `Version ${info.latest} is available`, body: `${prepared.reason || "This copy couldn't be prepared for an update."}\n\n${how}`, ok: "Copy steps" });
 				if (yes) {
 					const result = await api.copyText(prepared.steps || "git pull\nnpm install\nnpm run desktop");
@@ -492,12 +608,31 @@ export function App() {
 		}
 	}, [setNotice]);
 	const [shortcuts, setShortcuts] = useState(false);
+	const focusShortcuts = useCallback((sheet: HTMLDivElement | null) => { sheet?.focus({ preventScroll: true }); }, []);
 	const [rewindAsk, setRewindAsk] = useState<{ sessionId: string; message: ChatMessage; files: string[]; conflicts: string[] } | null>(null);
 	const [branching, setBranching] = useState<string | null>(null);
 	const [settingsOpen, setSettingsOpen] = useState<SettingsTab | null>(null);
+	const [grokBotOpen, setGrokBotOpen] = useState(false);
+	const [routinesOpen, setRoutinesOpen] = useState(false);
+	const grokBot = useGrokBot();
+	const grokBotShown = useRef(false);
 	const [setup, setSetup] = useState<{ result?: GrokReadiness; open: boolean; checking: boolean; installing: "" | "grok" | "git" | "update" }>({ open: false, checking: false, installing: "" });
 	const setupCheck = useRef(0);
 	const setupFromAbout = useRef(false);
+	// Back and Forward walk what this window has shown, like a browser's history: sessions, Routines, Settings and Grok Bot.
+	const place = routinesOpen ? "page:routines" : settingsOpen || (setup.open && setupFromAbout.current) ? "page:settings" : grokBotOpen ? "page:grok-bot" : activeId;
+	const [trail, setTrail] = useState<{ back: string[]; forward: string[] }>({ back: [], forward: [] });
+	const trailFrom = useRef(place);
+	const travelTo = useRef<string | null>(null);
+	useEffect(() => {
+		const previous = trailFrom.current;
+		trailFrom.current = place;
+		if (previous === place) { return; }
+		const travelled = travelTo.current === place;
+		travelTo.current = null;
+		if (travelled || !previous) { return; }
+		setTrail((current) => ({ back: [...current.back, previous].slice(-50), forward: [] }));
+	}, [place]);
 	const [confirms, setConfirms] = useState<ConfirmItem[]>([]);
 	const confirmQueue = useRef<ConfirmItem[]>([]);
 	const confirmIds = useRef(0);
@@ -505,7 +640,25 @@ export function App() {
 	const confirmShown = useRef(false);
 	const answerRef = useRef<(yes: boolean) => void>(() => {});
 	const [renaming, setRenaming] = useState<string | null>(null);
-	const [extraChats, setChatState] = useState<Record<string, ChatMessage[]>>(() => restoredChats(history?.extraChats ?? {}, history?.sessions));
+	const coldChatUnreadable = useRef(false);
+	// ponytail: every chat loads at startup, which search and fork rely on; load on demand once startup or memory hurts.
+	const [extraChats, setChatState] = useState<Record<string, ChatMessage[]>>(() => {
+		const chats = { ...history?.extraChats };
+		for (const { id } of history?.sessions ?? []) {
+			if (chats[id]) { continue; }
+			const cold = coldChat(id);
+			if (cold) { chats[id] = cold; } else if (cold === null) { coldChatUnreadable.current = true; }
+		}
+		return restoredChats(chats, history?.sessions);
+	});
+	useEffect(() => {
+		if (coldChatUnreadable.current) { setNotice(COLD_CHAT_UNREADABLE); }
+		try {
+			if (pasteHistory !== undefined) { window.grokCode?.prunePastedImages?.(pasteHistory.raw, pasteHistory.backup); }
+		} catch {}
+		// Covers a file left behind by a window that closed first or a delete that failed.
+		if (history?.deleted.length) { void window.grokCode?.removeColdChats?.(history.deleted); }
+	}, []);
 	const urgentSave = useRef(false);
 	const setExtraChats = useCallback((update: SetStateAction<Record<string, ChatMessage[]>>) => {
 		urgentSave.current = true;
@@ -514,6 +667,7 @@ export function App() {
 	const [deleted, setDeleted] = useState<string[]>(history?.deleted ?? []);
 	const deletedRef = useRef(deleted);
 	deletedRef.current = deleted;
+	const remotelyDeleted = useRef(new Set<string>());
 	const [views, setViews] = useState<Record<string, TranscriptView>>({});
 	const [findTick, setFindTick] = useState(0);
 	const [findAt, setFindAt] = useState({ tick: 0, text: "" });
@@ -559,6 +713,7 @@ export function App() {
 	const [modes, setModes] = useState<Record<string, PermissionMode>>(history?.modes ?? {});
 	const [prePlan, setPrePlan] = useState<Record<string, PermissionMode>>(history?.prePlan ?? {});
 	const modesRef = useRef(modes);
+	const modeRequest = useRef<Record<string, number>>({});
 	const sentModes = useRef<Record<string, PermissionMode>>({});
 	const [busy, setBusy] = useState<Record<string, boolean>>({});
 	// shortcut: the warning is once per session, not once per later collision
@@ -584,6 +739,11 @@ export function App() {
 	const resizeCleanup = useRef<(() => void) | null>(null);
 	useEffect(() => () => resizeCleanup.current?.(), []);
 	const turnTargets = useRef<Record<string, TurnTarget>>({});
+	// Each prompt keeps its reply when a late steer runs beside a newer prompt.
+	const replyTargets = useRef<Record<string, Record<string, TurnTarget>>>({});
+	const replyChats = useRef({ main: extraChats, side: sideChats });
+	replyChats.current = { main: extraChats, side: sideChats };
+	const [turnAnnouncements, setTurnAnnouncements] = useState<Notice[]>([]);
 	const sessionsRef = useRef(sessions);
 	const loopEpoch = useRef<Record<string, number>>({});
 	const openingCli = useRef(new Map<string, string>());
@@ -596,8 +756,11 @@ export function App() {
 	const creatingWorktree = useRef(false);
 	const autoArchiving = useRef(new Set<string>());
 	const settingsRef = useRef(settings);
+	const savedSandboxProfile = useRef(settings.sandboxProfile);
 	const keyActions = useRef<Record<string, () => void> & { restorePane?: () => boolean }>({});
 	const inboundAccept = useRef<(agentSessionId: string, text: string) => InboundResult>(() => ({ accepted: false }));
+	const routineFire = useRef<(event: GrokEvent) => void>(() => {});
+	const routineOpen = useRef<(event: GrokEvent) => void>(() => {});
 	const overlayOpen = useRef(false);
 	const overlayOpener = useRef<HTMLElement | null>(null);
 	const escapeStopAfter = useRef(0);
@@ -608,8 +771,8 @@ export function App() {
 	const promptRef = useRef<HTMLTextAreaElement | null>(null);
 	const appVersion = useRef("");
 	sessionsRef.current = sessions;
-	const hasOverlay = menu !== null || fileMenu !== null || shortcuts || settingsOpen !== null || rewindAsk !== null || setup.open || promptLibrary !== null;
-	const settingsCover = settingsOpen !== null || (setup.open && setupFromAbout.current);
+	const hasOverlay = menu !== null || fileMenu !== null || shortcuts || settingsOpen !== null || routinesOpen || rewindAsk !== null || setup.open || promptLibrary !== null;
+	const settingsCover = settingsOpen !== null || routinesOpen || (setup.open && setupFromAbout.current);
 	if (hasOverlay && !overlayOpen.current && !promptLibrary) {
 		overlayOpener.current = document.activeElement as HTMLElement | null;
 	}
@@ -625,6 +788,7 @@ export function App() {
 		if (opener?.isConnected && document.activeElement === document.body) { opener.focus(); }
 	}, [hasOverlay]);
 	settingsShown.current = settingsCover;
+	grokBotShown.current = grokBotOpen;
 	confirmShown.current = confirms.length > 0;
 	pendingRef.current = pending;
 	draftsRef.current = drafts;
@@ -636,7 +800,8 @@ export function App() {
 	attachmentsRef.current = attachments;
 	const persistedDrafts = useRef(editorDrafts);
 	const lastSaved = useRef<History | null>(history ? { sessions, extraChats, modes, prePlan, editorDrafts, composerDrafts: drafts, queued, attachments, backgroundWork, newSessionDraft: restoredForm ? history.newSessionDraft : undefined, deleted } : null);
-	const saveHistory = useRef<() => boolean>(() => true);
+	const closeDraftConflict = useRef<{ draft: History["newSessionDraft"] } | null>(null);
+	const saveHistory = useRef<(closing?: boolean) => boolean>(() => true);
 
 	useEffect(() => {
 		const orphaned = new Set(Object.keys(terminalsRef.current).filter((id) => !terminalOwner(id)));
@@ -693,12 +858,23 @@ export function App() {
 	const persistSettings = useCallback((next: AppSettings) => {
 		try {
 			localStorage.setItem(settingsKey, JSON.stringify(next));
+			savedSandboxProfile.current = next.sandboxProfile;
 			return true;
 		} catch {
 			setNotice("Settings could not be saved. Changes last until the app closes.");
 			return false;
 		}
 	}, [setNotice]);
+
+	function refreshSandboxProfile() {
+		const current = settingsRef.current;
+		if (PLATFORM === "win32" || current.sandboxProfile !== savedSandboxProfile.current) { return; }
+		const sandboxProfile = readSettings().sandboxProfile;
+		if (sandboxProfile === current.sandboxProfile) { return; }
+		savedSandboxProfile.current = sandboxProfile;
+		settingsRef.current = { ...current, sandboxProfile };
+		setSettings(settingsRef.current);
+	}
 
 	function changeSettings(patch: Partial<AppSettings>) {
 		const next = { ...settingsRef.current, ...patch };
@@ -727,6 +903,27 @@ export function App() {
 		if (next === "Plan" && previous !== "Plan") { setPrePlan((current) => ({ ...current, [id]: previous })); }
 		modesRef.current = { ...modesRef.current, [id]: next };
 		setModes(modesRef.current);
+	}
+
+	// The chip, /plan and /auto all wait for the host. A refusal, including a change during a reply, leaves the chip as it was.
+	// Two clicks before the first reply returns: only the later click may move the chip.
+	function requestMode(id: string, next: PermissionMode) {
+		const ticket = (modeRequest.current[id] ?? 0) + 1;
+		modeRequest.current[id] = ticket;
+		const api = window.grokCode;
+		if (!api?.setMode) {
+			if (turnTargets.current[id]) { setNotice("Stop or finish this turn before changing mode."); return; }
+			changeMode(id, next);
+			return;
+		}
+		void api.setMode(id, next).then((result) => {
+			if (modeRequest.current[id] !== ticket) { return; }
+			if (!result?.ok) { setNotice(result?.error || "Grok did not change mode."); return; }
+			changeMode(id, next);
+		}).catch(() => {
+			if (modeRequest.current[id] !== ticket) { return; }
+			setNotice("Grok did not change mode.");
+		});
 	}
 
 	function restartStops(next: PermissionMode) {
@@ -799,14 +996,128 @@ export function App() {
 
 	useEffect(() => { void window.grokCode?.inbound?.(settings.acceptLocalTurns).then((result) => { if (result && !result.ok) { setNotice(result.error || "Turns from local tools could not be switched."); } }); }, [settings.acceptLocalTurns]);
 
+	function showDeletedChat(id: string) {
+		const title = sessionsRef.current.find((item) => item.id === id)?.title;
+		const chat = title ? `The chat “${redactKeys(title)}”` : "This chat";
+		setNotice(`${chat} was deleted in another window. Copy any text you want to keep before closing.`);
+	}
+
+	function observeRemoteDeletes(saved: Pick<History, "deleted" | "allDeleted"> | null) {
+		const tombstones = new Set([...deletionIds(saved?.deleted), ...deletionIds(saved?.allDeleted)]);
+		if (!tombstones.size) { return; }
+		for (const { id } of sessionsRef.current) {
+			if (!tombstones.has(id) || remotelyDeleted.current.has(id) || deletedRef.current.includes(id)) { continue; }
+			remotelyDeleted.current.add(id);
+			if (id === activeIdRef.current && !settingsShown.current) { showDeletedChat(id); }
+		}
+	}
+
+	function refuseDeletedChat(id: string, saved?: History) {
+		if (!remotelyDeleted.current.has(id)) {
+			try { observeRemoteDeletes(saved ?? JSON.parse(localStorage.getItem(historyKey) ?? "null")); } catch { /* Damaged history is handled on save. */ }
+		}
+		if (!remotelyDeleted.current.has(id) && !deletedRef.current.includes(id)) { return false; }
+		showDeletedChat(id);
+		return true;
+	}
+
+	async function saveLocalSendSettings(id: string, patch: Partial<Session>, expectedFolder?: string) {
+		try {
+			return await navigator.locks.request(historyKey, () => {
+				const saved = JSON.parse(localStorage.getItem(historyKey) ?? "null") as History | null;
+				if (refuseDeletedChat(id, saved ?? undefined)) { return false; }
+				const remote = saved?.sessions.find((item) => item.id === id);
+				const local = sessionsRef.current.find((item) => item.id === id);
+				if (!local) { return false; }
+				if (expectedFolder !== undefined && (remote ?? local).folder !== expectedFolder) {
+					setNotice("The session folder changed in another window. Choose it again.");
+					return false;
+				}
+				const apply = (item: Session) => item.id === id ? { ...item, ...patch } : item;
+				if (saved && remote) {
+					localStorage.setItem(historyKey, JSON.stringify({ ...saved, sessions: saved.sessions.map(apply) }));
+					const last = lastSaved.current;
+					if (last) { lastSaved.current = { ...last, sessions: last.sessions.map(apply) }; }
+				}
+				sessionsRef.current = sessionsRef.current.map(apply);
+				setSessions((current) => current.map(apply));
+				return true;
+			});
+		} catch {
+			setNotice("The session settings could not be saved.");
+			return false;
+		}
+	}
+
+	function adoptLocalSendSettings(saved: History, targetId?: string) {
+		const last = lastSaved.current;
+		if (!last) { return; }
+		const stored = new Map(saved.sessions.map((item) => [item.id, item]));
+		const previous = new Map(last.sessions.map((item) => [item.id, item]));
+		const patches = new Map<string, Partial<Session>>();
+		const modePatches: Record<string, PermissionMode> = {};
+		const prePlanPatches: Record<string, PermissionMode> = {};
+		const resetSide = new Set<string>();
+		const same = (a: unknown, b: unknown) => a === b || JSON.stringify(a) === JSON.stringify(b);
+		for (const item of sessionsRef.current) {
+			const { id } = item;
+			const remote = stored.get(id);
+			const old = previous.get(id);
+			if (item.environment !== "Local" || (targetId && id !== targetId) || !remote || !old || remotelyDeleted.current.has(id)) { continue; }
+			const patch: Partial<Session> = {};
+			if (item.folder === old.folder && item.folder !== remote.folder) {
+				const { folder, project, worktree, worktreeFolder, allowedFolders, sandbox, agentSessionId, sandboxContextPending } = remote;
+				Object.assign(patch, { folder, project, worktree, worktreeFolder, allowedFolders, sandbox, agentSessionId, sandboxContextPending });
+				resetSide.add(id);
+			} else if (item.folder === remote.folder && !turnTargets.current[id] && item.agentSessionId === old.agentSessionId && same(item.sandbox, old.sandbox)) {
+				const runtimeChanged = item.agentSessionId !== remote.agentSessionId || !same(item.sandbox, remote.sandbox);
+				if (item.agentSessionId !== remote.agentSessionId) { patch.agentSessionId = remote.agentSessionId; }
+				if (!same(item.sandbox, remote.sandbox)) { patch.sandbox = remote.sandbox; resetSide.add(id); }
+				if ((runtimeChanged || item.sandboxContextPending === old.sandboxContextPending) && item.sandboxContextPending !== remote.sandboxContextPending) {
+					patch.sandboxContextPending = remote.sandboxContextPending;
+				}
+			}
+			if (item.sandboxOn === old.sandboxOn && item.sandboxOn !== remote.sandboxOn) { patch.sandboxOn = remote.sandboxOn; }
+			if (same(item.sandboxChoice, old.sandboxChoice) && !same(item.sandboxChoice, remote.sandboxChoice)) { patch.sandboxChoice = remote.sandboxChoice; }
+			if (Object.keys(patch).length) { patches.set(id, patch); }
+			const savedMode = saved.modes[id];
+			if (savedMode && modesRef.current[id] === last.modes[id] && savedMode !== last.modes[id]) {
+				modePatches[id] = savedMode;
+				if (saved.prePlan[id]) { prePlanPatches[id] = saved.prePlan[id]; }
+			}
+		}
+		if (patches.size) {
+			const adopt = (item: Session) => patches.has(item.id) ? { ...item, ...patches.get(item.id) } : item;
+			lastSaved.current = { ...last, sessions: last.sessions.map(adopt) };
+			sessionsRef.current = sessionsRef.current.map(adopt);
+			setSessions((current) => current.map(adopt));
+		}
+		if (resetSide.size) {
+			for (const id of resetSide) { delete sideSeen.current[id]; }
+			setSideAgents((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !resetSide.has(id))));
+		}
+		if (Object.keys(modePatches).length) {
+			lastSaved.current = { ...lastSaved.current!, modes: { ...last.modes, ...modePatches }, prePlan: { ...last.prePlan, ...prePlanPatches } };
+			modesRef.current = { ...modesRef.current, ...modePatches };
+			setModes(modesRef.current);
+			setPrePlan((current) => ({ ...current, ...prePlanPatches }));
+		}
+	}
+
 	useEffect(() => {
 		const reload = (event: StorageEvent) => {
 			if (event.key === settingsKey) {
+				const localProfile = settingsRef.current.sandboxProfile;
+				const keepProfile = PLATFORM !== "win32" && localProfile !== savedSandboxProfile.current;
 				settingsRef.current = readSettings();
+				savedSandboxProfile.current = settingsRef.current.sandboxProfile;
+				if (keepProfile) { settingsRef.current.sandboxProfile = localProfile; }
 				setSettings(settingsRef.current);
 			}
 			if (event.key === historyKey) {
-				const saved = readHistory();
+				const saved = readHistory(undefined, true);
+				observeRemoteDeletes(saved);
+				if (saved) { adoptLocalSendSettings(saved); }
 				const manual = new Map((saved?.sessions ?? []).filter((item) => item.titleAuto === false).map((item) => [item.id, item.title]));
 				const previous = new Map((lastSaved.current?.sessions ?? []).map((item) => [item.id, item.title]));
 				const changed = (item: Session) => manual.has(item.id) && (item.titleAuto === true || item.title === previous.get(item.id)) && (item.titleAuto !== false || item.title !== manual.get(item.id));
@@ -824,7 +1135,7 @@ export function App() {
 					if (item.environment === "Cloud" && !turnTargets.current[item.id] && remote?.cloud && item.cloud === old?.cloud && JSON.stringify(item.cloud) !== JSON.stringify(remote.cloud)) {
 						cloudPatches.set(item.id, { cloud: remote.cloud, cloudModelLabel: item.cloudModelLabel === old?.cloudModelLabel ? remote.cloudModelLabel : item.cloudModelLabel });
 					}
-					if (!remote && saved?.deleted.includes(item.id)) { watchPatches.set(item.id, { prWatch: undefined }); }
+					if (item.prWatch && remotelyDeleted.current.has(item.id)) { watchPatches.set(item.id, { prWatch: undefined }); }
 					if (!remote || (!item.prWatch && !remote.prWatch)) { continue; }
 					const patch: Partial<Session> = {};
 					if (item.prWatch === old?.prWatch && JSON.stringify(item.prWatch) !== JSON.stringify(remote.prWatch)) {
@@ -843,13 +1154,13 @@ export function App() {
 				const added = (saved?.sessions ?? []).filter((item) => item.prWatch && !sessionsRef.current.some((entry) => entry.id === item.id));
 				if (watchPatches.size || added.length) { setSessions((current) => [...current.map((item) => watchPatches.has(item.id) ? { ...item, ...watchPatches.get(item.id) } : item), ...added.filter((item) => !current.some((entry) => entry.id === item.id))]); }
 				if (added.length) {
-					const chats = restoredChats(Object.fromEntries(added.map((item) => [item.id, saved?.extraChats[item.id] ?? []])));
+					const chats = restoredChats(Object.fromEntries(added.map((item) => [item.id, saved?.extraChats[item.id] ?? coldChat(item.id) ?? []])));
 					lastSaved.current = { ...lastSaved.current!, sessions: [...last.sessions, ...added], extraChats: { ...last.extraChats, ...chats } };
 					setChatState((current) => ({ ...chats, ...current }));
 				}
 				const savedQueue = saved?.queued ?? {};
 				const mine = queuedRef.current;
-				const adopt = [...new Set([...Object.keys(mine), ...Object.keys(savedQueue)])].filter((id) => mine[id] === last.queued?.[id] && JSON.stringify(mine[id] ?? []) !== JSON.stringify(savedQueue[id] ?? []));
+				const adopt = [...new Set([...Object.keys(mine), ...Object.keys(savedQueue)])].filter((id) => !remotelyDeleted.current.has(id) && mine[id] === last.queued?.[id] && JSON.stringify(mine[id] ?? []) !== JSON.stringify(savedQueue[id] ?? []));
 				if (adopt.length) {
 					const next = { ...mine };
 					for (const id of adopt) { if (savedQueue[id]) { next[id] = savedQueue[id]; } else { delete next[id]; } }
@@ -859,7 +1170,7 @@ export function App() {
 				}
 				const savedAttachments = saved?.attachments ?? {};
 				const staged = attachmentsRef.current;
-				const take = [...new Set([...Object.keys(staged), ...Object.keys(savedAttachments)])].filter((id) => staged[id] === last.attachments?.[id] && JSON.stringify(staged[id] ?? []) !== JSON.stringify(savedAttachments[id] ?? []));
+				const take = [...new Set([...Object.keys(staged), ...Object.keys(savedAttachments)])].filter((id) => !remotelyDeleted.current.has(id) && staged[id] === last.attachments?.[id] && JSON.stringify(staged[id] ?? []) !== JSON.stringify(savedAttachments[id] ?? []));
 				if (take.length) {
 					const next = { ...staged };
 					for (const id of take) { if (savedAttachments[id]) { next[id] = savedAttachments[id]; } else { delete next[id]; } }
@@ -874,43 +1185,84 @@ export function App() {
 
 	useEffect(() => { persistSettings(settingsRef.current); }, [persistSettings]);
 
-	useEffect(() => {
+	const shownTheme = uiPreviewTheme ?? settings.appearance;
+	useLayoutEffect(() => {
 		const root = typeof document === "undefined" ? undefined : document.documentElement;
 		if (!root) { return; }
-		if (settings.appearance === "system") { root.removeAttribute("data-theme"); } else { root.setAttribute("data-theme", settings.appearance); }
-	}, [settings.appearance]);
+		if (shownTheme === "system") { root.removeAttribute("data-theme"); } else { root.setAttribute("data-theme", shownTheme); }
+	}, [shownTheme]);
+	const activeUiConfig = settings.uiConfigs.find(({ id }) => id === settings.activeUiConfig);
+	useLayoutEffect(() => { applyUiConfig(uiConfigCss(activeUiConfig?.values ?? {})); }, [activeUiConfig]);
 
-	useEffect(() => {
+	useLayoutEffect(() => {
+		const desktop = window as Window & { grokPrepareUnload?: () => Promise<void> };
+		let releaseHistoryLock: (() => void) | undefined;
+		// Electron resumes the unload once this lock is held, so the guard can save the latest state synchronously.
+		desktop.grokPrepareUnload = () => new Promise<void>((ready) => {
+			if (releaseHistoryLock || !navigator.locks) { ready(); return; }
+			void navigator.locks.request(historyKey, () => new Promise<void>((release) => {
+				const timeout = setTimeout(() => releaseHistoryLock?.(), 5000);
+				releaseHistoryLock = () => {
+					clearTimeout(timeout);
+					releaseHistoryLock = undefined;
+					release();
+				};
+				ready();
+			})).catch(() => { setNotice(HISTORY_FAILED); ready(); });
+		});
 		const guard = (event: BeforeUnloadEvent) => {
-			// ponytail: saved here without the lock, so a write from another window in the same instant can lose its last change.
-			const saved = saveHistory.current();
+			let saved = false;
+			const release = releaseHistoryLock;
+			if (release) {
+				try { saved = saveHistory.current(true); } finally { release(); }
+			}
 			const current = editorDraftsRef.current;
-			const unsavedMessage = !saved && Object.entries(draftsRef.current).some(([id, text]) => text && (pendingRef.current?.id === id || keptForm.current?.session.id === id || sessionsRef.current.some((item) => item.id === id)));
-			// Saved queued messages and attachments need a warning only when the save fails.
-			if (unsavedMessage || (current !== persistedDrafts.current && Object.values(current).some((draft) => draft && (draft.text !== draft.baseText || draft.recoveryTexts?.length))) || (!saved && (Object.values(queuedRef.current).some((items) => items.length) || Object.values(attachmentsRef.current).some((files) => files.length)))) {
+			const onlyInWindow = (id: string) => remotelyDeleted.current.has(id) && !deletedRef.current.includes(id);
+			const unsavedMessage = Object.entries(draftsRef.current).some(([id, text]) => text && (onlyInWindow(id) || (!saved && (pendingRef.current?.id === id || keptForm.current?.session.id === id || sessionsRef.current.some((item) => item.id === id)))));
+			const unsavedItems = [queuedRef.current, attachmentsRef.current].some((items) => Object.entries(items).some(([id, values]) => values.length && (!saved || onlyInWindow(id))));
+			if ((!saved && window.grokCode) || unsavedMessage || unsavedItems || (current !== persistedDrafts.current && Object.values(current).some((draft) => draft && (draft.text !== draft.baseText || draft.recoveryTexts?.length)))) {
 				event.preventDefault();
 				event.returnValue = false;
 			}
 		};
 		window.addEventListener("beforeunload", guard);
-		return () => window.removeEventListener("beforeunload", guard);
+		return () => {
+			window.removeEventListener("beforeunload", guard);
+			delete desktop.grokPrepareUnload;
+			releaseHistoryLock?.();
+		};
 	}, []);
 
 	// Set on every render, so a close saves what is on screen even before the effect below runs.
-	saveHistory.current = () => {
+	saveHistory.current = (closing = false) => {
 		const last = lastSaved.current;
 		const currentDrafts = draftsRef.current;
 		const currentQueue = queuedRef.current;
 		const currentAttachments = attachmentsRef.current;
 		const currentWork = backgroundWorkRef.current;
 		const form = pendingRef.current ? { session: pendingRef.current, useWorktree: useWorktreeRef.current } : keptForm.current;
-		const newSessionDraft = form && currentDrafts[form.session.id] ? { ...form, text: currentDrafts[form.session.id] } : undefined;
-		const sameForm = last?.newSessionDraft?.session === newSessionDraft?.session && last?.newSessionDraft?.useWorktree === newSessionDraft?.useWorktree && last?.newSessionDraft?.text === newSessionDraft?.text;
-		if (last && last.sessions === sessions && last.extraChats === extraChats && last.modes === modes && last.prePlan === prePlan && last.editorDrafts === editorDrafts && last.composerDrafts === currentDrafts && sameRecords(last.queued, currentQueue) && sameRecords(last.attachments, currentAttachments) && sameRecords(last.backgroundWork, currentWork) && sameForm && last.deleted === deleted) { return true; }
+		const formAttachments = form ? currentAttachments[form.session.id] : undefined;
+		const newSessionDraft = form && (currentDrafts[form.session.id] || formAttachments?.length) ? { ...form, text: currentDrafts[form.session.id] ?? "", ...(formAttachments?.length ? { attachments: formAttachments } : {}) } : undefined;
+		const sameDraft = (a: History["newSessionDraft"], b: History["newSessionDraft"]) => a?.session.id === b?.session.id && a?.text === b?.text && JSON.stringify(a?.attachments ?? []) === JSON.stringify(b?.attachments ?? []);
+		const retryingCloseSave = closeDraftConflict.current && sameDraft(closeDraftConflict.current.draft, newSessionDraft);
+		if (!retryingCloseSave) { closeDraftConflict.current = null; }
+		const sameForm = last?.newSessionDraft?.session === newSessionDraft?.session && last?.newSessionDraft?.useWorktree === newSessionDraft?.useWorktree && last?.newSessionDraft?.text === newSessionDraft?.text && last?.newSessionDraft?.attachments === newSessionDraft?.attachments;
+		const unchanged = last && last.sessions === sessions && last.extraChats === extraChats && last.modes === modes && last.prePlan === prePlan && last.editorDrafts === editorDrafts && last.composerDrafts === currentDrafts && sameRecords(last.queued, currentQueue) && sameRecords(last.attachments, currentAttachments) && sameRecords(last.backgroundWork, currentWork) && sameForm && last.deleted === deleted;
+		if (!closing && unchanged) { return true; }
 		try {
-			const saved = readHistory();
-			const previous = saved ? last : null;
-			const gone = new Set([...(saved?.deleted ?? []), ...deleted]);
+			let invalidHistory: string | undefined;
+			const saved = readHistory((raw) => { invalidHistory = raw; }, true);
+			observeRemoteDeletes(saved);
+			const savedForm = saved?.newSessionDraft;
+			const sameStoredForm = sameDraft(savedForm, newSessionDraft);
+			const keepOtherDraft = (closing || retryingCloseSave) && !!savedForm && !sameStoredForm && !sameDraft(savedForm, last?.newSessionDraft);
+			if (closing && keepOtherDraft) { closeDraftConflict.current = { draft: newSessionDraft }; }
+			const draftSaved = !keepOtherDraft || !newSessionDraft;
+			if (unchanged && (sameStoredForm || keepOtherDraft) && invalidHistory === undefined) { return draftSaved; }
+			const previous = saved && (saved.sessions.length || saved.newSessionDraft) ? last : null;
+			const priorDeletes = new Set(saved?.allDeleted);
+			const tombstones = new Set([...(saved?.deleted ?? []), ...deletedRef.current.filter((id) => !priorDeletes.has(id))]);
+			const gone = new Set([...priorDeletes, ...tombstones, ...remotelyDeleted.current]);
 			const oldSessions = new Map((previous?.sessions ?? []).map((item) => [item.id, item]));
 			const currentSessions = new Map((saved?.sessions ?? []).map((item) => [item.id, item]));
 			const savedIds = new Set(currentSessions.keys());
@@ -921,11 +1273,20 @@ export function App() {
 				currentSessions.set(item.id, currentSessions.has(item.id) ? { ...currentSessions.get(item.id), ...changes } as Session : item);
 			}
 			const order = [...sessions.filter((item) => !savedIds.has(item.id)).map((item) => item.id), ...savedIds].filter((id) => !gone.has(id) && id !== newSessionDraft?.session.id && (id !== firstSessionId.current || currentSessions.get(id)?.folder));
-			const chats = slimChats(mergeChats(saved?.extraChats ?? {}, extraChats, previous?.extraChats ?? {}));
+			// A changed chat that is not in the value has moved to its file, so it starts from there and returns whole. The value wins over the file from then on.
+			const chatBase = { ...saved?.extraChats };
+			if (previous) {
+				for (const [id, messages] of Object.entries(extraChats)) {
+					if (!chatBase[id] && messages !== previous.extraChats[id]) { chatBase[id] = coldChat(id) ?? previous.extraChats[id] ?? []; }
+				}
+			}
+			const chats = slimChats(mergeChats(chatBase, extraChats, previous?.extraChats ?? {}));
 			for (const id of gone) { delete chats[id]; }
 			const composerDrafts = { ...saved?.composerDrafts };
 			for (const [id, text] of Object.entries(currentDrafts)) {
-				if (text === previous?.composerDrafts?.[id]) { continue; }
+				// Committing a form moves its text out of newSessionDraft. The in-memory draft is unchanged, so copy it into the session's composer entry once.
+				const promoted = saved?.newSessionDraft?.session.id === id && saved.newSessionDraft.text === text && newSessionDraft?.session.id !== id;
+				if (text === previous?.composerDrafts?.[id] && !promoted) { continue; }
 				if (text) { composerDrafts[id] = text; } else { delete composerDrafts[id]; }
 			}
 			for (const id of Object.keys(composerDrafts)) { if (!order.includes(id)) { delete composerDrafts[id]; } }
@@ -952,7 +1313,7 @@ export function App() {
 			for (const id of Object.keys(queue)) { if (!order.includes(id)) { delete queue[id]; } }
 			for (const id of Object.keys(staged)) { if (!order.includes(id)) { delete staged[id]; } }
 			for (const id of Object.keys(work)) { if (!order.includes(id.startsWith("side-") ? id.slice(5) : id)) { delete work[id]; } }
-			localStorage.setItem(historyKey, JSON.stringify({
+			const record = {
 				sessions: order.map((id) => maskDisplay(currentSessions.get(id)!, "title", "detail")),
 				extraChats: chats,
 				modes: { ...saved?.modes, ...Object.fromEntries(Object.entries(modes).filter(([id, value]) => value !== previous?.modes[id])) },
@@ -963,13 +1324,30 @@ export function App() {
 				attachments: staged,
 				backgroundWork: work,
 				// ponytail: one stored form for all windows; a second window's unsent form replaces the first's here, though each window keeps its own until it closes.
-				newSessionDraft: sameForm ? saved?.newSessionDraft : newSessionDraft,
-				deleted: [...gone].slice(-500),
-			}));
+				newSessionDraft: keepOtherDraft || (!closing && sameForm) ? savedForm : newSessionDraft,
+				deleted: [...tombstones].slice(-500),
+				allDeleted: gone.size ? [...gone] : undefined,
+			};
+			let stored = JSON.stringify(record);
+			if (stored.length > HISTORY_MOVE_ABOVE) {
+				// Least recently active first. A running chat is about to change, so it stays.
+				const lastActive = (id: string) => currentSessions.get(id)?.lastActivityAt ?? 0;
+				const idle = order.filter((id) => chats[id]?.length && !turnTargets.current[id] && !currentSessions.get(id)?.cloud?.active).sort((a, b) => lastActive(a) - lastActive(b));
+				if (moveChats(chats, idle, stored.length - HISTORY_MOVE_TO)) { stored = JSON.stringify(record); }
+			}
+			if (invalidHistory !== undefined) {
+				try {
+					localStorage.setItem("grok-code.history.bad", invalidHistory);
+					setNotice(HISTORY_UNREADABLE);
+				} catch {
+					setNotice("The damaged chat history could not be backed up.");
+				}
+			}
+			localStorage.setItem(historyKey, stored);
 			persistedDrafts.current = editorDrafts;
 			lastSaved.current = { sessions, extraChats, modes, prePlan, editorDrafts, composerDrafts: currentDrafts, queued: currentQueue, attachments: currentAttachments, backgroundWork: currentWork, newSessionDraft, deleted };
 			setNotices((list) => list.some((item) => item.text === HISTORY_FULL || item.text === HISTORY_FAILED) ? list.filter((item) => item.text !== HISTORY_FULL && item.text !== HISTORY_FAILED) : list);
-			return true;
+			return draftSaved;
 		} catch (error) {
 			setNotice(error instanceof DOMException && error.name === "QuotaExceededError" ? HISTORY_FULL : HISTORY_FAILED);
 			return false;
@@ -1000,8 +1378,26 @@ export function App() {
 		return () => clearTimeout(timer);
 	}, [drafts]);
 
-	const writeReply = useCallback((uiSessionId: string, recipe: (message: ChatMessage) => ChatMessage, streamed = false) => {
-		const target = turnTargets.current[uiSessionId];
+	function rememberReply(uiSessionId: string, target: TurnTarget) {
+		(replyTargets.current[uiSessionId] ??= {})[target.turnId] = target;
+		if (!target.background) { turnTargets.current[uiSessionId] = target; }
+	}
+
+	function finishReply(uiSessionId: string, target: TurnTarget) {
+		target.finished = true;
+		if (turnTargets.current[uiSessionId] === target) {
+			const next = Object.values(replyTargets.current[uiSessionId] ?? {}).filter((item) => !item.finished && !item.background).at(-1);
+			if (next) { turnTargets.current[uiSessionId] = next; } else { delete turnTargets.current[uiSessionId]; }
+		}
+		setBusy((current) => ({ ...current, [uiSessionId]: !!turnTargets.current[uiSessionId] }));
+	}
+
+	function toolReplyTarget(uiSessionId: string, toolId: string) {
+		return Object.values(replyTargets.current[uiSessionId] ?? {}).find((target) => target.toolIds?.has(toolId));
+	}
+
+	const writeReply = useCallback((uiSessionId: string, recipe: (message: ChatMessage) => ChatMessage, streamed = false, replyTarget?: TurnTarget) => {
+		const target = replyTarget ?? turnTargets.current[uiSessionId];
 		if (!target) { return; }
 		const apply = (current: Record<string, ChatMessage[]>) => {
 			const list = current[target.sessionId] ?? [];
@@ -1014,6 +1410,11 @@ export function App() {
 		if (target.where === "side") { setSideChats(apply); } else if (streamed) { setChatState(apply); } else { setExtraChats(apply); }
 	}, []);
 
+	function announceTurn(text: string, title?: string) {
+		const message = title ? `In ${redactKeys(title)}, ${text}` : text;
+		setTurnAnnouncements((current) => [...current.slice(-7), { id: (current.at(-1)?.id ?? 0) + 1, text: message }]);
+	}
+
 	function notify(kind: "permission" | "question" | "done" | "pr", sessionId: string, body: string) {
 		const current = settingsRef.current;
 		const level = kind === "permission" ? current.notifyPermission : kind === "question" ? current.notifyQuestion : kind === "pr" ? current.notifyPr : current.notifyDone;
@@ -1024,7 +1425,7 @@ export function App() {
 		const title = sessionsRef.current.find((item) => item.id === sessionId)?.title ?? "Codewomplers Grok Desktop";
 		try {
 			const shown = new Notification(title, { body, silent: current.sound === "none" });
-			shown.onclick = () => { window.focus(); setActiveId(sessionId); leaveForm(); };
+			shown.onclick = () => { window.focus(); setGrokBotOpen(false); setActiveId(sessionId); leaveForm(); };
 		} catch {
 			// Notifications can be blocked by the system.
 		}
@@ -1080,8 +1481,11 @@ export function App() {
 	useEffect(() => {
 		const api = window.grokCode;
 		if (!api) { return; }
-		return api.onEvent((event) => {
+		const handleEvent = (event: GrokEvent): void => {
+			if (event.type.startsWith("grokbot-")) { grokBot.onEvent(event); return; }
 			if (event.type === "inbound" && event.requestId) { void api.inboundResult?.(event.requestId, inboundAccept.current(event.agentSessionId ?? "", event.text ?? "")); return; }
+			if (event.type === "routine-fire") { routineFire.current(event); return; }
+			if (event.type === "routine-open") { routineOpen.current(event); return; }
 			if (event.type === "browser-open") {
 				if (!settingsRef.current.browserControl || event.uiSessionId !== activeIdRef.current || !event.url || sessionsRef.current.some((item) => item.id === event.uiSessionId && item.environment === "Cloud")) { return; }
 				let url: URL;
@@ -1090,7 +1494,7 @@ export function App() {
 				const id = crypto.randomUUID();
 				setBrowserTabs((current) => ({ ...current, [event.uiSessionId]: [...(current[event.uiSessionId] ?? []), { id, url: url.toString(), title: url.host }] }));
 				setActiveBrowser((current) => ({ ...current, [event.uiSessionId]: id }));
-				showPane("browser");
+				openPane("browser");
 				return;
 			}
 			if (event.type === "browser-activity") {
@@ -1107,6 +1511,7 @@ export function App() {
 				}
 				return;
 			}
+			if (event.type === "ui-default") { changeSettings({ activeUiConfig: "" }); return; }
 			if (event.type === "update-open" && event.current && event.latest && event.tag) {
 				const info = { current: event.current, latest: event.latest, tag: event.tag };
 				setUpdate(info);
@@ -1210,28 +1615,49 @@ export function App() {
 				if (active && item?.cloud && !turnTargets.current[uiSessionId]) { void resumeCloud(item); }
 				return;
 			}
-			// Grok ran a steer that arrived after the turn ended as a turn of its own; it shows as a new message and reply.
+			// A late steer or a background command report gets its own reply.
 			if (event.type === "turn-start" && event.uiSessionId && event.turnId) {
 				const id = event.uiSessionId;
-				const item = sessionsRef.current.find((entry) => entry.id === id);
-				if (!item || (!event.resume && turnTargets.current[id])) { return; }
+				const background = event.background === true;
+				const side = background && id.startsWith("side-");
+				const sessionId = side ? id.slice(5) : id;
+				const where = side ? "side" : "main";
+				const item = sessionsRef.current.find((entry) => entry.id === sessionId);
+				const known = replyTargets.current[id]?.[event.turnId];
+				if (!item || (!background && !event.parallel && !event.resume && turnTargets.current[id])) { return; }
+				if (known && (background || event.parallel || !event.resume)) {
+					if (!known.finished && !known.background) { turnTargets.current[id] = known; }
+					return;
+				}
 				const stamp = Date.now();
 				const replyId = `grok-${event.turnId}`;
-				turnTargets.current[id] = { sessionId: id, replyId, turnId: event.turnId, where: "main" };
+				const saved = background && replyChats.current[where][sessionId]?.some((message) => message.id === replyId);
+				rememberReply(id, { sessionId, replyId, turnId: event.turnId, where, ...(background ? { background: true, finished: !!saved } : {}) });
+				if (saved) { return; }
 				const reply: ChatMessage = { id: replyId, role: "grok", text: "", pending: true, streaming: true, live: true };
-				const asked: ChatMessage[] = !event.resume && event.text ? [{ id: `user-${event.turnId}`, role: "user", text: event.text, at: stamp, live: true }] : [];
-				setExtraChats((list) => {
-					const messages = list[id] ?? [];
+				const asked: ChatMessage[] = !background && !event.resume && event.text ? [{ id: `user-${event.turnId}`, role: "user", text: event.text, at: stamp, live: true }] : [];
+				const store = side ? setSideChats : setExtraChats;
+				store((list) => {
+					const messages = list[sessionId] ?? [];
+					if (background && messages.some((message) => message.id === replyId)) { return list; }
 					const replay = event.resume && messages.some((message) => message.id === replyId);
-					return { ...list, [id]: replay ? messages.map((message) => message.id === replyId ? reply : message) : [...messages, ...asked, reply] };
+					return { ...list, [sessionId]: replay ? messages.map((message) => message.id === replyId ? reply : message) : [...messages, ...asked, reply] };
 				});
-				setSessions((list) => list.map((item) => (item.id === id ? { ...item, lastActivityAt: stamp, completed: false } : item)));
-				setBusy((list) => ({ ...list, [id]: true }));
+				if (!background) {
+					setSessions((list) => list.map((item) => (item.id === id ? { ...item, lastActivityAt: stamp, completed: false } : item)));
+					setBusy((list) => ({ ...list, [id]: true }));
+				}
 				return;
 			}
 			const uiId = event.uiSessionId;
-			const target = uiId ? turnTargets.current[uiId] : undefined;
-			if (!uiId || !target || event.turnId !== target.turnId) { return; }
+			const target = uiId ? replyTargets.current[uiId]?.[event.turnId] : undefined;
+			if (!uiId || !target) { return; }
+			if (event.type === "tool" && event.tool) { (target.toolIds ??= new Set()).add(event.tool.id); }
+			if (target.finished && event.type === "tool" && event.tool) {
+				writeReply(uiId, (message) => withTool(message, event.tool as GrokToolEvent), false, target);
+				return;
+			}
+			if (target.finished && event.type !== "steer") { return; }
 			const sessionId = target.sessionId;
 			const targetSession = sessionsRef.current.find((item) => item.id === sessionId);
 			const cloud = targetSession?.environment === "Cloud";
@@ -1254,16 +1680,48 @@ export function App() {
 				}
 				return;
 			}
-			if (event.type === "tool" && event.tool?.waiting && target.where === "main") {
-				notify(event.tool.questions ? "question" : "permission", sessionId, event.tool.questions ? "Grok has a question." : "Grok needs your approval.");
+			if (event.type === "chunk" && event.text?.trim()) { target.hasReply = true; }
+			if (event.type === "tool" && event.tool) {
+				const { id, waiting, questions } = event.tool;
+				if (waiting === false) { target.announcedWaiting?.delete(id); }
+				if (waiting) {
+					const message = questions ? "Grok has a question." : "Grok needs your approval.";
+					if (!target.announcedWaiting?.has(id)) {
+						(target.announcedWaiting ??= new Set()).add(id);
+						announceTurn(message, targetSession?.title);
+					}
+					if (target.where === "main") {
+						if (grokBotShown.current) { setSessions((current) => current.map((item) => item.id === sessionId ? { ...item, unread: true } : item)); }
+						notify(questions ? "question" : "permission", sessionId, message);
+					}
+				}
 			}
-			if (event.type === "done" || event.type === "error") {
+			if (target.background && (event.type === "done" || event.type === "error")) {
+				target.finished = true;
+				if (!target.hasReply && !target.toolIds?.size) {
+					const store = target.where === "side" ? setSideChats : setExtraChats;
+					store((list) => list[sessionId] ? { ...list, [sessionId]: list[sessionId].filter((message) => message.id !== target.replyId) } : list);
+					return;
+				}
+				if (target.where === "main") {
+					setSessions((current) => current.map((item) => (item.id === sessionId ? { ...item, lastActivityAt: Date.now(), unread: sessionId !== activeIdRef.current || item.unread } : item)));
+				}
+			}
+			if (!target.background && (event.type === "done" || event.type === "error")) {
+				finishReply(uiId, target);
+				const agent = cloud ? "Cursor" : "Grok";
+				const away = sessionId !== activeIdRef.current;
+				if (!target.awaitingReplay || event.type !== "error") {
+					const message = event.type === "error" ? `${agent} stopped with an error.`
+						: event.stopReason === "cancelled" ? `${agent} stopped.`
+						: target.hasReply ? `${agent}'s reply is ready.` : `${agent}'s turn ended.`;
+					announceTurn(message, away || settingsShown.current || target.where === "side" ? targetSession?.title : undefined);
+				}
 				if (cloud && event.type === "done" && validMachineName(event.machine)) {
 					const repo = cursorRepoSlug(targetSession.cloud?.repoUrl).toLowerCase();
 					if (repo) { changeSettings({ cursorMachines: normalizeCursorMachines([{ name: event.machine, repo }, ...settingsRef.current.cursorMachines]) }); }
 				}
 				if (cloud && event.type === "error") { setHeld((current) => ({ ...current, [sessionId]: true })); }
-				setBusy((current) => ({ ...current, [uiId]: false }));
 				setNotices((list) => list.some((item) => item.text === SIDE_BUSY) ? list.filter((item) => item.text !== SIDE_BUSY) : list);
 				if (!cloud) {
 					setDiffTick((value) => value + 1);
@@ -1271,14 +1729,11 @@ export function App() {
 					setFileTick((value) => value + 1);
 				}
 				if (target.where === "main") {
-					const away = sessionId !== activeIdRef.current;
 					setSessions((current) => current.map((item) => (item.id === sessionId ? { ...item, lastActivityAt: Date.now(), unread: away || item.unread, completed: false, failed: event.type === "error" } : item)));
-					const agent = cloud ? "Cursor" : "Grok";
 					notify("done", sessionId, event.type === "error" ? `${agent} stopped with an error.` : `${agent} finished.`);
 				}
 			}
 			if (target.awaitingReplay && event.type === "error") {
-				delete turnTargets.current[uiId];
 				if (event.message) { setNotice(event.message); }
 				return;
 			}
@@ -1290,39 +1745,14 @@ export function App() {
 					const base = message.pending ? "" : message.text;
 					const parts = [...(message.parts ?? [])];
 					const last = parts[parts.length - 1];
+					const separator = target.background && last?.kind === "tool" && base && !base.endsWith("\n") && !event.text.startsWith("\n") ? "\n" : "";
 					if (last && last.kind === "text") { parts[parts.length - 1] = { kind: "text", text: redactKeys(last.text + event.text) }; } else { parts.push({ kind: "text", text: redactKeys(event.text) }); }
-					return { ...message, pending: false, text: redactKeys(base + event.text), parts };
+					return { ...message, pending: false, text: redactKeys(base + separator + event.text), parts };
 				}
 				if (event.type === "thought" && event.text) {
 					return { ...message, thought: redactKeys((message.thought ?? "") + event.text) };
 				}
-				if (event.type === "tool" && event.tool) {
-					const tools = message.tools ? [...message.tools] : [];
-					const toolIndex = tools.findIndex((tool) => tool.id && tool.id === event.tool?.id);
-					let parts = message.parts;
-					if (toolIndex >= 0) {
-						const previous = tools[toolIndex];
-						const incoming = event.tool;
-						tools[toolIndex] = {
-							...previous,
-							...incoming,
-							kind: incoming.kind || previous.kind,
-							title: incoming.title || previous.title,
-							detail: incoming.detail || previous.detail,
-							summary: incoming.summary ?? previous.summary,
-							waiting: incoming.waiting ?? previous.waiting,
-						};
-					} else {
-						tools.push({
-							...event.tool,
-							kind: event.tool.kind || "tool",
-							title: event.tool.title || "Tool",
-							detail: event.tool.detail || "Not run",
-						});
-						if (event.tool.id) { parts = [...(message.parts ?? []), { kind: "tool", id: event.tool.id }]; }
-					}
-					return { ...message, pending: false, tools, parts };
-				}
+				if (event.type === "tool" && event.tool) { return withTool(message, event.tool); }
 				if (event.type === "done") {
 					const stoppedTurn = event.stopReason === "cancelled";
 					if (message.pending && !message.text) {
@@ -1330,14 +1760,13 @@ export function App() {
 					}
 					return { ...message, at: Date.now(), pending: false, streaming: false };
 				}
-				if (event.type === "error" && event.message) {
-					return replyWithNote({ ...message, at: Date.now() }, event.message);
+				if (event.type === "error") {
+					return event.message ? replyWithNote({ ...message, at: Date.now() }, event.message) : { ...message, at: Date.now(), pending: false, streaming: false };
 				}
 				return message;
-			}, event.type === "chunk" || event.type === "thought");
+			}, event.type === "chunk" || event.type === "thought", target);
 			if (event.type === "done" || event.type === "error") {
-				delete turnTargets.current[uiId];
-				if (!cloud && target.where === "main" && event.type === "done" && event.stopReason !== "cancelled" && settingsRef.current.promptSuggestions) {
+				if (!target.background && !cloud && target.where === "main" && !turnTargets.current[uiId] && event.type === "done" && event.stopReason !== "cancelled" && settingsRef.current.promptSuggestions && !sessionsRef.current.find((item) => item.id === sessionId)?.routineId) {
 					const generation = suggestionGeneration.current[sessionId] ?? 0;
 					suggestionGeneration.current[sessionId] = generation;
 					void api.suggestPrompt?.(sessionId).then((text) => {
@@ -1347,7 +1776,10 @@ export function App() {
 					}).catch(() => {});
 				}
 			}
-		});
+		};
+		const stopEvents = api.onEvent(handleEvent);
+		void api.routinesReady?.();
+		return stopEvents;
 	}, [writeReply, openUpdate]);
 	useEffect(() => {
 		for (const item of sessionsRef.current) {
@@ -1355,7 +1787,7 @@ export function App() {
 		}
 	}, []);
 
-	const visible = pending ?? sessions.find((item) => item.id === activeId) ?? sessions.find((item) => !item.archived) ?? sessions[0];
+	const visible = pending ?? sessions.find((item) => item.id === activeId) ?? firstOpen(sessions) ?? sessions[0];
 	const session = visible;
 	const isCloud = session.environment === "Cloud";
 	const firstRun = !!pending && !history?.sessions.length && !sessions.some((item) => item.agentSessionId || (item.id !== pending.id && item.folder));
@@ -1389,7 +1821,7 @@ export function App() {
 		`git clone ${cloudSetupResult?.repoUrl}.git ${clonePath}`,
 		`cursor-agent worker start --name ${machineName} --worker-dir ${clonePath}`,
 	] : [];
-	const cloudReady = cloudKeyAvailable && cloudSetupResult?.ok && cloudSetupResult.reachable === true && !!cloudSetupResult.repoUrl && !!cloudSetupResult.ref && !cloudSetupResult.modelsError && !!cloudVariant && (!machineMode || machineReady);
+	const cloudReady = cloudKeyAvailable && cloudSetupResult?.ok && cloudSetupResult.reachable !== false && !!cloudSetupResult.repoUrl && !!cloudSetupResult.ref && !cloudSetupResult.modelsError && !!cloudVariant && (!machineMode || machineReady);
 	const cloudModelLabel = cloudModel && cloudVariant
 		? `${cloudModel.displayName}${cloudVariant.isMaxMode ? " · Max" : ""}`
 		: session.cloudModelLabel || cloudChoice?.id || "Cursor model";
@@ -1448,7 +1880,20 @@ export function App() {
 	}, [session.id, isCloud, settings.browserControl, currentBrowserMounted]);
 	useEffect(() => { setRewindAsk(null); }, [session.id]);
 	// The session on screen, which is the first one before any is picked; a new-session page is none.
-	activeIdRef.current = pending ? "" : session.id;
+	activeIdRef.current = pending || grokBotOpen ? "" : session.id;
+	const visibleChatId = settingsCover ? "" : activeIdRef.current;
+	useEffect(() => {
+		if (visibleChatId && remotelyDeleted.current.has(visibleChatId)) { showDeletedChat(visibleChatId); }
+	}, [visibleChatId]);
+	useEffect(() => { setGrokBotOpen(false); }, [session.id]);
+	const botWindow = PLATFORM === "win32" && settings.grokBotWindow;
+	useEffect(() => { if (!grokBot.status.signedIn && !botWindow) { setGrokBotOpen(false); } }, [grokBot.status.signedIn, botWindow]);
+	useEffect(() => { if (!botWindow) { void window.grokCode?.grokBotWindowRelease?.(); } }, [botWindow]);
+	const botWasOpen = useRef(false);
+	useEffect(() => {
+		if (botWasOpen.current && !grokBotOpen) { promptRef.current?.focus(); }
+		botWasOpen.current = grokBotOpen;
+	}, [grokBotOpen]);
 	useEffect(() => { if (!pending) { readColdLoops(session.id); } }, [pending, session.id, session.agentSessionId]);
 	const mode = knownMode(modes[session.id] ?? settings.defaultMode, settings);
 	const view = views[session.id] ?? settings.defaultView;
@@ -1493,8 +1938,11 @@ export function App() {
 	const railShown = !isCloud && railOpen && railWidth <= railCap;
 	const model = session.model ?? settings.model;
 	const effort = session.effort ?? settings.effort;
-	const modelInfo = models.find((item) => item.id === model);
-	const efforts = modelInfo?.efforts.length ? modelInfo.efforts : EFFORTS.filter((item) => model !== "grok-4.5" || item !== "xhigh");
+	const effortsFor = (id: string): string[] => {
+		const info = models.find((item) => item.id === id);
+		return info?.efforts.length ? info.efforts : EFFORTS.filter((item) => id !== "grok-4.5" || item !== "xhigh");
+	};
+	const efforts = effortsFor(model);
 	const modelList = models.length ? models.map((item) => item.id).filter((id) => !Object.values(FAST_MODEL).includes(id)) : MODELS.filter((id) => !Object.values(FAST_MODEL).includes(id));
 	const fastBase = Object.entries(FAST_MODEL).find(([, fast]) => fast === model)?.[0];
 	const baseModel = fastBase ?? model;
@@ -1509,12 +1957,17 @@ export function App() {
 	const folderMissing = !pending && folderUnavailable(session);
 	const titleBranch = isCloud ? session.cloud?.branch ?? session.branch : branch?.ok && branch.repo !== false ? branch.branch : undefined;
 	const worktreeReason = !session.folder ? "Choose a project folder first."
+		: sandboxWanted(session) && PLATFORM === "win32" ? WINDOWS_SANDBOX_WORKTREE
 		: setup.result?.git.ok === false ? "Git is not installed."
 		: !window.grokCode?.branchInfo || !window.grokCode.addWorktree ? "Reopen this window to use worktrees."
 		: !branch ? "Checking the folder for Git…"
 		: !branch.ok ? branch.error || "The folder could not be checked for Git."
 		: branch.repo === false ? "This folder is not a Git checkout."
 		: "";
+	const sandboxBlocked = PLATFORM === "win32" && (pending ? useWorktree : !!session.worktreeFolder);
+	function setSessionSandbox(patch: Pick<Session, "sandboxOn" | "sandboxChoice">) {
+		if (pending) { setPending((current) => current ? { ...current, ...patch } : current); } else { void saveLocalSendSettings(session.id, patch); }
+	}
 
 	useEffect(() => {
 		const api = window.grokCode;
@@ -1711,9 +2164,14 @@ export function App() {
 	function createPr() {
 		const api = window.grokCode;
 		if (!api?.prCreate) { return Promise.resolve({ ok: false, error: "Reopen this window to create a pull request." }); }
-		return api.prCreate(session.folder, branch?.branch).then((result) => {
+		const id = session.id;
+		const folder = session.folder;
+		const request = sandboxGitSession(session) ? api.prCreate(folder, branch?.branch, { sandbox: true }) : api.prCreate(folder, branch?.branch);
+		return request.then((result) => {
 			const number = result.ok && /\/pull\/(\d+)/.exec(result.url ?? "")?.[1];
-			if (number) { updateSession(session.id, { prWatch: { number: Number(number), failing: [], seenAt: new Date().toISOString() } }); }
+			if (number) {
+				setSessions((current) => current.map((item) => item.id === id && folderKey(item.folder) === folderKey(folder) ? { ...item, prWatch: { number: Number(number), failing: [], seenAt: new Date().toISOString() } } : item));
+			}
 			setDiffTick((value) => value + 1);
 			setRemoteTick((value) => value + 1);
 			return result;
@@ -1788,10 +2246,10 @@ export function App() {
 
 	// Opening a session reads it; "Mark as unread" on the open session stays until you leave it.
 	useEffect(() => {
-		if (pending || !session.unread) { return; }
+		if (pending || grokBotOpen || !session.unread) { return; }
 		const id = session.id;
 		setSessions((current) => current.map((item) => (item.id === id ? { ...item, unread: false } : item)));
-	}, [session.id, !!pending]);
+	}, [session.id, !!pending, grokBotOpen]);
 
 	function pickPopup(index: number) {
 		if (!popup) { return; }
@@ -1902,15 +2360,18 @@ export function App() {
 		if (!days) { return; }
 		const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
 		for (const item of sessions) {
-			if (item.archived || item.pinned || busy[item.id] || item.cloud?.active || (item.lastActivityAt ?? Date.now()) >= cutoff || autoArchiving.current.has(item.id)) { continue; }
+			if (item.archived || item.pinned || turnTargets.current[item.id] || turnTargets.current[`side-${item.id}`] || item.cloud?.active || (item.lastActivityAt ?? Date.now()) >= cutoff || autoArchiving.current.has(item.id)) { continue; }
 			const api = window.grokCode;
 			if (!item.worktreeFolder || !api?.removeWorktree || sharesFolder(item)) {
 				updateSession(item.id, { archived: true });
 				continue;
 			}
 			autoArchiving.current.add(item.id);
-			void api.removeWorktree(item.folder, item.worktreeFolder, { force: false }).catch(() => {}).finally(() => {
+			void api.removeWorktree(item.folder, item.worktreeFolder, { force: false, branch: item.branch, autoArchive: true }).catch(() => null).then((result) => {
+				if (result?.skipped) { return; }
+				if (result && !result.ok && result.dirty) { setNotice(`Archived ${item.title}. ${result.error || "This worktree is not clean."} The worktree stays on disk.`); }
 				updateSession(item.id, { archived: true });
+			}).finally(() => {
 				autoArchiving.current.delete(item.id);
 			});
 		}
@@ -1933,6 +2394,10 @@ export function App() {
 
 	function showPane(id: SidePaneId) {
 		if (isCloud && id !== "editor") { return; }
+		openPane(id);
+	}
+
+	function openPane(id: SidePaneId) {
 		setExpandedPane((current) => current === id ? current : null);
 		setPanes((current) => (current.includes(id) ? current : [...current, id]));
 		setFocusedPane(id);
@@ -1970,7 +2435,17 @@ export function App() {
 		setPending(null);
 	}
 
-	function selectSession(id: string, find?: string) {
+	function selectSession(id: string, find?: string, saved?: History | null) {
+		if (!modesRef.current[id]) {
+			const stored = saved === undefined ? readHistory() : saved;
+			const savedMode = stored?.modes[id];
+			if (savedMode) {
+				modesRef.current = { ...modesRef.current, [id]: savedMode };
+				setModes(modesRef.current);
+			}
+			const savedPrePlan = stored?.prePlan[id];
+			if (savedPrePlan) { setPrePlan((current) => current[id] ? current : { ...current, [id]: savedPrePlan }); }
+		}
 		flushEditor();
 		leaveForm();
 		setExpandedPane(null);
@@ -1979,6 +2454,37 @@ export function App() {
 		if (find) { setFindAt((current) => ({ tick: current.tick + 1, text: find })); }
 		setSessions((current) => (current.some((item) => item.id === id && item.unread) ? current.map((item) => (item.id === id ? { ...item, unread: false } : item)) : current));
 		readColdLoops(id);
+	}
+
+	// The newest entry that can still be shown and isn't on screen now.
+	function trailStop(stack: string[]) {
+		for (let index = stack.length - 1; index >= 0; index--) {
+			const entry = stack[index];
+			const showable = entry === "page:grok-bot" ? !!(grokBot.status.signedIn || botWindow) : entry.startsWith("page:") || sessions.some((item) => item.id === entry);
+			if (entry !== place && showable) { return index; }
+		}
+		return -1;
+	}
+
+	// Back from a new-session form returns to the session shown before it, and keeps the form's text.
+	const formOver = place === activeId && !!pending && pending.id !== activeId && sessions.some((item) => item.id === activeId);
+
+	function travel(back: boolean) {
+		if (back && formOver) {
+			selectSession(activeId);
+			return;
+		}
+		const stack = back ? trail.back : trail.forward;
+		const index = trailStop(stack);
+		if (index < 0) { return; }
+		const target = stack[index];
+		const rest = stack.slice(0, index);
+		setTrail(back ? { back: rest, forward: [...trail.forward, place] } : { back: [...trail.back, place], forward: rest });
+		travelTo.current = target;
+		setRoutinesOpen(target === "page:routines");
+		setSettingsOpen(target === "page:settings" ? "general" : null);
+		setGrokBotOpen(target === "page:grok-bot");
+		if (!target.startsWith("page:") && target !== activeId) { selectSession(target); }
 	}
 
 	function createSession(seed?: Partial<ProjectSeed>) {
@@ -2032,11 +2538,27 @@ export function App() {
 	}
 
 	function stepSession(step: number) {
-		const list = sessionsRef.current.filter((item) => !item.archived && (item.id !== firstSessionId.current || item.folder));
+		const currentId = pendingRef.current ? "" : activeIdRef.current;
+		const shownActivity: Record<string, "running" | "needs-you"> = {};
+		for (const [id, list] of Object.entries(extraChats)) {
+			if (list.some((message) => message.tools?.some((tool) => tool.waiting))) { shownActivity[id] = "needs-you"; }
+		}
+		for (const [id, isBusy] of Object.entries(busy)) {
+			if (isBusy && !id.startsWith("side-") && !shownActivity[id]) { shownActivity[id] = "running"; }
+		}
+		const list = sidebarSessionIds({
+			sessions: sessionsRef.current.filter((item) => item.id !== firstSessionId.current || item.folder),
+			chats: extraChats,
+			query,
+			view: readSidebarView(),
+			sections: readSidebarSections(),
+			activity: shownActivity,
+			activeId: currentId,
+		});
 		if (!list.length) { return; }
-		const found = list.findIndex((item) => item.id === (pendingRef.current ? "" : activeIdRef.current));
+		const found = list.findIndex((id) => id === currentId);
 		const index = found < 0 ? (step < 0 ? 0 : -1) : found;
-		selectSession(list[(index + step + list.length) % list.length].id);
+		selectSession(list[(index + step + list.length) % list.length]);
 	}
 
 	async function resumeCloud(item: Session) {
@@ -2049,15 +2571,16 @@ export function App() {
 			setNotice("This Cursor run could not be resumed.");
 			return false;
 		}
-		turnTargets.current[id] = { sessionId: id, replyId: `grok-${turnId}`, turnId, where: "main", awaitingReplay: true };
+		const target: TurnTarget = { sessionId: id, replyId: `grok-${turnId}`, turnId, where: "main", awaitingReplay: true };
+		rememberReply(id, target);
 		setBusy((current) => ({ ...current, [id]: true }));
 		const fallback = "This Cursor run could not be resumed.";
 		const result = await resume({ uiSessionId: id, turnId, cloud }).catch(() => ({ ok: false, error: fallback }));
 		if (result.ok) { return true; }
-		if (turnTargets.current[id]?.turnId === turnId) {
-			delete turnTargets.current[id];
+		const currentTarget = replyTargets.current[id]?.[turnId];
+		if (currentTarget && !currentTarget.finished) {
+			finishReply(id, currentTarget);
 			setHeld((current) => ({ ...current, [id]: true }));
-			setBusy((current) => ({ ...current, [id]: false }));
 			setNotice(result.error || fallback);
 		}
 		return false;
@@ -2104,8 +2627,8 @@ export function App() {
 			// Grok's previous folder and its Always allow rules cannot follow the new folder.
 			await api.forgetSession?.(id);
 			const name = shortPath(picked);
-			const sameFolder = folderKey(picked) === folderKey(folder);
-			setSessions((current) => current.map((item) => item.id === id && item.folder === folder ? { ...item, folder: picked, project: name, worktree: name, worktreeFolder: sameFolder ? item.worktreeFolder : undefined, agentSessionId: undefined, allowedFolders: undefined, prWatch: undefined } : item));
+			const worktreeFolder = folderKey(picked) === folderKey(folder) ? session.worktreeFolder : undefined;
+			if (!await saveLocalSendSettings(id, { folder: picked, project: name, worktree: name, worktreeFolder, agentSessionId: undefined, sandbox: undefined, sandboxContextPending: undefined, allowedFolders: undefined, prWatch: undefined }, folder)) { return; }
 			setMissingFolders((current) => ({ ...current, [id]: "" }));
 			setBranches((current) => ({ ...current, [id]: undefined }));
 			setDiffTick((value) => value + 1);
@@ -2130,6 +2653,34 @@ export function App() {
 		const status = held[target.id] ? "held" : (busy[target.id] || turnTargets.current[target.id] || waiting ? "queued" : "sent");
 		setQueued((list) => ({ ...list, [target.id]: [...(list[target.id] ?? []), { id: crypto.randomUUID(), text: `[Sent by a local tool, not typed in Grok Code]\n\n${text}`, attachments: [] }] }));
 		return { accepted: true, status };
+	};
+
+	routineFire.current = ({ runId, routineId, sessionId, title, project, folder, model, effort, mode, text }) => {
+		if (!runId || !sessionId || !mode || sessionsRef.current.some((item) => item.id === sessionId)) { return; }
+		// `visible` falls back to the first open session when activeId matches nothing, so this new first session would take over the screen.
+		if (!pendingRef.current && !sessionsRef.current.some((item) => item.id === activeId)) { setActiveId(session.id); }
+		const created: Session = { ...newSession({ folder, project, worktree: project, environment: "Local" }), id: sessionId, title: title ?? "Routine", titleAuto: false, model, effort, routineId };
+		sessionsRef.current = [created, ...sessionsRef.current.filter((item) => item.id !== created.id)];
+		setSessions((current) => [created, ...current.filter((item) => item.id !== created.id)]);
+		changeMode(sessionId, mode);
+		// Only Auto-review: in Normal, cards are how a routine somebody supervises gets its approvals, and Always-approve never asks.
+		if (!send(text ?? "", false, sessionId, [], false, [], { runId, unattended: mode === "Auto-review" })) {
+			updateSession(sessionId, { failed: true, unread: true });
+			void window.grokCode?.routineResult?.(runId, { ok: false, error: "This window could not start the run." });
+		}
+	};
+
+	routineOpen.current = ({ sessionId, agentSessionId }) => {
+		// A notification's click already brought this window forward, and a half-written routine stays.
+		if (document.querySelector?.("[data-routine-form]")) { return; }
+		setSettingsOpen(null);
+		setGrokBotOpen(false);
+		setRoutinesOpen(false);
+		const existing = sessionId ? sessionsRef.current.find((item) => item.id === sessionId) ?? readHistory()?.sessions.find((item) => item.id === sessionId) : undefined;
+		if (existing) { showExistingCli(existing); return; }
+		if (agentSessionId) { openCliSession(agentSessionId); return; }
+		setRoutinesOpen(true);
+		if (sessionId) { setNotice("That run's chat is no longer in this window."); }
 	};
 
 	function openPromptLibrary(mode: "save" | "insert") {
@@ -2223,8 +2774,8 @@ export function App() {
 		expand: () => keyActions.current.cycleView?.(),
 		tasks: () => togglePane("tasks"),
 		"view-plan": () => togglePane("plan"),
-		plan: () => changeMode(session.id, "Plan"),
-		auto: () => changeMode(session.id, "Auto-review"),
+		plan: () => requestMode(session.id, "Plan"),
+		auto: () => requestMode(session.id, "Auto-review"),
 		model: () => keyActions.current.model?.(),
 		effort: () => setMenu("effort"),
 		cd: () => setMenu("folder"),
@@ -2245,12 +2796,15 @@ export function App() {
 
 	useEffect(() => {
 		function onKey(event: KeyboardEvent) {
+			if (event.isComposing) { return; }
 			if (document.querySelector?.("[data-commit-dialog]") || document.querySelector?.("[data-saved-prompts-dialog]")) { return; }
 			// An open confirm owns the keyboard: Escape cancels it without acting underneath it.
 			if (confirmShown.current) {
 				if (event.key === "Escape") { event.preventDefault(); answerRef.current(false); }
 				return;
 			}
+			// So does a running sandbox setup job, wherever focus is: leaving its panel stops the job, and Escape must not stop the turn behind it.
+			if (document.querySelector?.("[data-sandbox-job]")) { return; }
 			// The Files editor handled this key; the app's shortcut must not run too.
 			if (event.defaultPrevented && (event.target as Element | null)?.closest?.(".cm-editor")) { return; }
 			if ((event.target as Element | null)?.closest?.(".xterm")) { return; }
@@ -2267,9 +2821,12 @@ export function App() {
 					setPromptLibrary(null);
 					setRewindAsk(null);
 					setSettingsOpen(null);
+					// Wherever focus is, Escape never throws away a half-written routine. Only Save or Cancel leaves the form.
+					if (!document.querySelector?.("[data-routine-form]")) { setRoutinesOpen(false); }
 					setSetup((current) => ({ ...current, open: false }));
 					return;
 				}
+				if (grokBotShown.current) { event.preventDefault(); escapeStopAfter.current = Date.now() + ESCAPE_STOP_GRACE_MS; setGrokBotOpen(false); return; }
 				if (target?.closest?.(".side-q")) { setSideOpen(false); return; }
 				if (keyActions.current.restorePane?.()) { event.preventDefault(); return; }
 				if (target?.closest?.(".side-col, .session-rail")) { return; }
@@ -2277,8 +2834,8 @@ export function App() {
 				keyActions.current.stop?.();
 				return;
 			}
-			if (setupFromAbout.current) { return; }
-			if (/^[1-9]$/.test(event.key) && !event.ctrlKey && !event.altKey && !event.metaKey && document.querySelector(".pop")) {
+			if (setupFromAbout.current || grokBotShown.current) { return; }
+			if (/^[1-9]$/.test(event.key) && !event.ctrlKey && !event.altKey && !event.metaKey && !settingsShown.current && document.querySelector(".pop")) {
 				const items = Array.from(document.querySelectorAll<HTMLButtonElement>(".pop button:not(:disabled)"));
 				const item = items[Number(event.key) - 1];
 				if (item) { event.preventDefault(); item.click(); }
@@ -2306,6 +2863,11 @@ export function App() {
 			if (event.shiftKey && key === "m") { run("mode"); return; }
 			if (event.shiftKey && key === "i") { run("model"); return; }
 			if (event.shiftKey && key === "e") { run("effort"); return; }
+			if (!event.altKey && !event.getModifierState?.("AltGraph")) {
+				if (key === "/" || (!event.shiftKey && event.code === "Slash")) { event.preventDefault(); setShortcuts(true); return; }
+				if (key === ";" || (!event.shiftKey && event.code === "Semicolon")) { run("side"); return; }
+				if (key === "\\" || (!event.shiftKey && event.code === "Backslash")) { run("closePane"); return; }
+			}
 			if (event.shiftKey) { return; }
 			if (event.altKey) {
 				if (event.key === "1") { run("newSession"); }
@@ -2314,11 +2876,8 @@ export function App() {
 			if (key === "f") { run("find"); return; }
 			if (key === "n") { run("newSession"); return; }
 			if (key === "o") { run("cycleView"); return; }
-			if (key === "/") { event.preventDefault(); setShortcuts(true); return; }
 			if (key === ",") { event.preventDefault(); setSettingsOpen("general"); return; }
-			if (key === ";") { run("side"); return; }
-			if (event.code === "Backquote" || key === "`") { run("terminal"); return; }
-			if (key === "\\") { run("closePane"); }
+			if (event.code === "Backquote" || key === "`") { if (!event.repeat) { run("terminal"); } return; }
 		}
 		window.addEventListener("keydown", onKey);
 		return () => window.removeEventListener("keydown", onKey);
@@ -2366,23 +2925,39 @@ export function App() {
 	}
 
 	// `steer` is set for what the user types: during a turn it goes into that turn. Everything else waits in the queue.
-	function send(text: string, side: boolean, targetId = session.id, files: string[] = [], steer = false, contextFrom: ContextPick[] = []) {
+	function send(text: string, side: boolean, targetId = session.id, files: string[] = [], steer = false, contextFrom: ContextPick[] = [], routine?: { runId: string; unattended: boolean }) {
 		const body = text.trim();
-		const target = sessionsRef.current.find((item) => item.id === targetId);
-		if (!body || !target) { return false; }
+		const previousTarget = sessionsRef.current.find((item) => item.id === targetId);
+		if (!body || !previousTarget) { return false; }
+		const saved = previousTarget.environment === "Local" ? readHistory(undefined, true) : null;
+		if (refuseDeletedChat(targetId, saved ?? undefined)) { return false; }
+		// The history write can reach storage before the other window receives its storage event.
+		if (saved) { adoptLocalSendSettings(saved, targetId); }
+		const target = sessionsRef.current.find((item) => item.id === targetId)!;
 		if (!target.folder) { setNotice("Choose a project folder before sending."); return false; }
 		const sessionId = target.id;
 		const picks = side ? [] : contextPicksFrom(contextFrom, sessionId);
 		const uiId = side ? `side-${sessionId}` : sessionId;
 		const folder = target.folder;
+		if (target.environment === "Local") { refreshSandboxProfile(); }
 		const current = settingsRef.current;
 		const chosenModel = target.model ?? current.model;
 		const chosenEffort = target.effort ?? current.effort;
-		const chosenMode = side ? "Normal" : knownMode(modes[sessionId] ?? current.defaultMode, current);
+		const chosenMode = side ? "Normal" : knownMode(modesRef.current[sessionId] ?? current.defaultMode, current);
 		const cloud = target.environment === "Cloud";
 		const api = window.grokCode;
 		if (target.environment === "SSH") { setNotice("SSH execution is not available."); return false; }
 		if (folderUnavailable(target)) { return false; }
+		// Settings profiles apply on either conversation's next use. Checkbox changes wait for a main-chat message.
+		const sideSession = target.folder === previousTarget.folder && target.sandbox === previousTarget.sandbox ? sideAgents[sessionId] : undefined;
+		const conversation = side && sideSession ? { ...target, ...sideSession } : target;
+		const profileSession = (side || body.startsWith("/")) && conversation.sandbox?.option === "profile" ? { ...conversation, sandboxOn: true } : conversation;
+		const profileChanging = sandboxProfileChanging(profileSession, current);
+		const changing = sandboxChanging(target) || profileChanging;
+		const changeSandbox = profileChanging || (changing && !side && !body.startsWith("/"));
+		const carrySandboxContext = !side && !body.startsWith("/") && (changeSandbox || target.sandboxContextPending === true);
+		const sandbox = changing && !changeSandbox ? conversation.sandbox : sandboxFor(profileSession, current);
+		if (sandbox && target.worktreeFolder && PLATFORM === "win32") { setNotice(WINDOWS_SANDBOX_WORKTREE); return false; }
 		if (cloud && side) { setNotice("Side chat is unavailable in Cloud sessions."); return false; }
 		if (cloud && (files.length || picks.length)) { setNotice(CLOUD_ATTACHMENTS); return false; }
 		if (cloud && (!target.cloud || !api?.cloudSend)) { setNotice("Cursor cloud is unavailable for this session."); return false; }
@@ -2394,12 +2969,12 @@ export function App() {
 				return false;
 			}
 			const item = { id: crypto.randomUUID(), text: body, attachments: files, ...(picks.length ? { contextFrom: picks } : {}) };
-			setHeld((list) => ({ ...list, [sessionId]: false }));
 			// Attachments, earlier-chat context and commands cannot go into a running turn, so they wait; a steer Grok refuses joins the queue.
-			if (!cloud && steer && turnTargets.current[uiId] && api?.steer && !files.length && !picks.length && !body.startsWith("/")) {
+			if (!cloud && steer && !profileChanging && !target.sandboxContextPending && turnTargets.current[uiId] && api?.steer && !files.length && !picks.length && !body.startsWith("/")) {
 				void steerQueued(item, sessionId, true);
 				return true;
 			}
+			setHeld((list) => ({ ...list, [sessionId]: false }));
 			setQueued((list) => ({ ...list, [sessionId]: [...(list[sessionId] ?? []), item] }));
 			if (cloud && target.cloud?.active && !turnTargets.current[uiId]) { void resumeCloud(target); }
 			return true;
@@ -2407,7 +2982,7 @@ export function App() {
 		if (!cloud && !target.model) { updateSession(sessionId, { model: chosenModel, effort: chosenEffort }); }
 		if (!side) {
 			setHeld((list) => ({ ...list, [sessionId]: false }));
-			if (!cloud && !modes[sessionId]) { changeMode(sessionId, chosenMode); }
+			if (!cloud && !modesRef.current[sessionId]) { changeMode(sessionId, chosenMode); }
 		}
 		if (!side && target.title === "New session" && target.titleAuto !== false) {
 			const title = body.replace(/\s+/g, " ").slice(0, 48);
@@ -2416,15 +2991,16 @@ export function App() {
 		const stamp = Date.now();
 		const turnId = crypto.randomUUID();
 		const replyId = `${side ? "side-grok" : "grok"}-${cloud ? turnId : stamp}`;
-		turnTargets.current[uiId] = { sessionId, replyId, turnId, where: side ? "side" : "main" };
+		const replyTarget: TurnTarget = { sessionId, replyId, turnId, where: side ? "side" : "main" };
+		rememberReply(uiId, replyTarget);
 		const userMessage: ChatMessage = { id: `${side ? "side-user" : "user"}-${cloud ? turnId : stamp}`, role: "user", text: body, at: stamp, live: true, ...(files.length ? { attachments: files } : {}), ...(picks.length ? { contextFrom: picks } : {}) };
 		const replyMessage: ChatMessage = { id: replyId, role: "grok", text: "", pending: true, streaming: true, live: true };
 		const store = side ? setSideChats : setExtraChats;
 		store((list) => ({ ...list, [sessionId]: [...(list[sessionId] ?? []), userMessage, replyMessage] }));
 		if (!side) { setSessions((list) => list.map((item) => (item.id === sessionId ? { ...item, lastActivityAt: stamp, completed: false } : item))); }
 		if (!api) {
-			writeReply(uiId, (message) => replyWithNote({ ...message, at: Date.now() }, "Open this window from the desktop app to talk to Grok."));
-			delete turnTargets.current[uiId];
+			writeReply(uiId, (message) => replyWithNote({ ...message, at: Date.now() }, "Open this window from the desktop app to talk to Grok."), false, replyTarget);
+			finishReply(uiId, replyTarget);
 			return true;
 		}
 		setBusy((list) => ({ ...list, [uiId]: true }));
@@ -2432,22 +3008,25 @@ export function App() {
 			const fallback = "Cursor could not start this turn.";
 			const name = ((extraChats[sessionId] ?? []).find((message) => message.role === "user")?.text ?? body).slice(0, 80);
 			void api.cloudSend({ uiSessionId: uiId, turnId, text: body, name, cloud: target.cloud }).catch(() => ({ ok: false, error: fallback })).then((result) => {
-				if (result.ok || turnTargets.current[uiId]?.turnId !== turnId) { return; }
+				if (result.ok || replyTarget.finished) { return; }
 				setHeld((list) => ({ ...list, [sessionId]: true }));
-				setBusy((list) => ({ ...list, [uiId]: false }));
 				updateSession(sessionId, { failed: true });
-				writeReply(uiId, (message) => replyWithNote({ ...message, at: Date.now() }, result.error || fallback));
-				delete turnTargets.current[uiId];
+				writeReply(uiId, (message) => replyWithNote({ ...message, at: Date.now() }, result.error || fallback), false, replyTarget);
+				announceTurn(fallback, target.title);
+				finishReply(uiId, replyTarget);
 			});
 			return true;
 		}
-		const sideAgent = sideAgents[sessionId];
+		const sideAgent = changeSandbox ? undefined : sideSession?.agentSessionId;
 		// A side question carries the main-chat messages it has not seen yet; a reply still streaming waits for the next one.
 		const main = (extraChats[sessionId] ?? []).filter((message) => !message.streaming);
 		const seen = sideAgent ? main.findIndex((message) => message.id === sideSeen.current[sessionId]) : -1;
 		const blocks = picks.map((pick) => contextSnapshot(pick.title, extraChats[pick.id] ?? []));
-		const outgoing = side ? `${sideContext(main.slice(seen + 1))}${body}` : contextForGrok(blocks, body);
-		if (side && main.length) { sideSeen.current[sessionId] = main[main.length - 1].id; }
+		const outgoing = side ? `${sideContext(main.slice(seen + 1))}${body}` : contextForGrok(carrySandboxContext ? [contextSnapshot(target.title, main), ...blocks] : blocks, body);
+		// A run that never started has failed, so its sidebar row says so. A Stop or a closed window during the start has not.
+		const routineStartFailed = (reason?: string) => {
+			if (!side && target.routineId && reason !== "Stopped." && reason !== "Closed.") { updateSession(sessionId, { failed: true, unread: sessionId !== activeIdRef.current }); }
+		};
 		void api.send({
 			uiSessionId: uiId,
 			turnId,
@@ -2456,17 +3035,36 @@ export function App() {
 			model: chosenModel,
 			effort: chosenEffort,
 			mode: chosenMode,
-			agentSessionId: side ? sideAgent : target.agentSessionId,
+			agentSessionId: side ? sideAgent : changeSandbox ? undefined : target.agentSessionId,
 			allowedFolders: target.allowedFolders ?? [],
-			browser: !side && settings.browserControl,
+			browser: !side && settings.browserControl && !sandbox && !target.routineId,
+			...(routine ? { routineRunId: routine.runId } : {}),
+			...(routine?.unattended ? { unattended: true } : {}),
+			...(sandbox ? { sandbox } : {}),
 			...(files.length ? { attachments: files } : {}),
 		}).then((result) => {
-			if (!side && result.ok) { sentModes.current[sessionId] = chosenMode; }
+			if (!side && result.ok) { sentModes.current[sessionId] = result.mode ?? chosenMode; }
 			if (result.agentSessionId) {
 				const agentId = result.agentSessionId;
 				// A reply that lands after Choose a folder must not bring the old folder's side conversation back.
 				const now = sessionsRef.current.find((item) => item.id === sessionId) ?? (pendingRef.current?.id === sessionId ? pendingRef.current : undefined);
-				if (side) { if (now?.folder === folder) { setSideAgents((list) => ({ ...list, [sessionId]: agentId })); } } else { setSessions((list) => list.map((item) => (item.id === sessionId && item.folder === folder ? { ...item, agentSessionId: agentId } : item))); }
+				if (side) {
+					if (now?.folder === folder) { setSideAgents((list) => ({ ...list, [sessionId]: { agentSessionId: agentId, sandbox } })); }
+				} else {
+					setSessions((list) => list.map((item) => (item.id === sessionId && item.folder === folder ? {
+						...item, agentSessionId: agentId, sandbox,
+						sandboxContextPending: body.startsWith("/") ? changeSandbox || item.sandboxContextPending : result.ok ? undefined : item.sandboxContextPending,
+					} : item)));
+				}
+				if (changeSandbox && !side) {
+					// Only a side chat still in the old sandbox needs to start over.
+					if (!profileChanging || JSON.stringify(sideSession?.sandbox) !== JSON.stringify(sandbox)) {
+						setSideAgents((list) => Object.fromEntries(Object.entries(list).filter(([id]) => id !== sessionId)));
+						delete sideSeen.current[sessionId];
+					}
+					const carried = body.startsWith("/") ? "without earlier conversation. Your next main message will include the newest part of this conversation" : "with the newest part of this conversation";
+					setNotice(`Sandbox is ${sandbox ? "on" : "off"}. Grok started a new session ${carried}.`, true);
+				}
 			}
 			if (!side && result.ok && result.agentSessionId && Number.isInteger(result.promptIndex)) {
 				const point = { agentSessionId: result.agentSessionId, index: result.promptIndex as number };
@@ -2477,8 +3075,11 @@ export function App() {
 				delete sideSeen.current[sessionId];
 			} else if (result.lostSession) {
 				setSessions((list) => list.map((item) => (item.id === sessionId && item.folder === folder ? { ...item, agentSessionId: undefined } : item)));
+			} else if (result.ok && side && main.length) {
+				sideSeen.current[sessionId] = main[main.length - 1].id;
 			}
 			if (result.ok) { return; }
+			if (replyTarget.finished) { return; }
 			if (missingFolderError(result.error) && sessionsRef.current.some((item) => item.id === sessionId && item.folder === folder)) {
 				setMissingFolders((list) => ({ ...list, [sessionId]: folder }));
 				if (queuedRef.current[sessionId]?.length) { setHeld((list) => ({ ...list, [sessionId]: true })); }
@@ -2488,13 +3089,16 @@ export function App() {
 					if (picks.length) { setContextPicks((list) => ({ ...list, [sessionId]: picks.reduce((current, pick) => addContextPick(current, pick), list[sessionId] ?? []) })); }
 				}
 			}
-			setBusy((list) => ({ ...list, [uiId]: false }));
-			writeReply(uiId, (message) => replyWithNote({ ...message, at: Date.now() }, result.error || "Grok could not start."));
-			if (turnTargets.current[uiId]?.turnId === turnId) { delete turnTargets.current[uiId]; }
+			routineStartFailed(result.error);
+			writeReply(uiId, (message) => replyWithNote({ ...message, at: Date.now() }, result.error || "Grok could not start."), false, replyTarget);
+			announceTurn(result.error === "Stopped." ? "Grok stopped." : "Grok could not start the turn.", target.title);
+			finishReply(uiId, replyTarget);
 		}).catch(() => {
-			setBusy((list) => ({ ...list, [uiId]: false }));
-			writeReply(uiId, (message) => replyWithNote({ ...message, at: Date.now() }, "Grok could not start."));
-			if (turnTargets.current[uiId]?.turnId === turnId) { delete turnTargets.current[uiId]; }
+			if (replyTarget.finished) { return; }
+			routineStartFailed();
+			writeReply(uiId, (message) => replyWithNote({ ...message, at: Date.now() }, "Grok could not start."), false, replyTarget);
+			announceTurn("Grok could not start the turn.", target.title);
+			finishReply(uiId, replyTarget);
 		});
 		return true;
 	}
@@ -2502,6 +3106,7 @@ export function App() {
 	useEffect(() => {
 		for (const [sessionId, items] of Object.entries(queued)) {
 			if (!items.length || queuedRef.current[sessionId] !== items || held[sessionId] || busy[sessionId] || turnTargets.current[sessionId] || branching === sessionId) { continue; }
+			if (refuseDeletedChat(sessionId)) { setHeld((current) => ({ ...current, [sessionId]: true })); continue; }
 			const target = sessionsRef.current.find((item) => item.id === sessionId);
 			if (target && folderUnavailable(target)) {
 				setHeld((current) => ({ ...current, [sessionId]: true }));
@@ -2519,6 +3124,7 @@ export function App() {
 	}, [queued, held, busy, branching, branches, missingFolders]);
 
 	function sendNow(sessionId: string, itemId: string) {
+		if (refuseDeletedChat(sessionId)) { return; }
 		const target = sessionsRef.current.find((item) => item.id === sessionId);
 		if (target && folderUnavailable(target)) { return; }
 		setQueued((current) => {
@@ -2547,6 +3153,15 @@ export function App() {
 	async function steerQueued(item: Queued, sessionId = session.id, typed = false) {
 		const api = window.grokCode;
 		if (!api?.steer || !turnTargets.current[sessionId] || item.attachments.length || item.contextFrom?.length) { return; }
+		if (!typed) {
+			const saved = readHistory(undefined, true);
+			if (refuseDeletedChat(sessionId, saved ?? undefined)) { return; }
+			if (saved) { adoptLocalSendSettings(saved, sessionId); }
+			refreshSandboxProfile();
+			const target = sessionsRef.current.find((entry) => entry.id === sessionId);
+			const remote = saved?.sessions.find((entry) => entry.id === sessionId);
+			if (target && (sandboxProfileChanging(target, settingsRef.current) || target.sandboxContextPending || (remote?.folder === target.folder && remote.sandboxContextPending))) { return; }
+		}
 		const at = typed ? Infinity : (queuedRef.current[sessionId] ?? []).findIndex((entry) => entry.id === item.id);
 		if (at < 0) { return; }
 		if (!typed) { setQueued((current) => ({ ...current, [sessionId]: (current[sessionId] ?? []).filter((entry) => entry.id !== item.id) })); }
@@ -2563,7 +3178,7 @@ export function App() {
 
 	function branchRequest(message: ChatMessage): GrokBranchRequest {
 		const current = settingsRef.current;
-		return { uiSessionId: session.id, cwd: session.folder, model: session.model ?? current.model, effort: session.effort ?? current.effort, mode: knownMode(modes[session.id] ?? current.defaultMode, current), agentSessionId: message.point!.agentSessionId, index: message.point!.index, text: message.text };
+		return { uiSessionId: session.id, cwd: session.folder, model: session.model ?? current.model, effort: session.effort ?? current.effort, mode: knownMode(modes[session.id] ?? current.defaultMode, current), agentSessionId: message.point!.agentSessionId, index: message.point!.index, text: message.text, ...(session.sandbox ? { sandbox: session.sandbox } : {}) };
 	}
 
 	async function startRewind(message: ChatMessage) {
@@ -2622,7 +3237,7 @@ export function App() {
 		const at = messages.findIndex((item) => item.id === message.id);
 		const next = messages.findIndex((item, index) => index > at && item.role === "user");
 		const copied = (next < 0 ? messages : messages.slice(0, next)).map((item) => (!item.point ? item : item.point.agentSessionId === point.agentSessionId ? { ...item, point: { ...item.point, agentSessionId } } : { ...item, point: undefined }));
-		const forked: Session = { ...newSession({ folder: source.folder, project: source.project, branch: source.branch, worktree: source.worktree, environment: source.environment }, source.id), title: `${source.title} (fork)`, titleAuto: false, detail: "Fork", agentSessionId, model: source.model, effort: source.effort, allowedFolders: source.allowedFolders, worktreeFolder: source.worktreeFolder };
+		const forked: Session = { ...newSession({ folder: source.folder, project: source.project, branch: source.branch, worktree: source.worktree, environment: source.environment }, source.id), title: `${source.title} (fork)`, titleAuto: false, detail: "Fork", agentSessionId, model: source.model, effort: source.effort, allowedFolders: source.allowedFolders, worktreeFolder: source.worktreeFolder, sandbox: source.sandbox };
 		setSessions((current) => [forked, ...current]);
 		setExtraChats((list) => ({ ...list, [forked.id]: copied }));
 		if (modes[source.id]) { changeMode(forked.id, modes[source.id]); }
@@ -2659,7 +3274,9 @@ export function App() {
 			const name = `${(prompt.toLowerCase().match(/[a-z0-9]+/g) ?? ["session"]).slice(0, 4).join("-").slice(0, 28)}-${Math.random().toString(36).slice(2, 6)}`;
 			creatingWorktree.current = true;
 			setNotice("Creating the worktree…");
-			const result = await api.addWorktree(draft.folder, { name, prefix: settingsRef.current.branchPrefix }).finally(() => { creatingWorktree.current = false; });
+			const source = sessionsRef.current.find((item) => item.id === draft.parentId && item.folder === draft.folder);
+			const sandboxGit = sandboxGitSession(draft) || (source && sandboxGitSession(source));
+			const result = await api.addWorktree(draft.folder, { name, prefix: settingsRef.current.branchPrefix, ...(sandboxGit ? { sandbox: true } : {}) }).finally(() => { creatingWorktree.current = false; });
 			setNotices((list) => list.some((item) => item.text === "Creating the worktree…") ? list.filter((item) => item.text !== "Creating the worktree…") : list);
 			if (!result.ok || !result.folder) {
 				setNotice(result.error || "The worktree could not be created.");
@@ -2668,11 +3285,15 @@ export function App() {
 			created = { ...draft, folder: result.folder, branch: result.branch ?? draft.branch, worktree: shortPath(result.folder), worktreeFolder: result.folder };
 			setDrafts((current) => ({ ...current, [created.id]: current[draft.id] ?? "" }));
 		}
+		const formNow = pendingRef.current;
+		const keepForm = !!formNow && formNow.id !== draft.id;
 		sessionsRef.current = [created, ...sessionsRef.current.filter((item) => item.id !== created.id)];
 		setSessions((current) => [created, ...current.filter((item) => item.id !== created.id)]);
-		setActiveId(created.id);
-		pendingRef.current = null;
-		setPending(null);
+		if (!keepForm) {
+			setActiveId(created.id);
+			pendingRef.current = null;
+			setPending(null);
+		}
 		return created;
 	}
 
@@ -2805,8 +3426,24 @@ export function App() {
 		if (!target) { return; }
 		if (send(text, false, target.id, files, true, picks)) {
 			setDrafts((current) => ((current[target.id] ?? "") === prompt ? { ...current, [session.id]: "", [target.id]: "" } : current));
-			setAttachments((current) => ({ ...current, [session.id]: [], [target.id]: [] }));
-			setContextPicks((current) => ({ ...current, [session.id]: [], [target.id]: [] }));
+			setAttachments((current) => {
+				const sent = new Set(files);
+				const next = { ...current };
+				for (const id of new Set([session.id, target.id])) {
+					if (current[id] === undefined && files.length === 0) { continue; }
+					next[id] = (current[id] ?? []).filter((file) => !sent.has(file));
+				}
+				return next;
+			});
+			setContextPicks((current) => {
+				const sent = new Set(picks.map((pick) => pick.id));
+				const next = { ...current };
+				for (const id of new Set([session.id, target.id])) {
+					if (current[id] === undefined && picks.length === 0) { continue; }
+					next[id] = (current[id] ?? []).filter((pick) => !sent.has(pick.id));
+				}
+				return next;
+			});
 		}
 	}
 
@@ -2847,10 +3484,11 @@ export function App() {
 	function answerTool(uiId: string, toolId: string, request: (api: GrokCodeApi, uiSessionId: string) => Promise<GrokSendResult>, onAnswered?: () => void): Promise<GrokSendResult> {
 		const api = window.grokCode;
 		if (!api?.answerQuestion || !api.answerPlan) { return Promise.resolve({ ok: false, error: "Reopen this window to answer Grok." }); }
+		const target = toolReplyTarget(uiId, toolId);
 		return request(api, uiId).then((result) => {
 			if (result.ok) { onAnswered?.(); }
 			if (!result.ok && result.closed) {
-				writeReply(uiId, (message) => ({ ...message, tools: message.tools?.map((tool) => (tool.id === toolId ? { ...tool, waiting: false, detail: result.error || "That request already closed." } : tool)) }));
+				writeReply(uiId, (message) => ({ ...message, tools: message.tools?.map((tool) => (tool.id === toolId ? { ...tool, waiting: false, detail: result.error || "That request already closed." } : tool)) }), false, target);
 			}
 			return result;
 		}).catch(() => ({ ok: false, error: "That answer could not be sent." }));
@@ -2974,14 +3612,16 @@ export function App() {
 
 	function showExistingCli(item: Session) {
 		openingCli.current.delete(item.agentSessionId?.toLowerCase() ?? "");
-		if (!sessionsRef.current.some((entry) => entry.id === item.id)) {
+		const local = sessionsRef.current.some((entry) => entry.id === item.id);
+		const saved = local ? undefined : readHistory();
+		if (!local) {
 			setSessions((list) => (list.some((entry) => entry.id === item.id) ? list : [{ ...item, archived: false }, ...list]));
-			const messages = readHistory()?.extraChats[item.id];
+			const messages = saved?.extraChats[item.id] ?? coldChat(item.id);
 			if (messages) { setExtraChats((list) => (list[item.id] ? list : { ...list, [item.id]: messages })); }
 		} else if (item.archived) {
 			updateSession(item.id, { archived: false, pinned: false, lastActivityAt: Date.now() });
 		}
-		selectSession(item.id);
+		selectSession(item.id, undefined, saved);
 	}
 
 	function openCliSession(agentSessionId: string) {
@@ -3130,13 +3770,14 @@ export function App() {
 			subagentTranscript: (id) => window.grokCode?.subagentTranscript?.(id) ?? Promise.resolve({ ok: false, error: "Reopen this window to read task output." }),
 			busy: !!busy[uiId],
 			decide: (toolId, decision) => {
-				writeReply(uiId, (message) => ({ ...message, tools: message.tools?.map((tool) => (tool.id === toolId ? { ...tool, waiting: false, detail: decision === "deny" ? "Denied" : "Allowed" } : tool)) }));
+				const target = toolReplyTarget(uiId, toolId);
+				writeReply(uiId, (message) => ({ ...message, tools: message.tools?.map((tool) => (tool.id === toolId ? { ...tool, waiting: false, detail: decision === "deny" ? "Denied" : "Allowed" } : tool)) }), false, target);
 				void window.grokCode?.decide({ uiSessionId: uiId, toolId, decision }).then((result) => {
 					if (result.ok) {
 						if (result.warning) { setNotice(result.warning); }
 						return;
 					}
-					writeReply(uiId, (message) => ({ ...message, tools: message.tools?.map((tool) => (tool.id === toolId ? { ...tool, waiting: false, detail: result.error || "That approval already closed." } : tool)) }));
+					writeReply(uiId, (message) => ({ ...message, tools: message.tools?.map((tool) => (tool.id === toolId ? { ...tool, waiting: false, detail: result.error || "That approval already closed." } : tool)) }), false, target);
 				});
 			},
 			answerQuestion: (toolId, answers) => answerTool(uiId, toolId, (api, uiSessionId) => api.answerQuestion({ uiSessionId, toolId, answers })),
@@ -3185,7 +3826,8 @@ export function App() {
 		// A second save in the same event, such as the Files pane's flush and then flushEditor, must see this one before React renders.
 		editorDraftsRef.current = { ...editorDraftsRef.current, [key]: { ...draft, saving: true } };
 		const original = draft.baseText;
-		const savedText = /\r\n/.test(original) && !/(?<!\r)\n/.test(original) ? draft.text.replace(/\r?\n/g, "\r\n") : draft.text;
+		const crlf = (original.match(/\r\n/g)?.length ?? 0) > (original.match(/(?<!\r)\n/g)?.length ?? 0);
+		const savedText = draft.text.replace(/\r?\n/g, crlf ? "\r\n" : "\n");
 		setEditorDrafts((current) => (current[key] ? { ...current, [key]: { ...current[key]!, saving: true, note: "Saving…" } } : current));
 		void api.writeFile(folder, file, savedText, expected ?? draft.version).then((result) => {
 			if (result.ok) {
@@ -3297,6 +3939,7 @@ export function App() {
 		} else { void window.grokCode?.stopSession?.(id); }
 		deletedRef.current = [...deletedRef.current, id];
 		setDeleted(deletedRef.current);
+		void window.grokCode?.removeColdChats?.([id]);
 		// The window always has an unarchived session, so deleting the last one leaves a new one in the same folder.
 		setSessions((current) => {
 			const rest = current.filter((item) => item.id !== id);
@@ -3316,9 +3959,10 @@ export function App() {
 		if (target?.environment === "Cloud" && !target.archived && (turnTargets.current[id] || target.cloud?.active)) { setNotice("Stop this session first."); return; }
 		if (target && !target.archived && target.worktreeFolder && window.grokCode?.removeWorktree && !sharesFolder(target)) {
 			setHeld((current) => ({ ...current, [id]: true }));
-			void window.grokCode.removeWorktree(target.folder, target.worktreeFolder, { force: false }).then(async (result) => {
+			void window.grokCode.removeWorktree(target.folder, target.worktreeFolder, { force: false, branch: target.branch }).then(async (result) => {
 				if (result.ok) { updateSession(id, { archived: true, pinned: false }); return; }
-				if (result.dirty && await askConfirm({ title: "Archive this session?", body: result.ignored?.length ? `This worktree has files git ignores that removal would delete: ${result.ignored.join(", ")}. The worktree stays on disk.` : "This session's worktree has uncommitted changes. The worktree stays on disk.", ok: "Archive anyway", danger: true })) { updateSession(id, { archived: true, pinned: false }); return; }
+				const retained = result.ignored?.length ? `This worktree has files git ignores that removal would delete: ${result.ignored.join(", ")}.` : result.error || "This worktree is not clean.";
+				if (result.dirty && await askConfirm({ title: "Archive this session?", body: `${retained} The worktree stays on disk.`, ok: "Archive anyway", danger: true })) { updateSession(id, { archived: true, pinned: false }); return; }
 				if (result.dirty === false) { updateSession(id, { archived: true, pinned: false }); setNotice(`Archived, but the worktree folder could not be removed: ${result.error || "unknown error"}. Close any terminal open in it and delete the folder.`); return; }
 				if (!result.dirty) { updateSession(id, { archived: true, pinned: false }); setNotice(`Archived. The worktree could not be checked, so it stays on disk: ${result.error || "unknown error"}`); }
 			});
@@ -3326,7 +3970,12 @@ export function App() {
 		}
 		if (target?.archived && target.worktreeFolder) {
 			if (!window.grokCode?.restoreWorktree) { setNotice("Reopen this window to restore the worktree."); return; }
-			void window.grokCode.restoreWorktree(target.worktreeFolder, target.branch).then((result) => {
+			const base = folderKey(target.worktreeFolder).replace(/\/\.grok\/worktrees\/[^/]+$/, "");
+			const source = sessionsRef.current.find((item) => item.id === target.parentId);
+			const sourceFolder = source ? folderKey(source.folder) : "";
+			const sandbox = sandboxGitSession(target) || (source && sandboxGitSession(source) && (sourceFolder === base || sourceFolder.startsWith(`${base}/`)));
+			const policy = sandbox ? [{ sandbox: true }] as const : [] as const;
+			void window.grokCode.restoreWorktree(target.worktreeFolder, target.branch, ...policy).then((result) => {
 				if (result.ok) { updateSession(id, { archived: false, pinned: false, lastActivityAt: Date.now() }); } else { setNotice(result.error || "The worktree could not be restored."); }
 			}).catch(() => setNotice("The worktree could not be restored."));
 			return;
@@ -3367,6 +4016,7 @@ export function App() {
 		return () => clearTimeout(timer);
 	}, [limit]);
 	const queue = queued[session.id] ?? [];
+	const profileChanging = sandboxProfileChanging(session, settings);
 	const files = attachments[session.id] ?? [];
 	const chatChoices = contextChoices(sessions, session.id);
 	const chosenChats = contextPicks[session.id] ?? [];
@@ -3374,7 +4024,7 @@ export function App() {
 	const releaseCloudQueue = isCloud && queue.length > 0 && held[session.id] && !busy[session.id];
 	const suggestion = !isCloud && settings.promptSuggestions && !prompt && !isBusy && !pending ? suggestions[session.id] ?? "" : "";
 	const sendLabel = isBusy && !prompt.trim() && !releaseCloudQueue ? "Stop" : "Send";
-	const recentFolders = [...new Map(sessions.filter((item) => item.folder).map((item) => [folderKey(item.folder), item.folder])).values()].slice(0, 5);
+	const recentFolders = [...new Map(sessions.filter((item) => item.folder && !item.routineId).map((item) => [folderKey(item.folder), item.folder])).values()].slice(0, 5);
 	const projectPicks = firstRun ? cliProjectFolders : recentFolders;
 	const diffComments = comments[session.id] ?? [];
 	const prInfo = prs[session.id];
@@ -3417,6 +4067,7 @@ export function App() {
 					onSelectFile={setDiffFile}
 					onRefresh={() => { setDiffTick((value) => value + 1); setRemoteTick((value) => value + 1); }}
 					busy={isBusy}
+					sandboxGit={sandboxGitSession(session)}
 					onCommit={async (input) => {
 						const commit = window.grokCode?.gitCommit;
 						const result: WriteResult & { message?: string; committed?: boolean; sha?: string } = commit ? await commit(session.folder, { ...input, expected: branch?.branch }).catch(() => ({ ok: false, error: "The commit could not be checked. Refresh to see what happened." })) : { ok: false, error: "Reopen this window to commit." };
@@ -3426,7 +4077,8 @@ export function App() {
 					onRevert={(file) => {
 						const api = window.grokCode;
 						if (!api?.revertFile) { return Promise.resolve({ ok: false, error: "Reopen this window to restore this file." }); }
-						return api.revertFile(session.folder, file).then((result) => {
+						const policy = sandboxGitSession(session) ? { sandbox: true } : undefined;
+						return api.revertFile(session.folder, file, policy).then((result) => {
 							if (result.ok) { setDiffTick((value) => value + 1); setFileTick((value) => value + 1); }
 							return result;
 						}).catch(() => ({ ok: false, error: "That file could not be restored." }));
@@ -3523,13 +4175,13 @@ export function App() {
 							if (!result.stopped) { setNotice(`Nothing to stop. A ${PLATFORM === "win32" ? "PowerShell" : "bash"} command that starts no program stops only when you close the tab.`); }
 						});
 					}}
-					onClose={() => closePane("terminal")}
+					onClose={() => { closePane("terminal"); promptRef.current?.focus(); }}
 				/>
 			);
 		} else if (id === "browser") {
 			body = browserPaneIds.map((ownerId) => {
 				const reporting = ownerId === session.id;
-				const visible = reporting && browserVisible;
+				const visible = reporting && browserVisible && !grokBotOpen;
 				const tabs = browserTabs[ownerId] ?? [];
 				const servers: DevServer[] = (devScripts[ownerId] ?? []).map((item) => ({ ...item, running: !!devTabs[`${ownerId}:${item.script}`] }));
 				const updateTabs = (update: (tabs: BrowserTab[]) => BrowserTab[]) => {
@@ -3570,7 +4222,12 @@ export function App() {
 						error={browserError}
 						keepCookies={settings.keepCookies}
 						onKeepCookies={(on) => changeSettings({ keepCookies: on })}
-						onClearData={() => { void Promise.all(["persist:grok-code", "temp:grok-code"].map((partition) => window.grokCode?.clearBrowsingData?.(partition))).then((results) => { const failed = results.find((result) => result && !result.ok); setNotice(failed ? (failed.error || "Browsing data could not be cleared.") : "Browsing data cleared.", !failed); }); }}
+						onClearData={async () => {
+							if (!await askConfirm({ title: "Clear browsing data?", body: "Cookies, site data and cache in the Browser pane will be cleared.", ok: "Clear data", danger: true })) { return; }
+							const results = await Promise.all(["persist:grok-code", "temp:grok-code"].map((partition) => window.grokCode?.clearBrowsingData?.(partition)));
+							const failed = results.find((result) => result && !result.ok);
+							setNotice(failed ? (failed.error || "Browsing data could not be cleared.") : "Browsing data cleared.", !failed);
+						}}
 						linksInBuiltIn={settings.linksInBuiltIn}
 						onLinksInBuiltIn={(on) => changeSettings({ linksInBuiltIn: on, linkAsked: true })}
 						devServers={servers}
@@ -3720,8 +4377,19 @@ export function App() {
 		rowGap: paneRows === 2 ? 0 : undefined,
 	};
 
+	// One pair of buttons, shown on whatever covers the window: the chat's top bar, Settings, Routines or Grok Bot.
+	const historyNav = (
+		<span className="history-nav">
+			<button type="button" className="icon-btn" aria-label="Back" title="Back" disabled={!formOver && trailStop(trail.back) < 0} onClick={() => travel(true)}><Icon name="chevron-left" /></button>
+			<button type="button" className="icon-btn" aria-label="Forward" title="Forward" disabled={trailStop(trail.forward) < 0} onClick={() => travel(false)}><Icon name="chevron-right" /></button>
+		</span>
+	);
+
 	return (
 		<div className={sidebarCollapsed ? "app collapsed" : "app"} style={{ "--sidebar-width": `${sidebarWidth}px`, "--rail-width": `${railWidth}px` } as CSSProperties}>
+			<div aria-live="polite" aria-relevant="additions" style={{ position: "absolute", width: 1, height: 1, padding: 0, margin: -1, overflow: "hidden", clipPath: "inset(50%)", whiteSpace: "nowrap" }}>
+				{turnAnnouncements.map((item) => <span key={item.id}>{item.text}</span>)}
+			</div>
 			{(menu || fileMenu) && <button className="backdrop" inert={settingsCover} aria-label="Close menu" onClick={() => { setMenu(null); setFileMenu(null); }} />}
 			{!sidebarCollapsed && (
 				<Sidebar
@@ -3729,20 +4397,22 @@ export function App() {
 					revealActiveOnMount={revealSidebarProject.current}
 					sessions={sessions.filter((item) => item.id !== firstSessionId.current || item.folder)}
 					chats={extraChats}
-					activeId={sidebarActiveId}
+					activeId={grokBotOpen ? "" : sidebarActiveId}
+					grokBot={grokBot.status.signedIn || botWindow ? { open: grokBotOpen, running: grokBot.status.connection === "live" && Object.values(grokBot.status.live).some((live) => live.running), onOpen: () => setGrokBotOpen(true) } : undefined}
 					query={query}
 					activity={activity}
 					onQuery={setQuery}
-					onSelect={selectSession}
-					onNew={() => createSession()}
-					onNewIn={(seed) => createSession(seed)}
+					onSelect={(id, find) => { setGrokBotOpen(false); selectSession(id, find); }}
+					onNew={() => { setGrokBotOpen(false); createSession(); }}
+					onNewIn={(seed) => { setGrokBotOpen(false); createSession(seed); }}
 					onPin={(id) => setSessions((current) => current.map((item) => (item.id === id ? { ...item, pinned: !item.pinned } : item)))}
 					onArchive={(id) => {
 						const target = sessions.find((item) => item.id === id);
 						if (target?.environment === "Cloud") { archiveSession(id, target); return; }
 						const working = busy[id] || busy[`side-${id}`] || [...(grokTasks[id] ?? []), ...(grokTasks[`side-${id}`] ?? [])].some((task) => task.status === "running") || [...(subagents[id] ?? []), ...(subagents[`side-${id}`] ?? [])].some((agent) => agent.status === "running");
 						if (target && !target.archived && working) {
-							void askConfirm({ title: "Archive this session?", body: "Grok is still working in this session. Archiving stops the turn and any background commands.", ok: "Archive and stop", danger: true }).then((yes) => { if (yes) { archiveSession(id, target); } });
+							const worktree = target.worktreeFolder && !sharesFolder(target) ? ` ${WORKTREE_ARCHIVE_NOTE}` : "";
+							void askConfirm({ title: "Archive this session?", body: `Grok is still working in this session. Archiving stops the turn and any background commands.${worktree}`, ok: "Archive and stop", danger: true }).then((yes) => { if (yes) { archiveSession(id, target); } });
 							return;
 						}
 						archiveSession(id, target);
@@ -3759,6 +4429,7 @@ export function App() {
 					onOpenCliSession={openCliSession}
 					loopCounts={Object.fromEntries(sessions.map((item) => [item.id, (loops[item.id]?.length ?? 0) + (loops[`side-${item.id}`]?.length ?? 0)]))}
 					onSettings={() => setSettingsOpen("general")}
+					onRoutines={() => setRoutinesOpen(true)}
 					onCollapse={() => changeSettings({ sidebarCollapsed: true })}
 					onNotice={setNotice}
 					account={account}
@@ -3777,7 +4448,8 @@ export function App() {
 				/>
 			)}
 			{!sidebarCollapsed && resizeHandle("sidebarWidth", "Resize sidebar", sidebarWidth, SIDEBAR_MIN, sidebarCap)}
-			<main className="workspace" inert={settingsCover}>
+			<main className={grokBotOpen ? "workspace grok-bot-covered" : "workspace"} inert={settingsCover}>
+				{grokBotOpen && (botWindow ? <GrokBotWindow nav={historyNav} onClose={() => setGrokBotOpen(false)} /> : <GrokBotView bot={grokBot} nav={historyNav} onClose={() => setGrokBotOpen(false)} />)}
 				<header className="topbar">
 					{sidebarCollapsed && <button className="icon-btn" aria-label="Show sidebar" title={shouldCollapseSidebar(windowWidth, visiblePanes.length > 0) ? "Show sidebar and return to chat" : "Show sidebar"} onClick={() => {
 						if (shouldCollapseSidebar(windowWidth, visiblePanes.length > 0)) {
@@ -3788,6 +4460,7 @@ export function App() {
 						}
 						if (settings.sidebarCollapsed) { changeSettings({ sidebarCollapsed: false }); }
 					}}><Icon name="sidebar" /></button>}
+					{historyNav}
 					<div className="session-title">
 						{renaming === session.id ? (
 							<input
@@ -3797,6 +4470,7 @@ export function App() {
 								defaultValue={session.title}
 								onBlur={(event) => { const title = event.target.value.trim(); if (title && !pending) { renameSession(session.id, title); } setRenaming(null); }}
 								onKeyDown={(event) => {
+									if (event.nativeEvent?.isComposing) { return; }
 									if (event.key === "Enter") { (event.target as HTMLInputElement).blur(); }
 									if (event.key === "Escape") { event.stopPropagation(); setRenaming(null); }
 								}}
@@ -3805,7 +4479,7 @@ export function App() {
 							<button type="button" className="title-btn" title="Rename" onClick={() => { if (!pending) { setRenaming(session.id); } }}>{pending ? "New session" : session.title}</button>
 						)}
 						<button type="button" className="icon-btn caret" aria-label="Session menu" aria-haspopup="menu" aria-expanded={menu === "session"} onClick={() => setMenu(menu === "session" ? null : "session")}><Icon name="chevron-down" /></button>
-						<span className="meta">{session.project}{titleBranch ? ` · ${titleBranch}` : ""}{session.cloud?.machine ? ` · ${session.cloud.machine}` : ""}{isBusy ? " · working" : ""}</span>
+						<span className="meta">{session.project}{titleBranch ? ` · ${titleBranch}` : ""}{session.cloud?.machine ? ` · ${session.cloud.machine}` : ""}{sandboxActive(session) ? " · Sandboxed" : ""}{isBusy ? " · working" : ""}</span>
 					</div>
 					<span className="spacer" />
 					<div className="pane-switch" role="toolbar" aria-label="Panes">
@@ -3909,7 +4583,7 @@ export function App() {
 						<div className="dock" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}>
 							{!isCloud && sideOpen && (
 								<div className="side-q" role="dialog" aria-label="Side chat">
-									<div className="side-q-hd"><b>Side chat</b><span className="meta">Reads this session; nothing goes back into it. It is not added to this chat's history; Grok keeps its own copy in ~/.grok/sessions.</span><span className="spacer" /><button type="button" className="pane-x" aria-label="Close side chat" onClick={() => setSideOpen(false)}><Icon name="close" /></button></div>
+									<div className="side-q-hd"><b>Side chat</b><span className="meta">Always runs in Normal mode. Reads this session; nothing goes back into it. It is not added to this chat's history; Grok keeps its own copy in ~/.grok/sessions.</span><span className="spacer" /><button type="button" className="pane-x" aria-label="Close side chat" onClick={() => setSideOpen(false)}><Icon name="close" /></button></div>
 									<SideLog messages={sideChats[session.id] ?? []} model={sideModel} />
 									<textarea
 										aria-label="Side question"
@@ -3943,8 +4617,8 @@ export function App() {
 										{queue.map((item) => (
 											<div className="queued" key={item.id}>
 												<span>{item.text}{item.contextFrom?.length ? ` · ${item.contextFrom.map((pick) => pick.title).join(", ")}` : ""}</span>
-												{!isCloud && busy[session.id] && !held[session.id] && !item.attachments.length && !item.contextFrom?.length && !item.text.trim().startsWith("/") && <button className="texty" onClick={() => void steerQueued(item)}>Steer</button>}
-												{!isCloud && <button className="texty" disabled={folderMissing} onClick={() => sendNow(session.id, item.id)}>Send now</button>}
+												{!isCloud && !profileChanging && !session.sandboxContextPending && busy[session.id] && !held[session.id] && !item.attachments.length && !item.contextFrom?.length && !item.text.trim().startsWith("/") && <button className="texty" onClick={() => void steerQueued(item)}>Steer</button>}
+												{!isCloud && <button className="texty" title="Stops the current reply if one is running, then sends this message." disabled={folderMissing} onClick={() => sendNow(session.id, item.id)}>Send now</button>}
 												<button className="texty" onClick={() => editQueued(item)}>Edit</button>
 												<button className="texty" aria-label="Remove queued message" onClick={() => setQueued((current) => ({ ...current, [session.id]: (current[session.id] ?? []).filter((entry) => entry.id !== item.id) }))}><Icon name="close" /></button>
 											</div>
@@ -4017,7 +4691,7 @@ export function App() {
 									onChange={(event) => setPrompt(event.target.value)}
 									onPaste={onPaste}
 									onKeyDown={(event) => {
-										if (event.key === "Enter" && event.nativeEvent?.isComposing) { return; }
+									if (event.nativeEvent?.isComposing) { return; }
 										if (popup && popup.items.length) {
 											if (event.key === "ArrowDown" || event.key === "ArrowUp") {
 												event.preventDefault();
@@ -4050,6 +4724,13 @@ export function App() {
 										<MenuButton label={session.folder ? shortPath(session.folder) : "Choose folder…"} icon="folder" title={session.folder || "Choose a project folder"} open={menu === "folder"} onClick={() => setMenu(menu === "folder" ? null : "folder")} />
 										{pending && !isCloud && <label className="chip worktree-chip" title="Work on a new branch in its own Git worktree">
 											<input type="checkbox" aria-label="Worktree" checked={useWorktree} disabled={!!worktreeReason && !useWorktree} aria-describedby={worktreeReason ? "worktree-unavailable" : undefined} onChange={(event) => setUseWorktree(event.target.checked)} /> Worktree
+										</label>}
+										{session.environment === "Local" && (pending || !sandboxBlocked || sandboxWanted(session)) && <label className="chip worktree-chip" title="Run Grok's commands in a sandbox. Changing this during a session starts a new Grok session with the newest part of the conversation.">
+											<input type="checkbox" aria-label="Sandbox" checked={sandboxWanted(session)} disabled={sandboxBlocked && !sandboxWanted(session)} aria-describedby={pending && sandboxBlocked ? "sandbox-unavailable" : undefined} onChange={(event) => {
+												// Windows offers three kinds of sandbox, so turning one on asks which. Nothing changes until that's answered.
+												if (event.target.checked && PLATFORM === "win32") { setSandboxPicker(session.id); return; }
+												setSessionSandbox({ sandboxOn: event.target.checked });
+											}} /> {sandboxChipLabel(session, settings)}
 										</label>}
 										{!isCloud && <MenuButton label={mode} icon="shield" title={keyLabel("Permission mode (Ctrl+Shift+M)")} open={menu === "mode"} onClick={() => setMenu(menu === "mode" ? null : "mode")} />}
 									</div>
@@ -4159,14 +4840,14 @@ export function App() {
 													disabled={isBusy}
 													onClick={() => {
 														if (turnTargets.current[session.id]) { return; }
-														changeMode(session.id, item.id);
 														setMenu(null);
+														requestMode(session.id, item.id);
 													}}
 												>
 													{item.id}
 													<small>{item.detail}</small>
 													{mode === item.id && <Icon name="check" className="menu-check" />}
-													{restartStops(item.id) > 0 && <small className="mode-warn">Restarts Grok and stops {restartStops(item.id)} running background {restartStops(item.id) === 1 ? "task" : "tasks"}.</small>}
+													{restartStops(item.id) > 0 && <small className="mode-warn">The next message restarts Grok and stops {restartStops(item.id)} running background {restartStops(item.id) === 1 ? "task" : "tasks"}.</small>}
 												</button>
 											))}
 										</PopupMenu>
@@ -4238,6 +4919,7 @@ export function App() {
 							{pending && <>
 								{!session.folder && <p className="new-send-note">Choose a folder to send. You can type your task now.</p>}
 								{!isCloud && worktreeReason && <p className="new-worktree-help" id="worktree-unavailable">Worktree: {worktreeReason}</p>}
+								{session.environment === "Local" && sandboxBlocked && <p className="new-worktree-help" id="sandbox-unavailable">Sandbox: {WINDOWS_WORKTREE_SANDBOX}</p>}
 								<div className="new-project-picks" role="group" aria-label={firstRun ? "From your Grok CLI sessions" : "Projects"}>
 									{projectPicks.length > 0 && <span>{firstRun ? "From your Grok CLI sessions:" : "Projects:"}</span>}
 									{projectPicks.map((folder) => <button key={folder} type="button" aria-pressed={folderKey(session.folder) === folderKey(folder)} title={folder} onClick={() => choosePendingFolder(folder)}><Icon name="folder" />{shortPath(folder)}</button>)}
@@ -4261,6 +4943,7 @@ export function App() {
 							<SessionRail
 								key={session.id}
 								session={session}
+								sandboxSettings={settings}
 								folderMissing={folderMissing}
 								diff={progressiveChanges ? shownInventory : diffs[session.id]}
 								branch={branch}
@@ -4300,7 +4983,7 @@ export function App() {
 			)}
 			{shortcuts && (
 				<div className="overlay" onClick={() => setShortcuts(false)}>
-					<div className="sheet" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="Keyboard shortcuts">
+					<div className="sheet" onClick={(event) => event.stopPropagation()} role="dialog" aria-label="Keyboard shortcuts" tabIndex={-1} ref={focusShortcuts}>
 						<h2>Keyboard shortcuts</h2>
 						{Object.entries(SHORTCUTS).map(([group, shortcuts]) => (
 							<div className="shortcut-group" key={group}>
@@ -4337,8 +5020,10 @@ export function App() {
 					</div>
 				</div>
 			)}
+			{sandboxPicker === session.id && <SandboxSettings settings={settings} onChange={changeSettings} picker={{ sessionId: session.id, sessions, onUse: (sandboxChoice) => { setSessionSandbox({ sandboxOn: true, sandboxChoice }); setSandboxPicker(""); }, onClose: () => setSandboxPicker("") }} />}
 			{promptLibrary && <SavedPromptPicker prompts={settings.savedPrompts} draft={promptLibrary.text} mode={promptLibrary.mode} onSave={savePrompt} onInsert={insertPrompt} onClose={closePromptLibrary} />}
-			{settingsOpen && <SettingsPage settings={settings} onChange={changeSettings} onClose={() => setSettingsOpen(null)} onCheckSetup={openSetupFromAbout} servers={servers} folder={session.folder} onRun={(text) => void runFromSettings(text)} initialTab={settingsOpen} signInStatus={signInStatus} signInCheck={setup.result?.grok} cloudKeyStatus={cloudKeyStatus} />}
+			{settingsOpen && <SettingsPage settings={settings} onChange={changeSettings} onClose={() => setSettingsOpen(null)} onCheckSetup={openSetupFromAbout} servers={servers} folder={session.folder} onRun={(text) => void runFromSettings(text)} initialTab={settingsOpen} signInStatus={signInStatus} signInCheck={setup.result?.grok} cloudKeyStatus={cloudKeyStatus} grokBot={grokBot} previewTheme={uiPreviewTheme} onPreviewTheme={setUiPreviewTheme} nav={historyNav} />}
+			{routinesOpen && <RoutinesPage models={modelList.map((id) => ({ id, name: models.find((item) => item.id === id)?.name ?? id }))} effortsFor={effortsFor} defaultModel={model} defaultEffort={effort} onClose={() => setRoutinesOpen(false)} nav={historyNav} />}
 			{setup.open && <Setup result={setup.result} checking={setup.checking} installing={setup.installing} onInstallGrok={() => void runInstall("grok")} onInstallGit={() => void runInstall("git")} onUpdateGrok={() => void runInstall("update")} onCheck={() => checkSetup()} onCopy={(text) => void copyText(text)} onClose={closeSetup} onOpenSignIn={() => { closeSetup(); setSettingsOpen("general"); }} />}
 			{confirms[0] && (
 				<div key={confirms[0].id} className="overlay confirm-overlay">
@@ -4371,5 +5056,3 @@ function MenuButton({ label, icon, title, open, disabled, onClick }: { label: st
 		</button>
 	);
 }
-
-export const __defaults = DEFAULT_SETTINGS;

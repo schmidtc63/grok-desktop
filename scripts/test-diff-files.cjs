@@ -35,7 +35,7 @@ const react = {
 	},
 };
 react.useLayoutEffect = react.useEffect;
-const jsx = (type, props) => ({ type, props: props ?? {} });
+const jsx = (type, props, key) => ({ type, props: props ?? {}, key });
 
 // A test that needs to see the confirm questions passes the confirm module the component should share.
 function load(name, globals = {}, confirm) {
@@ -47,6 +47,7 @@ function load(name, globals = {}, confirm) {
 		if (id === "react/jsx-runtime") { return { jsx, jsxs: jsx, Fragment: "fragment" }; }
 		if (id === "./confirm") { return confirm ?? load("confirm.ts", globals); }
 		if (id === "./data") { return load("data.ts", globals); }
+		if (id === "./sandbox") { return load("sandbox.ts", globals); }
 		if (id === "./Icon") { return load("Icon.tsx", globals); }
 		if (id === "./PaneActions") { return load("PaneActions.tsx", globals); }
 		if (id === "./PopupMenu") { return { PopupMenu: (props) => jsx("div", { role: "menu", ...props }) }; }
@@ -63,7 +64,23 @@ function flatten(node, out = { elements: [], text: [] }) {
 	if (node === null || node === undefined || typeof node === "boolean") { return out; }
 	if (Array.isArray(node)) { node.forEach((child) => flatten(child, out)); return out; }
 	if (typeof node === "string" || typeof node === "number") { out.text.push(String(node)); return out; }
-	if (typeof node.type === "function") { return flatten(node.type(node.props), out); }
+	if (typeof node.type === "function") {
+		if (!hooks || node.key === undefined) { return flatten(node.type(node.props), out); }
+		const parent = hooks;
+		const index = parent.cursor++;
+		const previous = parent.values[index];
+		hooks = previous?.key === node.key ? previous : { key: node.key, values: [] };
+		parent.values[index] = hooks;
+		hooks.cursor = 0;
+		hooks.effects = [];
+		try {
+			flatten(node.type(node.props), out);
+			parent.effects.push(...hooks.effects);
+			return out;
+		} finally {
+			hooks = parent;
+		}
+	}
 	out.elements.push(node);
 	return flatten(node.props.children, out);
 }
@@ -168,6 +185,39 @@ check("PopupMenu moves focus with arrows, dismisses on Escape, and preserves act
 	}
 });
 
+check("PopupMenu fits top and bottom anchors into a short viewport", () => {
+	const { PopupMenu } = load("PopupMenu.tsx");
+	for (const [className, top, bottom, margin] of [["row-pop", 210, 390, "marginTop"], ["pop up", -40, 140, "marginBottom"]]) {
+		let resize;
+		const view = {
+			innerHeight: 320,
+			addEventListener(_name, handler) { resize = handler; },
+			removeEventListener(_name, handler) { if (resize === handler) { resize = undefined; } },
+		};
+		const menu = {
+			ownerDocument: { defaultView: view },
+			matches: () => true,
+			classList: { contains: (name) => className.split(" ").includes(name) },
+			style: {},
+			getBoundingClientRect: () => ({ top, bottom }),
+		};
+		const state = { cursor: 0, values: [], effects: [] };
+		hooks = state;
+		try {
+			PopupMenu({ className, focusOnOpen: false }).props.ref.current = menu;
+			state.effects.forEach((run) => run());
+		} finally {
+			hooks = undefined;
+		}
+		assert.equal(menu.style[margin], margin === "marginTop" ? "-78px" : "-48px");
+		view.innerHeight = 500;
+		resize();
+		assert.equal(menu.style[margin], margin === "marginTop" ? "" : "-48px");
+		state.values[2].cleanup();
+		assert.equal(resize, undefined);
+	}
+});
+
 const hunk = {
 	id: "h1",
 	loc: "@@ -10,3 +10,4 @@ function demo()",
@@ -248,6 +298,17 @@ const diffProps = {
 	branch: { branch: "feature", base: "main", ahead: 2 }, pr: null,
 	onCreatePr: asyncOk, onMergeWhenReady: asyncOk, onOpenFile: noop, onFileMenu: noop, onClose: noop,
 };
+
+check("Changes leaves commit scope when the selected commit disappears from refreshed history", () => {
+	const scopes = [];
+	const props = { ...diffProps, scope: diffProps.commits[0].sha, onScope: (scope) => scopes.push(scope) };
+	const render = renderer(DiffPane, props);
+	render();
+	assert.deepEqual(scopes, []);
+	props.commits = [{ sha: "def456", short: "def456", subject: "Amended" }];
+	render();
+	assert.deepEqual(scopes, ["uncommitted"]);
+});
 
 check("DiffPane renders gutter numbers, line comments, Create PR and the send bar", () => {
 	const tree = flatten(DiffPane(diffProps));
@@ -414,6 +475,23 @@ check("File checkboxes appear only where the commit buttons appear, all checked"
 	}
 });
 
+check("Conflicted files start unchecked and can be checked explicitly in either changes list", () => {
+	const [file, ...others] = pickFiles;
+	for (const progressive of [false, true]) {
+		const props = { ...pickProps, progressive, snapshot: { ok: true, files: [{ ...file, conflicted: true }, ...others] } };
+		const render = renderer(DiffPane, props);
+		let tree = render();
+		assert.deepEqual(pickBoxes(tree).map((box) => box.props.checked), [false, true, true]);
+		pickBox(tree, file.path).props.onChange();
+		assert.equal(pickBox(render(), file.path).props.checked, true);
+		props.snapshot = pickProps.snapshot;
+		render();
+		props.snapshot = { ok: true, files: [{ ...file, conflicted: true }, ...others] };
+		tree = render();
+		assert.equal(pickBox(tree, file.path).props.checked, false);
+	}
+});
+
 check("Paged changes reveal unchecked files and bulk inclusion affects only listed files", () => {
 	const files = Array.from({ length: 84 }, (_, index) => ({ path: `file-${index + 1}.txt`, hunks: [] }));
 	const render = renderer(DiffPane, { ...pickProps, progressive: true, snapshot: { ok: true, files } });
@@ -561,6 +639,18 @@ check("Create PR reports uncommitted files in both panes", () => {
 		render().elements.find((node) => node.type === "button" && node.props.children === "Create PR").props.onClick();
 		assert.ok(render().text.join("").includes(message));
 	}
+});
+
+check("The Changes pane offers Create PR again after switching branches", () => {
+	const onCreatePr = () => ({ then(run) { run({ ok: true, url: "https://example.test/pull/7" }); return { finally: (done) => done() }; } });
+	const props = { ...diffProps, onCreatePr };
+	const render = renderer(DiffPane, props);
+	commitButton(render(), "Create PR").props.onClick();
+	assert.match(render().text.join(""), /Opened #7/);
+	props.branch = { ...props.branch, branch: "next-feature" };
+	const tree = render();
+	assert.ok(commitButton(tree, "Create PR"));
+	assert.doesNotMatch(tree.text.join(""), /Opened #7/);
 });
 
 check("Merge when ready shows the message the merge reports", () => {
@@ -975,6 +1065,23 @@ async function main() {
 				rig.message("New summary");
 				assert.equal(alert(), undefined, "editing clears the previous error");
 			}
+		}
+	});
+	await checkAsync("Sandbox commit explains host limits and the hook opt-in resets each time", async () => {
+		const rig = commitRig({ ...pickProps, sandboxGit: true, onCommit: async () => ({ ok: true, committed: true }) });
+		for (const hooks of [true, false]) {
+			rig.open("Commit and push");
+			const modal = modalTree(rig.render());
+			assert.match(modal.text.join(""), /Git hooks are off by default.*\.grok.*\.mcp\.json.*Dev server Start/);
+			assert.match(modal.text.join(""), /With hooks off, a push can skip uploading Git LFS files/);
+			const checkbox = modal.elements.find((el) => el.type === "input" && el.props.type === "checkbox");
+			assert.equal(checkbox.props.checked, false);
+			if (hooks) { checkbox.props.onChange({ target: { checked: true } }); }
+			rig.message("Review changes");
+			modalButton(rig.render(), "Commit and push").props.onClick();
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.equal(rig.commits.at(-1).sandbox, true);
+			assert.equal(rig.commits.at(-1).hooks, hooks);
 		}
 	});
 	await checkAsync("Commit dialog keys stay isolated from review, comment-send and window shortcuts", async () => {

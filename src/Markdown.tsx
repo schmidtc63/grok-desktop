@@ -1,8 +1,8 @@
 import { createElement, useEffect, useState, type MouseEvent, type ReactNode } from "react";
-import { lexer, type Token, type Tokens } from "marked";
+import type { Token, Tokens } from "marked";
 import { PLATFORM } from "./data";
-import { MATH_MARK, mathHtml, stashMath, type StashedMath } from "./markdown-math";
-import { diagramTheme, drawDiagram, fenceClosed, isMermaid, type DiagramResult } from "./markdown-diagram";
+import { MATH_MARK, lexMarkdown, mathHtml, type StashedMath } from "./markdown-math";
+import { diagramDocument, diagramTheme, drawDiagram, fenceClosed, isMermaid, type DiagramResult } from "./markdown-diagram";
 
 export interface MarkdownProps {
 	text: string;
@@ -22,15 +22,20 @@ export function isShell(lang: string | undefined) {
 	return SHELLS.has(String(lang || "").trim().split(/\s+/)[0].toLowerCase());
 }
 
+export function visibleCommandControls(text: string) {
+	return text.replace(/(?=\p{Default_Ignorable_Code_Point})\p{Cf}|\u034F/gu, (control) => {
+		const hex = control.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0");
+		return `⟦U+${hex}⟧`;
+	});
+}
+
 export function Markdown(props: MarkdownProps) {
-	const stashed = stashMath(props.text);
-	let tokens: Token[];
 	try {
-		tokens = lexer(stashed.text, { gfm: true, breaks: true });
+		const { tokens, math } = lexMarkdown(props.text);
+		return <div className="md">{blocks(tokens, props, math, "b")}</div>;
 	} catch {
 		return <div className="md"><p>{props.text}</p></div>;
 	}
-	return <div className="md">{blocks(tokens, props, stashed.math, "b")}</div>;
 }
 
 function blocks(tokens: Token[], props: MarkdownProps, math: StashedMath[], prefix: string): ReactNode[] {
@@ -39,15 +44,16 @@ function blocks(tokens: Token[], props: MarkdownProps, math: StashedMath[], pref
 
 function codeBlock(code: { lang?: string; text: string }, props: Pick<MarkdownProps, "onCopy" | "onRun">, key: string) {
 	const lang = (code.lang || "").trim();
+	const runnable = !!props.onRun && isShell(lang);
 	return (
 		<div className="md-code" key={key}>
 			<div className="md-code-hd">
-				<span>{lang || "text"}</span>
+				<span>{runnable ? visibleCommandControls(lang) : lang || "text"}</span>
 				<span className="spacer" />
 				{props.onCopy && <button type="button" className="texty" onClick={() => props.onCopy?.(code.text)}>Copy</button>}
-				{props.onRun && isShell(lang) && <button type="button" className="texty" onClick={() => props.onRun?.(code.text)}>Run</button>}
+				{runnable && <button type="button" className="texty" onClick={() => props.onRun?.(code.text)}>Run</button>}
 			</div>
-			<pre><code>{code.text}</code></pre>
+			<pre><code>{runnable ? visibleCommandControls(code.text) : code.text}</code></pre>
 		</div>
 	);
 }
@@ -89,7 +95,12 @@ export function MermaidDiagram({ text, raw, onCopy }: { text: string; raw: strin
 				{onCopy && <button type="button" className="texty" onClick={() => onCopy(text)}>Copy</button>}
 			</div>
 			{result?.ok === false && <p className="note">This diagram could not be drawn.</p>}
-			{svg !== "" && !showCode ? <div className="md-diagram-body" dangerouslySetInnerHTML={{ __html: svg }} /> : <pre><code>{text}</code></pre>}
+			{result?.ok && !showCode ? <div className="md-diagram-body"><iframe
+				title="Mermaid diagram"
+				sandbox=""
+				srcDoc={diagramDocument(svg)}
+				style={{ display: "block", border: 0, width: "100%", maxWidth: result.width, aspectRatio: `${result.width} / ${result.height}`, colorScheme: "light" }}
+			/></div> : <pre><code>{text}</code></pre>}
 		</div>
 	);
 }
@@ -157,7 +168,9 @@ function plain(text: string, props: MarkdownProps, math: StashedMath[], key: str
 		if (index % 2 === 1) {
 			const item = math[Number(piece)];
 			if (!item) { return piece; }
-			return <span key={`${key}m${index}`} className={item.display ? "md-math md-math-display" : "md-math"} dangerouslySetInnerHTML={{ __html: mathHtml(item.tex, item.display) }} />;
+			const html = mathHtml(item.tex, item.display);
+			if (html === null) { return item.raw; }
+			return <span key={`${key}m${index}`} className={item.display ? "md-math md-math-display" : "md-math"} dangerouslySetInnerHTML={{ __html: html }} />;
 		}
 		if (piece === "") { return null; }
 		return <span key={`${key}t${index}`}>{props.renderText ? props.renderText(piece, `${key}t${index}`) : piece}</span>;

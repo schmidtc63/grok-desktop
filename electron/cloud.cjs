@@ -298,19 +298,20 @@ class CloudHost {
 
 	machineClaimProblem(machine, uiSessionId, resume = false) {
 		if (machine === undefined) { return ""; }
-		const owner = this.machines.get(machine.toLowerCase());
-		if (owner === undefined || (resume && owner === uiSessionId)) { return ""; }
-		if (this.turns.has(owner)) { return `Another session is using ${machine}. Wait for it to finish or stop it.`; }
+		const claim = this.machines.get(machine.toLowerCase());
+		if (!claim || (resume && claim.uiSessionId === uiSessionId && claim.resumable)) { return ""; }
+		if (this.turns.get(claim.uiSessionId)?.machineClaim === claim) { return `Another session is using ${machine}. Wait for it to finish or stop it.`; }
 		return `A run this app started on ${machine} may still be working, so the app won't start another there until it restarts. Check cursor.com/agents.`;
 	}
 
 	addTurn({ uiSessionId, turnId, cloud }, runId) {
 		const { repoUrl, agentId, machine } = cloud;
-		const turn = { uiSessionId, turnId, repoUrl, agentId, runId, machine, key: this.getKey(), mapping: {}, failures: 0, streamVersion: 0 };
+		const turn = { uiSessionId, turnId, repoUrl, agentId, runId, machine, key: this.getKey(), mapping: {}, failures: 0, seenEventIds: new Set(), streamVersion: 0 };
 		this.turns.set(uiSessionId, turn);
 		if (machine !== undefined) {
 			turn.branch = { branch: `grok/machine-${uiSessionId.replace(/^new-/, "").slice(0, 8)}` };
-			this.machines.set(machine.toLowerCase(), uiSessionId);
+			turn.machineClaim = { uiSessionId, resumable: Boolean(runId) };
+			this.machines.set(machine.toLowerCase(), turn.machineClaim);
 		}
 		return turn;
 	}
@@ -349,23 +350,26 @@ class CloudHost {
 		let reply;
 		try { reply = await (turn.agentId ? this.api.followUp(turn.agentId, prompt) : this.api.create(input)); }
 		catch { reply = { ok: false, error: requestFailureMessage(false, turn.agentId ? "run" : "agent") }; }
-		if (!this.current(turn)) { return; }
-		if (!reply?.ok) {
+		if (reply?.ok !== true) {
 			let message = reply?.code === "usage_limit_exceeded" ? CREDIT_MESSAGE : reply?.error || "Cursor couldn't start this run.";
 			if (turn.machine && !turn.agentId && [400, 404, 409].includes(reply?.status) && reply?.code !== "usage_limit_exceeded") {
 				message += machineHint(turn.machine);
 			}
-			this.finish(turn, { type: "error", message });
+			const refused = reply?.ok === false && ![408, 502, 504].includes(reply.status) && (reply.code === "missing_key" ||
+				(Number.isInteger(reply.status) && reply.status >= 400 && reply.status <= 599 && !["timeout", "invalid_reply"].includes(reply.code)));
+			this.finish(turn, { type: "error", message }, { keepMachine: !refused });
 			return;
 		}
 		const agentId = turn.agentId ?? reply.agent?.id;
 		const runId = reply.run?.id;
 		if (!validId(agentId) || !validId(runId)) {
-			this.finish(turn, { type: "error", message: `Cursor returned invalid run details. The agent may have started. Check ${AGENTS_LINK} before sending again.` });
+			this.finish(turn, { type: "error", message: `Cursor returned invalid run details. The agent may have started. Check ${AGENTS_LINK} before sending again.` }, { keepMachine: true });
 			return;
 		}
 		turn.agentId = agentId;
 		turn.runId = runId;
+		if (turn.machineClaim) { turn.machineClaim.resumable = true; }
+		if (!this.current(turn)) { return; }
 		this.state(turn, true);
 		if (turn.cancelRequested) { void this.cancelRun(turn); }
 		this.open(turn, false);
@@ -446,7 +450,10 @@ class CloudHost {
 				}
 				return;
 			}
-			turn.failures = 0;
+			const eventId = typeof frame.id === "string" ? frame.id : "";
+			const resent = eventId !== "" && turn.seenEventIds.has(eventId);
+			if (eventId !== "") { turn.seenEventIds.add(eventId); }
+			if (!resent && frame.event !== "status" && frame.event !== "heartbeat") { turn.failures = 0; }
 			if (replay) { replay = false; this.resetReply(turn); }
 			if (frame.event === "done") { this.finish(turn, { type: "done" }); return; }
 			this.accept(turn, frame);
@@ -469,7 +476,7 @@ class CloudHost {
 			this.finish(turn, { type: "done" });
 			return;
 		}
-		this.finish(turn, { type: "error", message: `Lost the connection to Cursor. The agent may still be working; it's on ${AGENTS_LINK}.` }, true);
+		this.finish(turn, { type: "error", message: `Lost the connection to Cursor. The agent may still be working; it's on ${AGENTS_LINK}.` }, { active: true });
 	}
 
 	resetReply(turn) {
@@ -483,6 +490,7 @@ class CloudHost {
 		const textDelta = frame.event === "assistant" || frame.event === "thinking";
 		const safe = textDelta ? masked : redactDeep(masked);
 		const failed = frame.event === "result" && failedResult(safe.data);
+		if (frame.event === "result") { turn.runFailed = failed; }
 		if (turn.machine && frame.event === "result" && (failed || ["CANCELLED", "CANCELED"].includes(safe.data?.status))) {
 			turn.machineRunUnsuccessful = true;
 		}
@@ -536,15 +544,19 @@ class CloudHost {
 		this.publish(turn, { type: "cloud-state", agentId: turn.agentId, runId: turn.runId, active, ...turn.branch });
 	}
 
-	finish(turn, event, active = false) {
-		if (!this.current(turn)) { return; }
-		this.flush(turn);
-		this.stop(turn.uiSessionId);
-		if (!active && turn.machine) {
-			const name = turn.machine.toLowerCase();
-			if (this.machines.get(name) === turn.uiSessionId) { this.machines.delete(name); }
+	finish(turn, event, { active = false, keepMachine = active } = {}) {
+		const current = this.current(turn);
+		if (current) {
+			this.flush(turn);
+			this.stop(turn.uiSessionId);
 		}
+		if (!keepMachine && turn.machine) {
+			const name = turn.machine.toLowerCase();
+			if (this.machines.get(name) === turn.machineClaim) { this.machines.delete(name); }
+		}
+		if (!current) { return; }
 		if (turn.runId) { this.state(turn, active); }
+		if (turn.runFailed && event.type === "done" && event.stopReason !== "cancelled") { event = { type: "error" }; }
 		if (turn.machine && event.type === "done" && !turn.machineRunUnsuccessful && !turn.cancelRequested && event.stopReason !== "cancelled") {
 			event = { ...event, machine: turn.machine };
 		}

@@ -1,0 +1,23 @@
+.workspace.grok-bot-covered { position: relative; }
+.workspace.grok-bot-covered > :not(.grok-bot-view) { visibility: hidden; }
+.grok-bot-view { position: absolute; inset: 0; z-index: 10; display: flex; flex-direction: column; min-width: 0; background: var(--bg); }
+.grok-bot-header { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.grok-bot-window-area { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 16px; box-sizing: border-box; text-align: center; }
+.grok-bot-header > strong, .grok-bot-header > select { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.grok-bot-status { flex: 1 1 140px; min-width: 0; overflow-wrap: anywhere; }
+.grok-bot-actions, .grok-bot-options { display: flex; gap: 8px; flex-wrap: wrap; }
+.grok-bot-actions { margin-left: auto; }
+.grok-bot-options { margin: 8px 0; }
+.grok-bot-options button { white-space: normal; overflow-wrap: anywhere; }
+.grok-bot-scroll { flex: 1; min-height: 0; overflow: auto; }
+.grok-bot-scroll > .chat-col { width: 100%; box-sizing: border-box; }
+.grok-bot-earlier { display: block; margin: 0 auto 16px; }
+.grok-bot-dock { flex-shrink: 0; width: 100%; max-width: 760px; box-sizing: border-box; margin: 0 auto; padding: 8px 16px 12px; }
+.grok-bot-dock > .note { margin: 0 0 8px; overflow-wrap: anywhere; }
+.grok-bot-dock textarea { display: block; width: 100%; box-sizing: border-box; }
+.grok-bot-view .note { overflow-wrap: anywhere; }
+@media (max-width: 700px) {
+	.grok-bot-header { padding: 8px; }
+	.grok-bot-status { flex-basis: 100%; order: 2; }
+	.grok-bot-dock { padding: 8px; }
+}

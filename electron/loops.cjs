@@ -2,6 +2,7 @@
 // ponytail: no captured task yet, so both key forms and both field styles are accepted; a shape that does not parse shows nothing.
 const fs = require("fs");
 const path = require("path");
+const { redactKeys } = require("./redact.cjs");
 
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const FILE_CAP = 2 * 1024 * 1024;
@@ -27,7 +28,7 @@ function fileTime(value) {
 
 function scheduleOf(task) {
 	const human = task.human_schedule ?? task.humanSchedule ?? task.schedule;
-	if (typeof human === "string" && human.trim()) { return human.trim().slice(0, 200); }
+	if (typeof human === "string" && human.trim()) { return redactKeys(human.trim()).slice(0, 200); }
 	const secs = task.intervalSecs ?? task.interval_secs;
 	if (typeof secs === "number" && Number.isFinite(secs) && secs > 0 && secs < 10 * 365 * 24 * 3600) { return `every ${secs}s`; }
 	return "";
@@ -45,7 +46,7 @@ function taskLoop(id, task) {
 	if (task.durable !== undefined && typeof task.durable !== "boolean") { return null; }
 	const loop = {
 		id,
-		prompt: typeof promptRaw === "string" && promptRaw.trim() ? promptRaw.trim().slice(0, 200) : "Scheduled loop",
+		prompt: typeof promptRaw === "string" && promptRaw.trim() ? redactKeys(promptRaw.trim()).slice(0, 200) : "Scheduled loop",
 		schedule: scheduleOf(task),
 		nextFireAt: next,
 	};

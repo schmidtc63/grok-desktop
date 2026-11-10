@@ -18,10 +18,12 @@ function Install-GrokDesktop {
 	$repo = "schmidtc63/grok-desktop"
 	$release = "latest/download"
 	if ($Tag) { $release = "download/$Tag" }
-	$dest = Join-Path $env:LOCALAPPDATA "Programs\Codewomplers Grok Desktop"
+	$programs = Join-Path $env:LOCALAPPDATA "Programs"
+	$dest = Join-Path $programs "Codewomplers Grok Desktop"
 	$exeName = "Codewomplers Grok Desktop.exe"
 	$exe = Join-Path $dest $exeName
-	$work = Join-Path ([System.IO.Path]::GetTempPath()) ("grok-desktop-install-" + [guid]::NewGuid().ToString("n"))
+	New-Item -ItemType Directory -Force -Path $programs | Out-Null
+	$work = Join-Path $programs ("grok-desktop-install-" + [guid]::NewGuid().ToString("n"))
 	New-Item -ItemType Directory -Path $work | Out-Null
 	try {
 		$zip = Join-Path $work "app.zip"
@@ -36,7 +38,6 @@ function Install-GrokDesktop {
 			$path -and [string]::Equals($path, $exe, [StringComparison]::OrdinalIgnoreCase)
 		})
 		if ($running.Count -gt 0) { throw "Quit Codewomplers Grok Desktop, then run this again." }
-		New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null
 		$previous = $null
 		if (Test-Path -LiteralPath $dest) {
 			$previous = Join-Path $work "previous"

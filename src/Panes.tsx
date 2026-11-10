@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { Icon, type IconName } from "./Icon";
-import { Markdown } from "./Markdown";
+import { Markdown, visibleCommandControls } from "./Markdown";
 import { PaneActions, type PaneLayoutControls } from "./PaneActions";
 import { type NumberedLine } from "./DiffPane";
 import { imageSrc, type ChatMessage, type Session, type ToolCard, type ToolDiff, type TranscriptView } from "./types";
@@ -92,21 +92,31 @@ function lineRange(detail: string) {
 }
 
 // Built once per file list; the list keeps its identity until its contents change.
-const knownIndexes = new WeakMap<string[], { byLower: Map<string, string>; names: { file: string; base: string }[] }>();
+const knownIndexes = new WeakMap<string[], { byLower: Map<string, string[]>; names: { file: string; base: string }[] }>();
 
 function knownIndex(known: string[]) {
 	let index = knownIndexes.get(known);
 	if (!index) {
-		const byLower = new Map<string, string>();
+		const byLower = new Map<string, string[]>();
 		const names = known.map((file) => {
 			const lower = file.toLowerCase();
-			if (!byLower.has(lower)) { byLower.set(lower, file); }
+			const group = byLower.get(lower);
+			if (group) { group.push(file); } else { byLower.set(lower, [file]); }
 			return { file, base: lower.slice(lower.lastIndexOf("/") + 1) };
 		});
 		index = { byLower, names };
 		knownIndexes.set(known, index);
 	}
 	return index;
+}
+
+function knownFile(slash: string, known: string[]) {
+	const matches = knownIndex(known).byLower.get(slash.toLowerCase());
+	if (!matches) { return undefined; }
+	const exact = matches.find((file) => file === slash);
+	if (exact) { return exact; }
+	if (matches.length === 1) { return matches[0]; }
+	return "";
 }
 
 function toRelative(raw: string, folder: string, known: string[]) {
@@ -119,8 +129,8 @@ function toRelative(raw: string, folder: string, known: string[]) {
     slash = slash.slice(folderKey.length + 1);
   }
   if (!slash || slash.split("/").some((part) => part === ".." || part === ".")) return "";
-  const knownHit = knownIndex(known).byLower.get(slash.toLowerCase());
-  if (knownHit) return knownHit;
+  const knownHit = knownFile(slash, known);
+  if (knownHit !== undefined) { return knownHit; }
 	if (/\s/.test(slash)) { return ""; }
 	if (/^[\w.@][\w.@/-]*\.[A-Za-z0-9]{1,8}$/.test(slash) && (slash.includes("/") || /\.(?:[cm]?[jt]sx?|json|md|txt|css|s[ac]ss|html?|xml|ya?ml|toml|ini|sql|asp|inc|vbs|asa|py|rb|go|rs|[ch]|cpp|hpp|sh|ps1|png|jpe?g|gif|svg|webp)$/i.test(slash))) { return slash; }
   return "";
@@ -148,7 +158,8 @@ export function mentionedFiles(text: string, tools: ToolCard[] | undefined, fold
 	for (const file of [...new Set(files)].sort((left, right) => right.length - left.length)) {
 		const root = folder.replace(/\\/g, "/").replace(/\/+$/, "");
 		const candidates = [`${root}/${file}`, `${root}/${file}`.replace(/\//g, "\\"), file];
-		const pattern = new RegExp(`(?:^|[^\\w./\\\\:-])(${candidates.map(escapeReg).join("|")})(?=$|[^\\w./\\\\-])`, "gi");
+		const variants = index.byLower.get(file.toLowerCase());
+		const pattern = new RegExp(`(?:^|[^\\w./\\\\:-])(${candidates.map(escapeReg).join("|")})(?=$|[^\\w./\\\\-])`, variants && variants.length > 1 ? "g" : "gi");
 		for (const match of text.matchAll(pattern)) {
 			const start = (match.index ?? 0) + match[0].length - match[1].length;
 			if (spans.some((span) => start >= span.start && start < span.end) || (!file.includes("/") && partialPathAt(start))) { continue; }
@@ -312,7 +323,7 @@ function editMarker(kind: NumberedLine["kind"]) {
 	return <span className="edit-marker">{kind === "add" ? "+" : kind === "del" ? "−" : ""}</span>;
 }
 
-export function EditDiff({ diff, all = false, view = "unified", onView, width = 0, onWidth }: { diff: ToolDiff; all?: boolean; view?: "unified" | "split"; onView?: (view: "unified" | "split") => void; width?: number; onWidth?: (width: number) => void }) {
+export function EditDiff({ diff, all = false, revealControls = false, view = "unified", onView, width = 0, onWidth }: { diff: ToolDiff; all?: boolean; revealControls?: boolean; view?: "unified" | "split"; onView?: (view: "unified" | "split") => void; width?: number; onWidth?: (width: number) => void }) {
 	const rows = editRows(diff);
 	const shown = all ? rows : rows.slice(0, 200);
 	const split = view === "split" && (width === 0 || splitFits(width));
@@ -344,7 +355,7 @@ export function EditDiff({ diff, all = false, view = "unified", onView, width = 
 								<div className={`edit-side dp-${cell.kind}`} key={side}>
 									<span className="dp-num">{cell.line ?? ""}</span>
 									{editMarker(cell.kind)}
-									<span className="dp-text">{cell.text}</span>
+									<span className="dp-text">{revealControls ? visibleCommandControls(cell.text) : cell.text}</span>
 								</div>
 							) : <div className="edit-side edit-side-empty" key={side}><span className="dp-num" />{editMarker("context")}<span className="dp-text" /></div>)}
 						</div>
@@ -353,7 +364,7 @@ export function EditDiff({ diff, all = false, view = "unified", onView, width = 
 							<span className="dp-num">{row.oldLine ?? ""}</span>
 							<span className="dp-num">{row.newLine ?? ""}</span>
 							{editMarker(row.kind)}
-							<span className="dp-text">{row.text}</span>
+							<span className="dp-text">{revealControls ? visibleCommandControls(row.text) : row.text}</span>
 						</div>
 					))}
 				</div>
@@ -377,8 +388,9 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 	const kind = questions !== undefined ? "question" : plan !== undefined ? "plan" : tool.todos ? "todos" : tool.kind.toLowerCase();
 	const label = (kind === "todos" ? TOOL_LABELS.todos : tool.label) || TOOL_LABELS[kind] || "Tool";
 	const found = kind === "todos" ? `${tool.todos?.filter((item) => item.status === "completed").length ?? 0} of ${tool.todos?.length ?? 0} done` : tool.description || (tool.path ? shownPath(tool.path, m.session.folder) : "") || plainTitle(tool.title);
-	const text = found.toLowerCase() === label.toLowerCase() ? "" : found;
 	const waiting = tool.waiting === true;
+	const shown = waiting ? visibleCommandControls(found) : found;
+	const text = found.toLowerCase() === label.toLowerCase() ? "" : shown;
 	const toolId = waiting ? tool.id : undefined;
 	const command = tool.command || (tool.path ? undefined : tool.summary);
 	const expandable = !!(questions?.length || plan || command || tool.output || tool.path || tool.diff);
@@ -483,26 +495,27 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 			</>
 		);
 	} else if (waiting) {
-		const approval = tool.command || tool.input || tool.path || tool.summary;
+		const approval = visibleCommandControls(tool.command || tool.input || tool.path || tool.summary || "");
+		const commandPrefix = visibleCommandControls(tool.commandPrefix ?? "");
 		body = (
 			<>
 				{tool.diff ? (
 					<>
-						<div className="tool-path">{tool.path ?? tool.summary}</div>
+						<div className="tool-path">{visibleCommandControls(tool.path ?? tool.summary ?? "")}</div>
 						{tool.diff.clipped ? (
 							<>
 								{tool.diff.whole && <p className="note">Writes the whole file. If the file exists, all of its current text is replaced.</p>}
 								{tool.diff.replaceAll && <p className="note">Replaces every match in the file, not only this one.</p>}
 								{approval && <pre className="tool-code">{approval}</pre>}
 							</>
-						) : <EditDiff diff={tool.diff} all view={m.diffView === "split" ? "split" : "unified"} onView={m.setDiffView} width={diffWidth} onWidth={setDiffWidth} />}
+						) : <EditDiff diff={tool.diff} all revealControls view={m.diffView === "split" ? "split" : "unified"} onView={m.setDiffView} width={diffWidth} onWidth={setDiffWidth} />}
 					</>
 				) : approval && <pre className="tool-code">{approval}</pre>}
 				{toolId && (
 					<div className="actions">
 						<button type="button" onClick={() => m.decide(toolId, "deny")}>Deny</button>
 						{!toolId.startsWith("native-permission:") && tool.always && !tool.noAlways && <button type="button" title={tool.always === "folder" ? "Allow this exact command in this folder from now on, in every session. Settings lists the commands you allowed." : tool.always === "site" ? "Allow browser access on this site for the rest of this conversation." : "Allow this tool for the rest of this conversation"} onClick={() => m.decide(toolId, "always")}>{tool.always === "folder" ? "Always allow in this folder" : tool.always === "site" ? "Allow on this site for this conversation" : "Allow for this conversation"}</button>}
-						{!toolId.startsWith("native-permission:") && kind === "command" && tool.commandPrefix && <button type="button" title={`Allow "${tool.commandPrefix} …" with any arguments in this conversation. Some arguments make a tool run other programs. Ends when the conversation does.`} onClick={() => m.decide(toolId, "prefix")}>{`Allow ${tool.commandPrefix} commands`}</button>}
+						{!toolId.startsWith("native-permission:") && kind === "command" && commandPrefix && <button type="button" title={`Allow "${commandPrefix} …" with any arguments in this conversation. Some arguments make a tool run other programs. Ends when the conversation does.`} onClick={() => m.decide(toolId, "prefix")}>{`Allow ${commandPrefix} commands`}</button>}
 						<button type="button" className="yes" onClick={() => m.decide(toolId, "allow")}>Allow</button>
 					</div>
 				)}
@@ -524,7 +537,7 @@ export function ToolRow({ tool, m }: { tool: ToolCard; m: PaneModel }) {
 		<>
 			<Icon className="tool-glyph" name={TOOL_ICONS[kind] ?? "dot"} />
 			<span className="tool-label">{label}</span>
-			{kind === "command" && tool.readsOnly && <small className="meta" title="Usually only reads, but arguments can change that. Check them.">Reads only</small>}
+			{kind === "command" && tool.readsOnly && <small className="meta" title="Usually only reads, but arguments can change that. Check them.">Often used to read</small>}
 			{text && <span className="tool-text" title={text}>{text}</span>}
 			{(additions !== undefined || deletions !== undefined) && (
 				<span className="tool-count"><span className="add">{`+${additions ?? 0}`}</span> <span className="del">{`−${deletions ?? 0}`}</span></span>
@@ -871,7 +884,7 @@ function Chat({ m }: { m: PaneModel }) {
   return (
 		<section className="chat" aria-label="Chat">
 			{find !== null && (
-				<div className="find-bar" role="search" onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); setFind(null); setHit(0); } }}>
+				<div className="find-bar" role="search" onKeyDown={(event) => { if (event.key === "Escape" && !event.nativeEvent?.isComposing) { event.stopPropagation(); setFind(null); setHit(0); } }}>
 					<input
 						ref={findBox}
 						autoFocus
@@ -880,7 +893,7 @@ function Chat({ m }: { m: PaneModel }) {
 						value={find}
 						onChange={(event) => { jump.current = true; setHit(0); setFind(event.target.value); }}
 						onKeyDown={(event) => {
-							if (event.key === "Enter") { event.preventDefault(); jump.current = true; setHit((value) => value + (event.shiftKey ? -1 : 1)); }
+							if (event.key === "Enter" && !event.nativeEvent?.isComposing) { event.preventDefault(); jump.current = true; setHit((value) => value + (event.shiftKey ? -1 : 1)); }
 						}}
 					/>
 					<span className="find-count" role="status">{hits ? `${(((hit % hits) + hits) % hits) + 1} of ${hits}` : find ? "No results" : ""}</span>
@@ -946,10 +959,13 @@ function Tasks({ m, layout }: { m: PaneModel; layout?: PaneLayoutControls }) {
 	const [refresh, setRefresh] = useState(0);
 	const [output, setOutput] = useState<{ id: string; result?: Awaited<ReturnType<PaneModel["taskOutput"]>> }>({ id: "" });
 	const [transcriptRequest, setTranscriptRequest] = useState({ id: "", version: 0 });
-	const [transcript, setTranscript] = useState<{ id: string; result?: Awaited<ReturnType<PaneModel["subagentTranscript"]>> }>({ id: "" });
-	const info = m.tasks.find((task) => task.id === openId)?.info;
+	const [transcript, setTranscript] = useState<{ childId: string; result: Awaited<ReturnType<PaneModel["subagentTranscript"]>>; signature: string }>();
+	const transcriptRead = useRef<ReturnType<PaneModel["subagentTranscript"]> | null>(null);
+	const openTask = m.tasks.find((task) => task.id === openId);
+	const info = openTask?.info;
 	const command = info?.kind === "command" ? info : undefined;
 	const childId = info?.kind === "agent" ? info.subagent.childSessionId : undefined;
+	const running = openTask?.running;
 	useEffect(() => {
 		if (!command) { return; }
 		let cancelled = false;
@@ -962,14 +978,24 @@ function Tasks({ m, layout }: { m: PaneModel; layout?: PaneLayoutControls }) {
 	useEffect(() => {
 		if (!childId || transcriptRequest.id !== openId) { return; }
 		let cancelled = false;
-		setTranscript({ id: openId });
-		void m.subagentTranscript(childId).then((result) => { if (!cancelled) { setTranscript({ id: openId, result }); } }).catch(() => {
-			if (!cancelled) { setTranscript({ id: openId, result: { ok: false, error: "This subagent's transcript could not be read." } }); }
-		});
-		return () => { cancelled = true; };
-	}, [openId, childId, transcriptRequest]);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const read = async () => {
+			await transcriptRead.current;
+			if (cancelled) { return; }
+			const pending = m.subagentTranscript(childId).catch(() => ({ ok: false, error: "This subagent's transcript could not be read." }));
+			transcriptRead.current = pending;
+			const result = await pending;
+			transcriptRead.current = null;
+			if (cancelled) { return; }
+			const signature = JSON.stringify(result);
+			setTranscript((current) => current?.childId === childId && (current.signature === signature || (!result.ok && current.result.ok)) ? current : { childId, result, signature });
+			if (running) { timer = setTimeout(read, 2000); }
+		};
+		void read();
+		return () => { cancelled = true; clearTimeout(timer); };
+	}, [openId, childId, transcriptRequest, running]);
 	const log = output.id === openId ? output.result : undefined;
-	const conversation = transcript.id === openId ? transcript.result : undefined;
+	const conversation = transcriptRequest.id === openId && transcript?.childId === childId ? transcript?.result : undefined;
   return (
     <section className="pane" aria-label="Background tasks">
 			<div className="pane-hd"><b>Background tasks</b><PaneActions name="Background tasks" layout={layout} onClose={() => m.closePane("tasks")} /></div>

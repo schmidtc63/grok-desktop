@@ -36,14 +36,14 @@ export interface BrowserPaneProps {
 	onStopServer: (script: string) => void;
 	onStopAll: () => void;
 	selectTick: number;
-	onPicked: (pick: { url: string; selector: string; html: string; text: string }) => void;
+	onPicked: (pick: ElementPick & { url: string }) => void;
 	onProblem: (tabId: string, problem: BrowserProblemInput) => void;
 	onClearProblems: (tabId: string) => void;
 	onDiagnostics: (text: string) => void;
 	onClose: () => void;
 }
 
-interface ElementPick { selector: string; html: string; text: string }
+interface ElementPick { selector: string; html: string }
 
 interface WebviewElement extends HTMLElement {
 	getURL(): string;
@@ -74,7 +74,7 @@ export const PICKER_SCRIPT: string = `(() => new Promise((resolve) => {
 	function cssPath(node) {
 		const parts = [];
 		while (node && node.nodeType === 1 && parts.length < 5) {
-			if (node.id) {
+			if (node.id && !/[?#:/]/.test(node.id)) {
 				parts.unshift("#" + CSS.escape(node.id));
 				break;
 			}
@@ -112,11 +112,9 @@ export const PICKER_SCRIPT: string = `(() => new Promise((resolve) => {
 		if (!(target instanceof Element)) {
 			return;
 		}
-		const text = target.innerText !== undefined ? target.innerText : target.textContent;
 		finish({
 			selector: cssPath(target),
 			html: String(target.outerHTML || "").slice(0, 4000),
-			text: String(text || "").slice(0, 500),
 		});
 	}
 	function key(event) {
@@ -162,16 +160,38 @@ function attempt<T>(run: () => T, fallback: T): T {
 	}
 }
 
-// The page is untrusted: accept only the expected string fields and re-clip them.
+const PICK_ATTRIBUTES = new Set(["id", "class", "role", "type", "name", "for"]);
+
+function cleanPickMarkup(html: string): string {
+	const template = document.createElement("template");
+	template.innerHTML = html.slice(0, 4000);
+	for (const element of template.content.querySelectorAll("script, style, template, noscript, iframe, [hidden], [aria-hidden=true i], input[type=hidden i]")) {
+		element.remove();
+	}
+	for (const element of template.content.querySelectorAll("*")) {
+		if (element.localName === "textarea") { element.textContent = ""; }
+		for (const name of element.getAttributeNames()) {
+			if (!PICK_ATTRIBUTES.has(name) || /\?|\/\/|data:|blob:|javascript:/i.test(element.getAttribute(name) ?? "")) { element.removeAttribute(name); }
+		}
+	}
+	const textNodes = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_COMMENT);
+	while (textNodes.nextNode()) {
+		const node = textNodes.currentNode;
+		node.nodeValue = node.nodeType === Node.COMMENT_NODE ? "" : (node.nodeValue ?? "").replace(/https?:\/\/[^\s<>"'`]+/gi, (url) => URL.canParse(url) ? cleanUrl(url) : "[omitted URL]");
+	}
+	return template.innerHTML.slice(0, 4000);
+}
+
+// The page is untrusted: accept only the expected string fields and filter its markup before using it.
 function asPick(value: unknown): ElementPick | null {
 	if (!value || typeof value !== "object") {
 		return null;
 	}
-	const { selector, html, text } = value as Record<string, unknown>;
-	if (typeof selector !== "string" || typeof html !== "string" || typeof text !== "string") {
+	const { selector, html } = value as Record<string, unknown>;
+	if (typeof selector !== "string" || typeof html !== "string") {
 		return null;
 	}
-	return { selector: selector.slice(0, 1000), html: html.slice(0, 4000), text: text.slice(0, 500) };
+	return { selector: selector.slice(0, 1000), html: cleanPickMarkup(html) };
 }
 
 function tabLabel(tab: BrowserTab): string {
@@ -306,7 +326,8 @@ export function BrowserPane(props: BrowserPaneProps) {
 			.then((value) => {
 				const picked = asPick(value);
 				if (picked && stillPicking()) {
-					latest.current.onPicked({ url: attempt(() => view.getURL(), seen.current[tabId] ?? ""), ...picked });
+					const url = cleanUrl(attempt(() => view.getURL(), seen.current[tabId] ?? ""));
+					latest.current.onPicked({ url: /^https?:\/\//i.test(url) ? url : "[omitted URL]", ...picked });
 				}
 			})
 			.catch(() => undefined)
@@ -552,6 +573,8 @@ export function BrowserPane(props: BrowserPaneProps) {
 						if (!active || !url) {
 							return;
 						}
+						addressRef.current?.blur();
+						setDraft(activeUrl);
 						props.onNavigate(active.id, url);
 						if (url === active.url) {
 							go("reload");

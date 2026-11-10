@@ -1,19 +1,26 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import { Customize } from "./Customize";
-import { keyLabel } from "./data";
+import { keyLabel, PLATFORM } from "./data";
 import { DEFAULT_FILE_TYPES, PLAIN_TEXT } from "./editor-defaults";
 import { mapMode, MODES, validMachineName, type PermissionMode, type TranscriptView } from "./types";
+import { SandboxSettings } from "./SandboxSettings";
 import { SavedPromptsSettings } from "./SavedPromptsSettings";
 import { normalizeSavedPrompts, type SavedPrompt } from "./saved-prompts";
 import { askConfirm } from "./confirm";
 import { Icon } from "./Icon";
+import { normalizeUiConfigs, type UiConfig, type UiTheme } from "./ui-config";
+import { UiConfigSettings } from "./UiConfigSettings";
 
 const EditorSettings = lazy(() => import("./EditorSettings").then((module) => ({ default: module.EditorSettings })).catch(() => ({
 	default: () => <p className="note" role="alert">Editor file types could not load. Restart the app to try again.</p>,
 })));
 
+export const WORKTREE_ARCHIVE_NOTE = "Removing a clean worktree also deletes ignored files in node_modules, dist, build, out, target, .next, coverage, __pycache__, and .cache.";
+
 export interface AppSettings {
 	appearance: "system" | "light" | "dark";
+	uiConfigs: UiConfig[];
+	activeUiConfig: string;
 	autoSave: boolean;
 	terminalScreenReader: boolean;
 	editorFileTypes: Record<string, string>;
@@ -23,6 +30,7 @@ export interface AppSettings {
 	keepCookies: boolean;
 	linksInBuiltIn: boolean;
 	browserControl: boolean;
+	grokBotWindow: boolean;
 	linkAsked: boolean;
 	notifyPermission: "banner" | "off";
 	notifyQuestion: "banner" | "off";
@@ -37,9 +45,6 @@ export interface AppSettings {
 	branchPrefix: string;
 	defaultMode: PermissionMode;
 	defaultView: TranscriptView;
-	allowBypass: boolean;
-	// Set once so an older saved Manual default is not applied again after this choice.
-	bypassDefaultApplied: boolean;
 	model: string;
 	effort: string;
 	sideWidth: number;
@@ -48,10 +53,17 @@ export interface AppSettings {
 	sidebarCollapsed: boolean;
 	railOpen: boolean;
 	diffView: "unified" | "split";
+	sandboxProfile: "workspace" | "strict";
+	sandboxOption: "docker" | "wsl" | "windows-sandbox";
+	sandboxDockerImage: string;
+	sandboxWslDistro: string;
+	sandboxMappedFolders: string[];
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
 	appearance: "system",
+	uiConfigs: [],
+	activeUiConfig: "",
 	autoSave: true,
 	terminalScreenReader: false,
 	editorFileTypes: DEFAULT_FILE_TYPES,
@@ -61,6 +73,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
 	keepCookies: true,
 	linksInBuiltIn: true,
 	browserControl: false,
+	grokBotWindow: false,
 	linkAsked: false,
 	notifyPermission: "banner",
 	notifyQuestion: "banner",
@@ -75,8 +88,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
 	branchPrefix: "grok",
 	defaultMode: "Normal",
 	defaultView: "normal",
-	allowBypass: true,
-	bypassDefaultApplied: true,
 	model: "grok-4.7",
 	effort: "high",
 	sideWidth: 560,
@@ -85,6 +96,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
 	sidebarCollapsed: false,
 	railOpen: true,
 	diffView: "unified",
+	sandboxProfile: "workspace",
+	sandboxOption: "docker",
+	sandboxDockerImage: "",
+	sandboxWslDistro: "",
+	sandboxMappedFolders: [],
 };
 
 export const settingsKey = "grok-code.settings.v1";
@@ -118,7 +134,14 @@ export function readSettings(): AppSettings {
 		if (!Number.isFinite(settings.sidebarWidth)) { settings.sidebarWidth = DEFAULT_SETTINGS.sidebarWidth; }
 		if (!Number.isFinite(settings.railWidth)) { settings.railWidth = DEFAULT_SETTINGS.railWidth; }
 		settings.savedPrompts = normalizeSavedPrompts(settings.savedPrompts);
+		settings.uiConfigs = normalizeUiConfigs(settings.uiConfigs);
+		if (!settings.uiConfigs.some(({ id }) => id === settings.activeUiConfig)) { settings.activeUiConfig = ""; }
 		settings.cursorMachines = normalizeCursorMachines(settings.cursorMachines);
+		if (settings.sandboxProfile !== "strict") { settings.sandboxProfile = "workspace"; }
+		if (!["docker", "wsl", "windows-sandbox"].includes(settings.sandboxOption)) { settings.sandboxOption = "docker"; }
+		if (typeof settings.sandboxDockerImage !== "string") { settings.sandboxDockerImage = ""; }
+		if (typeof settings.sandboxWslDistro !== "string") { settings.sandboxWslDistro = ""; }
+		settings.sandboxMappedFolders = Array.isArray(settings.sandboxMappedFolders) ? settings.sandboxMappedFolders.filter((folder) => typeof folder === "string") : [];
 		return settings;
 	} catch {
 		return { ...DEFAULT_SETTINGS, editorFileTypes: { ...DEFAULT_FILE_TYPES } };
@@ -129,7 +152,7 @@ export function validPrefix(value: string) {
 	return /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(value) && !/^(main|master|staging|warm|prod-.*|release.*)$/i.test(value);
 }
 
-export type SettingsTab = "general" | "editor" | "notifications" | "sessions" | "prompts" | "skills" | "connectors" | "plugins" | "about";
+export type SettingsTab = "general" | "editor" | "notifications" | "sessions" | "sandbox" | "prompts" | "skills" | "connectors" | "plugins" | "ui" | "about";
 
 const SIGN_IN_ERRORS = new Set([
 	"Grok is still answering. Press Stop or wait, then save.",
@@ -143,7 +166,7 @@ const SIGN_IN_ERRORS = new Set([
 	"The API key couldn't be encrypted.",
 ]);
 
-export function SettingsPage({ settings, onChange, onClose, onCheckSetup, servers, folder, onRun, signInStatus, signInCheck, onSignInChanged, cloudKeyStatus, initialTab = "general" }: {
+export function SettingsPage({ settings, onChange, onClose, onCheckSetup, servers, folder, onRun, signInStatus, signInCheck, onSignInChanged, cloudKeyStatus, grokBot, initialTab = "general", previewTheme, onPreviewTheme, nav }: {
 	settings: AppSettings;
 	onChange: (patch: Partial<AppSettings>) => boolean;
 	onClose: () => void;
@@ -155,9 +178,14 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 	signInCheck?: GrokReadiness["grok"];
 	onSignInChanged?: () => void;
 	cloudKeyStatus?: CursorKeyStatus;
+	grokBot?: ReturnType<typeof import("./grok-bot").useGrokBot>;
 	initialTab?: SettingsTab;
+	previewTheme: UiTheme | null;
+	onPreviewTheme: (theme: UiTheme | null) => void;
+	nav?: ReactNode;
 }) {
 	const [tab, setTab] = useState<SettingsTab>(initialTab);
+	const [peek, setPeek] = useState(false);
 	const toolsOpen = tab === "skills" || tab === "connectors" || tab === "plugins";
 	const section = toolsOpen ? "skills" : tab;
 	const selectedButton = useRef<HTMLButtonElement | null>(null);
@@ -182,6 +210,11 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 	const [cursorKeyBusy, setCursorKeyBusy] = useState(false);
 	const [cursorKeyNotice, setCursorKeyNotice] = useState<{ ok: boolean; text: string } | null>(null);
 	const [machineHelpNotice, setMachineHelpNotice] = useState("");
+	const [openAtSignIn, setOpenAtSignIn] = useState<GrokOpenAtSignIn | null>(null);
+	useEffect(() => { void window.grokCode?.openAtSignIn?.().then(setOpenAtSignIn).catch(() => {}); }, []);
+	const changeOpenAtSignIn = (enabled: boolean) => {
+		void window.grokCode?.openAtSignIn?.(enabled).then(setOpenAtSignIn).catch(() => setOpenAtSignIn((current) => current && { ...current, ok: false, error: "The setting could not be changed." }));
+	};
 	const signInOpen = useRef(tab === "general");
 	useEffect(() => {
 		signInOpen.current = tab === "general";
@@ -252,7 +285,10 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 		setCursorKeyBusy(true);
 		setCursorKeyNotice(null);
 		const fallback = "The Cursor key change could not be saved. Try again.";
+		let attempted = false;
 		try {
+			if (remove && (!await askConfirm({ title: "Remove the Cursor API key?", body: "A Cursor API key is required to send Cloud messages.", ok: "Remove", danger: true }) || !signInOpen.current)) { return; }
+			attempted = true;
 			const result = await (remove ? api?.cloudKeyRemove?.() : api?.cloudKeySave?.(key));
 			setCursorKeyNotice(result?.ok
 				? { ok: true, text: remove ? "Cursor API key removed." : "Cursor API key saved." }
@@ -260,7 +296,7 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 		} catch {
 			setCursorKeyNotice({ ok: false, text: fallback });
 		} finally {
-			if (field) { field.value = ""; }
+			if (field && attempted) { field.value = ""; }
 			cursorKeyPending.current = false;
 			setCursorKeyBusy(false);
 		}
@@ -326,20 +362,25 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 		}}>Copy</button></>
 	);
 	return (
-		<div className="settings-page" role="dialog" aria-label="Settings">
+		<div className={peek ? "settings-page peek" : "settings-page"} role="dialog" aria-label="Settings">
 			<nav className="settings-nav">
+				{nav}
 				<h2>Settings</h2>
-				{([["general", "General"], ["editor", "Editor"], ["notifications", "Notifications"], ["sessions", "Sessions"], ["prompts", "Saved prompts"], ["skills", "Skills and tools"], ["about", "About"]] as [SettingsTab, string][]).map(([id, label]) => (
+				{([["general", "General"], ["editor", "Editor"], ["notifications", "Notifications"], ["sessions", "Sessions"], ["sandbox", "Sandbox"], ["prompts", "Saved prompts"], ["skills", "Skills and tools"], ["ui", "UI Configuration"], ["about", "About"]] as [SettingsTab, string][]).filter(([id]) => id !== "sandbox" || PLATFORM !== "win32").map(([id, label]) => (
 					<button key={id} type="button" ref={section === id ? selectedButton : undefined} aria-current={section === id ? "page" : undefined} className={section === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>
 				))}
 				<span className="spacer" />
 				<button type="button" className="texty" onClick={onClose}>Done</button>
 			</nav>
-			<div className={toolsOpen ? "settings-body customize" : "settings-body"}>
+			{tab === "ui" ? <UiConfigSettings settings={settings} onChange={onChange} onPeek={setPeek} previewTheme={previewTheme} onPreviewTheme={onPreviewTheme} /> : <div className={toolsOpen ? "settings-body customize" : "settings-body"}>
 				{tab === "general" && (
 					<>
 						<h3>General</h3>
 						{row("Appearance", "Follow the system, or always light or dark.", choose("appearance", "Appearance", [["system", "System"], ["light", "Light"], ["dark", "Dark"]]))}
+						{row("Open at sign-in", "Starts the app when you sign in to this computer. Scheduled routines run only while the app is open.", <input type="checkbox" role="switch" className="set-switch" aria-label="Open at sign-in" checked={openAtSignIn?.on === true} disabled={!openAtSignIn?.available} onChange={(event) => changeOpenAtSignIn(event.target.checked)} />)}
+						{openAtSignIn && !openAtSignIn.available && <p className="note">Open at sign-in works in the installed app.</p>}
+						{openAtSignIn?.blockedBySystem && <p className="note">This setting is turned off in Windows' Startup apps, so the app won't start at sign-in until you turn it back on there.</p>}
+						{openAtSignIn?.error && <p className="note" role="alert">{openAtSignIn.error}</p>}
 						{row("Keep computer awake while Grok works", "Prevents idle sleep while any session is working. A closed lid still sleeps.", toggle("keepAwake", "Keep computer awake while Grok works"))}
 						{row("Keep awake on battery power", "When off, the hold drops while on battery. On battery, the computer may still sleep a few minutes after its own sleep timeout.", toggle("keepAwakeOnBattery", "Keep awake on battery power"))}
 						{row("Auto save in the Files pane", "Save edits shortly after you stop typing.", toggle("autoSave", "Auto save"))}
@@ -374,6 +415,20 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 							{cursorKeyNotice && <p className="note" role={cursorKeyNotice.ok ? "status" : "alert"}>{cursorKeyNotice.text}</p>}
 							<div className="actions"><button type="submit" className="texty" disabled={cursorKeyBusy || !cloudKeyStatus?.keyring}>Save</button><button type="button" className="texty" disabled={cursorKeyBusy || !cloudKeyStatus?.hasKey} onClick={() => void changeCursorKey(true)}>Remove</button></div>
 						</form>
+						<h3>Grok Bot</h3>
+						<section aria-label="Grok Bot settings">
+							<p className="note">Grok Bot has no public API. This feature uses the private service Grok Bot's own apps use, so it's unofficial and can stop working at any time. It signs in to your Cursor account, and messages count toward your Grok Bot plan. Cursor's <a href="https://cursor.com/terms-of-service" onClick={(event) => { event.preventDefault(); void window.grokCode?.openExternal?.("https://cursor.com/terms-of-service"); }}>terms</a> limit reverse engineering and extracting data from its service, and Cursor can suspend access, so read them and decide for yourself.</p>
+							{grokBot?.status.signedIn && <p className="note">{grokBot.status.connection === "expired" ? "Your sign-in ended." : grokBot.status.until ? `Signed in until ${new Date(grokBot.status.until).toLocaleDateString()}.` : "Signed in."} Signing out removes the sign-in from this app. It stays valid on Cursor's side until it expires.</p>}
+							{grokBot && !grokBot.status.keyring && <p className="note">This computer has no keyring the app can use, so the Grok Bot sign-in can't be saved.</p>}
+							{grokBot?.note && <p className="note" role="status">{grokBot.note}</p>}
+							<div className="actions">
+								{grokBot?.status.signingIn ? <button type="button" className="texty" onClick={() => void grokBot.cancelSignIn()}>Cancel sign-in</button> : (!grokBot?.status.signedIn || grokBot.status.connection === "expired") && <button type="button" className="texty" disabled={!grokBot?.status.keyring} onClick={() => void grokBot?.signIn()}>Sign in</button>}
+								{grokBot?.status.signedIn && <button type="button" className="texty" onClick={() => void grokBot.signOut()}>Sign out</button>}
+							</div>
+							{PLATFORM === "win32"
+								? row("Show the Grok Bot app here", "Choosing Grok Bot in the sidebar moves the real app's window into this one, so it has every card and button. It needs Grok Bot installed and no sign-in here, and this app contacts no Cursor service for it. While it's inside, it has no taskbar icon. Grok Bot closes when this app closes, and if this app crashes, anything not yet sent there may be lost.", toggle("grokBotWindow", "Show the Grok Bot app here"))
+								: row("Show the Grok Bot app here", "Windows only for now. Another app's window can't be placed inside this one the same way here.", <input type="checkbox" role="switch" className="set-switch" aria-label="Show the Grok Bot app here" checked={false} disabled />)}
+						</section>
 						<h3>My machines</h3>
 						<p className="note">Run Cloud sessions on a computer you own. Cursor's agent works there with that computer's files, tools and sign-ins, and can change anything its user can. Only use computers you trust, and give the worker its own clone.</p>
 						<p className="note">1. Turn on Enable my machines on Cursor's dashboard. <button type="button" className="texty" onClick={async () => {
@@ -393,7 +448,7 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 						<h3>Browser</h3>
 						{row("Keep cookies", "Sign-ins in the Browser pane survive restarts.", toggle("keepCookies", "Keep cookies"))}
 						{row("Open links in built-in browser", keyLabel("Links in the chat open in the Browser pane. Ctrl+click opens your default browser."), toggle("linksInBuiltIn", "Open links in built-in browser"))}
-						{row("Let Grok use the Browser pane", "Grok uses sites where you are signed in. What it reads goes to xAI as part of the conversation. Other sites ask for permission; Stop pauses browser access.", toggle("browserControl", "Let Grok use the Browser pane"))}
+						{row("Let Grok use the Browser pane", "Grok uses sites where you are signed in. What it reads goes to xAI as part of the conversation. Links and redirects can load a new site before Grok asks to read it. Stop pauses browser access.", toggle("browserControl", "Let Grok use the Browser pane"))}
 					</>
 				)}
 				{tab === "editor" && (
@@ -402,6 +457,7 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 						{saved("editorFileTypes")}
 					</Suspense>
 				)}
+				{tab === "sandbox" && <SandboxSettings settings={settings} onChange={onChange} />}
 				{tab === "prompts" && <><SavedPromptsSettings prompts={settings.savedPrompts} onChange={(savedPrompts) => saveSetting("savedPrompts", savedPrompts)} />{saved("savedPrompts")}</>}
 				{tab === "notifications" && (
 					<>
@@ -410,7 +466,7 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 						{row("Questions", "When Grok asks you to choose.", choose("notifyQuestion", "Question notifications", [["banner", "Banners"], ["off", "Off"]]))}
 						{row("Task complete", "When a session finishes while you are not looking at it.", choose("notifyDone", "Task complete notifications", [["banner", "Banners"], ["off", "Off"]]))}
 						{row("Pull requests", "When CI fails or new review feedback arrives on a pull request a session opened.", choose("notifyPr", "Pull request notifications", [["banner", "Banners"], ["off", "Off"]]))}
-						{row("Draw attention", "Flash the taskbar button when Grok needs you.", toggle("attention", "Draw attention on notifications"))}
+						{row("Draw attention", "Flash the taskbar button for approvals, questions, finished replies, and pull request updates while you're away.", toggle("attention", "Draw attention on notifications"))}
 						{row("Notification sound", "The sound banners play.", choose("sound", "Notification sound", [["system", "System sound"], ["none", "None"]]))}
 					</>
 				)}
@@ -419,7 +475,7 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 						<h3>Sessions</h3>
 						{row("Default permission mode", `The mode each new session starts in. ${MODES.find((item) => item.id === settings.defaultMode)?.detail ?? ""}`, choose("defaultMode", "Default permission mode", MODES.map((item) => [item.id, item.id])))}
 						{row("Transcript view", keyLabel("How much each session shows until you change it with Ctrl+O. Thinking adds Grok's reasoning; Verbose also opens tool details."), choose("defaultView", "Transcript view", [["normal", "Normal"], ["thinking", "Thinking"], ["verbose", "Verbose"]]))}
-						{row("Archive inactive sessions", "Archive sessions with no activity for this long. Clean worktree folders are removed; their branches stay. Pinned and running sessions stay.", choose("autoArchiveDays", "Archive inactive sessions", [[0, "Never"], [1, "1 day"], [2, "2 days"], [7, "7 days"], [14, "14 days"], [30, "30 days"]]))}
+						{row("Archive inactive sessions", `Archive sessions with no activity for this long. Clean worktree folders are removed and their branches stay. ${WORKTREE_ARCHIVE_NOTE} Pinned and running sessions stay.`, choose("autoArchiveDays", "Archive inactive sessions", [[0, "Never"], [1, "1 day"], [2, "2 days"], [7, "7 days"], [14, "14 days"], [30, "30 days"]]))}
 						{row("Accept turns from local tools", "Lets programs on this computer that hold the private token add a message to an open session. The message waits in that session's queue and runs with that session's mode and approvals. Off by default.", toggle("acceptLocalTurns", "Accept turns from local tools"))}
 						{row("Branch prefix", "Added to the branch names of new worktree sessions.", (
 							<span className="set-inline">
@@ -459,7 +515,7 @@ export function SettingsPage({ settings, onChange, onClose, onCheckSetup, server
 						<button type="button" className="texty" onClick={onCheckSetup}>Check setup</button>
 					</>
 				)}
-			</div>
+			</div>}
 		</div>
 	);
 }

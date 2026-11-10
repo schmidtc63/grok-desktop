@@ -241,4 +241,39 @@ fs.rmSync(cliRoot, { recursive: true, force: true });
 fs.rmSync(cliWork, { recursive: true, force: true });
 console.log("PASS CLI sessions: newest first, known ids left out, transcript without rules, missing folder refused");
 
-fs.rmSync(root, { recursive: true, force: true });
+async function checkSavedDataWorker() {
+	const vm = require("node:vm");
+	const workerThreads = require("node:worker_threads");
+	const file = require.resolve("../electron/session-data.cjs");
+	const preload = path.join(root, "codex-slow-session-reads.cjs");
+	fs.writeFileSync(preload, `const fs = require("fs");
+const original = fs.readdirSync;
+fs.readdirSync = function(folder, ...args) {
+	if (folder === ${JSON.stringify(root)}) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100); }
+	return original.call(this, folder, ...args);
+};
+`);
+	const loaded = { exports: {} };
+	vm.runInNewContext(fs.readFileSync(file, "utf8"), {
+		module: loaded, __filename: file,
+		require(name) {
+			if (name !== "worker_threads") { return require(name); }
+			return { ...workerThreads, Worker: class extends workerThreads.Worker {
+				constructor(script, options) { super(script, { ...options, execArgv: ["--require", preload] }); }
+			} };
+		},
+	});
+	let responsive = false;
+	const reading = loaded.exports.readSessionData({ action: "spend", roots: [root] });
+	setTimeout(() => { responsive = true; }, 0);
+	const spent = await reading;
+	assert.equal(responsive, true, "the main event loop runs while a saved-data filesystem read blocks its worker");
+	assert.deepEqual(spent, recentSpend(Date.now(), root));
+	assert.deepEqual(await loaded.exports.readSessionData({ action: "context", sessionId: id, roots: [root] }), contextBreakdown(id, root));
+	console.log("PASS saved session worker: slow filesystem reads preserve event-loop progress and existing data results");
+}
+
+checkSavedDataWorker().catch((error) => {
+	console.error(error);
+	process.exitCode = 1;
+}).finally(() => fs.rmSync(root, { recursive: true, force: true }));

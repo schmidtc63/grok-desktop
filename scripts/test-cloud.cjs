@@ -335,7 +335,7 @@ function fakeHost({ getKey = () => fakeKey, retryDelays = [0, 0, 0, 0, 0], waitN
 		return overrides[method] ? overrides[method](...args) : defaults[method];
 	}]));
 	api.stream = (agentId, runId, onEvent) => {
-		const stream = { agentId, runId, stops: 0, send: (event, data = {}) => onEvent({ event, data }), stop() { this.stops += 1; } };
+		const stream = { agentId, runId, stops: 0, send: (event, data = {}, id) => onEvent({ event, data, ...(id === undefined ? {} : { id }) }), stop() { this.stops += 1; } };
 		streams.push(stream);
 		return stream;
 	};
@@ -491,17 +491,76 @@ async function checkHostRecovery() {
 	recovered.streams[0].send("assistant", { text: "Obsolete partial" });
 	recovered.streams[0].send("closed");
 	await waitFor(() => recovered.streams.length === 2, "First recovery replay");
-	recovered.streams[1].send("heartbeat");
-	recovered.streams[1].send("closed");
-	await waitFor(() => recovered.streams.length === 3, "Received events reset the retry count");
-	assert.equal(recovered.calls.run.length, 0);
-	recovered.streams[2].send("expired");
+	recovered.streams[1].send("expired");
 	await waitFor(() => recovered.events.at(-1)?.type === "done", "Expired stream run lookup");
 	const lastReset = recovered.events.findLastIndex(({ type }) => type === "turn-start");
 	assert.match(chatText(recovered.events.slice(lastReset + 1)), /^Complete result[\s\S]*cursor\/example[\s\S]*pull\/7/);
 	assert.equal(recovered.events.at(-2).active, false);
 	assert.equal(recovered.events.at(-2).prUrl, sampleBranch.prUrl);
-	console.log("PASS CloudHost retries five times, resets failures on events, retains live runs and fills terminal fallback results");
+	console.log("PASS CloudHost retries five times, retains live runs and fills terminal fallback results");
+}
+
+async function checkStatusRetryBudget() {
+	const f = fakeHost({ retryDelays: [0, 0] });
+	f.send();
+	await waitFor(() => f.streams.length === 1, "Cloud stream before status-only drops");
+	for (let index = 0; index < 3; index++) {
+		await waitFor(() => f.streams.length === index + 1, "Status-only retry");
+		f.streams[index].send("status", { status: "RUNNING" });
+		f.streams[index].send("closed");
+	}
+	await waitFor(() => f.events.at(-1)?.type === "error", "Status-only reconnects stop at the retry limit");
+	assert.equal(f.streams.length, 3, "status frames do not buy extra reconnects");
+	assert.equal(f.calls.run.length, 1);
+	console.log("PASS Cloud status frames do not reset the reconnect budget");
+}
+
+async function checkHeartbeatRetryBudget() {
+	const f = fakeHost({ retryDelays: [0, 0] });
+	f.send();
+	await waitFor(() => f.streams.length === 1, "Cloud stream before heartbeat drops");
+	for (let index = 0; index < 3; index++) {
+		await waitFor(() => f.streams.length === index + 1, "Heartbeat retry");
+		f.streams[index].send("heartbeat");
+		f.streams[index].send("closed");
+	}
+	await waitFor(() => f.events.at(-1)?.type === "error", "Heartbeat reconnects stop at the retry limit");
+	assert.equal(f.streams.length, 3, "heartbeats do not buy extra reconnects");
+	assert.equal(f.calls.run.length, 1);
+	console.log("PASS Cloud heartbeats do not reset the reconnect budget");
+}
+
+async function checkResendRetryBudget() {
+	const f = fakeHost({ retryDelays: [0] });
+	f.send();
+	await waitFor(() => f.streams.length === 1, "Cloud stream before a resent frame");
+	f.streams[0].send("assistant", { text: "Partial answer" }, "evt-1");
+	f.streams[0].send("closed");
+	await waitFor(() => f.streams.length === 2, "Reconnect after the first drop");
+	f.streams[1].send("assistant", { text: "Partial answer" }, "evt-1");
+	f.streams[1].send("closed");
+	await waitFor(() => f.events.at(-1)?.type === "error", "A resent frame does not buy another reconnect");
+	assert.equal(f.streams.length, 2, "resent frames do not reset the reconnect budget");
+	assert.equal(f.calls.run.length, 1);
+	console.log("PASS Cloud resent frames do not reset the reconnect budget");
+}
+
+async function checkProgressResetsRetryBudget() {
+	const f = fakeHost({ retryDelays: [0] });
+	f.send();
+	await waitFor(() => f.streams.length === 1, "Cloud stream before new progress");
+	f.streams[0].send("assistant", { text: "One" }, "evt-1");
+	f.streams[0].send("closed");
+	await waitFor(() => f.streams.length === 2, "Retry before new progress");
+	f.streams[1].send("assistant", { text: "Two" }, "evt-2");
+	f.streams[1].send("closed");
+	await waitFor(() => f.streams.length === 3, "New run progress resets the reconnect budget");
+	assert.equal(f.calls.run.length, 0);
+	f.streams[2].send("closed");
+	await waitFor(() => f.events.at(-1)?.type === "error", "Drops after the reset still stop at the limit");
+	assert.equal(f.streams.length, 3);
+	assert.equal(f.calls.run.length, 1);
+	console.log("PASS Cloud new run progress resets the reconnect budget");
 }
 
 async function checkHostDetachAndErrors() {
@@ -543,6 +602,7 @@ async function checkHostDetachAndErrors() {
 const machineRecord = { ...cloudRecord, machine: "laptop" };
 const savedMachineRun = { ...savedRun, machine: machineRecord.machine };
 const machineHint = " Check that Cursor's worker is running on laptop, in a clone of this repository.";
+const detachedRefusal = (machine) => ({ ok: false, error: `A run this app started on ${machine} may still be working, so the app won't start another there until it restarts. Check cursor.com/agents.` });
 
 async function checkMachineCreateBody() {
 	const bodies = [];
@@ -631,7 +691,6 @@ async function checkMachineClaims() {
 	const f = fakeHost({ retryDelays: [] });
 	const other = { uiSessionId: "other-cloud-chat", turnId: "other-turn", cloud: { ...machineRecord, machine: "LAPTOP" } };
 	const liveRefusal = { ok: false, error: "Another session is using LAPTOP. Wait for it to finish or stop it." };
-	const detachedRefusal = (machine) => ({ ok: false, error: `A run this app started on ${machine} may still be working, so the app won't start another there until it restarts. Check cursor.com/agents.` });
 	assert.equal(f.send({ cloud: machineRecord }).ok, true);
 	assert.deepEqual(f.send(other), liveRefusal);
 	await waitFor(() => f.streams.length === 1, "First machine stream");
@@ -693,8 +752,42 @@ async function checkMachineCreateErrors() {
 			assert.equal(message, error + (hasHint ? machineHint : ""));
 		}
 		assert.equal(f.streams.length, 0);
+		assert.equal(f.calls.create.length, 1, "the failed start is not retried");
+		const next = f.send({ cloud: machineRecord, turnId: "next" });
+		if (code === "timeout") { assert.deepEqual(next, detachedRefusal("laptop")); }
+		else { assert.equal(next.ok, true, "a clear refusal releases the machine"); }
 	}
 	console.log("PASS machine create hints are limited to eligible provider refusals");
+}
+
+async function checkUncertainMachineStarts() {
+	for (const [label, method, start] of [
+		["connection", "create", () => ({ ok: false, status: 0, code: "connection" })],
+		["thrown", "create", () => { throw new Error("Connection dropped."); }],
+		["absent", "create", () => undefined],
+		["invalid reply", "create", () => ({ ok: false, status: 200, code: "invalid_reply" })],
+		["HTTP 502", "create", () => ({ ok: false, status: 502, code: "http_error" })],
+		["HTTP 504", "followUp", () => ({ ok: false, status: 504, code: "http_error" })],
+		["invalid run details", "followUp", () => ({ ok: true, run: { id: ".." } })],
+	]) {
+		const f = fakeHost({ [method]: start });
+		const cloud = method === "create" ? machineRecord : { ...savedMachineRun, active: false };
+		assert.equal(f.send({ cloud }).ok, true);
+		await waitFor(() => f.events.at(-1)?.type === "error", label);
+		assert.deepEqual(f.send({ uiSessionId: "other-window", cloud: { ...machineRecord, machine: "LAPTOP" } }), detachedRefusal("LAPTOP"));
+		assert.deepEqual(f.resume({ cloud: savedMachineRun }), detachedRefusal("laptop"), "an old run cannot release the uncertain claim");
+		assert.equal(f.events.some(({ type }) => type === "cloud-state"), false, "the unknown run is not saved as active");
+		assert.equal(f.calls[method].length, 1);
+	}
+	const pending = deferred();
+	const f = fakeHost({ create: () => pending.promise });
+	assert.equal(f.send({ cloud: machineRecord }).ok, true);
+	f.host.stop(sendInput.uiSessionId);
+	assert.deepEqual(f.resume({ cloud: savedMachineRun }), detachedRefusal("laptop"));
+	pending.resolve({ ok: false, status: 409, code: "conflict" });
+	await new Promise(setImmediate);
+	assert.equal(f.send({ cloud: machineRecord }).ok, true, "a refusal also releases a machine after its starting window closes");
+	console.log("PASS uncertain machine starts block sends and stale resumes without saving or retrying an unknown run");
 }
 
 async function checkMachineResults() {
@@ -710,13 +803,15 @@ async function checkMachineResults() {
 				} else {
 					f.streams[0].send("expired");
 				}
-				await waitFor(() => f.events.at(-1)?.type === "done", `Cloud ${source} ${status}`);
+				const failedRun = status === "ERROR" || status === "FAILED";
+				await waitFor(() => f.events.at(-1)?.type === (failedRun ? "error" : "done"), `Cloud ${source} ${status}`);
 				const expected = ["ERROR", "FAILED"].includes(status) ? `Cursor ended the run with an error.${machine ? machineHint : ""}` : "";
 				assert.equal(chatText(f.events).trim(), expected);
 				assert.equal(f.events.at(-2).active, false);
 				const done = f.events.at(-1);
 				if (machine && status === "FINISHED") { assert.equal(done.machine, machine); }
 				else { assert.equal(Object.hasOwn(done, "machine"), false, `${source} ${status} must not mark a machine successful`); }
+				if (failedRun) { assert.equal(done.type, "error", `${source} ${status} ends the turn as a failure`); }
 			}
 		}
 	}
@@ -785,11 +880,16 @@ async function main() {
 	await checkHostCancel();
 	await checkHostReplay();
 	await checkHostRecovery();
+	await checkStatusRetryBudget();
+	await checkHeartbeatRetryBudget();
+	await checkResendRetryBudget();
+	await checkProgressResetsRetryBudget();
 	await checkHostDetachAndErrors();
 	await checkMachineCreateBody();
 	await checkMachineValidation();
 	await checkMachineClaims();
 	await checkMachineCreateErrors();
+	await checkUncertainMachineStarts();
 	await checkMachineResults();
 	await checkMachineNotes();
 }

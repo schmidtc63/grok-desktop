@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { pathToFileURL } = require("url");
 process.env.NoDefaultCurrentDirectoryInExePath = "1";
 // `npm run desktop` puts this app's node_modules\.bin folders and node-gyp-bin first on PATH and adds npm_* variables.
 // Grok and every terminal would inherit them, so a bare tsc or vite in the user's project would run this app's copy.
@@ -29,29 +30,53 @@ app.setPath("userData", path.join(app.getPath("appData"), "grok-code"));
 app.setName("Codewomplers Grok Desktop");
 if (process.platform === "win32") app.setAppUserModelId("Grok.Code");
 const appIcon = nativeImage.createFromPath(path.join(__dirname, "..", "assets", "codewomplers-grok-desktop.png"));
-const { AgentHost, grokHome, probeGrok, setSignIn } = require("./agent.cjs");
+const { AgentHost, grokHome, grokPath, probeGrok, setSignIn } = require("./agent.cjs");
+const sandbox = require("./sandbox.cjs");
+sandbox.setDataDir(path.join(app.getPath("userData"), "sandbox"));
 const { createSignIn, validKey } = require("./sign-in.cjs");
-const { redactKeys } = require("./redact.cjs");
+const { redactDeep, redactKeys } = require("./redact.cjs");
 const { CloudHost, createCursorApi, createCursorKey } = require("./cloud.cjs");
+const { createGrokBot } = require("./grokbot.cjs");
+const { createGrokBotWindow } = require("./grokbot-window.cjs");
 const { createBrowserAgent } = require("./browser-agent.cjs");
-const loops = require("./loops.cjs");
 const { readDiff, revertFile, revertHunk, localFilterOff } = require("./diff.cjs");
 const git = require("./git.cjs");
 if (process.platform === "win32") { git.useBundledGit(); }
 const { TerminalHost } = require("./terminal.cjs");
 const { createInbound, candidatesFor, askInOrder } = require("./inbound.cjs");
-const { listFiles, readText, readImage, writeText, runCommand, locateFile, DEFAULT_APP_EXT } = require("./files.cjs");
+const { listFiles, readText, readImage, writeText, locateFile, DEFAULT_APP_EXT } = require("./files.cjs");
 const usage = require("./usage.cjs");
 const customize = require("./customize.cjs");
 const { chooseExport } = require("./export.cjs");
+const { readSessionData } = require("./session-data.cjs");
 const updates = require("./updates.cjs");
 const updateHelper = require("../scripts/update-helper.cjs");
+const { createColdChats } = require("./cold-chats.cjs");
+const { createPastedImages } = require("./pasted-images.cjs");
+const { signInCommand, desktopEntry, autostartFile } = require("./startup.cjs");
+const { createRoutines, isOutstanding } = require("./routines.cjs");
 const signIn = createSignIn({ file: path.join(app.getPath("userData"), "sign-in.json"), safeStorage, platform: process.platform, fs });
 setSignIn(signIn);
+async function sessionRoots() {
+	const roots = [path.join(grokHome(), "sessions"), ...await sandbox.sessionRoots()];
+	return process.platform === "win32" ? [...new Map(roots.map((root) => [root.toLowerCase(), root])).values()] : roots;
+}
+async function savedSessionData(action, request = {}) {
+	return readSessionData({ ...request, action, roots: await sessionRoots() });
+}
 let pendingUpdate = null;
 let startingUpdate = false;
+let preparingUpdate = false;
+let stagedUpdate = null;
+// Set in startApplication, after the single-instance lock: loading the store marks outstanding runs interrupted, and a second launch must not.
+let routines;
+let routineTimer;
+const routineWindows = new Set();
+const routineOwners = new Map();
+const routineNotices = new Set();
 
 const owners = new Map();
+const turnOwners = new Map();
 const terminalOwners = new Map();
 const changeReads = new Map();
 const cloudOwners = new Map();
@@ -63,22 +88,81 @@ const cloudHost = new CloudHost((event) => {
 	if (event.type === "done" || event.type === "error") { cloudOwners.delete(event.uiSessionId); }
 	if (!owner.contents.isDestroyed()) { owner.contents.send("grok:event", event); }
 }, { api: cursorApi, getKey: cursorKey.key });
+const grokBot = createGrokBot({
+	file: path.join(app.getPath("userData"), "grok-bot.json"),
+	healthFile: path.join(app.getPath("userData"), "grok-bot-health.json"),
+	safeStorage, platform: process.platform, fs, emit: broadcast,
+	openExternal: (url) => shell.openExternal(url), version: app.getVersion(),
+});
+const grokBotWindow = createGrokBotWindow({ platform: process.platform, spawn, exists: fs.existsSync, launch: (file) => { void shell.openPath(file); } });
 let changingCursorKey = false;
 let cursorModels;
 let browserAgent;
-const host = new AgentHost((event) => {
-	// A turn Grok starts for a late steer belongs to the window that steered; with that window gone, it stops.
-	if (event.type === "turn-start") {
-		const owner = owners.get(event.uiSessionId);
-		if (owner && !owner.contents.isDestroyed()) {
-			owners.set(event.uiSessionId, { contents: owner.contents, turn: host.turns.get(event.uiSessionId) });
-			owner.contents.send("grok:event", event);
-		} else {
-			host.cancel(event.uiSessionId);
-		}
-		return;
+let pasteStartupContents;
+const sandboxGitFile = path.join(app.getPath("userData"), "sandbox-git.json");
+const sandboxGitCaptures = new Map();
+const sandboxGitActions = new Set();
+const startingSandboxTurns = new Map();
+let sandboxGitBaselines;
+
+function sandboxGitFolder(cwd) {
+	let folder;
+	try { folder = fs.realpathSync(cwd); } catch { folder = path.resolve(cwd); }
+	return process.platform === "win32" ? folder.toLowerCase() : folder;
+}
+
+function sandboxGitHistory() {
+	if (!sandboxGitBaselines) {
+		try { sandboxGitBaselines = new Map(JSON.parse(fs.readFileSync(sandboxGitFile, "utf8"))); }
+		catch { sandboxGitBaselines = new Map(); }
 	}
-	broadcast(event);
+	return sandboxGitBaselines;
+}
+
+function saveSandboxGit(key, snapshot) {
+	const baselines = sandboxGitHistory();
+	baselines.set(key, snapshot ? { config: snapshot.config, hooks: snapshot.hooks } : null);
+	try {
+		fs.mkdirSync(path.dirname(sandboxGitFile), { recursive: true });
+		fs.writeFileSync(`${sandboxGitFile}.tmp`, JSON.stringify([...baselines]));
+		fs.renameSync(`${sandboxGitFile}.tmp`, sandboxGitFile);
+	} catch { /* The in-memory baseline still protects this launch. */ }
+}
+
+function rememberSandboxGit(cwd) {
+	const key = sandboxGitFolder(cwd);
+	if (sandboxGitHistory().has(key)) { return; }
+	if (!sandboxGitCaptures.has(key)) {
+		const capture = git.gitSecuritySnapshot(cwd).catch(() => null)
+			.then((snapshot) => saveSandboxGit(key, snapshot?.ok ? snapshot : null))
+			.finally(() => sandboxGitCaptures.delete(key));
+		sandboxGitCaptures.set(key, capture);
+	}
+	return sandboxGitCaptures.get(key);
+}
+
+const host = new AgentHost((event) => {
+	routines?.hostEvent(event);
+	if (!event.turnId) { broadcast(event); return; }
+	let turns = turnOwners.get(event.uiSessionId);
+	let contents = turns?.get(event.turnId);
+	if (event.type === "turn-start") {
+		if (contents === undefined) {
+			contents = turns?.has(event.sourceTurnId) ? turns.get(event.sourceTurnId) : owners.get(event.uiSessionId)?.contents;
+		}
+		if (!contents || contents.isDestroyed()) {
+			host.cancel(event.uiSessionId);
+			return;
+		}
+		if (!turns) {
+			turns = new Map();
+			turnOwners.set(event.uiSessionId, turns);
+		}
+		turns.set(event.turnId, contents);
+		const turn = host.turns.get(event.uiSessionId);
+		if (turn?.turnId === event.turnId) { owners.set(event.uiSessionId, { contents, turn }); }
+	}
+	if (contents && !contents.isDestroyed()) { contents.send("grok:event", event); }
 }, { rulesFile: () => path.join(app.getPath("userData"), "always-allow.json"), browserServer: (id) => browserAgent.server(id) });
 
 const blockedBrowserPorts = new Set();
@@ -125,7 +209,16 @@ app.on("accessibility-support-changed", (_event, active) => broadcast({ type: "a
 
 const appDir = path.resolve(__dirname, "..");
 const pageFile = path.join(appDir, "dist", "index.html");
+const appPageUrl = appPageAddress(pathToFileURL(pageFile).href);
 const appIconFile = path.join(appDir, "assets", "codewomplers-grok-desktop.ico");
+
+function appPageAddress(url) {
+	return url.split(/[?#]/, 1)[0].replace(/^file:\/\/\/([a-z]):\//i, (_match, drive) => `file:///${drive.toUpperCase()}:/`);
+}
+
+function isAppPage(url) {
+	return appPageAddress(url) === appPageUrl;
+}
 
 // The taskbar pin starts Electron directly, skipping the build in `npm run desktop`, so it passes --build-if-stale.
 // The page is rebuilt when the source is newer. If that fails, the old page loads as before.
@@ -181,7 +274,10 @@ function windowPlacement(first) {
 	return { bounds: { ...size, x: Math.round(area.x + (area.width - size.width) / 2), y: Math.round(area.y + (area.height - size.height) / 2) }, maximized: false };
 }
 
+const reloadAppWindow = new WeakMap();
+
 function createWindow(uiSessionId) {
+	const atSignIn = process.argv.includes("--at-sign-in") && BrowserWindow.getAllWindows().length === 0;
 	const placement = windowPlacement(BrowserWindow.getAllWindows().length === 0);
   const win = new BrowserWindow({
 		...placement.bounds,
@@ -194,6 +290,7 @@ function createWindow(uiSessionId) {
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
+      additionalArguments: [`--grok-app-page=${appPageUrl}`],
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -202,11 +299,7 @@ function createWindow(uiSessionId) {
   });
 
 	const contents = win.webContents;
-	// Ctrl+R in the app's own page would reload the window and stop its turns. View > Reload stays, and a focused Browser-pane page still refreshes.
-	contents.on("before-input-event", (event, input) => {
-		const reloadKey = process.platform === "darwin" ? input.meta && !input.control : input.control && !input.meta;
-		if (input.type === "keyDown" && reloadKey && !input.alt && input.key.toLowerCase() === "r") { event.preventDefault(); }
-	});
+	pasteStartupContents ??= contents;
 	const closeOwnedTerminals = () => {
 		for (const [id, owner] of terminalOwners) {
 			if (owner === contents) { terminals.close(id); }
@@ -216,8 +309,15 @@ function createWindow(uiSessionId) {
 	contents.on("destroyed", closeOwnedTerminals);
 	contents.on("render-process-gone", closeOwnedTerminals);
 	const stopOwnedTurn = () => {
+		routineWindows.delete(contents);
+		for (const turns of turnOwners.values()) {
+			for (const [turnId, owner] of turns) {
+				if (owner === contents) { turns.set(turnId, null); }
+			}
+		}
+		for (const [id, start] of startingSandboxTurns) { if (start.contents === contents) { startingSandboxTurns.delete(id); } }
 		for (const [uiSessionId, owner] of owners) {
-			if (owner.contents === contents && owner.turn === host.turns.get(uiSessionId)) { host.cancel(uiSessionId); }
+			if (owner.contents === contents && (!host.turns.has(uiSessionId) || owner.turn === host.turns.get(uiSessionId))) { host.cancel(uiSessionId); }
 		}
 	};
 	// The question is async so the main process keeps answering approvals, and their auto-deny keeps running, while it is open.
@@ -225,19 +325,79 @@ function createWindow(uiSessionId) {
 	let asking = false;
 	let leave = false;
 	let closing = false;
-	win.on("close", () => {
+	let preparing = null;
+	let prepared = false;
+	const finishUnload = () => {
+		if (!preparing) { return; }
+		clearTimeout(preparing.timeout);
+		preparing = null;
+	};
+	const resumeUnload = (wasClosing) => {
+		if (wasClosing) { win.close(); } else { contents.reload(); }
+	};
+	const prepareUnload = async (wasClosing) => {
+		if (asking) { return; }
+		if (preparing) { preparing.closing ||= wasClosing; return; }
+		const request = { closing: wasClosing, resumed: false };
+		preparing = request;
+		request.timeout = setTimeout(() => {
+			if (preparing !== request) { return; }
+			finishUnload();
+			if (win.isDestroyed()) { return; }
+			if (!request.closing) {
+				let sessionId = uiSessionId;
+				try { sessionId = new URL(contents.getURL()).searchParams.get("session") || uiSessionId; } catch {}
+				const replacement = createWindow(sessionId);
+				replacement.setBounds(win.getNormalBounds());
+				if (win.isMaximized()) { replacement.maximize(); }
+			}
+			win.destroy();
+		}, 5000);
+		try { await contents.executeJavaScript("window.grokPrepareUnload?.()"); } catch {}
+		if (preparing !== request || win.isDestroyed()) { return; }
+		prepared = true;
+		request.resumed = true;
+		resumeUnload(request.closing);
+	};
+	reloadAppWindow.set(win, () => void prepareUnload(false));
+	win.on("close", (event) => {
+		// Windows would destroy Grok Bot's window along with this one. Closing the app closes Grok Bot properly first; with another window still open, it goes back to the desktop.
+		if (grokBotWindow.holds(win)) {
+			event.preventDefault();
+			const last = BrowserWindow.getAllWindows().every((item) => item === win || item.getParentWindow());
+			void (last ? grokBotWindow.close() : grokBotWindow.release()).finally(() => { if (!win.isDestroyed()) { win.close(); } });
+			return;
+		}
+		if (preparing) { preparing.closing = true; }
+		if (!leave && !prepared && !contents.isCrashed()) {
+			event.preventDefault();
+			void prepareUnload(true);
+			return;
+		}
 		closing = true;
 		try { fs.writeFileSync(windowStateFile, JSON.stringify({ ...win.getNormalBounds(), maximized: win.isMaximized() })); } catch {}
 	});
-	win.webContents.on("did-finish-load", () => { leave = false; });
+	contents.on("destroyed", finishUnload);
+	contents.on("did-finish-load", () => {
+		if (preparing?.resumed) { finishUnload(); }
+		leave = false;
+		prepared = false;
+	});
 	win.webContents.on("will-prevent-unload", (event) => {
 		const wasClosing = closing;
 		closing = false;
 		if (leave) {
+			finishUnload();
 			event.preventDefault();
 			return;
 		}
 		if (asking) { return; }
+		if (!prepared) {
+			void prepareUnload(wasClosing);
+			return;
+		}
+		finishUnload();
+		prepared = false;
 		asking = true;
 		dialog.showMessageBox(win, {
 			type: "warning",
@@ -251,7 +411,7 @@ function createWindow(uiSessionId) {
 			asking = false;
 			if (response !== 0 || win.isDestroyed()) { pendingUpdate = null; return; }
 			leave = true;
-			if (wasClosing) { win.close(); } else { win.webContents.reload(); }
+			void prepareUnload(wasClosing);
 		}, () => { asking = false; pendingUpdate = null; });
 	});
 	win.webContents.on("destroyed", stopOwnedTurn);
@@ -264,14 +424,24 @@ function createWindow(uiSessionId) {
 		}
 	});
 	win.webContents.on("render-process-gone", stopOwnedTurn);
+	win.webContents.on("render-process-gone", () => grokBotWindow.hide(win));
 	win.webContents.on("did-start-navigation", (details) => {
-		if (details.isMainFrame && !details.isSameDocument) {
+		if (details.isMainFrame && !details.isSameDocument && isAppPage(details.url)) {
 			stopOwnedTurn();
+			grokBotWindow.hide(win);
 		}
 	});
 	win.webContents.on("will-frame-navigate", (details) => {
 		const source = details.frame?.url ?? "";
-		if (!details.isMainFrame && (source === "about:srcdoc" || source.startsWith("about:srcdoc#")) && details.url !== "about:srcdoc") {
+		const blocked = details.isMainFrame
+			? !isAppPage(details.url)
+			: (source === "about:srcdoc" || source.startsWith("about:srcdoc#")) && details.url !== "about:srcdoc";
+		if (blocked) {
+			details.preventDefault();
+		}
+	});
+	win.webContents.on("will-redirect", (details) => {
+		if (details.isMainFrame) {
 			details.preventDefault();
 		}
 	});
@@ -293,6 +463,12 @@ function createWindow(uiSessionId) {
   const reveal = () => {
     if (revealed || win.isDestroyed()) return;
     revealed = true;
+		// Opening the app by hand while the page loads has already shown this window, so it stays up.
+		if (atSignIn && !win.isVisible()) {
+			if (placement.maximized) { win.once("restore", () => win.maximize()); }
+			win.minimize();
+			return;
+		}
 		if (placement.maximized) { win.maximize(); }
     win.show();
   };
@@ -308,20 +484,85 @@ function createWindow(uiSessionId) {
   });
   if (!fs.existsSync(pageFile)) {
     win.loadURL(failed).catch(() => {});
-    return;
+    return win;
   }
-	win.loadFile(pageFile, uiSessionId ? { query: { session: uiSessionId } } : undefined).catch(() => {
+	const destination = new URL(appPageUrl);
+	if (uiSessionId) { destination.searchParams.set("session", uiSessionId); }
+	win.loadURL(destination.href).catch(() => {
     if (!win.isDestroyed()) win.loadURL(failed).catch(() => {});
   });
+	return win;
+}
+
+ipcMain.handle("grok:set-mode", (_event, uiSessionId, mode) => host.setMode(String(uiSessionId || ""), mode));
+
+function promptFromWindow(event, payload, options) {
+	if (changingSignIn) { return Promise.resolve({ ok: false, error: "Grok's sign-in is changing. Try again in a moment." }); }
+	const uiSessionId = payload && payload.uiSessionId;
+	if (options?.routine && routines?.run(payload.routineRunId)?.state !== "running") { return Promise.resolve({ ok: false, error: "Stopped." }); }
+	const previous = host.turns.get(uiSessionId);
+	const turnId = payload?.turnId;
+	if (!previous && typeof turnId === "string" && turnId.trim() && turnId.length <= 200) {
+		const turns = turnOwners.get(uiSessionId);
+		if (turns?.has(turnId) && turns.get(turnId) !== event.sender) {
+			return Promise.resolve({ ok: false, error: "That turn belongs to another window." });
+		}
+		if (!turns) { turnOwners.set(uiSessionId, new Map()); }
+		turnOwners.get(uiSessionId).set(turnId, event.sender);
+	}
+	const result = host.prompt(payload, options);
+	const turn = host.turns.get(uiSessionId);
+	if (turn && turn !== previous) {
+		if (!turnOwners.has(uiSessionId)) { turnOwners.set(uiSessionId, new Map()); }
+		turnOwners.get(uiSessionId).set(turn.turnId, event.sender);
+		owners.set(uiSessionId, { contents: event.sender, turn });
+	}
+	return result;
+}
+
+function promptWithSandboxSnapshot(event, payload, options) {
+	const id = payload?.uiSessionId;
+	if (startingSandboxTurns.has(id)) { return Promise.resolve({ ok: false, error: "Grok is still starting in this session." }); }
+	if (!payload?.sandbox || typeof id !== "string" || !id || typeof payload.cwd !== "string" || !payload.cwd || host.turns.has(id)) {
+		return promptFromWindow(event, payload, options);
+	}
+	const capture = rememberSandboxGit(payload.cwd);
+	if (!capture) { return promptFromWindow(event, payload, options); }
+	const start = { contents: event.sender, folder: sandboxGitFolder(payload.cwd) };
+	startingSandboxTurns.set(id, start);
+	return capture.then(() => {
+		if (startingSandboxTurns.get(id) !== start) { return { ok: false, error: "Stopped." }; }
+		startingSandboxTurns.delete(id);
+		return start.contents.isDestroyed() ? { ok: false, error: "Closed." } : promptFromWindow(event, payload, options);
+	});
+}
+
+const autoArchiveRemovals = new Map();
+
+function worktreeContains(folder, cwd) {
+	const relative = path.relative(folder, cwd);
+	return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 ipcMain.handle("grok:send", (event, payload) => {
-	const uiSessionId = payload && payload.uiSessionId;
-	const previous = host.turns.get(uiSessionId);
-	const result = host.prompt(payload);
-	const turn = host.turns.get(uiSessionId);
-	if (turn && turn !== previous) {
-		owners.set(uiSessionId, { contents: event.sender, turn });
+	const uiSessionId = payload?.uiSessionId;
+	const turnId = payload?.turnId;
+	const routineRunId = payload?.routineRunId;
+	const routine = routineRunId !== undefined;
+	if (routine && !routines?.sendStarted(uiSessionId, turnId, (runId) => runId === routineRunId && routineOwners.get(runId) === event.sender)) {
+		return Promise.resolve({ ok: false, error: "Stopped." });
+	}
+	const cwd = autoArchiveRemovals.size && typeof payload?.cwd === "string" && sandboxGitFolder(payload.cwd);
+	const removals = cwd ? [...autoArchiveRemovals].filter(([folder]) => worktreeContains(folder, cwd)).map(([, removal]) => removal) : [];
+	// Once Git starts deleting, it cannot be interrupted safely. Until then, starting a turn wins.
+	const result = removals.some((removal) => removal.deleting)
+		? Promise.resolve({ ok: false, error: "This worktree is being auto-archived. Unarchive the session when it finishes to continue." })
+		: promptWithSandboxSnapshot(event, payload, { routine });
+	if (removals.length && (host.turns.has(uiSessionId) || startingSandboxTurns.has(uiSessionId))) {
+		for (const removal of removals) { removal.skipped = true; }
+	}
+	if (routine) {
+		void result.then((value) => routines.startResult(uiSessionId, turnId, value), (error) => routines.startResult(uiSessionId, turnId, { ok: false, error: error?.message }));
 	}
 	return result;
 });
@@ -332,7 +573,9 @@ function ownsTurn(event, uiSessionId) {
 }
 
 ipcMain.handle("grok:cancel", (event, uiSessionId) => {
-	if (ownsTurn(event, uiSessionId)) {
+	if (startingSandboxTurns.get(uiSessionId)?.contents === event.sender) { startingSandboxTurns.delete(uiSessionId); }
+	const ownsRetained = !host.turns.has(uiSessionId) && owners.get(uiSessionId)?.contents === event.sender;
+	if (ownsTurn(event, uiSessionId) || ownsRetained) {
 		host.cancel(uiSessionId);
 	}
 });
@@ -369,7 +612,10 @@ ipcMain.handle("grok:cloud-cancel", (event, uiSessionId) => {
 });
 
 ipcMain.handle("grok:stop-session", (_event, uiSessionId) => {
-	if (typeof uiSessionId === "string" && uiSessionId) { host.stopSession(uiSessionId); }
+	if (typeof uiSessionId === "string" && uiSessionId) {
+		startingSandboxTurns.delete(uiSessionId);
+		host.stopSession(uiSessionId);
+	}
 });
 
 ipcMain.handle("grok:suggest-prompt", (_event, uiSessionId) => host.suggestPrompt(String(uiSessionId || "")));
@@ -386,7 +632,10 @@ ipcMain.handle("grok:steer", (event, uiSessionId, text) => {
 });
 
 ipcMain.handle("grok:forget-session", (_event, uiSessionId) => {
-	if (typeof uiSessionId === "string" && uiSessionId) { host.forgetSession(uiSessionId); }
+	if (typeof uiSessionId === "string" && uiSessionId) {
+		startingSandboxTurns.delete(uiSessionId);
+		host.forgetSession(uiSessionId);
+	}
 });
 
 ipcMain.handle("grok:decide", (event, payload) => {
@@ -428,14 +677,20 @@ ipcMain.handle("grok:read-image", (_event, cwd, file) => readImage(cwd, file));
 
 ipcMain.handle("grok:write", (_event, cwd, file, text, expectedVersion) => writeText(cwd, file, text, expectedVersion));
 
-ipcMain.handle("grok:revert", (_event, cwd, file) => revertFile(cwd, file));
-ipcMain.handle("grok:revert-hunk", (_event, cwd, file, hunk) => revertHunk(cwd, file, hunk));
-
-ipcMain.handle("grok:run", (_event, payload) => {
-  const cwd = payload && payload.cwd;
-  const command = payload && payload.command;
-  return runCommand(cwd, command);
+ipcMain.handle("grok:revert", (event, cwd, file, policy) => {
+	if (policy?.sandbox !== true) { return revertFile(cwd, file); }
+	return revertFile(cwd, file, async () => {
+		const win = BrowserWindow.fromWebContents(event.sender);
+		if (!win || win.isDestroyed()) { return false; }
+		const answer = await dialog.showMessageBox(win, {
+			type: "warning", message: `Allow Git filters to revert ${file}?`,
+			detail: "Git may run filter programs outside the sandbox. Continue only if you trust this repository's Git configuration.",
+			buttons: ["Run filters and revert", "Cancel"], defaultId: 1, cancelId: 1,
+		});
+		return answer.response === 0 && !win.isDestroyed();
+	});
 });
+ipcMain.handle("grok:revert-hunk", (_event, cwd, file, hunk) => revertHunk(cwd, file, hunk));
 
 ipcMain.handle("grok:pick-folder", async (event) => {
   const parent = BrowserWindow.fromWebContents(event.sender);
@@ -476,9 +731,11 @@ ipcMain.handle("grok:copy", (_event, text) => {
 
 ipcMain.handle("grok:export-markdown", async (event, payload) => {
   const parent = BrowserWindow.fromWebContents(event.sender);
+  const sessionId = payload && payload.agentSessionId;
   return chooseExport({
-    sessionId: payload && payload.agentSessionId,
+    sessionId,
     title: payload && payload.title,
+    write: (request) => savedSessionData("export", request),
     choose: async (name) => {
       const options = {
         title: "Export as Markdown",
@@ -507,7 +764,6 @@ ipcMain.handle("grok:terminal-write", (event, id, text) => (terminalOwners.get(i
 ipcMain.handle("grok:terminal-input", (event, id, data) => (terminalOwners.get(id) === event.sender ? terminals.input(id, data) : { ok: false, error: "That terminal is closed." }));
 ipcMain.handle("grok:terminal-resize", (event, id, cols, rows) => (terminalOwners.get(id) === event.sender ? terminals.resize(id, cols, rows) : { ok: false, error: "That terminal is closed." }));
 ipcMain.handle("grok:terminal-close", (event, id) => (terminalOwners.get(id) === event.sender ? terminals.close(id) : { ok: false, error: "That terminal is closed." }));
-ipcMain.handle("grok:terminal-history", (event, id) => (terminalOwners.get(id) === event.sender ? terminals.history(id) : ""));
 ipcMain.handle("grok:terminal-interrupt", (event, id) => (terminalOwners.get(id) === event.sender ? terminals.interrupt(id) : { ok: false, error: "That terminal is closed." }));
 
 ipcMain.handle("grok:branch-info", (_event, cwd) => git.branchInfo(cwd));
@@ -534,14 +790,101 @@ ipcMain.handle("grok:stop-changes", ({ sender }, id) => {
 });
 ipcMain.handle("grok:list-commits", (_event, cwd) => git.listCommits(cwd));
 ipcMain.handle("grok:pr-status", (_event, cwd, number) => git.prStatus(cwd, Number.isInteger(number) && number > 0 ? number : undefined));
-ipcMain.handle("grok:pr-create", (_event, cwd, expected) => git.prCreate(cwd, { expected: typeof expected === "string" ? expected : undefined }));
-ipcMain.handle("grok:git-commit", (_event, cwd, options) => git.commitFiles(cwd, options));
+function withSandboxGit(event, cwd, policy, title, run, lfsNote = "", setsUpstream = false) {
+	if (policy?.sandbox !== true) { return run(); }
+	return (async () => {
+		const win = BrowserWindow.fromWebContents(event.sender);
+		if (!win || typeof cwd !== "string" || !cwd) { return { ok: false, error: "Choose a folder in this window to use Git." }; }
+		const key = sandboxGitFolder(cwd);
+		if (sandboxGitActions.has(key)) { return { ok: false, error: "A sandbox Git action is already in progress in this folder." }; }
+		sandboxGitActions.add(key);
+		try {
+			await sandboxGitCaptures.get(key);
+			const before = sandboxGitHistory().get(key);
+			const now = await git.gitSecuritySnapshot(cwd, setsUpstream).catch(() => null);
+			const changed = before && now?.ok ? [
+				...(before.config !== now.config ? ["Git configuration"] : []),
+				...(before.hooks !== now.hooks ? ["Git hooks"] : []),
+			] : [];
+			const warning = !before || !now?.ok ? "Git configuration and hooks could not be compared with a saved snapshot."
+				: changed.length ? `${changed.join(" and ")} changed since the last saved Git snapshot.` : "";
+			const chooseHooks = typeof policy.hooks !== "boolean";
+			let hooks = policy.hooks === true;
+			if (win.isDestroyed()) { return { ok: false, error: "Git action cancelled." }; }
+			if (warning || chooseHooks) {
+				const answer = await dialog.showMessageBox(win, {
+					type: warning ? "warning" : "question", message: title,
+					detail: [warning, hooks ? "Git hooks will run for this action." : "Git hooks are off by default for sandbox sessions.", lfsNote].filter(Boolean).join("\n\n"),
+					buttons: ["Continue", "Cancel"], defaultId: 1, cancelId: 1,
+					...(chooseHooks ? { checkboxLabel: "Run Git hooks this time", checkboxChecked: false } : {}),
+				});
+				if (answer.response !== 0 || win.isDestroyed()) { return { ok: false, error: "Git action cancelled." }; }
+				if (chooseHooks) { hooks = answer.checkboxChecked === true; }
+			}
+			let upstreamBranch;
+			try {
+				return await run(hooks, setsUpstream ? (branch) => { upstreamBranch = branch; } : undefined);
+			} finally {
+				await sandboxGitCaptures.get(key);
+				let accepted = now?.ok ? now : before;
+				if (upstreamBranch && now?.upstream) {
+					const prior = now.upstream(upstreamBranch);
+					const after = await git.gitSecuritySnapshot(cwd, true).catch(() => null);
+					const upstream = after?.upstream?.(upstreamBranch);
+					if (upstream?.established && prior.config === upstream.config) {
+						accepted = { config: after.config, hooks: now.hooks };
+					}
+				}
+				saveSandboxGit(key, accepted);
+			}
+		} finally {
+			sandboxGitActions.delete(key);
+		}
+	})();
+}
+
+ipcMain.handle("grok:pr-create", (event, cwd, expected, policy) => withSandboxGit(event, cwd, policy, "Create a pull request?", (hooks, onUpstream) =>
+	git.prCreate(cwd, { expected: typeof expected === "string" ? expected : undefined, ...(hooks !== undefined ? { hooks, onUpstream } : {}) }),
+	"With hooks off, the push can skip uploading Git LFS files.", true));
+ipcMain.handle("grok:git-commit", (event, cwd, options) => withSandboxGit(event, cwd, options, options?.push ? "Commit and push?" : "Commit changes?", (hooks, onUpstream) =>
+	git.commitFiles(cwd, hooks === undefined ? options : { ...options, hooks, onUpstream }), "", options?.push === true));
 ipcMain.handle("grok:pr-merge", (_event, cwd, number) => git.prMergeWhenReady(cwd, number));
-ipcMain.handle("grok:add-worktree", (_event, cwd, payload) => git.addWorktree(cwd, { name: payload && payload.name, prefix: payload && payload.prefix }));
-ipcMain.handle("grok:restore-worktree", (_event, folder, branch) => git.restoreWorktree(folder, branch));
+const worktreeLfsNote = "With hooks off, a worktree can keep Git LFS pointers if a checkout hook normally fetches the files.";
+ipcMain.handle("grok:add-worktree", (event, cwd, payload) => withSandboxGit(event, cwd, payload, "Create a worktree?", (hooks) =>
+	git.addWorktree(cwd, { name: payload?.name, prefix: payload?.prefix, ...(hooks !== undefined ? { hooks } : {}) }),
+	worktreeLfsNote));
+ipcMain.handle("grok:restore-worktree", (event, folder, branch, policy) => git.restoreWorktree(folder, branch,
+	policy?.sandbox === true ? (cwd, add) => withSandboxGit(event, cwd, policy, "Restore a worktree?", add, worktreeLfsNote) : undefined));
 ipcMain.handle("grok:remove-worktree", async (_event, cwd, folder, payload) => {
+	const key = typeof folder === "string" && folder ? sandboxGitFolder(folder) : "";
+	const branch = typeof payload?.branch === "string" ? payload.branch : undefined;
+	if (payload?.autoArchive === true && key) {
+		const skipped = { ok: false, skipped: true };
+		if (autoArchiveRemovals.has(key)) { return skipped; }
+		const removal = { deleting: false, skipped: false };
+		const occupied = () => removal.skipped ||
+			[...startingSandboxTurns.values()].some((start) => worktreeContains(key, start.folder)) ||
+			[...host.turns.values()].some((turn) => !turn.finished && typeof turn.cwd === "string" && worktreeContains(key, sandboxGitFolder(turn.cwd)));
+		if (occupied()) { return skipped; }
+		autoArchiveRemovals.set(key, removal);
+		try {
+			await host.stopFolder(folder);
+			if (occupied()) { return skipped; }
+			const result = await git.removeWorktree(cwd, folder, { branch, beforeRemove() {
+				if (occupied()) { return false; }
+				removal.deleting = true;
+				return true;
+			} });
+			return !removal.deleting && occupied() ? skipped : result;
+		} finally {
+			autoArchiveRemovals.delete(key);
+		}
+	}
+	if (key) {
+		for (const [id, start] of startingSandboxTurns) { if (start.folder === key) { startingSandboxTurns.delete(id); } }
+	}
 	await host.stopFolder(folder);
-	return git.removeWorktree(cwd, folder, { force: !!(payload && payload.force) });
+	return git.removeWorktree(cwd, folder, { force: !!payload?.force, branch });
 });
 
 ipcMain.handle("grok:open-external", (_event, url) => {
@@ -676,15 +1019,10 @@ app.whenReady().then(() => {
 	powerMonitor.on("on-ac", applyKeepAwake);
 });
 
-ipcMain.handle("grok:save-image", (_event, base64) => {
-	if (typeof base64 !== "string" || !base64 || base64.length > 14 * 1024 * 1024 || !/^[A-Za-z0-9+/=]+$/.test(base64)) { return { ok: false, error: "That image could not be attached." }; }
-	const file = path.join(os.tmpdir(), `grok-code-paste-${crypto.randomUUID()}.png`);
-	try {
-		fs.writeFileSync(file, Buffer.from(base64, "base64"));
-		return { ok: true, path: file };
-	} catch {
-		return { ok: false, error: "That image could not be attached." };
-	}
+const pastedImages = createPastedImages({ getPath: (name) => app.getPath(name), platform: process.platform, spawnSync });
+ipcMain.handle("grok:save-image", (_event, base64) => pastedImages.save(base64));
+ipcMain.on("grok:prune-pasted-images", (event, history, backup) => {
+	event.returnValue = event.sender === pasteStartupContents && pastedImages.prune(history, (id) => coldChats.read(id), backup);
 });
 
 // Clicking an attached image opens it full size in its own window. Only an image file loads, sandboxed and with no preload.
@@ -714,16 +1052,67 @@ ipcMain.handle("grok:open-image", (event, file) => {
 });
 
 ipcMain.handle("grok:app-info", () => ({ ok: true, version: app.getVersion(), electron: process.versions.electron }));
+// The answer is what the system says, not a saved setting: Windows' Startup apps can turn it off, and macOS may not keep an unsigned app's login item.
+ipcMain.handle("grok:open-at-sign-in", (_event, enabled) => {
+	const isWindows = process.platform === "win32";
+	const isLinux = !isWindows && process.platform !== "darwin";
+	// macOS takes no arguments for a login item, so a source checkout would open bare Electron.
+	const available = process.platform !== "darwin" || app.isPackaged;
+	const command = signInCommand({ isPackaged: app.isPackaged, execPath: process.execPath, appDir });
+	const file = autostartFile(process.env, os.homedir());
+	// Never `name`: Electron writes the Run value under it but reads it back under the app's user model id, so a custom name always reads as off.
+	const item = isWindows ? { path: command.path, args: command.args } : {};
+	let error = "";
+	if (typeof enabled === "boolean" && available) {
+		try {
+			if (!isLinux) {
+				app.setLoginItemSettings({ openAtLogin: enabled, ...item });
+			} else if (enabled) {
+				fs.mkdirSync(path.dirname(file), { recursive: true });
+				fs.writeFileSync(file, desktopEntry(command));
+			} else {
+				fs.rmSync(file, { force: true });
+			}
+		} catch (failure) {
+			error = `The setting could not be changed: ${failure.message}`;
+		}
+	}
+	const system = isLinux ? { openAtLogin: fs.existsSync(file) } : app.getLoginItemSettings(item);
+	const on = system.openAtLogin === true;
+	return { ok: !error, available, on, blockedBySystem: isWindows && on && !system.executableWillLaunchAtLogin, ...(error ? { error } : {}) };
+});
 ipcMain.handle("grok:update-check", (_event, force) => updates.checkForUpdate(appDir, app.getVersion(), { force: force === true, packaged: app.isPackaged }));
-ipcMain.handle("grok:update-prepare", (_event, tag) => updates.updatePrepare(appDir, app.getVersion(), tag, { packaged: app.isPackaged }));
+// One at a time across every window: two prepares would overwrite the same download.
+ipcMain.handle("grok:update-prepare", async (_event, tag) => {
+	if (preparingUpdate) { return { ok: true, ready: false, busy: true }; }
+	preparingUpdate = true;
+	stagedUpdate = null;
+	try {
+		if (!app.isPackaged) { return await updates.updatePrepare(appDir, app.getVersion(), tag, { packaged: false }); }
+		const appRoot = updates.installedRoot(process.platform, process.execPath);
+		const prepared = await updates.updatePrepare(appDir, app.getVersion(), tag, { packaged: true, installed: { appRoot, arch: process.arch, home: os.homedir(), localAppData: process.env.LOCALAPPDATA, userData: app.getPath("userData") } });
+		if (!prepared.ready) { return prepared; }
+		const { kind, file, staged, previous, sandbox, checksum, ...shown } = prepared;
+		stagedUpdate = { tag, appRoot, kind, file, staged, previous, sandbox, checksum };
+		return shown;
+	} finally {
+		preparingUpdate = false;
+	}
+});
 ipcMain.handle("grok:update-start", async (_event, tag) => {
 	if (pendingUpdate || startingUpdate) { return { ok: false, error: "An update is already running." }; }
 	startingUpdate = true;
 	try {
 		if (await updateHelper.markerLive(updateHelper.readMarker(app.getPath("userData")))) { return { ok: false, error: "An update is already running." }; }
-		const prepared = await updates.updatePrepare(appDir, app.getVersion(), tag, { packaged: app.isPackaged });
-		if (!prepared.ok || !prepared.ready) { return { ok: false, error: prepared.reason || "The update isn't ready." }; }
-		pendingUpdate = { tag, from: prepared.from, node: prepared.node };
+		if (app.isPackaged) {
+			// Antivirus can remove an unsigned download while the dialog waits, and the app must not close for a file that's gone.
+			if (stagedUpdate?.tag !== tag || !fs.existsSync(stagedUpdate.file)) { return { ok: false, error: "The update isn't ready." }; }
+			pendingUpdate = { ...stagedUpdate, installed: true };
+		} else {
+			const prepared = await updates.updatePrepare(appDir, app.getVersion(), tag, { packaged: false });
+			if (!prepared.ok || !prepared.ready) { return { ok: false, error: prepared.reason || "The update isn't ready." }; }
+			pendingUpdate = { tag, from: prepared.from, node: prepared.node };
+		}
 		app.quit();
 		return { ok: true };
 	} finally {
@@ -731,6 +1120,8 @@ ipcMain.handle("grok:update-start", async (_event, tag) => {
 	}
 });
 ipcMain.handle("grok:update-result", () => {
+	const expected = app.isPackaged ? installedUpdateResult() : null;
+	if (expected) { return expected; }
 	const file = path.join(app.getPath("userData"), "update-result.json");
 	try {
 		const result = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -740,15 +1131,25 @@ ipcMain.handle("grok:update-result", () => {
 		return null;
 	}
 });
-ipcMain.handle("grok:context-breakdown", (_event, agentSessionId) => usage.contextBreakdown(String(agentSessionId || "")));
-ipcMain.handle("grok:task-output", (_event, file) => usage.taskOutput(String(file || "")));
-ipcMain.handle("grok:subagent-transcript", (_event, id) => usage.subagentTranscript(String(id || "")));
-ipcMain.handle("grok:recent-spend", () => usage.recentSpend());
+ipcMain.handle("grok:context-breakdown", (_event, agentSessionId) => savedSessionData("context", { sessionId: String(agentSessionId || "") }));
+ipcMain.handle("grok:task-output", (_event, file) => savedSessionData("output", { file: String(file || "") }));
+ipcMain.handle("grok:subagent-transcript", (_event, id) => savedSessionData("transcript", { sessionId: String(id || "") }));
+ipcMain.handle("grok:recent-spend", () => savedSessionData("spend"));
+function sandboxText(event) {
+	return (text) => { if (!event.sender.isDestroyed()) { event.sender.send("grok:sandbox-text", redactKeys(text)); } };
+}
+const sandboxGrok = () => ({ grokExe: grokPath(), grokHome: grokHome(), env: { ...process.env, ...signIn.grokEnv() } });
+ipcMain.handle("grok:sandbox-check", (_event, choice) => sandbox.check(choice));
+ipcMain.handle("grok:sandbox-holder", () => sandbox.windowsSandboxHolder());
+ipcMain.handle("grok:sandbox-test", (_event, choice, model) => sandbox.runTest(choice, { ...sandboxGrok(), model }).then(redactDeep));
+ipcMain.handle("grok:sandbox-sign-in", (event, choice) => sandbox.signIn(choice, { ...sandboxGrok(), onText: sandboxText(event) }).then(redactDeep));
+ipcMain.handle("grok:sandbox-build", (event) => sandbox.buildImage(sandboxText(event)).then(redactDeep));
+ipcMain.handle("grok:sandbox-cancel", () => sandbox.cancelJob());
 ipcMain.handle("grok:list-cli-sessions", (_event, knownIds) => usage.listCliSessions(knownIds));
 ipcMain.handle("grok:list-cli-project-folders", () => usage.listCliProjectFolders());
-ipcMain.handle("grok:session-loops", (_event, uiSessionId, agentSessionId) => {
+ipcMain.handle("grok:session-loops", async (_event, uiSessionId, agentSessionId) => {
 	if (host.procs.has(String(uiSessionId || ""))) { return { ok: true, live: true }; }
-	return loops.readSessionLoops(String(agentSessionId || ""), path.join(grokHome(), "sessions"));
+	return savedSessionData("loops", { sessionId: String(agentSessionId || "") });
 });
 ipcMain.handle("grok:open-cli-session", (_event, agentSessionId) => usage.openCliSession(String(agentSessionId || "")));
 ipcMain.handle("grok:readiness", async (_event, request) => {
@@ -780,6 +1181,121 @@ ipcMain.handle("grok:inbound-result", (event, requestId, result) => {
 		inboundWaits.delete(requestId);
 		wait.resolve(result);
 	}
+});
+
+const ROUTINE_NOTE = "[Scheduled run. Nobody is watching. Do not ask questions. If something is blocked, say what and carry on.]";
+
+function firstRoutineWindow() {
+	return [...routineWindows].find((contents) => !contents.isDestroyed()) ?? null;
+}
+
+function routineWindow() {
+	const focused = focusedContents();
+	return focused && routineWindows.has(focused) && !focused.isDestroyed() ? focused : firstRoutineWindow();
+}
+
+function dispatchRoutine({ run, routine }, contents) {
+	let folder = routine.folder;
+	try {
+		if (!folder) {
+			folder = path.join(app.getPath("userData"), "routines", routine.id);
+			fs.mkdirSync(folder, { recursive: true });
+		} else if (!fs.statSync(folder, { throwIfNoEntry: false })?.isDirectory()) {
+			routines.fail(run.id, `That folder is not on this computer: ${folder}`, true);
+			return;
+		}
+	} catch (error) {
+		routines.fail(run.id, `The routine's folder could not be used: ${error.message}`, true);
+		return;
+	}
+	routineOwners.set(run.id, contents);
+	contents.send("grok:event", {
+		type: "routine-fire",
+		runId: run.id,
+		routineId: routine.id,
+		sessionId: run.sessionId,
+		title: `${routine.name} · ${new Date(run.scheduledFor).toLocaleDateString([], { month: "short", day: "numeric" })}`,
+		project: routine.folder ? path.basename(routine.folder) || routine.name : routine.name,
+		folder,
+		model: routine.model,
+		effort: routine.effort,
+		mode: routine.mode,
+		text: `${ROUTINE_NOTE}\n\n${routine.prompt}`,
+	});
+}
+
+// ponytail: runs due in the same minute all start together, with no cap. Add a cap if someone has enough routines for it to matter.
+function routineTick() {
+	const contents = routines && routineWindow();
+	if (!contents) { return; }
+	for (const fire of routines.tick()) { dispatchRoutine(fire, contents); }
+}
+
+function openRoutineRun(runId, asking) {
+	const run = routines?.run(runId);
+	const owner = routineOwners.get(runId);
+	// routineWindows leaves out an owner whose page crashed or is reloading, which isDestroyed alone does not.
+	const target = owner && routineWindows.has(owner) && !owner.isDestroyed() ? owner : asking && !asking.isDestroyed() ? asking : firstRoutineWindow();
+	if (!target) { return { ok: false, error: "No window is ready to show that run." }; }
+	target.send("grok:event", { type: "routine-open", ...(run?.sessionId ? { sessionId: run.sessionId } : {}), ...(run?.agentSessionId ? { agentSessionId: run.agentSessionId } : {}) });
+	const win = BrowserWindow.fromWebContents(target);
+	if (win && !win.isDestroyed()) {
+		if (win.isMinimized()) { win.restore(); }
+		win.show();
+		win.focus();
+	}
+	return { ok: true };
+}
+
+// Held until it closes or is clicked, so its click handler is not garbage collected.
+function showRoutineNotice({ title, body, runId }) {
+	const notice = new Notification({ title, body });
+	routineNotices.add(notice);
+	notice.on("close", () => routineNotices.delete(notice));
+	notice.on("click", () => {
+		routineNotices.delete(notice);
+		openRoutineRun(runId);
+	});
+	notice.show();
+}
+
+// Right after sign-in the network is often not up, so that launch waits for the interval.
+ipcMain.handle("grok:routines-ready", (event) => {
+	routineWindows.add(event.sender);
+	if (!process.argv.includes("--at-sign-in")) { routineTick(); }
+});
+ipcMain.handle("grok:routines", (event, request) => {
+	if (!routines) { return { ok: false, error: "Routines are not available right now." }; }
+	const action = request?.action;
+	if (action === "list") { return { ok: true, ...routines.state() }; }
+	if (action === "save" || action === "setEnabled") {
+		const result = action === "save" ? routines.save(request.routine) : routines.setEnabled(request.id, request.enabled);
+		// A once time already past becomes a missed run now, not at the next interval.
+		if (result.ok) { routineTick(); }
+		return result;
+	}
+	if (action === "remove") { return routines.remove(request.id); }
+	if (action === "runNow") {
+		const contents = routineWindow();
+		if (!contents) { return { ok: false, error: "No window is ready to start this run." }; }
+		const result = routines.runNow(request.id);
+		if (!result.ok) { return result; }
+		dispatchRoutine(result.fire, contents);
+		return { ok: true, runId: result.fire.run.id };
+	}
+	if (action === "stop") {
+		const run = routines.run(request.runId);
+		if (!run || !isOutstanding(run)) { return { ok: false, error: "That run has already ended." }; }
+		host.cancel(run.sessionId);
+		if (!host.turns.has(run.sessionId)) { routines.interrupt(run.id); }
+		return { ok: true };
+	}
+	if (action === "open") { return openRoutineRun(request.runId, event.sender); }
+	return { ok: false, error: "Unknown routine action." };
+});
+// Only for a start that failed in the window the run went to. A start that works reports through grok:send.
+ipcMain.handle("grok:routine-result", (event, runId, result) => {
+	if (routineOwners.get(runId) === event.sender && result?.ok === false) { routines?.fail(runId, result.error); }
 });
 ipcMain.handle("grok:billing", () => host.billing());
 let changingSignIn = false;
@@ -858,6 +1374,23 @@ async function changeCursorKey(action) {
 }
 
 ipcMain.handle("grok:cloud-key-status", () => cursorKey.status());
+ipcMain.handle("grok:grokbot-status", () => grokBot.status());
+ipcMain.handle("grok:grokbot-sign-in", () => grokBot.signIn());
+ipcMain.handle("grok:grokbot-cancel-sign-in", () => grokBot.cancelSignIn());
+ipcMain.handle("grok:grokbot-sign-out", () => grokBot.signOut());
+ipcMain.handle("grok:grokbot-history", (_event, agentId, beforeSeq) => grokBot.history(agentId, beforeSeq));
+ipcMain.handle("grok:grokbot-send", (_event, payload) => grokBot.send(payload));
+ipcMain.handle("grok:grokbot-stop", (_event, agentId) => grokBot.stop(agentId));
+ipcMain.handle("grok:grokbot-answer", (_event, payload) => grokBot.answer(payload));
+ipcMain.handle("grok:grokbot-open-file", (_event, payload) => grokBot.openFile(payload));
+ipcMain.handle("grok:grokbot-retry", () => grokBot.retry());
+ipcMain.handle("grok:grokbot-window-open", (event) => {
+	const win = BrowserWindow.fromWebContents(event.sender);
+	return win ? grokBotWindow.open(win) : { ok: false };
+});
+ipcMain.handle("grok:grokbot-window-place", (event, box) => grokBotWindow.place(BrowserWindow.fromWebContents(event.sender), box));
+ipcMain.handle("grok:grokbot-window-hide", (event) => grokBotWindow.hide(BrowserWindow.fromWebContents(event.sender)));
+ipcMain.handle("grok:grokbot-window-release", () => grokBotWindow.release());
 ipcMain.handle("grok:cloud-key-save", (_event, key) => changeCursorKey(async () => {
 	if (!validKey(key)) { return { ok: false, error: "Enter a Cursor key of 1 to 512 characters with no spaces." }; }
 	if (!cursorKey.status().keyring) { return { ok: false, error: "This computer has no keyring the app can use, so the Cursor key can't be saved." }; }
@@ -871,7 +1404,7 @@ ipcMain.handle("grok:cloud-key-remove", () => changeCursorKey(cursorKey.remove))
 function githubCloudUrl(value, bare = false) {
 	if (typeof value !== "string") { return ""; }
 	const url = bare && /^github\.com\//i.test(value) ? `https://${value}` : value;
-	const match = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([\w-]+)\/([\w.-]+?)(?:\.git)?\/?$/i.exec(url);
+	const match = /^(?:https:\/\/(?:[\w.%+-]+@)?github\.com\/|git@github\.com:|ssh:\/\/git@github\.com(?::22)?\/)([\w-]+)\/([\w.-]+?)(?:\.git)?\/?$/i.exec(url);
 	return match && match[2] !== "." && match[2] !== ".." ? `https://github.com/${match[1]}/${match[2]}` : "";
 }
 
@@ -927,6 +1460,11 @@ ipcMain.handle("grok:cloud-setup", async (_event, folder) => {
 });
 // Read once by the preload: the folder a first session opens in.
 ipcMain.on("grok:home-dir", (event) => { event.returnValue = os.homedir(); });
+// Synchronous because the history save calls them: a chat leaves the saved value only after its file is written.
+const coldChats = createColdChats(path.join(app.getPath("userData"), "chats"));
+ipcMain.on("grok:read-cold-chat", (event, id) => { event.returnValue = coldChats.read(id); });
+ipcMain.on("grok:write-cold-chat", (event, id, text) => { event.returnValue = coldChats.write(id, text); });
+ipcMain.handle("grok:remove-cold-chats", (_event, ids) => coldChats.remove(ids));
 
 const DEV_SCRIPTS = ["dev", "start", "serve", "preview", "storybook"];
 ipcMain.handle("grok:dev-scripts", (_event, cwd) => {
@@ -946,6 +1484,43 @@ function aboutDialog(win) {
 	});
 }
 
+// Whichever copy opens after an installed update reads this once: the new version if it worked, the old one if it didn't.
+function installedUpdateResult() {
+	const file = path.join(app.getPath("userData"), "update-expected.json");
+	let version;
+	try {
+		version = JSON.parse(fs.readFileSync(file, "utf8")).version;
+		fs.unlinkSync(file);
+	} catch {
+		return null;
+	}
+	if (version === app.getVersion()) { return { ok: true, message: `Updated to version ${version}.` }; }
+	return { ok: false, message: `The update to version ${version} didn't finish. Try again from Help > Check for Updates, or update by hand: ${updates.updateSteps()}` };
+}
+
+// An update reopens the app the way it was started, except that it must not reopen minimized.
+function relaunchArgs() {
+	return process.argv.slice(1).filter((arg) => arg !== "--at-sign-in");
+}
+
+function startInstalledUpdate(update) {
+	const userData = app.getPath("userData");
+	const expected = path.join(userData, "update-expected.json");
+	const failed = (error) => {
+		try { fs.rmSync(expected, { force: true }); } catch {}
+		try { updateHelper.writeAtomic(path.join(userData, "update-result.json"), { ok: false, message: `The update couldn't start: ${error.message}. Nothing was updated. To update by hand: ${updates.updateSteps()}` }); } catch {}
+	};
+	try {
+		updateHelper.writeAtomic(expected, { version: update.tag.slice(1) });
+		const { program, args } = updates.installedUpdateCommand(update, { platform: process.platform, pid: process.pid, userData, argv: relaunchArgs() });
+		const child = spawn(program, args, { detached: true, stdio: "ignore", cwd: os.tmpdir() });
+		child.on("error", failed);
+		child.unref();
+	} catch (error) {
+		failed(error);
+	}
+}
+
 async function checkForUpdates(win) {
 	const result = await updates.checkForUpdate(appDir, app.getVersion(), { force: true, packaged: app.isPackaged });
 	if (result.ok && result.available) {
@@ -954,12 +1529,12 @@ async function checkForUpdates(win) {
 		return;
 	}
 	const latest = result.ok && result.reason === "up-to-date";
-	const origin = app.isPackaged ? "GitHub" : "this copy's origin";
-	const reason = result.reason === "no-releases" ? `No releases were found on ${origin}.` : result.reason === "not-checkout" ? "This copy isn't a git checkout of the app." : `The update check couldn't reach ${origin}.`;
-	const where = process.platform === "win32" ? "PowerShell" : "Terminal";
+	const noReleases = app.isPackaged ? "No releases were found on GitHub." : "No published GitHub release with a matching tag in this copy's origin was found.";
+	const failed = app.isPackaged ? "The update check couldn't reach GitHub." : "The update check couldn't finish checking GitHub releases and this copy's origin.";
+	const reason = result.reason === "no-releases" ? noReleases : result.reason === "not-checkout" ? "This copy isn't a git checkout of the app." : failed;
 	const detail = app.isPackaged
-		? `Codewomplers Grok Desktop updates come from its GitHub releases.\nVersion ${app.getVersion()}. To update, quit Codewomplers Grok Desktop, then run this in ${where}:\n${updates.installCommand()}`
-		: `Codewomplers Grok Desktop updates come from its git checkout.\nVersion ${app.getVersion()}. To update, quit Codewomplers Grok Desktop, then in its folder run git pull, npm install and npm run desktop.`;
+		? `Codewomplers Grok Desktop updates come from its GitHub releases.\nVersion ${app.getVersion()}. ${updates.updateInstructions()}`
+		: `Codewomplers Grok Desktop checks the published GitHub release, then its tag in this copy's git origin.\nVersion ${app.getVersion()}. To update, quit Codewomplers Grok Desktop, then in its folder run git pull, npm install and npm run desktop.`;
 	await dialog.showMessageBox(win, {
 		type: "info", title: "Check for Updates",
 		message: latest ? `You have the latest version (${app.getVersion()}).` : reason,
@@ -972,7 +1547,16 @@ Menu.setApplicationMenu(Menu.buildFromTemplate([
 	...(process.platform === "darwin" ? [{ role: "appMenu" }] : []),
 	{ label: "File", submenu: [{ label: "New Window", accelerator: "CmdOrCtrl+Shift+N", click: () => createWindow() }, { type: "separator" }, { role: "quit" }] },
 	{ role: "editMenu" },
-	{ label: "View", submenu: [{ role: "reload" }, { role: "toggleDevTools" }, { type: "separator" }, { role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" }, { type: "separator" }, { role: "togglefullscreen" }] },
+	{ label: "View", submenu: [
+		{ label: "Reload", click: (_item, win) => {
+			const reload = reloadAppWindow.get(win);
+			if (reload) { reload(); } else { win?.webContents?.reload(); }
+		} },
+		{ role: "toggleDevTools" }, { type: "separator" },
+		{ role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" }, { type: "separator" }, { role: "togglefullscreen" },
+		{ type: "separator" },
+		{ label: "Use Default UI", click: (_item, win) => { if (win && !win.isDestroyed()) { win.webContents.send("grok:event", { type: "ui-default" }); } } },
+	] },
 	{ label: "Help", submenu: [
 		{ label: "About Codewomplers Grok Desktop", click: (_item, win) => aboutDialog(win) },
 		{ label: "Check for Updates…", click: (_item, win) => checkForUpdates(win) },
@@ -1085,7 +1669,17 @@ app.on("web-contents-created", (_event, contents) => {
 		guestSession.setPermissionCheckHandler((_contents, permission) => GUEST_PERMISSIONS.has(permission));
   });
   contents.on("did-attach-webview", (_attach, guest) => {
-		if (guest.hostWebContents === contents && allowedGuestSessions.has(guest.session)) { watchBrowserGuest(guest); browserAgent.guestSession(guest.session, guest); }
+		if (guest.hostWebContents === contents && allowedGuestSessions.has(guest.session)) {
+			watchBrowserGuest(guest);
+			browserAgent.guestSession(guest.session, guest);
+			guest.on("before-input-event", (event, input) => {
+				const reloadKey = (input.control && !input.meta) || (process.platform === "darwin" && input.meta && !input.control);
+				if (input.type === "keyDown" && reloadKey && !input.alt && !input.shift && input.key.toLowerCase() === "r") {
+					event.preventDefault();
+					if (!input.isAutoRepeat) { guest.reload(); }
+				}
+			});
+		}
     guest.setWindowOpenHandler(() => ({ action: "deny" }));
     const block = (event, url) => {
       if (!httpUrl(url)) event.preventDefault();
@@ -1101,6 +1695,15 @@ function startApplication() {
 		app.quit();
 		return;
 	}
+	routines = createRoutines({
+		file: path.join(app.getPath("userData"), "routines.json"),
+		fs,
+		writeAtomic: updateHelper.writeAtomic,
+		now: () => Date.now(),
+		onChange: () => broadcast({ type: "routines", ...routines.state() }),
+		onNotice: showRoutineNotice,
+	});
+	if (app.isPackaged) { updates.removeUpdateFiles({ platform: process.platform, appRoot: updates.installedRoot(process.platform, process.execPath), userData: app.getPath("userData") }); }
 	// The DevTools port is for local automation only: it opens when GROK_CODE_DEBUG_PORT names one, never by default, since any process on the computer could drive the app through it.
 	if (/^\d+$/.test(process.env.GROK_CODE_DEBUG_PORT || "")) { app.commandLine.appendSwitch("remote-debugging-port", process.env.GROK_CODE_DEBUG_PORT); }
 	app.on("second-instance", () => {
@@ -1115,17 +1718,20 @@ function startApplication() {
 	});
 	if (process.argv.includes("--build-if-stale")) { buildIfStale(); }
 	app.whenReady().then(createWindow);
+	app.whenReady().then(() => { routineTimer = setInterval(routineTick, 60000); });
+	app.whenReady().then(() => grokBot.start());
 	app.whenReady().then(repairShortcuts);
+	app.whenReady().then(sandbox.stopLeftover);
 	// macOS ignores a window's icon and shows the dock icon instead.
 	if (process.platform === "darwin" && !appIcon.isEmpty()) { app.whenReady().then(() => app.dock.setIcon(appIcon)); }
 }
 
-const startupMarker = updateHelper.readMarker(app.getPath("userData"));
+const startupMarker = app.isPackaged ? null : updateHelper.readMarker(app.getPath("userData"));
 if (startupMarker) {
 	void (async () => {
 		if (await updateHelper.markerLive(startupMarker)) {
 			await app.whenReady();
-			new Notification({ title: "Codewomplers Grok Desktop is updating", body: "It opens by itself when it's done." }).show();
+			new Notification({ title: "Codewomplers Grok Desktop is updating", body: "The app usually reopens when the update finishes. If it stays closed, check update.log in the app's data folder." }).show();
 			setTimeout(() => app.quit(), 1500);
 			return;
 		}
@@ -1144,8 +1750,17 @@ if (startupMarker) {
 	startApplication();
 }
 
+// A window's close event can't hold the quit and then finish it, so Grok Bot closes first.
+app.on("before-quit", (event) => {
+	if (!grokBotWindow.holding()) { return; }
+	event.preventDefault();
+	void grokBotWindow.close().finally(() => app.quit());
+});
+
 // After every window has closed, so a quit that a window's unsaved-text question cancels leaves Grok running.
 app.on("will-quit", () => {
+	clearInterval(routineTimer);
+	void grokBot.close();
 	for (const id of cloudOwners.keys()) { cloudHost.stop(id); }
 	cloudOwners.clear();
 	terminals.closeAll();
@@ -1156,13 +1771,17 @@ app.on("will-quit", () => {
 	if (pendingUpdate) {
 		const update = pendingUpdate;
 		pendingUpdate = null;
+		if (update.installed) {
+			startInstalledUpdate(update);
+			return;
+		}
 		const failed = (error) => {
 			try { updateHelper.writeAtomic(path.join(app.getPath("userData"), "update-result.json"), { ok: false, message: `The update couldn't start: ${error.message}. Nothing was updated.` }); } catch {}
 		};
 		try {
 			const helper = path.join(os.tmpdir(), `grok-code-update-${crypto.randomUUID()}.cjs`);
 			fs.copyFileSync(path.join(appDir, "scripts", "update-helper.cjs"), helper);
-			const input = { appDir, tag: update.tag, from: update.from, fromVersion: app.getVersion(), waitPid: process.pid, args: process.argv.slice(1), cwd: process.cwd(), userData: app.getPath("userData") };
+			const input = { appDir, tag: update.tag, from: update.from, fromVersion: app.getVersion(), waitPid: process.pid, args: relaunchArgs(), cwd: process.cwd(), userData: app.getPath("userData") };
 			const child = spawn(update.node, [helper, JSON.stringify(input)], { detached: true, windowsHide: true, stdio: "ignore" });
 			child.on("error", failed);
 			child.unref();

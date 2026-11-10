@@ -61,6 +61,12 @@ function createBrowserAgent({ host, owners, blockedPorts = new Set(), webContent
 		return url;
 	};
 	const cleanUrl = (value) => { try { const url = new URL(value); return `${url.origin}${url.pathname}`; } catch { return ""; } };
+	const submissionOrigin = (value) => {
+		try {
+			const url = new URL(value);
+			return ["http:", "https:"].includes(url.protocol) ? url.origin : null;
+		} catch { return null; }
+	};
 	const local = (url) => url.hostname === "localhost" || url.hostname.endsWith(".localhost") || (net.isIP(url.hostname) === 4 && url.hostname.startsWith("127.")) || url.hostname === "[::1]";
 	const activity = (ctx, text, running, isStopped = false) => {
 		if (alive(ctx.sender)) { ctx.sender.send("grok:event", { type: "browser-activity", uiSessionId: ctx.ui, text, running, ...(isStopped ? { stopped: true } : {}) }); }
@@ -115,7 +121,7 @@ function createBrowserAgent({ host, owners, blockedPorts = new Set(), webContent
 			}
 		};
 		state.status = (_event, _url, status) => { const mark = markFor(guest); if (mark) { mark.ctx.status = status; } };
-		state.destroyed = () => { const mark = downloads.get(guest); if (mark) { clearTimeout(mark.timer); downloads.delete(guest); openings.delete(mark); } guests.delete(guest); };
+		state.destroyed = () => { state.submissions?.dispose(); const mark = downloads.get(guest); if (mark) { clearTimeout(mark.timer); downloads.delete(guest); openings.delete(mark); } guests.delete(guest); };
 		guest.on("did-start-navigation", state.navigation);
 		guest.on("will-navigate", state.guard);
 		guest.on("will-redirect", state.guard);
@@ -124,6 +130,119 @@ function createBrowserAgent({ host, owners, blockedPorts = new Set(), webContent
 		guests.set(guest, state);
 	}
 	function abort(ctx) { ctx.controller.abort(); }
+	function blockSubmission(ctx, destination) {
+		const outcome = ctx.submissionSent
+			? "Grok's original form submission was already sent and may have been processed. Inspect its result before submitting again to avoid a duplicate."
+			: "This form request was not sent. Take a new snapshot and request approval again.";
+		ctx.failure = `The Browser pane blocked a form submission to ${destination || "a non-HTTP(S) destination"}\n${outcome}`;
+		abort(ctx);
+	}
+	function watchSubmissions(guest) {
+		const state = guests.get(guest);
+		const debug = guest.debugger;
+		if (state.submissions && debug.isAttached()) { return state.submissions.ready; }
+		state.submissions?.dispose();
+		if (!debug || debug.isAttached()) { throw new Error("Browser form protection is unavailable. Close this tab's DevTools before using browser control."); }
+		try { debug.attach("1.3"); } catch { throw new Error("Browser form protection could not attach. Close this tab's DevTools and try again."); }
+		const forms = new Map(), requests = new Map(), children = new Map();
+		let pausedCount = 0;
+		const command = (method, params = {}, sessionId) => debug.sendCommand(method, params, sessionId || undefined);
+		const requestKey = (sessionId, requestId) => JSON.stringify([sessionId || "", requestId]);
+		const requestUrl = (value) => { const url = new URL(value); url.hash = ""; return url.href; };
+		const clearFrame = (frameId) => {
+			forms.delete(frameId);
+			for (const [key, request] of requests) { if (request.frameId === frameId) { requests.delete(key); } }
+		};
+		const lost = () => {
+			let stopLoading = pausedCount > 0 || requests.size > 0;
+			for (const contexts of calls.values()) {
+				for (const ctx of contexts) {
+					if (ctx.guest === guest) { stopLoading = true; ctx.failure = "Browser form protection disconnected. Close this tab's DevTools and take a new snapshot."; abort(ctx); }
+				}
+			}
+			if (stopLoading && alive(guest)) { guest.stop(); }
+			forms.clear(); requests.clear();
+		};
+		const enable = async (sessionId) => {
+			await Promise.all([
+				command("Page.enable", {}, sessionId),
+				command("Fetch.enable", { patterns: [{ resourceType: "Document", requestStage: "Request" }] }, sessionId),
+				command("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: true, flatten: true, filter: [{ type: "iframe" }, { exclude: true }] }, sessionId),
+			]);
+			if (sessionId) { await command("Runtime.runIfWaitingForDebugger", {}, sessionId); }
+		};
+		const paused = async (params, sessionId) => {
+			const key = requestKey(sessionId, params.requestId);
+			const priorKey = requestKey(sessionId, params.redirectedRequestId);
+			let request = params.redirectedRequestId && requests.get(priorKey);
+			requests.delete(priorKey);
+			if (request && params.request.method === "GET") { request = null; }
+			if (!request && !params.redirectedRequestId) {
+				const form = forms.get(params.frameId);
+				forms.delete(params.frameId);
+				if (form && requestUrl(form.url) === requestUrl(params.request.url)) { request = { ctx: form.ctx, allowed: new Set([form.ctx.origin]), frameId: params.frameId }; }
+			}
+			if (!request) { await command("Fetch.continueRequest", { requestId: params.requestId }, sessionId); return; }
+			const { ctx } = request;
+			pausedCount += 1;
+			const authorize = (ctx.formApproval || Promise.resolve()).then(async () => {
+				try {
+					const destination = new URL(params.request.url);
+					urlOf(destination.origin);
+					if (!request.allowed.has(destination.origin)) {
+						await approve(ctx, destination, true, submissionOrigin(guest.getURL()) || ctx.origin, true);
+						request.allowed.add(destination.origin);
+					}
+					if (closed || ctx.failure || ctx.controller.signal.aborted) { throw new Error("Browser control is stopped."); }
+					requests.set(key, request);
+					if (ctx.mark) {
+						clearTimeout(ctx.mark.timer);
+						ctx.mark.active = true; ctx.mark.until = Infinity;
+						downloads.set(guest, ctx.mark);
+					}
+					await command("Fetch.continueRequest", { requestId: params.requestId }, sessionId);
+					ctx.submissionSent = true;
+				} catch {
+					requests.delete(key);
+					await command("Fetch.failRequest", { requestId: params.requestId, errorReason: "Aborted" }, sessionId).catch(() => {});
+					blockSubmission(ctx, submissionOrigin(params.request.url));
+				} finally { finishMark(ctx.mark); }
+			});
+			ctx.formApproval = authorize;
+			await authorize;
+			pausedCount -= 1;
+			if (ctx.formApproval === authorize) { ctx.formApproval = null; }
+		};
+		const message = (_event, method, params, sessionId) => {
+			if (method === "Target.attachedToTarget") { const ready = enable(params.sessionId); children.set(params.sessionId, ready); void ready.catch(lost); }
+			if (method === "Target.detachedFromTarget") { children.delete(params.sessionId); }
+			if (method === "Page.frameRequestedNavigation" && !sessionId) {
+				const ctx = markFor(guest)?.ctx;
+				if (ctx?.formSourceActive && ["formSubmissionGet", "formSubmissionPost"].includes(params.reason)) { forms.set(params.frameId, { ctx, url: params.url }); }
+				else { forms.delete(params.frameId); }
+			}
+			if (method === "Page.frameNavigated") {
+				const ctx = markFor(guest)?.ctx;
+				if (ctx && !params.frame.parentId) { ctx.formSourceActive = false; }
+				for (const request of requests.values()) { if (request.frameId === params.frame.id) { request.ctx.formSourceActive = false; } }
+			}
+			if (method === "Page.frameNavigated" || method === "Page.frameStoppedLoading" || (method === "Page.frameDetached" && params.reason !== "swap")) { clearFrame(params.frame?.id || params.frameId); }
+			if (method === "Fetch.requestPaused") { void paused(params, sessionId).catch(lost); }
+		};
+		debug.on("message", message);
+		debug.on("detach", lost);
+		const dispose = () => {
+			if ((pausedCount > 0 || requests.size > 0) && alive(guest)) { guest.stop(); }
+			debug.removeListener("message", message); debug.removeListener("detach", lost);
+			if (debug.isAttached()) { debug.detach(); }
+		};
+		const ready = enable().then(async () => {
+			let count;
+			do { count = children.size; await Promise.all(children.values()); } while (children.size !== count);
+		}).catch((error) => { dispose(); state.submissions = null; throw error; });
+		state.submissions = { ready, dispose };
+		return ready;
+	}
 	function clearHold(hold) {
 		if (holds.get(hold.ctx.ui) === hold) { holds.delete(hold.ctx.ui); }
 		finishMark(hold.ctx.mark);
@@ -139,7 +258,9 @@ function createBrowserAgent({ host, owners, blockedPorts = new Set(), webContent
 			ctx.sent = true;
 			hold = { ctx, guest: ctx.guest };
 			hold.release = () => clearHold(hold);
-			hold.navigation = (details, _url, _inPlace, isMainFrame) => { if (details?.isMainFrame === true || isMainFrame === true) { clearHold(hold); } };
+			hold.navigation = (details, _url, inPlace, isMainFrame) => {
+				if ((details?.isMainFrame ?? isMainFrame) && !(details?.isSameDocument ?? inPlace)) { clearHold(hold); }
+			};
 			holds.set(ctx.ui, hold);
 			hold.guest.once("destroyed", hold.release);
 			hold.guest.on("did-start-navigation", hold.navigation);
@@ -165,9 +286,10 @@ function createBrowserAgent({ host, owners, blockedPorts = new Set(), webContent
 		}
 	}
 	async function pause(ctx, milliseconds, requireGuest = true) {
-		const until = Date.now() + milliseconds;
+		let until = Date.now() + milliseconds;
 		while (Date.now() < until) {
 			check(ctx, requireGuest);
+			if (ctx.formApproval) { const started = Date.now(); await ctx.formApproval; until += Date.now() - started; continue; }
 			await step(ctx, () => new Promise((resolve) => setTimeout(resolve, Math.min(25, until - Date.now()))));
 		}
 	}
@@ -186,17 +308,26 @@ function createBrowserAgent({ host, owners, blockedPorts = new Set(), webContent
 			return decision;
 		} finally { ctx.controller.signal.removeEventListener("abort", cancel); }
 	}
-	async function approve(ctx, url, action, sourceOrigin) {
+	function grantKey(ctx, origin) {
 		const cwd = path.resolve(ctx.turn.cwd).replace(/\\/g, "/");
 		const scope = JSON.stringify([ctx.ui, process.platform === "win32" ? cwd.toLowerCase() : cwd, ctx.turn.agentSessionId]);
-		const key = `${scope}|${url.origin}`;
+		return `${scope}|${origin}`;
+	}
+	async function approve(ctx, url, action, sourceOrigin, submit = false) {
+		const key = grantKey(ctx, url.origin);
 		const granted = grants.get(key);
 		if ((!action && local(url)) || (action && local(url) && ctx.turn.mode === "Always-approve") || granted === "act" || (!action && granted === "read")) { return; }
-		const decision = await ask(ctx, { title: action ? `Let Grok act on ${url.origin}?` : `Let Grok read ${url.origin}?`, summary: action ? `Read and act on ${url.origin} in the active Browser tab.` : `Read ${url.origin} in the active Browser tab.`, always: "site" }, sourceOrigin);
+		const password = url.password ? "The URL includes a password.\n" : "";
+		const username = url.username ? `The URL username is "${url.username}".\n` : "";
+		const summary = action ? `Read and act on ${url.origin} in the active Browser tab.` : `Read ${url.origin} in the active Browser tab.`;
+		const title = submit ? `Let Grok submit a form to ${url.origin}?` : action ? `Let Grok act on ${url.origin}?` : `Let Grok read ${url.origin}?`;
+		const submission = submit ? `Send form data from ${sourceOrigin} to ${url.origin}.\n` : "";
+		const decision = await ask(ctx, { title, summary: `${password}${username}${submission}${summary}`, always: "site" }, sourceOrigin);
 		if (decision === "always") { grants.set(key, action ? "act" : "read"); }
 	}
 	const execute = (ctx, op, args = {}, mutation = false) => step(ctx, () => ctx.guest.executeJavaScriptInIsolatedWorld(7301, [{ code: pageScript(op, { ...args, navigationEpoch: guests.get(ctx.guest)?.epoch ?? 0 }) }]), mutation);
 	function armDownload(ctx) {
+		if (ctx.formSourceActive === undefined) { ctx.formSourceActive = true; }
 		const mark = ctx.mark ?? { ctx, active: true, until: Infinity, blocked: false };
 		ctx.mark = mark;
 		if (ctx.guest) { trackGuest(ctx.guest); downloads.set(ctx.guest, mark); } else { openings.add(mark); }
@@ -278,6 +409,7 @@ function createBrowserAgent({ host, owners, blockedPorts = new Set(), webContent
 				sensitive = sensitiveField(meta);
 				if (sensitive) { await ask(ctx, { title: `Let Grok enter a sensitive field on ${target.origin}?`, summary: `${String(meta.label || meta.name || meta.id || "Sensitive field").slice(0, 120)}: ${(name === "fill" ? args.text : args.option).length} characters, hidden.` }, target.origin); }
 			}
+			await step(ctx, () => watchSubmissions(ctx.guest));
 			if (action) {
 				armDownload(ctx);
 				await execute(ctx, "highlight", { ref: args.ref, origin: target.origin, deadline: Date.now() + ctx.remaining });
@@ -286,6 +418,7 @@ function createBrowserAgent({ host, owners, blockedPorts = new Set(), webContent
 		}
 		check(ctx);
 		if (name !== "navigate" && urlOf(ctx.guest.getURL()).origin !== target.origin) { throw new Error("The page changed origin. Take a new snapshot."); }
+		if (name === "navigate") { await step(ctx, () => watchSubmissions(ctx.guest)); }
 		const mark = armDownload(ctx);
 		let value;
 		try {
@@ -293,6 +426,7 @@ function createBrowserAgent({ host, owners, blockedPorts = new Set(), webContent
 				value = await step(ctx, () => navigate(ctx, target, args), true);
 			} else {
 				value = await execute(ctx, name, { ...args, origin: target.origin, deadline: Date.now() + ctx.remaining, expectedMeta: meta, sensitiveApproved: sensitive }, true);
+				if (name === "fill" && args.submit && value?.error) { throw new Error(value.error); }
 			}
 		} finally { if (holds.get(ctx.ui)?.ctx !== ctx) { finishMark(mark); } }
 		if (name === "navigate" || name === "click") {
@@ -427,13 +561,16 @@ function createBrowserAgent({ host, owners, blockedPorts = new Set(), webContent
 		reports.clear();
 		grants.clear();
 		for (const hold of holds.values()) { clearHold(hold); }
-		for (const [session, download] of guestSessions) { session.removeListener("will-download", download); }
+		for (const [session, download] of guestSessions) {
+			session.removeListener("will-download", download);
+		}
 		guestSessions.clear();
 		for (const mark of new Set([...downloads.values(), ...openings])) { clearTimeout(mark.timer); }
 		downloads.clear();
 		openings.clear();
 		for (const [guest, state] of guests) {
 			guest.removeListener("did-start-navigation", state.navigation);
+			state.submissions?.dispose();
 			guest.removeListener("will-navigate", state.guard);
 			guest.removeListener("will-redirect", state.guard);
 			guest.removeListener("did-navigate", state.status);

@@ -6,6 +6,7 @@ const path = require("path");
 const os = require("os");
 const { pathToFileURL } = require("url");
 const { redactKeys, redactDeep, heldTail } = require("./redact.cjs");
+const sandbox = require("./sandbox.cjs");
 const CLIENT_INFO = { name: "grok-code", version: require("../package.json").version };
 const grokSignIn = { mode: "grok" };
 let signInProvider = { grokEnv: () => ({}), status: () => grokSignIn };
@@ -55,6 +56,8 @@ const FALLBACK_PROMPT = "interject-fallback-";
 const HOOKS = {
   PreToolUse: [{ matcher: ".*", hookCallbackIds: ["gate"], timeout: HOOK_TIMEOUT_SEC }],
 };
+// Grok's wording in 1.0.77 for a call that a rule, a hook or its review refused. Any other wording reads as an ordinary failure.
+const REFUSED_CALL = /^(Tool `[^`]+` was not executed:|Hook denied:|Auto mode blocked)/;
 
 function folderProblem(cwd) {
   if (typeof cwd !== "string" || !cwd.trim()) return "Choose a folder for this session.";
@@ -105,6 +108,21 @@ function resolvedEditPath(target) {
 	}
 }
 
+// The browser's loopback server can't be reached from inside a sandbox.
+function browserFor(input) {
+	return !!input.browser && !input.sandbox && !input.uiSessionId.startsWith("side-");
+}
+
+// A session's side chat runs in the same sandbox as the session.
+function sandboxOwner(input) {
+	return input.uiSessionId.replace(/^side-/, "");
+}
+
+// A sandboxed Grok names files by its own paths. "" means this computer can't see that file.
+function hostPath(proc, file) {
+	return proc && proc.target ? proc.target.toHost(file) : file;
+}
+
 function editIsAllowed(turn, input) {
 	if (input == null || typeof input !== "object" || Array.isArray(input)) { return false; }
 	const keys = ["file_path", "target_file", "path"].filter((key) => Object.prototype.hasOwnProperty.call(input, key));
@@ -115,7 +133,9 @@ function editIsAllowed(turn, input) {
 			const resolved = resolvedEditPath(value);
 			return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 		};
-		const targets = keys.map((key) => canonical(path.resolve(turn.cwd, input[key])));
+		const hostFiles = keys.map((key) => hostPath(turn.proc, input[key]));
+		if (hostFiles.some((file) => !file)) { return false; }
+		const targets = hostFiles.map((file) => canonical(path.resolve(turn.cwd, file)));
 		if (targets.some((target) => path.relative(targets[0], target) !== "")) { return false; }
 		return [turn.cwd, ...(turn.allowedFolders || []), os.tmpdir()].some((folder) => {
 			const relative = path.relative(canonical(folder), targets[0]);
@@ -131,6 +151,97 @@ function editIsAllowed(turn, input) {
 	}
 }
 
+const FILE_READ_TOOLS = new Set(["read_file", "list_dir", "grep"]);
+const READ_PATH_KEYS = ["file_path", "target_file", "target_directory", "path", "file"];
+const windowsReadName = (file) => file.replace(/\//g, "\\")
+	.replace(/^\\\\\?\\UNC\\/i, "\\\\")
+	.replace(/^\\\\\?\\(?=[A-Za-z]:\\)/, "")
+	.replace(/^\\\\wsl\$\\/i, "\\\\wsl.localhost\\");
+
+function walkWindowsReadPath(file, volumes, depth = 0) {
+	const name = windowsReadName(file);
+	const { root } = path.win32.parse(name);
+	// Opening an unapproved UNC path can authenticate to its server before we show a card.
+	if (depth >= 32 || !volumes.has(root.toLowerCase()) || /^\\\\[.?]\\/.test(name)) { return ""; }
+	let current = root;
+	for (const part of name.slice(root.length).split("\\")) {
+		if (!part || part === ".") { continue; }
+		if (part === "..") { current = path.win32.dirname(current); continue; }
+		if (/[:]|[. ]$/.test(part)) { return ""; }
+		const next = path.win32.join(current, part);
+		if (!fs.lstatSync(next, { throwIfNoEntry: false })?.isSymbolicLink()) {
+			current = next;
+			continue;
+		}
+		const link = fs.readlinkSync(next);
+		current = walkWindowsReadPath(path.win32.isAbsolute(link) ? link : current + "\\" + link, volumes, depth + 1);
+		if (!current) { return ""; }
+	}
+	return current;
+}
+
+function readIsAllowed(turn, input, locations = []) {
+	const paths = READ_PATH_KEYS.filter((key) => input && Object.prototype.hasOwnProperty.call(input, key)).map((key) => input[key]);
+	if (!Array.isArray(locations)) { return false; }
+	paths.push(...locations.map((location) => location?.path));
+	if (!paths.length) { return false; }
+	const target = turn.proc?.target;
+	const windows = path.sep === "\\";
+	const posixGuest = target?.guestCwd?.startsWith("/");
+	const folders = [turn.cwd, ...(turn.allowedFolders || []), target?.home || grokHome(), os.tmpdir()];
+	if (posixGuest) {
+		const guestTemp = hostPath(turn.proc, "/tmp");
+		if (guestTemp) { folders.push(guestTemp); }
+	}
+	const roots = folders.flatMap((folder) => {
+		try { return [fs.realpathSync.native(folder)]; } catch { return []; }
+	});
+	const volume = (file) => path.win32.parse(windowsReadName(file)).root.toLowerCase();
+	const volumes = windows ? new Set([...folders, ...roots].map(volume).filter(Boolean)) : null;
+	const scopeKey = (file) => {
+		if (!windows) { return file; }
+		const name = windowsReadName(file);
+		const root = volume(name);
+		return root + name.slice(root.length);
+	};
+	const keys = roots.map(scopeKey);
+	const inside = (file) => {
+		const key = scopeKey(file);
+		return keys.some((root) => key === root || key.startsWith(root.endsWith(path.sep) ? root : root + path.sep));
+	};
+	const canonicalInside = (file, allowMissing) => {
+		if (!file) { return false; }
+		try { return inside(fs.realpathSync.native(file)); } catch (error) {
+			return allowMissing && error.code === "ENOENT" && inside(resolvedEditPath(file));
+		}
+	};
+	return paths.every((file) => {
+		if (typeof file !== "string" || !file.trim() || file.includes("\0") || file.startsWith("~")) { return false; }
+		// Mapping POSIX names to Windows would treat a literal backslash as a separator.
+		if (windows && posixGuest && file.includes("\\")) { return false; }
+		// Guest path mapping can collapse '..' before the guest follows a link.
+		if (target && /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(file)) { return false; }
+		try {
+			let mapped = hostPath(turn.proc, file);
+			if (!mapped) { return false; }
+			if (windows) {
+				if (/^[A-Za-z]:(?![\\/])/.test(mapped)) { return false; }
+				if (/^[\\/](?![\\/])/.test(mapped)) {
+					const drive = /^[A-Za-z]:/.exec(turn.cwd);
+					if (!drive) { return false; }
+					mapped = drive[0] + mapped;
+				}
+			}
+			const absolute = path.isAbsolute(mapped) ? mapped : turn.cwd + path.sep + mapped;
+			const parent = absolute.split(windows ? /[\\/]/ : /\//).includes("..");
+			if (!windows) { return canonicalInside(absolute, !parent); }
+			// Check both orders when '..' and a reparse point can change the destination.
+			return canonicalInside(walkWindowsReadPath(absolute, volumes), !parent) &&
+				(!parent || canonicalInside(walkWindowsReadPath(path.win32.resolve(absolute), volumes), false));
+		} catch { return false; }
+	});
+}
+
 // On macOS and Linux a child spawned with these options leads its own process group, so killTree can end its whole tree.
 // Windows needs none: taskkill /T follows parent ids, and `detached` there would open a console window.
 const OWN_GROUP = process.platform === "win32" ? {} : { detached: true };
@@ -139,7 +250,10 @@ const OWN_GROUP = process.platform === "win32" ? {} : { detached: true };
 // are gone before the app exits or a folder is removed. On macOS and Linux the kill is synchronous either way, and
 // the result says whether every group is gone (ESRCH: it had already exited).
 function killTree(children, sync = false) {
-	const list = (Array.isArray(children) ? children : [children]).filter((child) => child && child.pid != null);
+	const all = (Array.isArray(children) ? children : [children]).filter(Boolean);
+	// A container or Windows Sandbox outlives the local process that talks to it.
+	for (const child of all) { if (child.stopRemote) { child.stopRemote(sync); } }
+	const list = all.filter((child) => child.pid != null);
 	if (!list.length) { return; }
   if (process.platform === "win32") {
 		(sync ? spawnSync : spawn)("taskkill", [...list.flatMap((child) => ["/PID", String(child.pid)]), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
@@ -206,11 +320,13 @@ function permissionOf(mode) {
 	return "ask";
 }
 
-function permissionMeta(mode) {
+function permissionMeta(mode, unattended) {
 	return {
 		"x.ai/hooks": HOOKS,
 		...(mode === "Always-approve" ? { yoloMode: true } : {}),
 		...(mode === "Auto-review" ? { autoMode: true } : {}),
+		// Undocumented, seen in Grok 1.0.77. A call Grok's review blocks then fails and the model is told, where an unanswered approval would end the whole turn. A Grok that ignores this goes back to asking.
+		...(unattended ? { startupHints: { nonInteractive: true } } : {}),
 	};
 }
 
@@ -229,10 +345,12 @@ function actionFor(mode, kind) {
 }
 
 function isPlanFile(turn, input) {
-	const target = input && typeof input === "object" ? input.file_path : "";
-	if (!turn || !turn.agentSessionId || typeof target !== "string" || !path.isAbsolute(target)) { return false; }
+	const named = input && typeof input === "object" ? input.file_path : "";
+	if (!turn || !turn.agentSessionId || typeof named !== "string") { return false; }
+	const target = hostPath(turn.proc, named);
+	if (!target || !path.isAbsolute(target)) { return false; }
 	const resolved = path.resolve(target);
-	const sessions = path.join(grokHome(), "sessions");
+	const sessions = path.join(turn.proc && turn.proc.target ? turn.proc.target.home : grokHome(), "sessions");
 	const relative = path.relative(sessions, resolved);
 	return path.basename(resolved).toLowerCase() === "plan.md"
 		&& path.basename(path.dirname(resolved)) === turn.agentSessionId
@@ -411,7 +529,7 @@ function summaryOf(toolName, input) {
   if (kind === "command") {
 		return clipText(typeof data.command === "string" ? data.command : String(toolName || "Command"), 500);
   }
-  const path = data.file_path || data.path || data.target_file || data.file || data.url || data.query || "";
+  const path = data.file_path || data.path || data.target_file || data.target_directory || data.file || data.url || data.query || "";
 	if (typeof path === "string" && path) { return clipText(path, 300); }
   return String(toolName || "Tool");
 }
@@ -435,6 +553,7 @@ function todosOf(input) {
 // "Always allow" remembers a command exactly as Grok sent it (outer spaces aside), and never one that chains, pipes or redirects.
 // An MCP call through use_tool is remembered by the MCP tool it names, and never when that name is inside a file.
 function alwaysKey(kind, toolName, command, input) {
+	if (kind === "read") { return ""; }
 	if (kind === "command") {
 		const text = String(command || "").trim();
 		if (!text || /[;&|`$<>()\r\n]/.test(text)) { return ""; }
@@ -504,18 +623,25 @@ function attachmentsProblem(list) {
 	return "";
 }
 
-function promptBlocks(text, attachments) {
+// A sandboxed Grok is told only the paths it can reach. An image still arrives, since its bytes travel in the prompt.
+function promptBlocks(text, attachments, target) {
 	const files = attachments || [];
-	const blocks = [{ type: "text", text: files.length ? `${text}\n\nAttached files:\n${files.join("\n")}` : text }];
+	const named = [];
+	const blocks = [];
 	for (const file of files) {
 		const mimeType = IMAGE_TYPES.get(path.extname(file).toLowerCase());
-		if (mimeType && fs.statSync(file).size <= IMAGE_LIMIT) {
+		const embedded = mimeType && fs.statSync(file).size <= IMAGE_LIMIT;
+		const seen = target ? target.toGuest(file) : file;
+		if (seen) { named.push(seen); }
+		if (embedded) {
 			blocks.push({ type: "image", mimeType, data: fs.readFileSync(file).toString("base64") });
+		} else if (!seen) {
+			throw new Error(`Grok's sandbox can't reach this attachment. Put it in the session's folder: ${file}`);
 		} else {
-			blocks.push({ type: "resource_link", uri: pathToFileURL(file).href, name: path.basename(file) });
+			blocks.push({ type: "resource_link", uri: pathToFileURL(seen, { windows: !seen.startsWith("/") && process.platform === "win32" }).href, name: path.basename(file) });
 		}
 	}
-	return blocks;
+	return [{ type: "text", text: named.length ? `${text}\n\nAttached files:\n${named.join("\n")}` : text }, ...blocks];
 }
 
 // Some Grok commands answer with a notification instead of message text.
@@ -654,9 +780,13 @@ class AgentHost {
 		this.models = [];
 		this.contextWindows = new Map();
 		this.suggestGeneration = 0;
+		// The newest mode click wins. An older setMode must not write lastTurn after a newer one has started.
+		this.modeSerial = 0;
+		this.modeTicket = new Map();
+		this.selectedModes = new Map();
   }
 
-  prompt(input) {
+  prompt(input, { routine = false } = {}) {
     const problem = this.inputProblem(input);
     if (problem) return Promise.resolve({ ok: false, error: problem });
 		if (this.branching.has(input.uiSessionId)) {
@@ -667,13 +797,14 @@ class AgentHost {
 		}
     const missing = folderProblem(input.cwd);
     if (missing) return Promise.resolve({ ok: false, error: missing });
-    const mode = MODES.has(input.mode) ? input.mode : "Normal";
+		const mode = this.selectedModes.get(input.uiSessionId) ?? input.mode ?? "Normal";
 		const turn = {
       uiSessionId: input.uiSessionId,
 			turnId: input.turnId,
       cwd: input.cwd,
 			allowedFolders: [...(input.allowedFolders || [])],
       mode,
+			routine,
 			agentSessionId: "",
       cancelled: false,
       finished: false,
@@ -682,7 +813,7 @@ class AgentHost {
 			said: false,
     };
 		this.turns.set(input.uiSessionId, turn);
-		return this.dispatch(input, turn);
+		return this.dispatch({ ...input, mode }, turn);
   }
 
 	emitTurn(turn, event) {
@@ -716,24 +847,41 @@ class AgentHost {
 	}
 
 	checkTurn(turn) {
-		if (this.turns.get(turn.uiSessionId) !== turn || turn.cancelled || turn.finished) { throw new Error("Stopped."); }
+		const registered = turn.proc?.promptTurns;
+		if (turn.cancelled || turn.finished || turn.proc?.lost || (this.turns.get(turn.uiSessionId) !== turn && registered?.get(String(turn.promptId)) !== turn && registered?.get(turn) !== turn)) { throw new Error("Stopped."); }
+	}
+
+	turn(uiSessionId, turnId) {
+		const current = this.turns.get(uiSessionId);
+		if (current?.turnId === turnId) { return current; }
+		return [...(this.procs.get(uiSessionId)?.promptTurns?.values() || [])].find((item) => item.turnId === turnId);
 	}
 
 	// A process serves one app session, so only its Grok session, or a subagent that session started, reaches the turn.
+	// The prompt ending removes that turn, but a background subagent keeps calling tools and a finished task wakes
+	// Grok without a new app turn. Those calls use that turn's mode, which the mode chip can replace. Stop, a replaced
+	// process, or a session this turn did not start still gets no turn, and the hook denies. A call that still
+	// needs an approval card is denied too: the reply is finished, so the card can no longer be shown.
 	turnFor(proc, sessionId) {
 		let id = String(sessionId || "");
 		for (let hops = 0; hops < 8 && proc.parents.has(id); hops += 1) { id = proc.parents.get(id); }
-		const turn = this.turns.get(proc.uiSessionId);
-		if (!turn || turn.finished || turn.proc !== proc) { return null; }
-		return !id || id === turn.agentSessionId ? turn : null;
+		const current = this.turns.get(proc.uiSessionId);
+		if (current && current.proc !== proc) { return null; }
+		const wake = proc.runningWake?.turn;
+		if (wake && !proc.lost && !wake.cancelled && (wake.background || !proc.lastTurn?.cancelled) && id === wake.agentSessionId) { return wake; }
+		if (current && !current.finished) { return !id || id === current.agentSessionId ? current : null; }
+		const last = proc.lastTurn;
+		if (!last || !last.finished || last.cancelled || last.proc !== proc || !id || id !== last.agentSessionId) { return null; }
+		return last;
 	}
 
 	async dispatch(input, turn) {
     try {
 			turn.proc = this.procFor(input, turn);
+			turn.proc.promptTurns.set(turn, turn);
 			turn.proc.lastTurn = turn;
-			turn.proc.steers = [];
 			turn.proc.promptGeneration = (turn.proc.promptGeneration || 0) + 1;
+			turn.generation = turn.proc.promptGeneration;
 			this.touch(turn.proc);
 			await turn.proc.ready;
 			this.checkTurn(turn);
@@ -746,19 +894,27 @@ class AgentHost {
 			this.checkTurn(turn);
 			const promptIndex = turn.slash || input.uiSessionId.startsWith("side-") ? null : await this.nextPromptIndex(turn.proc, session.sessionId);
 			this.checkTurn(turn);
+			// ponytail: Grok's /context prints only in its own terminal UI; /session-info carries the same context numbers over ACP.
+			const prompt = promptBlocks(turn.slash && input.text.trim() === "/context" ? "/session-info" : input.text, input.attachments, turn.proc.target);
 			const sent = this.request(turn.proc, "session/prompt", {
         sessionId: session.sessionId,
-				// ponytail: Grok's /context prints only in its own terminal UI; /session-info carries the same context numbers over ACP.
-				prompt: promptBlocks(turn.slash && input.text.trim() === "/context" ? "/session-info" : input.text, input.attachments),
+				prompt,
       });
 			turn.promptId = sent.id;
-      sent.promise.then(
-				(result) => this.finishPrompt(turn, sent.id, result, ""),
-				(error) => this.finishPrompt(turn, sent.id, null, error.message || "Grok rejected the request."),
-      );
-			return { ok: true, agentSessionId: session.sessionId, ...(promptIndex != null ? { promptIndex } : {}) };
+			turn.proc.promptTurns.delete(turn);
+			turn.proc.promptTurns.set(String(sent.id), turn);
+			const waiter = turn.proc.pending.get(sent.id);
+			if (waiter) {
+				waiter.promptTurn = turn;
+				waiter.promptText = prompt[0].text;
+			}
+			void sent.promise.catch((error) => this.finishPrompt(turn, sent.id, null, error.message || "Grok rejected the request."));
+			return { ok: true, agentSessionId: session.sessionId, mode: input.mode, ...(promptIndex != null ? { promptIndex } : {}) };
     } catch (error) {
-			if (this.turns.get(turn.uiSessionId) === turn && turn.promptId == null) { this.turns.delete(turn.uiSessionId); }
+			if (turn.promptId == null) {
+				turn.proc?.promptTurns?.delete(turn);
+				if (this.turns.get(turn.uiSessionId) === turn) { this.turns.delete(turn.uiSessionId); }
+			}
 			return { ok: false, error: redactKeys(error.message || "Grok could not start."), ...(error.lostSession ? { lostSession: true } : {}) };
     }
   }
@@ -888,11 +1044,14 @@ class AgentHost {
 	answerPlan(input) {
 		const gate = input && this.gates.get(String(input.toolId || ""));
 		if (!gate || gate.type !== "plan" || gate.uiSessionId !== input.uiSessionId) { return { ok: false, closed: true, error: "That plan approval already closed." }; }
-		const found = this.turns.get(gate.uiSessionId);
+		const found = this.turn(gate.uiSessionId, gate.turnId);
 		const turn = found && !found.finished ? found : null;
 		if (input.outcome === "approved") {
 			const next = MODES.has(input.mode) && input.mode !== "Plan" ? input.mode : "Normal";
-			if (turn) { turn.mode = next; }
+			if (turn) {
+				turn.mode = next;
+				if (!turn.uiSessionId.startsWith("side-")) { this.selectedModes.set(turn.uiSessionId, next); }
+			}
 			this.settleGate(gate, { outcome: "approved" }, `Approved · ${next}`);
 			return { ok: true };
 		}
@@ -903,7 +1062,10 @@ class AgentHost {
 		}
 		if (input.outcome === "abandoned") {
 			const next = MODES.has(input.mode) && input.mode !== "Plan" ? input.mode : "Normal";
-			if (turn) { turn.mode = next; }
+			if (turn) {
+				turn.mode = next;
+				if (!turn.uiSessionId.startsWith("side-")) { this.selectedModes.set(turn.uiSessionId, next); }
+			}
 			this.settleGate(gate, { outcome: "abandoned" }, "Abandoned");
 			return { ok: true };
 		}
@@ -921,9 +1083,22 @@ class AgentHost {
 
   cancel(uiSessionId) {
 		const turn = this.turns.get(uiSessionId);
-		if (!turn || turn.finished) { return; }
+		if (!turn || turn.finished) {
+			const proc = this.procs.get(uiSessionId);
+			if (proc?.steers?.length) {
+				for (const steer of proc.steers) { steer.turn.cancelled = true; }
+				this.stopProc(proc, "Stopped.");
+			}
+			return;
+		}
 		turn.cancelled = true;
     this.denyOpen(uiSessionId, "Stopped.");
+		if (turn.pendingSteer || turn.proc?.steers?.length || [...(turn.proc?.promptTurns?.values() || [])].some((item) => item !== turn && !item.background && !item.finished)) {
+			// A queued interjection can start after session/cancel has already been answered.
+			if (turn.pendingSteer?.accepted) { this.showSteer(turn, turn.pendingSteer); }
+			this.stopProc(turn.proc, "Stopped.");
+			return;
+		}
     const session = this.sessions.get(uiSessionId);
 		if (session && session.proc && session.proc === turn.proc) {
 			this.write(turn.proc, { jsonrpc: "2.0", method: "session/cancel", params: { sessionId: session.sessionId } });
@@ -1039,7 +1214,8 @@ class AgentHost {
 		try {
 			return await this.withSession(input, async (proc, session) => {
 				if (!(await this.promptMatches(proc, session.sessionId, input.index, input.text))) { return { ok: false, error: "Grok's history no longer matches this message, so nothing was forked." }; }
-				const result = (await this.request(proc, "_x.ai/session/fork", { sourceSessionId: session.sessionId, sourceCwd: session.cwd, newCwd: session.cwd, targetPromptIndex: input.index }).promise) || {};
+				const grokCwd = proc.target ? proc.target.guestCwd : session.cwd;
+				const result = (await this.request(proc, "_x.ai/session/fork", { sourceSessionId: session.sessionId, sourceCwd: grokCwd, newCwd: grokCwd, targetPromptIndex: input.index }).promise) || {};
 				return typeof result.newSessionId === "string" && result.newSessionId ? { ok: true, agentSessionId: result.newSessionId } : { ok: false, error: "Grok did not create the fork." };
 			});
 		} catch (error) {
@@ -1055,64 +1231,212 @@ class AgentHost {
 		if (turn.slash) { return { ok: false, error: "Grok is running a command, which can't be steered." }; }
 		if (typeof text !== "string" || !text.trim() || text.length > 100000) { return { ok: false, error: "Write a message first." }; }
 		if (text.trim().startsWith("/")) { return { ok: false, error: "Send commands on their own, not into a running turn." }; }
-		const proc = turn.proc;
-		const said = text.trim();
-		// Kept until the next turn starts, so a turn Grok starts for a late steer can show what was sent.
-		proc.steers = [...(proc.steers || []), said].slice(-5);
-		const drop = () => {
-			const at = proc.steers.lastIndexOf(said);
-			if (at >= 0) { proc.steers.splice(at, 1); }
-		};
+		if (turn.pendingSteer) { return { ok: false, error: "Grok is still taking the previous steer." }; }
+		const steer = { text: text.trim(), accepted: false, shown: false, turn };
+		turn.pendingSteer = steer;
+		turn.proc.promptTurns.set(String(turn.promptId), turn);
+		turn.proc.steers.push(steer);
 		try {
-			const result = await this.request(proc, "_x.ai/interject", { sessionId: session.sessionId, text: said }).promise;
+			const result = await this.request(turn.proc, "_x.ai/interject", { sessionId: session.sessionId, text: steer.text }).promise;
+			if (steer.shown) { return { ok: true }; }
+			if (turn.cancelled) { return { ok: false, error: "Stopped." }; }
 			const status = String(((result && result.result) || result || {}).status || "");
-			if (status !== "queued") { drop(); }
-			return status === "queued" ? { ok: true } : { ok: false, error: "Grok did not take the message." };
+			if (status === "queued") {
+				steer.accepted = true;
+				this.retireSteers(turn.proc, turn.proc.lastOrdinaryTurn);
+				return { ok: true };
+			}
+			turn.proc.steers = turn.proc.steers.filter((item) => item !== steer);
+			this.settleSteer(turn, steer);
+			return { ok: false, error: "Grok did not take the message." };
 		} catch (error) {
-			drop();
+			if (steer.shown) { return { ok: true }; }
+			turn.proc.steers = turn.proc.steers.filter((item) => item !== steer);
+			this.settleSteer(turn, steer);
 			return { ok: false, error: this.clip(error.message || "Grok could not take the message.") };
 		}
 	}
 
+	showSteer(turn, steer) {
+		if (steer.shown) { return; }
+		steer.shown = true;
+		this.emitTurn(turn, { type: "steer", text: steer.text });
+	}
+
+	settleSteer(turn, steer) {
+		if (turn.pendingSteer !== steer) { return; }
+		turn.pendingSteer = null;
+	}
+
+	retireSteers(proc, turn, update = {}) {
+		if (!turn || !proc.steers?.length) { return; }
+		const echo = update.sessionUpdate === "user_message_chunk" && !update._meta?.isReplay
+			? /The user sent a message while you were working:\s*<user_query>([\s\S]*?)<\/user_query>/.exec(chunkText(update))?.[1]?.trim() : "";
+		proc.steers = proc.steers.filter((steer) => {
+			const consumed = steer.turn === turn && echo === steer.text;
+			const followed = turn === proc.lastOrdinaryTurn && steer.turn.finished && (steer.accepted || steer.shown) && turn.generation > (steer.turn.generation ?? 0);
+			if (!consumed && !followed) { return true; }
+			this.showSteer(steer.turn, steer);
+			this.settleSteer(steer.turn, steer);
+			return false;
+		});
+	}
+
 	// A steer that reaches Grok just after its turn ended starts a turn of Grok's own, with no session/prompt waiting on it.
 	// That turn joins the app as a new one, with the last turn's folder, folders and mode, so its reply and approvals show.
-	adoptFallback(proc, params, update) {
+	adoptFallback(proc, params, update, promptId) {
 		const sessionId = String(params.sessionId || "");
-		const promptId = String((params._meta && params._meta.promptId) || update.prompt_id || "");
-		const echoed = update.sessionUpdate === "user_message_chunk" && !(update._meta && update._meta.isReplay) ? chunkText(update).trim() : "";
-		const steers = proc.steers || [];
-		if (!steers.length || update.sessionUpdate === "turn_completed" || (!promptId.startsWith(FALLBACK_PROMPT) && !(echoed && steers.includes(echoed)))) { return; }
-		const last = proc.lastTurn;
+		if (proc.lost || proc.parents.has(sessionId) || proc.uiSessionId.startsWith("side-") || this.procs.get(proc.uiSessionId) !== proc) { return; }
+		const echoed = update.sessionUpdate === "user_message_chunk" && !update._meta?.isReplay ? chunkText(update).trim() : "";
+		const reported = typeof params.runningText === "string" ? params.runningText.trim() : echoed;
+		const candidates = proc.steers.filter((item) => !item.turn.cancelled);
+		const steer = candidates.find((item) => reported && item.text === reported) || (!reported && candidates.length === 1 ? candidates[0] : null);
+		const origin = steer?.turn || (candidates.length && candidates.every((item) => item.turn === candidates[0].turn) ? candidates[0].turn : null);
+		if (!promptId.startsWith(FALLBACK_PROMPT) && (!reported || !steer || !steer.turn.finished)) { return; }
 		const session = this.sessions.get(proc.uiSessionId);
-		if (!last || proc.lost || this.turns.has(proc.uiSessionId) || proc.parents.has(sessionId) || proc.uiSessionId.startsWith("side-") || !session || session.proc !== proc || session.sessionId !== sessionId) { return; }
-		const text = echoed && steers.includes(echoed) ? echoed : steers[steers.length - 1];
-		steers.splice(steers.indexOf(text), 1);
+		if (!session || session.proc !== proc || session.sessionId !== sessionId) { return; }
+		const key = promptId || FALLBACK_PROMPT;
+		if (proc.promptTurns.has(key)) { return; }
+		const last = origin || this.turns.get(proc.uiSessionId) || proc.lastTurn;
+		if (!last || last.cancelled || last.proc !== proc) { return; }
+		if (steer) {
+			steer.shown = true;
+			this.settleSteer(steer.turn, steer);
+			proc.steers = proc.steers.filter((item) => item !== steer);
+		}
 		const turn = {
 			uiSessionId: proc.uiSessionId,
 			turnId: `steer-${randomUUID()}`,
 			cwd: last.cwd,
 			allowedFolders: [...(last.allowedFolders || [])],
-			mode: last.mode,
+			mode: this.selectedModes.get(proc.uiSessionId) ?? last.mode,
 			agentSessionId: sessionId,
 			cancelled: false,
 			finished: false,
-			promptId: promptId.startsWith(FALLBACK_PROMPT) ? promptId : FALLBACK_PROMPT,
+			promptId: key,
 			slash: false,
 			said: false,
 			proc,
 			fallback: true,
+			generation: last.generation ?? proc.promptGeneration ?? 0,
 		};
+		proc.promptTurns.set(key, turn);
 		this.turns.set(turn.uiSessionId, turn);
 		proc.lastTurn = turn;
+		proc.runningWake = null;
 		this.touch(proc);
-		this.emit({ type: "turn-start", uiSessionId: turn.uiSessionId, turnId: turn.turnId, text });
+		this.emitTurn(turn, { type: "turn-start", parallel: true, ...(origin ? { sourceTurnId: origin.turnId } : {}), text: reported || steer?.text || "" });
+	}
+
+	backgroundReport(proc, params, promptId) {
+		const sessionId = String(params.sessionId || "");
+		const session = this.sessions.get(proc.uiSessionId);
+		if (!promptId.startsWith("task-completed-") || proc.lost || proc.parents.has(sessionId) || this.procs.get(proc.uiSessionId) !== proc || !session || session.proc !== proc || session.sessionId !== sessionId) { return null; }
+		const existing = proc.promptTurns.get(promptId);
+		if (existing) { return existing.background ? existing : null; }
+		const source = proc.taskTools.get(promptId.slice("task-completed-".length))?.turn || proc.lastCompletedTurn || proc.lastTurn;
+		if (!source || source.proc !== proc) { return null; }
+		const turn = {
+			uiSessionId: proc.uiSessionId,
+			turnId: `task-report-${promptId}`,
+			cwd: source.cwd,
+			allowedFolders: [...(source.allowedFolders || [])],
+			mode: source.mode,
+			agentSessionId: sessionId,
+			cancelled: false,
+			finished: false,
+			promptId,
+			slash: false,
+			said: false,
+			proc,
+			background: true,
+			sourceTurn: source,
+			reportEvents: new Set(),
+		};
+		proc.promptTurns.set(promptId, turn);
+		this.emitTurn(turn, { type: "turn-start", parallel: true, background: true });
+		return turn;
+	}
+
+	streamTurn(proc, params, update) {
+		const promptId = String(params._meta?.promptId || update.prompt_id || "");
+		const sessionId = String(params.sessionId || "");
+		if (proc.lost) { return null; }
+		if (!promptId) {
+			this.adoptFallback(proc, params, update, "");
+			const turn = this.turnFor(proc, params.sessionId);
+			if (turn && !turn.finished) { this.retireSteers(proc, turn, update); }
+			return turn;
+		}
+		if (proc.parents.has(sessionId)) { return this.turnFor(proc, sessionId); }
+		let turn = proc.promptTurns.get(promptId);
+		if (promptId.startsWith("task-completed-")) {
+			if (params._meta?.isReplay || update._meta?.isReplay) { return null; }
+			const started = params.runningPromptId != null || (update.sessionUpdate === "hook_execution" && update.event_name === "user_prompt_submit");
+			const hasContent = (update.sessionUpdate === "agent_message_chunk" && chunkText(update)) ||
+				((update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") && update.toolCallId);
+			if (!turn && (started || hasContent)) { turn = this.backgroundReport(proc, params, promptId); }
+			if (!turn?.background || turn.agentSessionId !== sessionId) { return null; }
+			if (started && !turn.finished) {
+				proc.runningWake = { promptId, turn };
+			}
+			return turn;
+		}
+		const current = this.turns.get(proc.uiSessionId);
+		if (!turn && current?.proc === proc && String(current.promptId) === promptId) { turn = current; }
+		if (!turn && !promptId.startsWith(FALLBACK_PROMPT) && !update._meta?.isReplay && !params._meta?.isReplay) {
+			// A wake can still run while an app prompt waits in Grok's queue.
+			if (typeof params.runningText === "string" && (params.runningKind == null || params.runningKind === "prompt")) {
+				turn = [...proc.promptTurns.values()].find((item) => !item.fallback && !item.finished && !item.cancelled && item.promptId != null && item.agentSessionId === sessionId && !item.providerPromptId && proc.pending.get(item.promptId)?.promptText === params.runningText);
+			}
+			if (!turn) {
+				const last = proc.lastCompletedTurn || proc.lastTurn;
+				if (last?.finished && !last.cancelled && !proc.lastTurn?.cancelled && last.proc === proc && sessionId && last.agentSessionId === sessionId && (!current || current.proc === proc)) {
+					if (update.sessionUpdate === "turn_completed" && proc.runningWake?.promptId === promptId) {
+						proc.runningWake = null;
+					} else if (!current?.providerPromptId && (params.runningPromptId != null || (update.sessionUpdate === "hook_execution" && update.event_name === "user_prompt_submit"))) {
+						proc.runningWake = { promptId, turn: last };
+					}
+					return last;
+				}
+			}
+			if (turn) {
+				turn.providerPromptId = promptId;
+				proc.promptTurns.set(promptId, turn);
+			}
+		}
+		if (!turn && promptId.startsWith(FALLBACK_PROMPT)) {
+			const partial = proc.promptTurns.get(FALLBACK_PROMPT);
+			if (partial && !partial.finished) {
+				proc.promptTurns.delete(FALLBACK_PROMPT);
+				partial.promptId = promptId;
+				proc.promptTurns.set(promptId, partial);
+			} else {
+				this.adoptFallback(proc, params, update, promptId);
+			}
+			turn = proc.promptTurns.get(promptId);
+		}
+		if (!turn) { return null; }
+		if (turn.agentSessionId !== sessionId) { return null; }
+		if (!turn.finished) {
+			proc.runningWake = null;
+			if (!turn.fallback) { proc.lastOrdinaryTurn = turn; }
+			this.retireSteers(proc, turn, update);
+		}
+		if (!turn.finished && this.turns.get(turn.uiSessionId) !== turn) {
+			this.turns.set(turn.uiSessionId, turn);
+			proc.lastTurn = turn;
+			this.emitTurn(turn, { type: "turn-start", parallel: true, resume: true });
+		}
+		return turn;
 	}
 
 	// Grok ends its own turn with `turn_completed`, since no session/prompt reply comes for it.
-	finishFallback(proc, sessionId, update) {
-		const turn = this.turns.get(proc.uiSessionId);
-		const promptId = String(update.prompt_id || "");
-		if (!turn || !turn.fallback || turn.proc !== proc || turn.agentSessionId !== sessionId || !promptId.startsWith(FALLBACK_PROMPT)) { return; }
+	finishFallback(proc, sessionId, update, promptId = String(update.prompt_id || "")) {
+		const turn = proc.promptTurns.get(promptId) || this.turns.get(proc.uiSessionId);
+		const own = turn?.background ? promptId.startsWith("task-completed-") : turn?.fallback && promptId.startsWith(FALLBACK_PROMPT);
+		if (!own || turn.proc !== proc || turn.agentSessionId !== sessionId || (turn.promptId !== FALLBACK_PROMPT && turn.promptId !== promptId)) { return; }
+		if (proc.runningWake?.promptId === promptId) { proc.runningWake = null; }
 		turn.promptId = promptId;
 		const usage = update.usage && typeof update.usage === "object" ? update.usage : null;
 		const modelId = usage && usage.modelUsage && typeof usage.modelUsage === "object" ? Object.keys(usage.modelUsage)[0] || "" : "";
@@ -1142,6 +1466,7 @@ class AgentHost {
 		const procs = [...this.procs.values()];
 		for (const proc of procs) { this.loseProc(proc, "Closed."); }
 		killTree(procs.map((proc) => proc.child), true);
+		sandbox.shutdown();
 		this.turns.clear();
     this.sessions.clear();
   }
@@ -1192,29 +1517,35 @@ class AgentHost {
     if (input.mode != null && !MODES.has(input.mode)) return "Pick a permission mode from the list.";
 		if (input.allowedFolders !== undefined && allowedFoldersProblem(input.allowedFolders)) { return allowedFoldersProblem(input.allowedFolders); }
 		if (input.browser !== undefined && typeof input.browser !== "boolean") { return "Browser control must be on or off."; }
+		if (input.unattended !== undefined && typeof input.unattended !== "boolean") { return "Unattended must be on or off."; }
+		if (input.sandbox !== undefined && sandbox.choiceProblem(input.sandbox, process.platform)) { return sandbox.choiceProblem(input.sandbox, process.platform); }
 		return attachmentsProblem(input.attachments);
   }
 
 	// Grok fixes a session's permission when the session opens, so a new permission or folder gets a new Grok process.
 	procFor(input, turn) {
 		const permission = permissionOf(turn.mode);
-		const browser = !!input.browser && !input.uiSessionId.startsWith("side-");
+		const browser = browserFor(input);
 		const current = this.procs.get(input.uiSessionId);
-		if (current && current.permission === permission && !!current.browser === browser && pathKey(current.cwd) === pathKey(input.cwd)) { return current; }
+		const sandboxKey = sandbox.choiceKey(input.sandbox);
+		if (current && current.permission === permission && !!current.browser === browser && !!current.unattended === !!input.unattended && pathKey(current.cwd) === pathKey(input.cwd) && current.sandboxKey === sandboxKey) { return current; }
+		// Before anything stops, so a refused change leaves the session's Grok as it was.
+		const taken = sandbox.inUseProblem(input.sandbox, sandboxOwner(input));
+		if (taken) { throw new Error(taken); }
 		if (current) {
 			this.stopProc(current, "Grok restarted.");
 			// Stopping that Grok also stopped what it left running in the background, such as a dev server.
-			const reason = pathKey(current.cwd) !== pathKey(input.cwd) ? "in the new folder" : !!current.browser !== browser ? `to turn browser control ${browser ? "on" : "off"}` : "to apply the new permission mode";
+			const reason = pathKey(current.cwd) !== pathKey(input.cwd) ? "in the new folder" : current.sandboxKey !== sandboxKey ? "to change the sandbox" : !!current.browser !== browser ? `to turn browser control ${browser ? "on" : "off"}` : !!current.unattended !== !!input.unattended ? "so it can ask you for approvals" : "to apply the new permission mode";
 			this.emitTurn(turn, { type: "chunk", text: `Grok restarted ${reason}. Commands it left running in the background were stopped.\n\n` });
 		}
 		return this.start(input, permission);
 	}
 
 	start(input, permission) {
-		const browser = !!input.browser && !input.uiSessionId.startsWith("side-");
+		const browser = browserFor(input);
 		const status = signInStatus();
 		const envKey = hasEnvKey();
-    const child = spawn(grokPath(), [
+		const grokArgs = [
       "--permission-mode",
       "default",
       "agent",
@@ -1224,18 +1555,24 @@ class AgentHost {
       "--reasoning-effort",
       input.effort,
       "stdio",
-    ], {
+		];
+		// The app's own setting decides whether it asks for prompt suggestions, so Grok's config.toml switch must not veto them here.
+		const grokEnv = { ...process.env, GROK_PROMPT_SUGGESTIONS: "1", ...(browser ? {
+			NO_PROXY: `${process.env.NO_PROXY || process.env.no_proxy || ""},127.0.0.1,localhost`,
+			no_proxy: `${process.env.no_proxy || process.env.NO_PROXY || ""},127.0.0.1,localhost`,
+		} : {}), ...signInProvider.grokEnv() };
+		// A sandbox that can't start stops the session here. It never falls back to an unsandboxed Grok.
+		const target = input.sandbox ? sandbox.targetFor(input.sandbox, input.cwd, { platform: process.platform, grokExe: grokPath(), grokHome: grokHome(), owner: sandboxOwner(input), side: input.uiSessionId.startsWith("side-") }) : null;
+		const launch = target ? target.launch(grokArgs, grokEnv) : { command: grokPath(), args: grokArgs, env: grokEnv };
+		const child = launch.child || spawn(launch.command, launch.args, {
       ...OWN_GROUP,
       cwd: input.cwd,
-      // The app's own setting decides whether it asks for prompt suggestions, so Grok's config.toml switch must not veto them here.
-      env: { ...process.env, GROK_PROMPT_SUGGESTIONS: "1", ...(browser ? {
-				NO_PROXY: `${process.env.NO_PROXY || process.env.no_proxy || ""},127.0.0.1,localhost`,
-				no_proxy: `${process.env.no_proxy || process.env.NO_PROXY || ""},127.0.0.1,localhost`,
-			} : {}), ...signInProvider.grokEnv() },
+      env: launch.env,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
-		const proc = { uiSessionId: input.uiSessionId, cwd: input.cwd, permission, browser, browserReady: false, child, lost: false, buf: "", decoder: new StringDecoder("utf8"), pending: new Map(), parents: new Map(), loops: new Map(), looping: false };
+		if (target && target.stop) { child.stopRemote = target.stop; }
+		const proc = { uiSessionId: input.uiSessionId, cwd: input.cwd, permission, browser, unattended: !!input.unattended, browserReady: false, target, sandboxKey: sandbox.choiceKey(input.sandbox), child, lost: false, buf: "", decoder: new StringDecoder("utf8"), pending: new Map(), promptTurns: new Map(), toolTurns: new Map(), taskTools: new Map(), steers: [], parents: new Map(), loops: new Map(), looping: false };
 		proc.exited = new Promise((resolve) => {
 			child.once("exit", resolve);
 			child.once("error", resolve);
@@ -1247,7 +1584,7 @@ class AgentHost {
 		let stderr = "";
 		const stderrDecoder = new StringDecoder("utf8");
 		child.stderr.on("data", (chunk) => { stderr = (stderr + stderrDecoder.write(chunk)).slice(-4096); });
-		child.on("error", (error) => this.loseProc(proc, this.processFailure(error && error.code === "ENOENT" ? "Grok is not installed, or not on PATH. Set GROK_PATH to its full path." : `Grok could not start${error && error.message ? `: ${error.message}` : "."}`, stderr)));
+		child.on("error", (error) => this.loseProc(proc, this.processFailure(error && error.code === "ENOENT" ? (target && target.missing) || "Grok is not installed, or not on PATH. Set GROK_PATH to its full path." : `Grok could not start${error && error.message ? `: ${error.message}` : "."}`, stderr)));
 		child.on("exit", () => this.loseProc(proc, this.processFailure("Grok exited.", stderr)));
 		let version = "";
 		proc.ready = this.request(proc, "initialize", {
@@ -1261,10 +1598,13 @@ class AgentHost {
 				const sign = signState(init && init.authMethods, envKey, status);
 				if (sign.keyUnreadable) { throw new Error("The saved API key can't be read on this computer. Enter it again in Settings."); }
 				if (sign.keyRejected) { throw new Error("Grok rejected the API key, or couldn't reach xAI to check it. Check the key in Settings."); }
+				if (target && sign.signIn === "none") { throw new Error(sandbox.SIGN_IN_ERROR); }
 				return this.request(proc, "authenticate", { methodId: "cached_token" }).promise;
 			})
       .then((auth) => {
 				if (proc.lost) { throw new Error("Grok exited."); }
+				const unenforced = target && target.profile ? sandbox.enforcementProblem(target.home, target.profile) : "";
+				if (unenforced) { throw new Error(unenforced); }
 				this.account = accountOf(auth, version);
 				this.emit({ type: "account", account: this.account });
       })
@@ -1350,6 +1690,9 @@ class AgentHost {
 		if (proc.lost) { return; }
 		proc.lost = true;
 		clearTimeout(proc.idle);
+		for (const owner of new Set(proc.taskTools.values())) {
+			if (owner.detail === "Running") { this.emitTaskTool(owner, "Stopped"); }
+		}
 		if (this.procs.get(proc.uiSessionId) === proc) {
 			this.procs.delete(proc.uiSessionId);
 			this.emit({ type: "bg-tasks", uiSessionId: proc.uiSessionId, tasks: [], reset: true });
@@ -1367,19 +1710,24 @@ class AgentHost {
 		for (const gate of [...this.gates.values()]) {
 			if (gate.proc === proc) { this.answerGate(gate, "deny", "Grok exited.", false); }
 		}
-		const turn = this.turns.get(proc.uiSessionId);
-		if (!turn || turn.proc !== proc) { return; }
-		this.turns.delete(proc.uiSessionId);
-		if (turn.finished || turn.promptId == null) { return; }
-		turn.finished = true;
-		if (turn.cancelled) { this.emitTurn(turn, { type: "done", stopReason: "cancelled" }); } else { this.emitTurn(turn, { type: "error", message }); }
+		const current = this.turns.get(proc.uiSessionId);
+		const turns = new Set([...proc.promptTurns.values(), ...(current?.proc === proc ? [current] : [])]);
+		if (current?.proc === proc) { this.turns.delete(proc.uiSessionId); }
+		proc.steers = [];
+		for (const turn of turns) {
+			turn.pendingSteer = null;
+			if (turn.finished || turn.promptId == null) { continue; }
+			turn.finished = true;
+			if (turn.cancelled || message === "Stopped.") { this.emitTurn(turn, { type: "done", stopReason: "cancelled" }); } else { this.emitTurn(turn, { type: "error", message }); }
+		}
 	}
 
 	async ensureSession(proc, input) {
     const existing = this.sessions.get(input.uiSessionId);
 		const sameFolder = existing && pathKey(existing.cwd) === pathKey(input.cwd);
 		if (sameFolder && existing.proc === proc) { return existing; }
-		const savedId = sameFolder ? existing.sessionId : input.agentSessionId;
+		// Grok can't change a session's sandbox, so a different sandbox opens what the app asked for, not the Grok session it left.
+		const savedId = sameFolder && existing.sandboxKey === proc.sandboxKey ? existing.sessionId : input.agentSessionId;
 		let mcpServers = [];
 		if (proc.browser && this.browserServer) {
 			try {
@@ -1397,9 +1745,9 @@ class AgentHost {
 		try {
 			created = await this.request(proc, savedId ? "session/load" : "session/new", {
 				...(savedId ? { sessionId: savedId } : {}),
-				cwd: input.cwd,
+				cwd: proc.target ? proc.target.guestCwd : input.cwd,
 				mcpServers,
-				_meta: permissionMeta(MODES.has(input.mode) ? input.mode : "Normal"),
+				_meta: permissionMeta(MODES.has(input.mode) ? input.mode : "Normal", proc.unattended),
 			}).promise;
 		} catch (error) {
 			if (error.fromGrok && savedId) {
@@ -1415,6 +1763,7 @@ class AgentHost {
 			sessionId: String(sessionId),
       cwd: input.cwd,
 			proc,
+			sandboxKey: proc.sandboxKey,
       model: "",
       effort: "",
 			configOptions: [],
@@ -1448,14 +1797,58 @@ class AgentHost {
 		}
 	}
 
-	onModeUpdate(proc, sessionId, modeId) {
+	// The mode chip calls this once a reply has finished, so background work follows the chip before the next message.
+	// Grok refusing the change leaves the previous mode in place. A newer click replaces one that has not finished.
+	// Choosing a folder drops the cached session and keeps the process; late calls still follow lastTurn.
+	// A permission-group change still restarts Grok on the next message.
+	async setMode(uiSessionId, mode) {
+		if (typeof uiSessionId !== "string" || !uiSessionId) { return { ok: false, error: "Missing session." }; }
+		if (!MODES.has(mode)) { return { ok: false, error: "Pick a permission mode from the list." }; }
+		const live = this.turns.get(uiSessionId);
+		if (live && !live.finished) { return { ok: false, error: "Stop or finish this turn before changing mode." }; }
+		const ticket = ++this.modeSerial;
+		this.modeTicket.set(uiSessionId, ticket);
+		const current = () => this.modeTicket.get(uiSessionId) === ticket;
+		const proc = this.procs.get(uiSessionId);
+		const session = this.sessions.get(uiSessionId);
+		const last = proc && proc.lastTurn;
+		if (!proc || proc.lost || !last || last.cancelled || last.proc !== proc) {
+			this.selectedModes.set(uiSessionId, mode);
+			return { ok: true };
+		}
+		// forgetSession removes the session and leaves this process. There is no Grok session to retarget.
+		if (!session || session.proc !== proc) {
+			last.mode = mode;
+			this.selectedModes.set(uiSessionId, mode);
+			return { ok: true };
+		}
+		const grokMode = mode === "Plan" ? "plan" : "default";
+		if (session.grokMode !== grokMode) {
+			try {
+				await this.request(proc, "session/set_mode", { sessionId: session.sessionId, modeId: grokMode }).promise;
+			} catch (error) {
+				if (!current()) { return { ok: false }; }
+				return { ok: false, error: this.clip(error.message || "Grok did not change mode.") };
+			}
+			if (!current()) { return { ok: false }; }
+			const begun = this.turns.get(uiSessionId);
+			if (session.proc !== proc || proc.lastTurn !== last || (begun && !begun.finished)) { return { ok: false, error: "Stop or finish this turn before changing mode." }; }
+			session.grokMode = grokMode;
+		}
+		if (!current()) { return { ok: false }; }
+		if (proc.lastTurn === last) { last.mode = mode; }
+		this.selectedModes.set(uiSessionId, mode);
+		return { ok: true };
+	}
+
+	onModeUpdate(proc, sessionId, modeId, turn = this.turnFor(proc, sessionId)) {
 		const session = this.sessions.get(proc.uiSessionId);
 		if (session && session.proc === proc && session.sessionId === sessionId) { session.grokMode = modeId; }
-		const turn = this.turnFor(proc, sessionId);
-		if (!turn || turn.agentSessionId !== sessionId) { return; }
+		if (!turn || turn.background || turn.finished || turn.agentSessionId !== sessionId) { return; }
 		const mode = modeId === "plan" ? "Plan" : (turn.mode === "Plan" ? "Normal" : "");
 		if (!mode || mode === turn.mode) { return; }
 		turn.mode = mode;
+		if (!turn.uiSessionId.startsWith("side-")) { this.selectedModes.set(turn.uiSessionId, mode); }
 		this.emitTurn(turn, { type: "mode", mode });
 	}
 
@@ -1570,23 +1963,50 @@ class AgentHost {
 		}
 		if (msg.method === "_x.ai/session/interjection") {
 			const params = msg.params || {};
-			const turn = this.turnFor(proc, params.sessionId);
-			if (turn && typeof params.text === "string" && params.text.trim()) { this.emitTurn(turn, { type: "steer", text: redactKeys(params.text).slice(0, 100000) }); }
+			const steer = typeof params.text === "string" && proc.steers.find((item) => !item.shown && item.text === params.text.trim() && item.turn.agentSessionId === params.sessionId);
+			const turn = steer?.turn;
+			if (turn && !proc.lost && !turn.cancelled) {
+				this.showSteer(turn, steer);
+				this.settleSteer(turn, steer);
+				this.retireSteers(proc, proc.lastOrdinaryTurn);
+			}
+			if (msg.id != null) { this.reply(proc, msg.id, null); }
+			return;
+		}
+		if (msg.method === "_x.ai/queue/changed") {
+			const params = msg.params || {};
+			if ((typeof params.runningPromptId === "string" || typeof params.runningPromptId === "number") && String(params.runningPromptId)) {
+				this.streamTurn(proc, { ...params, sessionId: params.sessionId || this.sessions.get(proc.uiSessionId)?.sessionId, _meta: { promptId: params.runningPromptId } }, {});
+			}
 			if (msg.id != null) { this.reply(proc, msg.id, null); }
 			return;
 		}
 		if (msg.method === "_x.ai/session_notification") {
 			const update = (msg.params && msg.params.update) || {};
+			const turn = this.streamTurn(proc, msg.params || {}, update);
 			if (update.sessionUpdate === "subagent_spawned" && update.child_session_id && update.parent_session_id) {
 				proc.parents.set(String(update.child_session_id), String(update.parent_session_id));
 			}
 			const sessionId = String((msg.params && msg.params.sessionId) || "");
 			if (LOOP_KINDS.has(update.sessionUpdate)) { this.onScheduled(proc, sessionId, update); }
+			if (update.sessionUpdate === "task_backgrounded" && update.task_id) {
+				const owner = proc.toolTurns.get(String(update.tool_call_id || ""));
+				if (owner?.sessionId === sessionId && !proc.lost) {
+					proc.taskTools.set(String(update.task_id), owner);
+					if (!owner.detail) { this.emitTaskTool(owner, "Running"); }
+				}
+			}
+			if (update.sessionUpdate === "task_completed" && update.task_snapshot?.completed) {
+				this.updateTaskTool(proc, sessionId, { ...update.task_snapshot, status: update.task_snapshot.explicitly_killed ? "cancelled" : "completed" });
+			}
 			// Grok lists its background commands here. While one runs, the idle stop would kill it along with this Grok.
-			if (update.sessionUpdate === "background_tasks" && Array.isArray(update.tasks) && !proc.parents.has(sessionId)) {
-				proc.background = update.tasks.some((task) => task && task.status === "running");
-				const tasks = update.tasks.map(grokTask).filter(Boolean);
-				this.emit({ type: "bg-tasks", uiSessionId: proc.uiSessionId, tasks: [...tasks.filter((task) => task.status === "running"), ...tasks.filter((task) => task.status !== "running").slice(0, 50)] });
+			if (update.sessionUpdate === "background_tasks" && Array.isArray(update.tasks)) {
+				for (const task of update.tasks) { this.updateTaskTool(proc, sessionId, task); }
+				if (!proc.parents.has(sessionId)) {
+					proc.background = update.tasks.some((task) => task && task.status === "running");
+					const tasks = update.tasks.map(grokTask).filter(Boolean).map((task) => ({ ...task, outputFile: hostPath(proc, task.outputFile) }));
+					this.emit({ type: "bg-tasks", uiSessionId: proc.uiSessionId, tasks: [...tasks.filter((task) => task.status === "running"), ...tasks.filter((task) => task.status !== "running").slice(0, 50)] });
+				}
 			}
 			if ((update.sessionUpdate === "subagent_spawned" || update.sessionUpdate === "subagent_finished") && update.subagent_id) {
 				this.emit({ type: "subagent", uiSessionId: proc.uiSessionId, subagent: {
@@ -1604,9 +2024,9 @@ class AgentHost {
 					} : {}),
 				} });
 			}
-			if (update.sessionUpdate === "turn_completed") { this.finishFallback(proc, sessionId, update); } else { this.adoptFallback(proc, msg.params || {}, update); }
-			const turn = this.turnFor(proc, sessionId);
-			const live = turn && turn.promptId != null ? turn : null;
+			const completed = update.sessionUpdate === "turn_completed";
+			if (completed && !msg.params?._meta?.isReplay && !update._meta?.isReplay) { this.finishFallback(proc, sessionId, update, String(msg.params?._meta?.promptId || update.prompt_id || "")); }
+			const live = turn && !turn.finished && turn.promptId != null ? turn : null;
 			const note = commandNote(update);
 			if (live && note && live.slash) {
 				live.said = true;
@@ -1635,12 +2055,25 @@ class AgentHost {
 		if (msg.id != null && proc.pending.has(msg.id)) {
 			const waiter = proc.pending.get(msg.id);
 			proc.pending.delete(msg.id);
-			if (msg.error) { waiter.reject(Object.assign(new Error(this.clip(msg.error.message)), { fromGrok: true })); } else { waiter.resolve(msg.result); }
+			const error = msg.error ? this.clip(msg.error.message) || "Grok rejected the request." : "";
+			// The fallback start can arrive on the next line of this same stdout chunk.
+			if (waiter.promptTurn) {
+				const promptId = msg.result?._meta?.promptId;
+				if (promptId) {
+					waiter.promptTurn.providerPromptId = String(promptId);
+					proc.promptTurns.set(String(promptId), waiter.promptTurn);
+				}
+				this.finishPrompt(waiter.promptTurn, msg.id, msg.result, error);
+			}
+			if (error) { waiter.reject(Object.assign(new Error(error), { fromGrok: true })); } else { waiter.resolve(msg.result); }
     }
   }
 
 	onUpdate(proc, params) {
 		const update = params.update || {};
+		const promptId = String(params._meta?.promptId || update.prompt_id || "");
+		if (promptId.startsWith("task-completed-") && (params._meta?.isReplay || update._meta?.isReplay)) { return; }
+		const turn = this.streamTurn(proc, params, update);
 		if (update.sessionUpdate === "available_commands_update") {
 			const list = Array.isArray(update.availableCommands) ? update.availableCommands : [];
 			this.commands = list.slice(0, 200).map((item) => ({
@@ -1652,7 +2085,7 @@ class AgentHost {
 			return;
 		}
 		if (update.sessionUpdate === "current_mode_update") {
-			this.onModeUpdate(proc, String(params.sessionId || ""), String(update.currentModeId || ""));
+			this.onModeUpdate(proc, String(params.sessionId || ""), String(update.currentModeId || ""), turn);
 			return;
 		}
 		if (update.sessionUpdate === "session_info_update" && typeof update.title === "string") {
@@ -1665,23 +2098,44 @@ class AgentHost {
 			return;
 		}
 		if (update.sessionUpdate === "turn_completed") {
-			this.finishFallback(proc, String(params.sessionId || ""), update);
+			this.finishFallback(proc, String(params.sessionId || ""), update, String(params._meta?.promptId || update.prompt_id || ""));
 			return;
 		}
-		this.adoptFallback(proc, params, update);
-		const turn = this.turnFor(proc, params.sessionId);
 		if (!turn || turn.promptId == null) { return; }
+		if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+			const tool = this.toolCard(update, proc);
+			if (tool) {
+				const sessionId = String(params.sessionId || turn.agentSessionId);
+				const owner = proc.toolTurns.get(tool.id) || { turn, toolId: tool.id, sessionId };
+				if (owner.sessionId !== sessionId) { return; }
+				proc.toolTurns.set(tool.id, owner);
+				if (update.rawOutput?.type === "BackgroundTaskStarted" && update.rawOutput.task_id) {
+					if (!owner.detail) { owner.detail = "Running"; }
+					proc.taskTools.set(String(update.rawOutput.task_id), owner);
+				}
+				if (owner.detail) {
+					tool.detail = owner.detail;
+					tool.backgroundTask = true;
+				}
+				if (owner.turn.background) { owner.turn.hasReportTool = true; }
+				this.emitTurn(owner.turn, { type: "tool", tool });
+			}
+			return;
+		}
+		if (turn.finished) { return; }
 		if (update.sessionUpdate === "agent_message_chunk" || update.sessionUpdate === "agent_thought_chunk") {
 			const text = chunkText(update);
 			if (text && !proc.parents.has(String(params.sessionId || ""))) {
+				if (turn.background && !turn.said && !turn.hasReportTool && update.sessionUpdate === "agent_thought_chunk") { return; }
+				if (turn.background && params._meta?.eventId) {
+					const eventId = String(params._meta.eventId);
+					if (turn.reportEvents.has(eventId)) { return; }
+					turn.reportEvents.add(eventId);
+				}
 				if (update.sessionUpdate === "agent_message_chunk") { turn.said = true; }
 				this.emitTurn(turn, { type: update.sessionUpdate === "agent_message_chunk" ? "chunk" : "thought", text });
 			}
 			return;
-		}
-		if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
-			const tool = this.toolCard(update);
-			if (tool) { this.emitTurn(turn, { type: "tool", tool }); }
 		}
 	}
 
@@ -1690,8 +2144,11 @@ class AgentHost {
 		const toolId = String(params.toolUseId || params.hookCallbackId || "tool");
 		const toolName = String(params.toolName || "tool");
 		const kind = classify(toolName);
-		const found = this.turnFor(proc, params.sessionId);
-		const turn = found && !found.cancelled ? found : null;
+		const found = this.streamTurn(proc, params, {});
+		const report = found?.background ? found : null;
+		const source = report ? report.sourceTurn : found;
+		const turn = source && !source.cancelled && !report?.finished ? source : null;
+		const row = report && !report.finished ? report : turn;
 		const mode = turn ? turn.mode : "Normal";
 		const browserName = toolName.startsWith("browser_pane__") ? toolName : toolName === "use_tool" && params.toolInput && typeof params.toolInput.tool_name === "string" ? params.toolInput.tool_name : "";
 		if (turn && proc.browser && proc.browserReady && browserName.startsWith("browser_pane__") && !(params.toolInput && Object.prototype.hasOwnProperty.call(params.toolInput, "file"))) {
@@ -1703,19 +2160,24 @@ class AgentHost {
 		let action = "deny";
 		if (turn) {
 			action = actionFor(mode, kind);
+			const readTool = toolName.toLowerCase();
+			if ((mode === "Normal" || mode === "Plan") && FILE_READ_TOOLS.has(readTool)) {
+				const input = params.toolInput;
+				const usesWorkspace = readTool === "grep" && input && typeof input === "object" && !Array.isArray(input) &&
+					(input.path === undefined || input.path === "");
+				if (!readIsAllowed(turn, usesWorkspace ? { ...input, path: "." } : input)) { action = "ask"; }
+			}
 			// Auto-review leaves the call to Grok's own review only when Grok says that review is on; otherwise the card asks.
 			if (action === "allow" && mode === "Auto-review" && kind !== "read" && kind !== "internal" && params.permissionMode !== "auto") { action = "ask"; }
 			if (kind === "edit" && isPlanFile(turn, params.toolInput)) { action = "allow"; }
 			if (mode === "Plan" && toolName === "enter_plan_mode") { action = "allow"; }
 		}
 		if (action !== "ask") {
-			const reason = action === "deny" && mode === "Plan" ? "Plan mode only edits its plan file." : "";
-			this.reply(proc, msg.id, { decision: action, reason });
+			const planDeny = action === "deny" && mode === "Plan";
+			this.reply(proc, msg.id, { decision: action, reason: planDeny ? "Plan mode only edits its plan file." : "" });
 			this.outcomes.set(toolId, action);
-			if (action === "deny" && turn) {
-				this.outcomes.set(`${toolId}:detail`, "Not run · plan mode");
-				this.emitTurn(turn, { type: "tool", tool: { id: toolId, kind, title: toolName, detail: "Not run · plan mode", summary: summaryOf(toolName, params.toolInput), waiting: false } });
-			}
+			if (planDeny && row) { this.showDecision(row, toolId, kind, toolName, params.toolInput, "Not run · plan mode"); }
+			else if (row && (report || turn.finished)) { this.showDecision(row, toolId, kind, toolName, params.toolInput, action === "allow" ? "Allowed" : "Not run"); }
 			return;
 		}
 		const command = params.toolInput && typeof params.toolInput.command === "string" ? params.toolInput.command : "";
@@ -1730,6 +2192,13 @@ class AgentHost {
 			this.reply(proc, msg.id, { decision: "allow", reason: "" });
 			this.outcomes.set(toolId, "allow");
 			this.outcomes.set(`${toolId}:detail`, "Allowed");
+			if (report || turn.finished) { this.showDecision(row, toolId, kind, toolName, params.toolInput, "Allowed"); }
+			return;
+		}
+		if (report || turn.finished) {
+			this.reply(proc, msg.id, { decision: "deny", reason: "The reply already finished, so this approval can no longer be shown." });
+			this.outcomes.set(toolId, "deny");
+			this.showDecision(row, toolId, kind, toolName, params.toolInput, "Not run · the reply already finished");
 			return;
 		}
 		const previous = this.gates.get(toolId);
@@ -1763,8 +2232,8 @@ class AgentHost {
 	onInteraction(proc, msg) {
 		const params = msg.params || {};
 		const question = msg.method === "_x.ai/ask_user_question";
-		const found = this.turnFor(proc, params.sessionId);
-		const turn = found && !found.cancelled ? found : null;
+		const found = this.streamTurn(proc, params, {});
+		const turn = found && !found.background && !found.cancelled && !found.finished ? found : null;
 		const questions = question && Array.isArray(params.questions) ? params.questions.filter((item) => item && typeof item.question === "string" && item.question.trim()).slice(0, 20).map((item) => ({
 			question: item.question,
 			options: (Array.isArray(item.options) ? item.options : []).slice(0, 20).map((option) => (typeof option === "string"
@@ -1781,7 +2250,7 @@ class AgentHost {
 		const toolId = typeof params.toolCallId === "string" && params.toolCallId ? params.toolCallId : `${question ? "question" : "plan"}:${turn.uiSessionId}:${msg.id}`;
 		const previous = this.gates.get(toolId);
 		if (previous) { this.answerGate(previous, "deny", "Replaced by a newer approval."); }
-		this.openGate({
+		const gate = {
 			type: question ? "question" : "plan",
 			proc,
 			rpcId: msg.id,
@@ -1793,7 +2262,15 @@ class AgentHost {
 			detail: question ? "Waiting for your answer" : "Waiting for your approval",
 			...(question ? { questions } : { plan: clipText(typeof params.planContent === "string" ? params.planContent : "", 60000) }),
 			timer: null,
-		});
+		};
+		if (turn.routine) {
+			gate.timer = setTimeout(() => {
+				if (this.gates.get(toolId) !== gate || this.turn(turn.uiSessionId, turn.turnId) !== turn || turn.finished) { return; }
+				this.settleGate(gate, { outcome: question ? "cancelled" : "abandoned" }, "Denied · timed out");
+				this.cancel(turn.uiSessionId);
+			}, AUTO_DENY_MS);
+		}
+		this.openGate(gate);
 	}
 
 	openGate(gate) {
@@ -1828,17 +2305,23 @@ class AgentHost {
 		const params = msg.params || {};
 		const tool = params.toolCall || {};
 		const toolName = String(tool.title || tool.kind || "tool");
-		const found = this.turnFor(proc, params.sessionId);
-		const turn = found && !found.cancelled ? found : null;
+		const found = this.streamTurn(proc, params, {});
+		const report = found?.background ? found : null;
+		const source = report ? report.sourceTurn : found;
+		const turn = source && !source.cancelled && !report?.finished ? source : null;
 		const mode = turn ? turn.mode : "Normal";
 		const kind = PERMISSION_KINDS.get(String(tool.kind || "")) || classify(toolName);
+		const fileRead = (mode === "Normal" || mode === "Plan") && kind === "read" &&
+			(FILE_READ_TOOLS.has(toolName.toLowerCase()) || classify(toolName) !== "read");
 		const userAllowed = tool.toolCallId != null && this.outcomes.get(`${tool.toolCallId}:detail`) === "Allowed";
 		let action = !turn ? "deny" : (userAllowed ? "allow" : (mode === "Auto-review" ? "ask" : actionFor(mode, kind)));
-		if (action !== "ask") {
-			this.reply(proc, msg.id, this.permissionResult(params, action));
+		if (turn && fileRead && !readIsAllowed(turn, tool.rawInput, tool.locations)) { action = "ask"; }
+		if (action !== "ask" || report || turn.finished) {
+			this.reply(proc, msg.id, this.permissionResult(params, action === "ask" ? "deny" : action));
 			return;
 		}
 		const command = tool.rawInput && typeof tool.rawInput.command === "string" ? tool.rawInput.command : "";
+		const locations = fileRead && Array.isArray(tool.locations) ? tool.locations.map((item) => item?.path).filter((file) => typeof file === "string") : [];
 		this.openGate({
 			proc,
 			rpcId: msg.id,
@@ -1847,10 +2330,10 @@ class AgentHost {
 			turnId: turn.turnId,
 			toolName: `Permission: ${toolName}`,
 			kind,
-			summary: summaryOf(toolName, tool.rawInput),
+			summary: locations.length ? clipText(locations.join(", "), 300) : summaryOf(toolName, tool.rawInput),
 			...(command ? { command } : {}),
 			...(kind === "command" ? { readsOnly: commandInfo(command).readsOnly } : {}),
-			...inputOf(tool.rawInput),
+			...inputOf(locations.length ? { ...tool.rawInput, locations } : tool.rawInput),
 			...editDiffOf(kind, tool.rawInput),
 			detail: "Waiting for you",
 			permission: params,
@@ -1908,11 +2391,11 @@ class AgentHost {
 		});
 	}
 
-  denyOpen(uiSessionId, reason) {
-    for (const gate of [...this.gates.values()]) {
-      if (!uiSessionId || gate.uiSessionId === uiSessionId) this.answerGate(gate, "deny", reason);
-    }
-  }
+	denyOpen(uiSessionId, reason, turnId) {
+		for (const gate of [...this.gates.values()]) {
+			if ((!uiSessionId || gate.uiSessionId === uiSessionId) && (!turnId || gate.turnId === turnId)) { this.answerGate(gate, "deny", reason); }
+		}
+	}
 
   permissionResult(params, decision) {
     const options = Array.isArray(params.options) ? params.options : [];
@@ -1931,27 +2414,63 @@ class AgentHost {
   }
 
 	finishPrompt(turn, id, result, error) {
-		if (this.turns.get(turn.uiSessionId) !== turn || turn.finished || turn.promptId !== id) { return; }
-		turn.finished = true;
-		this.turns.delete(turn.uiSessionId);
-		this.denyOpen(turn.uiSessionId, "The turn ended.");
+		if (turn.finished || String(turn.promptId) !== String(id) || (this.turns.get(turn.uiSessionId) !== turn && turn.proc?.promptTurns?.get(String(id)) !== turn)) { return; }
+		this.denyOpen(turn.uiSessionId, "The turn ended.", turn.turnId);
 		const usage = this.usageOf(result, turn);
 		if (usage) { this.emitTurn(turn, { type: "usage", usage }); }
-		if (turn.cancelled) {
-			this.emitTurn(turn, { type: "done", stopReason: "cancelled" });
-			return;
+		const stopReason = turn.cancelled ? "cancelled" : String(result?.stopReason || "end_turn");
+		const event = error && !turn.cancelled ? { type: "error", message: this.clip(error) } : { type: "done", stopReason };
+		if (stopReason === "cancelled") {
+			turn.cancelled = true;
+			if (!turn.background && (turn.pendingSteer || turn.proc?.steers?.length || [...(turn.proc?.promptTurns?.values() || [])].some((item) => item !== turn && !item.background && !item.finished))) {
+				if (turn.pendingSteer?.accepted) { this.showSteer(turn, turn.pendingSteer); }
+				this.stopProc(turn.proc, "Stopped.");
+				return;
+			}
 		}
-		if (error) {
-			this.emitTurn(turn, { type: "error", message: this.clip(error) });
-			return;
-		}
-		if (turn.slash && !turn.said) { this.emitTurn(turn, { type: "chunk", text: "Grok ran the command. It sent no output." }); }
-		const stopReason = result && result.stopReason ? String(result.stopReason) : "end_turn";
-		if (["max_tokens", "max_turn_requests"].includes(stopReason)) { this.emitTurn(turn, { type: "chunk", text: `\n\nGrok stopped early (${stopReason.replace(/_/g, " ")}).` }); }
-		this.emitTurn(turn, { type: "done", stopReason });
+		this.completePrompt(turn, event);
 	}
 
-	toolCard(update) {
+	completePrompt(turn, event) {
+		turn.finished = true;
+		if (turn.proc && !turn.background) { turn.proc.lastCompletedTurn = turn; }
+		let next;
+		if (this.turns.get(turn.uiSessionId) === turn) {
+			next = [...(turn.proc?.promptTurns?.values() || [])].find((item) => !item.background && !item.finished && !item.cancelled);
+			if (next) {
+				this.turns.set(turn.uiSessionId, next);
+				next.proc.lastTurn = next;
+			} else {
+				this.turns.delete(turn.uiSessionId);
+			}
+		}
+		if (event.type === "done" && event.stopReason !== "cancelled" && turn.slash && !turn.said) { this.emitTurn(turn, { type: "chunk", text: "Grok ran the command. It sent no output." }); }
+		if (["max_tokens", "max_turn_requests"].includes(event.stopReason)) { this.emitTurn(turn, { type: "chunk", text: `\n\nGrok stopped early (${event.stopReason.replace(/_/g, " ")}).` }); }
+		this.emitTurn(turn, event);
+		if (next) { this.emitTurn(next, { type: "turn-start", parallel: true, resume: true }); }
+	}
+
+	showDecision(turn, toolId, kind, toolName, input, detail) {
+		this.outcomes.set(`${toolId}:detail`, detail);
+		if (turn.background) { turn.hasReportTool = true; }
+		this.emitTurn(turn, { type: "tool", tool: { id: toolId, kind, title: toolName, detail, summary: summaryOf(toolName, input), waiting: false } });
+	}
+
+	emitTaskTool(owner, detail) {
+		owner.detail = detail;
+		this.emitTurn(owner.turn, { type: "tool", tool: { id: owner.toolId, detail, waiting: false, backgroundTask: true } });
+	}
+
+	updateTaskTool(proc, sessionId, task) {
+		const owner = proc.taskTools.get(String(task?.task_id || ""));
+		if (!owner || proc.lost || this.procs.get(proc.uiSessionId) !== proc || owner.sessionId !== sessionId) { return; }
+		const status = String(task.status || "");
+		if (!["running", "completed", "failed", "cancelled", "killed"].includes(status)) { return; }
+		const detail = status === "running" ? "Running" : (status === "cancelled" || status === "killed" ? "Stopped" : (status === "failed" || (typeof task.exit_code === "number" && task.exit_code !== 0) || task.signal ? "Failed" : "Ran"));
+		this.emitTaskTool(owner, detail);
+	}
+
+	toolCard(update, proc) {
 		const id = String(update.toolCallId || "");
 		if (!id) { return null; }
 		const gate = this.gates.get(id);
@@ -1974,7 +2493,7 @@ class AgentHost {
 		}
 		const location = Array.isArray(update.locations) && update.locations[0] && update.locations[0].path;
 		const target = location || (input && (input.file_path || input.target_file || input.target_directory || input.path));
-		if (typeof target === "string" && target.trim()) { card.path = clipText(target, 1000); }
+		if (typeof target === "string" && target.trim()) { card.path = clipText(hostPath(proc, target) || target, 1000); }
 		const parts = Array.isArray(update.content) ? update.content : [];
 		const diffs = parts.filter((part) => part && part.type === "diff");
 		if (diffs.length) {
@@ -1985,14 +2504,14 @@ class AgentHost {
 			card.diff = toolDiff(diffs[0].oldText, diffs[0].newText, meta.old_line ?? detail.old_line, meta.new_line ?? detail.new_line);
 		}
 		const kind = this.cardKinds.get(id) || "";
+		const text = parts.map((part) => (part && part.type === "content" && part.content && typeof part.content.text === "string" ? part.content.text : "")).filter(Boolean).join("\n");
 		if ((update.status === "completed" || update.status === "failed") && kind !== "read" && kind !== "edit") {
-			const text = parts.map((part) => (part && part.type === "content" && part.content && typeof part.content.text === "string" ? part.content.text : "")).filter(Boolean).join("\n");
 			if (text.trim()) { card.output = clipText(text, 1500); }
 		}
 		if (gate) { card.detail = gate.detail; }
 		else if (outcome === "deny" || outcome === "answered") { card.detail = this.outcomes.get(`${id}:detail`) || "Denied"; }
 		else if (update.status === "completed") { card.detail = "Ran"; }
-		else if (update.status === "failed") { card.detail = outcome === "allow" ? "Failed" : "Not run · failed"; }
+		else if (update.status === "failed") { card.detail = REFUSED_CALL.test(text) ? "Denied · not run" : outcome === "allow" ? "Failed" : "Not run · failed"; }
 		else { card.detail = "Running"; }
 		return card;
 	}

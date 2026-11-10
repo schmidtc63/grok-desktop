@@ -1,4 +1,4 @@
-import { lexer, type Token, type Tokens } from "marked";
+import { Lexer, Marked, Tokenizer, type Token } from "marked";
 import { renderToString } from "katex";
 import "katex/dist/katex.min.css";
 
@@ -8,6 +8,7 @@ export const MATH_MARK = "\uE000";
 export interface StashedMath {
 	display: boolean;
 	tex: string;
+	raw: string;
 }
 
 interface MathHit {
@@ -16,33 +17,52 @@ interface MathHit {
 	tex: string;
 }
 
+const MARKDOWN_OPTIONS = { gfm: true, breaks: true };
+
+const markdown = new Marked({
+	...MARKDOWN_OPTIONS,
+	extensions: [{
+		name: "displayMath",
+		level: "block",
+		tokenizer(source) {
+			const start = /^ {1,3}/.exec(source)?.[0].length ?? 0;
+			const found = readPair(source, start, "$$", "$$", true) ?? readPair(source, start, "\\[", "\\]", true);
+			if (!found || !/^[ \t]*(?:\n|$)/.test(source.slice(found.end))) { return; }
+			const text = source.slice(start, found.end);
+			const tokens = Lexer.lex(text, { ...MARKDOWN_OPTIONS });
+			if (tokens.length === 1) { return; }
+			let hasCode = false;
+			markdown.walkTokens(tokens, (token) => {
+				if (token.type === "code" || token.type === "codespan") { hasCode = true; }
+			});
+			if (hasCode) { return; }
+			return { type: "paragraph", raw: source.slice(0, found.end), text, tokens: this.lexer.inline(text) };
+		},
+	}],
+});
+
 function codeRanges(source: string): Array<[number, number]> {
 	const ranges: Array<[number, number]> = [];
-	const cursor = { at: 0 };
-	const visit = (token: Token) => {
-		if (token.type === "code" || token.type === "codespan") {
-			const raw = token.raw;
-			const at = source.indexOf(raw, cursor.at);
-			if (at !== -1) {
-				ranges.push([at, at + raw.length]);
-				cursor.at = at + raw.length;
+	const visit = (tokens: Token[], from: number, to: number) => {
+		let cursor = from;
+		for (const token of tokens) {
+			const start = source.indexOf(token.raw, cursor);
+			const end = start + token.raw.length;
+			if (start === -1 || end > to) {
+				ranges.push([from, to]);
+				return;
 			}
-			return;
-		}
-		if (token.type === "table") {
-			const table = token as Tokens.Table;
-			for (const cell of [...table.header, ...table.rows.flat()]) {
-				for (const child of cell.tokens ?? []) { visit(child); }
+			if (token.type === "codespan") {
+				ranges.push([start, end]);
+			} else if ("tokens" in token && token.tokens) {
+				visit(token.tokens, start, end);
 			}
-			return;
-		}
-		const nested = token as Token & { tokens?: Token[]; items?: Array<{ tokens?: Token[] }> };
-		for (const child of nested.tokens ?? []) { visit(child); }
-		for (const item of nested.items ?? []) {
-			for (const child of item.tokens ?? []) { visit(child); }
+			cursor = end;
 		}
 	};
-	for (const token of lexer(source, { gfm: true, breaks: true })) { visit(token); }
+	if (source.includes("`")) {
+		visit(Lexer.lexInline(source, { ...MARKDOWN_OPTIONS }), 0, source.length);
+	}
 	return ranges;
 }
 
@@ -99,15 +119,9 @@ function readMath(source: string, index: number): MathHit | null {
 		?? readDollar(source, index);
 }
 
-// Pull closed math out before Marked runs, so line breaks cannot split $$ and code stays code.
-export function stashMath(source: string): { text: string; math: StashedMath[] } {
-	let ranges: Array<[number, number]> = [];
-	try {
-		ranges = codeRanges(source);
-	} catch {
-		return { text: source, math: [] };
-	}
-	const math: StashedMath[] = [];
+function stashMath(source: string, math: StashedMath[]): string {
+	if (!/[$\\]/.test(source)) { return source; }
+	const ranges = codeRanges(source);
 	let text = "";
 	let index = 0;
 	while (index < source.length) {
@@ -120,16 +134,51 @@ export function stashMath(source: string): { text: string; math: StashedMath[] }
 		const found = readMath(source, index);
 		if (found && !overlaps(ranges, index, found.end)) {
 			text += `${MATH_MARK}${math.length}${MATH_MARK}`;
-			math.push({ display: found.display, tex: found.tex });
+			math.push({ display: found.display, tex: found.tex, raw: source.slice(index, found.end) });
 			index = found.end;
 			continue;
 		}
 		text += source[index];
 		index += 1;
 	}
-	return { text, math };
+	return text;
 }
 
-export function mathHtml(tex: string, display: boolean): string {
-	return renderToString(tex, { throwOnError: false, trust: false, displayMode: display });
+class MathTokenizer extends Tokenizer {
+	override table(source: string) {
+		const raw = this.rules.block.table.exec(source)?.[0];
+		if (raw === undefined) { return; }
+		const math = (this.lexer as MathLexer).math;
+		const count = math.length;
+		const text = raw.split("\n").map((line) => stashMath(line, math)).join("\n");
+		const table = super.table(text);
+		if (table) {
+			table.raw = raw;
+		} else {
+			math.length = count;
+		}
+		return table;
+	}
+}
+
+class MathLexer extends Lexer {
+	readonly math: StashedMath[] = [];
+
+	// Marked resolves fences and container prefixes before it lexes inline text.
+	override inlineTokens(source: string, tokens?: Token[]): Token[] {
+		return super.inlineTokens(stashMath(source, this.math), tokens);
+	}
+}
+
+export function lexMarkdown(source: string): { tokens: Token[]; math: StashedMath[] } {
+	const lexer = new MathLexer({ ...markdown.defaults, tokenizer: new MathTokenizer() });
+	return { tokens: lexer.lex(source), math: lexer.math };
+}
+
+export function mathHtml(tex: string, display: boolean): string | null {
+	try {
+		return renderToString(tex, { throwOnError: false, trust: false, displayMode: display });
+	} catch {
+		return null;
+	}
 }

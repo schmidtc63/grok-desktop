@@ -48,9 +48,9 @@ const setup = [
 ];
 
 const theme = EditorView.theme({
-	"&": { backgroundColor: "var(--input)", color: "var(--text)", fontSize: "13px" },
+	"&": { backgroundColor: "var(--input)", color: "var(--text)", fontSize: "var(--editor-font-size, calc(13px * var(--mono-scale)))" },
 	"&.cm-focused": { outline: "none" },
-	".cm-scroller": { fontFamily: "Consolas, \"Cascadia Mono\", ui-monospace, Menlo, monospace", lineHeight: "20px", overflow: "auto" },
+	".cm-scroller": { fontFamily: "var(--editor-font, var(--mono-font))", lineHeight: "var(--editor-line-height, calc(20px * var(--mono-scale)))", overflow: "auto" },
 	".cm-content": { padding: "10px 0", caretColor: "var(--accent)" },
 	".cm-line": { padding: "0 10px" },
 	".cm-gutters": { backgroundColor: "var(--code)", color: "var(--muted)", borderRight: "1px solid var(--line)" },
@@ -112,9 +112,15 @@ export function CodeEditor(props: CodeEditorProps) {
 		if (!parent.current) { return; }
 		const editor = new EditorView({ state: build(latest.current.props.value, 0), parent: parent.current });
 		view.current = editor;
+		let observer: MutationObserver | undefined;
+		if (typeof MutationObserver === "function" && document.documentElement) {
+			observer = new MutationObserver(() => editor.requestMeasure());
+			observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-ui-config"] });
+		}
 		return () => {
 			loadTick.current++;
 			view.current = null;
+			observer?.disconnect();
 			editor.destroy();
 		};
 	}, []);

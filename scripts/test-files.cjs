@@ -5,7 +5,7 @@ const path = require("path");
 const childProcess = require("child_process");
 const { execFileSync } = childProcess;
 const { createHash } = require("crypto");
-const { listFiles, readText, readImage, writeText, runCommand } = require("../electron/files.cjs");
+const { listFiles, readText, readImage, writeText } = require("../electron/files.cjs");
 const { readDiff, parseUnified, revertFile } = require("../electron/diff.cjs");
 
 // macOS puts the temp folder behind the /var symlink and the GitHub Windows runner names it with a short 8.3 name (RUNNER~1),
@@ -112,6 +112,102 @@ async function checkRepoFiles() {
 	console.log("PASS repository and plain-folder files: ignores, binary extensions, SVG, containment, budgets and 5000-file caps");
 }
 
+async function checkWslSave() {
+	const file = "wsl-save.txt";
+	const originals = Object.fromEntries(["realpathSync", "statSync", "existsSync", "readFileSync", "openSync", "closeSync", "writeSync", "renameSync", "chmodSync", "unlinkSync"].map((name) => [name, fs[name]]));
+	const tmpdir = os.tmpdir;
+	const exec = childProcess.execFile;
+	for (const host of ["wsl.localhost", "wsl$"]) {
+		const share = `\\\\${host}\\Ubuntu\\project`;
+		const localPath = (value) => value === share ? root : typeof value === "string" && value.startsWith(`${share}\\`) ? path.join(root, value.slice(share.length + 1)) : value;
+		const target = `${share}\\${file}`;
+		write(file, "original");
+		const before = fs.statSync(path.join(root, file));
+		let stale = false;
+		let fault = "";
+		let destination;
+		try {
+			os.tmpdir = () => root;
+			for (const [name, call] of Object.entries(originals)) {
+				fs[name] = (...args) => call(...args.map(localPath));
+			}
+			fs.realpathSync = (value) => localPath(value) === value ? originals.realpathSync(value) : value;
+			fs.openSync = (value, ...args) => {
+				const handle = originals.openSync(localPath(value), ...args);
+				if (value === target && args[0] === "r+") { destination = handle; }
+				if (stale && path.basename(value).startsWith(".grok-save-")) { nativeWrite(path.join(root, file), "concurrent edit"); }
+				return handle;
+			};
+			fs.renameSync = () => { throw new Error("WSL must preserve the destination inode"); };
+			fs.closeSync = (descriptor) => {
+				if (descriptor === destination) { destination = undefined; }
+				return originals.closeSync(descriptor);
+			};
+			fs.writeSync = (descriptor, ...args) => {
+				if (descriptor !== destination || !fault) { return originals.writeSync(descriptor, ...args); }
+				if (fault === "primary" || fault === "both") {
+					originals.writeSync(descriptor, args[0], args[1], 1, args[3]);
+					fault = fault === "both" ? "rollback" : "";
+				} else if (fault === "outside") {
+					nativeWrite(path.join(root, file), "outside edit");
+					fault = "";
+				}
+				throw new Error("Injected WSL destination failure");
+			};
+			childProcess.execFile = (...args) => {
+				assert.ok(!args[2]?.env?.GROK_SAVE_TEMP, "WSL does not use the Windows ACL route");
+				return exec(...args);
+			};
+			const saved = await writeText(share, file, "new", readText(share, file).version);
+			assert.equal(saved.ok, true);
+			assert.equal(read(file), "new");
+			const after = fs.statSync(path.join(root, file));
+			assert.deepEqual([after.ino, after.uid, after.mode], [before.ino, before.uid, before.mode]);
+			const [first, second] = await Promise.all([
+				writeText(share, file, "first", saved.version),
+				writeText(share, file, "second", saved.version),
+			]);
+			assert.equal(first.ok, true);
+			assert.match(second.error, /changed on disk/);
+			assert.equal(read(file), "first");
+			stale = true;
+			assert.match((await writeText(share, file, "stale", first.version)).error, /changed on disk/);
+			assert.equal(read(file), "concurrent edit");
+			stale = false;
+			fault = "untouched";
+			const version = readText(share, file).version;
+			assert.match((await writeText(share, file, "draft", version)).error, /original file was not replaced/);
+			assert.equal(read(file), "concurrent edit");
+			assert.equal(fs.readdirSync(root).some((name) => name.startsWith(".grok-save-")), false);
+			fault = "primary";
+			assert.match((await writeText(share, file, "draft", version)).error, /original file was not replaced/);
+			assert.equal(read(file), "concurrent edit");
+			assert.equal(fs.readdirSync(root).some((name) => name.startsWith(".grok-save-")), false);
+			for (const [failure, expected] of [["both", "doncurrent edit"], ["outside", "outside edit"]]) {
+				write(file, "concurrent edit");
+				fault = failure;
+				const failed = await writeText(share, file, "draft", version);
+				assert.equal(failed.ok, false);
+				assert.equal(read(file), expected);
+				const recovery = fs.readdirSync(root).find((name) => name.startsWith(".grok-save-") && name.endsWith(".tmp"));
+				const recoveryPath = path.join(root, recovery);
+				assert.ok(failed.error.includes(`"${recoveryPath}"`) && failed.error.includes(`"${recoveryPath}.original"`));
+				assert.equal(fs.readFileSync(recoveryPath, "utf8"), "draft");
+				assert.equal(fs.readFileSync(`${recoveryPath}.original`, "utf8"), "concurrent edit");
+				fs.unlinkSync(recoveryPath);
+				fs.unlinkSync(`${recoveryPath}.original`);
+			}
+			const final = fs.statSync(path.join(root, file));
+			assert.deepEqual([final.ino, final.uid, final.mode], [before.ino, before.uid, before.mode]);
+		} finally {
+			Object.assign(fs, originals);
+			os.tmpdir = tmpdir;
+			childProcess.execFile = exec;
+		}
+	}
+	console.log("PASS WSL saves preserve file identity, reject stale edits, roll back failures and keep both copies when rollback is unsafe");
+}
+
 async function main() {
 	const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1ZkAAAAASUVORK5CYII=", "base64");
 	write("preview.PNG", png);
@@ -169,6 +265,92 @@ async function main() {
 	assert.equal(git(["ls-files", "--", "new.txt"]).trim(), "new.txt");
 	console.log("PASS CR01/CR15: literal revert preserves neighboring work and staged additions");
 
+	const filterRepo = path.join(root, "codex-revert-filter");
+	fs.mkdirSync(filterRepo);
+	const filterGit = (args) => git(args, filterRepo);
+	const filterWrite = (file, contents) => fs.writeFileSync(path.join(filterRepo, file), contents);
+	const filterRead = (file) => fs.readFileSync(path.join(filterRepo, file), "utf8");
+	const filterMarker = path.join(filterRepo, "filter-ran");
+	filterGit(["init", "--quiet"]);
+	filterGit(["config", "core.autocrlf", "false"]);
+	filterWrite("sample.txt", "original\n");
+	filterWrite("plain.txt", "original\n");
+	filterWrite(".gitattributes", "sample.txt filter=unspecified\n.gitattributes filter=unspecified\nplain.txt -filter\n");
+	filterGit(["add", "--all"]);
+	filterGit(["-c", "user.name=GrokCode test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "--no-gpg-sign", "-m", "Filters"]);
+	filterGit(["config", "filter.unspecified.smudge", "echo ran >> filter-ran; cat"]);
+	filterWrite("sample.txt", "staged edit\n");
+	filterGit(["add", "--", "sample.txt"]);
+	filterWrite("sample.txt", "working edit\n");
+	let filterPrompts = 0;
+	const denyFilter = async () => {
+		filterPrompts++;
+		assert.equal(fs.existsSync(filterMarker), false, "the filter has not run when the prompt opens");
+		return false;
+	};
+	assert.equal((await revertFile(filterRepo, "sample.txt", denyFilter)).ok, false);
+	assert.equal(filterPrompts, 1);
+	assert.equal(filterRead("sample.txt"), "working edit\n");
+	assert.equal(filterGit(["show", ":sample.txt"]), "staged edit\n");
+	assert.equal(fs.existsSync(filterMarker), false);
+	filterWrite("plain.txt", "unfiltered edit\n");
+	assert.equal((await revertFile(filterRepo, "plain.txt", denyFilter)).ok, true);
+	assert.equal(filterPrompts, 1, "the unfiltered file restores without a filter prompt");
+	assert.equal(filterRead("plain.txt"), "original\n");
+	const replaced = await revertFile(filterRepo, "sample.txt", async () => {
+		filterGit(["config", "filter.unspecified.smudge", "echo replaced >> filter-ran; cat"]);
+		return true;
+	});
+	assert.equal(replaced.ok, false, "approval does not cover a filter command replaced while the prompt was open");
+	assert.equal(fs.existsSync(filterMarker), false);
+	assert.equal((await revertFile(filterRepo, "sample.txt", async () => true)).ok, true);
+	assert.equal(filterRead("sample.txt"), "original\n");
+	assert.match(filterRead("filter-ran"), /replaced/);
+	fs.unlinkSync(filterMarker);
+	filterWrite(".gitattributes", "# staged without filter\n");
+	filterGit(["add", "--", ".gitattributes"]);
+	filterWrite(".gitattributes", "# working without filter\n");
+	const sourceAttributes = childProcess.spawnSync("git", ["check-attr", "--source=HEAD", "filter", "--", ".gitattributes"], { cwd: filterRepo, windowsHide: true }).status === 0;
+	assert.equal((await revertFile(filterRepo, ".gitattributes", denyFilter)).ok, false);
+	assert.equal(filterPrompts, sourceAttributes ? 2 : 1, "restored attributes require approval when their filter can be identified");
+	assert.equal(filterRead(".gitattributes"), "# working without filter\n");
+	assert.equal(fs.existsSync(filterMarker), false);
+	console.log("PASS sandbox file revert: unfiltered path, cancel and allow before a smudge, and changed configuration and restored attributes");
+
+	const indexFilterRepo = path.join(root, "codex-revert-index-filters");
+	fs.mkdirSync(indexFilterRepo);
+	const indexGit = (args) => git(args, indexFilterRepo);
+	const indexWrite = (file, contents) => fs.writeFileSync(path.join(indexFilterRepo, file), contents);
+	indexGit(["init", "--quiet"]);
+	indexGit(["config", "core.autocrlf", "false"]);
+	indexWrite(".gitattributes", "approved.txt filter=approved\nother-local.txt filter=other\nother-global.txt filter=global-other\n");
+	for (const file of ["approved.txt", "plain.txt", "other-local.txt", "other-global.txt"]) { indexWrite(file, "original\n"); }
+	indexGit(["add", "--all"]);
+	indexGit(["-c", "user.name=GrokCode test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "--no-gpg-sign", "-m", "Index filters"]);
+	indexGit(["config", "filter.approved.smudge", "echo approved >> approved-ran; cat"]);
+	indexGit(["config", "filter.other.clean", "echo local >> other-ran; cat"]);
+	const globalFilterConfig = path.join(indexFilterRepo, "codex-global-config");
+	indexGit(["config", "--file", globalFilterConfig, "filter.global-other.clean", "echo global >> other-ran; cat"]);
+	const savedGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+	process.env.GIT_CONFIG_GLOBAL = globalFilterConfig;
+	try {
+		for (const file of ["approved.txt", "plain.txt"]) {
+			indexWrite(file, "working edit\n");
+			indexGit(["-c", "filter.other.clean=", "-c", "filter.global-other.clean=", "add", "--", "other-local.txt", "other-global.txt"]);
+			// A racy index causes Git to rehash other entries while it writes the restored file's index.
+			fs.utimesSync(path.join(indexFilterRepo, ".git", "index"), 1, 1);
+			let prompts = 0;
+			assert.equal((await revertFile(indexFilterRepo, file, async () => { prompts++; return true; })).ok, true);
+			assert.equal(prompts, file === "approved.txt" ? 1 : 0);
+			assert.equal(fs.readFileSync(path.join(indexFilterRepo, file), "utf8"), "original\n");
+			assert.equal(fs.existsSync(path.join(indexFilterRepo, "other-ran")), false, "an index rewrite cannot run unrelated local or global filter drivers");
+		}
+		assert.match(fs.readFileSync(path.join(indexFilterRepo, "approved-ran"), "utf8"), /approved/, "the approved target filter still runs");
+	} finally {
+		if (savedGlobalConfig === undefined) { delete process.env.GIT_CONFIG_GLOBAL; } else { process.env.GIT_CONFIG_GLOBAL = savedGlobalConfig; }
+	}
+	console.log("PASS sandbox file revert: index rewrites run only the approved target filter, including with unrelated global drivers");
+
 	const legacy = Buffer.from([0x63, 0x61, 0x66, 0xe9]);
 	write("legacy.txt", legacy);
 	assert.equal(readText(root, "legacy.txt").ok, false);
@@ -189,6 +371,16 @@ async function main() {
 	const saved = await pendingSave;
 	assert.equal(saved.ok, true);
 	assert.equal(readText(root, "editor.txt").version, saved.version);
+	if (process.platform !== "win32") {
+		const target = path.join(root, "editor.txt");
+		fs.chmodSync(target, 0o444);
+		try {
+			assert.deepEqual(await writeText(root, "editor.txt", "replacement", saved.version), { ok: false, error: "This file is read-only. Your draft was not saved." });
+			assert.equal(read("editor.txt"), "fresh save\n");
+		} finally {
+			fs.chmodSync(target, 0o644);
+		}
+	}
 	const originalWrite = fs.writeFileSync;
 	const originalRename = fs.renameSync;
 	const prior = read("editor.txt");
@@ -399,6 +591,7 @@ async function main() {
 		assert.equal(fs.existsSync(path.join(outsideRoot, "a.txt")), false, "Revert must not write through a junction");
 		console.log("PASS 6.1 Windows: Revert refuses a deleted file behind a junction that leaves the folder");
 	}
+	if (process.platform === "win32") { await checkWslSave(); }
 	if (process.platform === "win32" && process.argv.includes("--acl")) {
 		const aclFile = path.join(root, "acl-target.txt");
 		write("acl-target.txt", "private original");
@@ -453,31 +646,6 @@ async function main() {
 	}
 
 	await checkRepoFiles();
-
-	// `echo` is Write-Output in PowerShell and a builtin in bash, so one command checks the shell of each platform.
-	const echoed = await runCommand(root, "echo run-box-ok");
-	assert.equal(echoed.ok, true, JSON.stringify(echoed));
-	assert.equal(echoed.code, 0);
-	assert.equal(echoed.output.trim(), "run-box-ok");
-	console.log(`PASS the Run box runs a command in ${process.platform === "win32" ? "PowerShell" : "bash"}`);
-
-	if (process.argv.includes("--terminal")) {
-		const childFile = path.join(root, "codex-timeout-child.cjs");
-		const marker = path.join(root, "codex-survived.txt");
-		fs.writeFileSync(childFile, `setTimeout(() => require("fs").writeFileSync(${JSON.stringify(marker)}, "survived"), 23000);`);
-		const escapePs = (text) => `'${text.replace(/'/g, "''")}'`;
-		const escapeSh = (text) => `'${text.replace(/'/g, "'\\''")}'`;
-		const started = Date.now();
-		const result = await runCommand(root, process.platform === "win32" ? `& ${escapePs(process.execPath)} ${escapePs(childFile)}` : `${escapeSh(process.execPath)} ${escapeSh(childFile)}`);
-		assert.equal(result.ok, true, JSON.stringify(result));
-		assert.equal(result.code, -1);
-		assert.equal(result.timedOut, true);
-		assert.match(result.output, /20-second limit/);
-		assert.ok(Date.now() - started < 23000, "Timeout must settle before the child marker deadline");
-		await new Promise((resolve) => setTimeout(resolve, Math.max(0, 24500 - (Date.now() - started))));
-		assert.equal(fs.existsSync(marker), false, "Descendant must be stopped before it writes its marker");
-		console.log("PASS CR10: real shell/Node descendant stopped at timeout without writing its delayed marker");
-	}
 }
 
 main().catch((error) => {

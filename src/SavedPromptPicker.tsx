@@ -23,6 +23,7 @@ export function SavedPromptPicker({ prompts, draft, mode, onSave, onInsert, onCl
 	return (
 		<div className="overlay" onClick={onClose}>
 			<div ref={dialog} className="sheet saved-prompt-dialog" data-saved-prompts-dialog role="dialog" aria-modal="true" aria-label={mode === "save" ? "Save prompt" : "Saved prompts"} onClick={(event) => event.stopPropagation()} onKeyDown={(event) => {
+				if (event.nativeEvent?.isComposing) { return; }
 				if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); onClose(); }
 				if (event.key === "Tab") {
 					const controls = Array.from(dialog.current?.querySelectorAll<HTMLElement>("input, button:not(:disabled)") ?? []);
@@ -48,6 +49,7 @@ export function SavedPromptPicker({ prompts, draft, mode, onSave, onInsert, onCl
 				) : (
 					<>
 						<input className="saved-prompt-search" aria-label="Search saved prompts" role="combobox" aria-expanded="true" aria-controls="saved-prompt-results" aria-activedescendant={matches.length ? `saved-prompt-option-${selected}` : undefined} autoFocus value={query} placeholder="Search names and text" onChange={(event) => { setQuery(event.target.value); setIndex(0); }} onKeyDown={(event) => {
+							if (event.nativeEvent?.isComposing) { return; }
 							if (event.key === "ArrowDown" || event.key === "ArrowUp") {
 								event.preventDefault();
 								const next = matches.length ? (selected + (event.key === "ArrowDown" ? 1 : matches.length - 1)) % matches.length : 0;

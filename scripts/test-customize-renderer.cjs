@@ -19,6 +19,7 @@ module.exports = async function checkCustomizeRenderer({ harness, button, textOf
 			{ name: "docs", command: "/docs", description: "Personal documentation helper.", source: "Personal", path: "C:/home/.grok/skills/docs/SKILL.md", disabled: false },
 			{ name: "review", command: "/user:review", description: "Review changed code.", source: "Personal · Claude Code", path: "C:/home/.claude/skills/review/SKILL.md", disabled: false },
 			{ name: "ship", command: "/ship", description: "Plugin release helper.", source: "Plugin · tools", path: "C:/plugins/tools/skills/ship/SKILL.md", disabled: true },
+			{ name: "pathless", command: "/pathless", source: "Personal", path: "", disabled: false },
 		],
 		servers: [
 			{ name: "github", source: "Personal", detail: "https://api.githubcopilot.com/mcp/", target: "https://api.githubcopilot.com/mcp/", transport: "http", enabled: true, removable: true, env: [{ name: "PRIVATE_KEY", value: "Hidden" }], headers: [{ name: "Authorization", value: "Bearer ${GITHUB_TOKEN}" }] },
@@ -61,14 +62,16 @@ module.exports = async function checkCustomizeRenderer({ harness, button, textOf
 		const props = { view, folder: "C:/project", live: [{ name: "github", source: "Personal", status: "connected" }], onRun: (text) => runs.push(text) };
 		props.onViewChange = (next) => { props.view = next; app.customizeView(props); };
 		app.customizeView(props);
-		if (view === "skills") { assert.equal(textOf(labelled(app, "Skills")), "Skills (…)"); }
+		for (const label of ["Skills", "Connectors", "Plugins", ...(view === "plugins" ? ["Installed", "Discover"] : [])]) {
+			assert.equal(textOf(labelled(app, label)), `${label} (…)`);
+		}
 		await app.settle();
 		return { app, props, changes, excerpts, opened, runs };
 	}
 
 	const skill = await open("skills");
 	const skillApp = skill.app;
-	assert.match(textOf(labelled(skillApp, "Skills")), /\(4\)/);
+	assert.match(textOf(labelled(skillApp, "Skills")), /\(5\)/);
 	assert.match(textOf(labelled(skillApp, "Connectors")), /\(2\)/);
 	assert.match(textOf(labelled(skillApp, "Plugins")), /\(\d+\)/);
 	for (const group of ["This project", "Personal", "Claude Code", "Plugin · tools"]) {
@@ -95,6 +98,11 @@ module.exports = async function checkCustomizeRenderer({ harness, button, textOf
 	click(skillApp, "Open folder");
 	await skillApp.settle();
 	same(skill.opened.at(-1), { target: "explorer", cwd: "C:/project/.grok/skills/release" });
+	click(skillApp, "Details for pathless");
+	await skillApp.settle();
+	assert.match(textOf(labelled(skillApp, "Skill details")), /Not reported by Grok/);
+	assert.doesNotMatch(textOf(labelled(skillApp, "Skill details")), /Reading the skill|First excerpt line/);
+	assert.equal(skill.excerpts.length, 1, "a skill without a path does not request a file");
 	assert.equal(skillApp.customizeModule().pluginSubtitle("ponytail", "ponytail"), "", "a plugin does not repeat its own name as its marketplace subtitle");
 	click(skillApp, "New skill");
 	await skillApp.settle();

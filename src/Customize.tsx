@@ -10,7 +10,7 @@ type Connector = NonNullable<GrokInventory["servers"]>[number] & {
 	transport?: string; target?: string; command?: string; args?: string[];
 	env?: { name: string; value: string }[]; headers?: { name: string; value: string }[];
 };
-type Item = { id: string; name: string; description: string; source: string; enabled: boolean; skill?: Skill; connector?: Connector; plugin?: Plugin; other?: boolean };
+type Item = { id: string; name: string; description: string; source: string; enabled?: boolean; skill?: Skill; connector?: Connector; plugin?: Plugin; other?: boolean };
 type Sheet = "connector" | "plugin" | "marketplaces" | "skill" | "";
 
 export function sourceGroup(source: string): string {
@@ -124,7 +124,7 @@ export function Customize({ view, folder, live, onRun, onViewChange }: {
 		: view === "connectors"
 			? connectors.map((connector) => ({ id: `connector:${connector.name}`, name: connector.name, description: connector.enabled ? statusOf(connector.name) : "Turned off", source: connector.source, enabled: connector.enabled, connector }))
 			: pluginTab === "discover"
-				? available.map((plugin) => ({ id: `available:${plugin.marketplace}|${plugin.name}`, name: plugin.name, description: plugin.description, source: marketplaceLabel(plugin.marketplace) || "Other marketplaces", enabled: true, plugin }))
+				? available.map((plugin) => ({ id: `available:${plugin.marketplace}|${plugin.name}`, name: plugin.name, description: plugin.description, source: marketplaceLabel(plugin.marketplace) || "Other marketplaces", plugin }))
 				: [...installed.map((plugin) => ({ id: `plugin:${plugin.name}`, name: plugin.name, description: plugin.description || pluginSubtitle(plugin.name, plugin.marketplace), source: marketplaceLabel(plugin.marketplace) || "Personal", enabled: plugin.enabled, plugin })), ...otherPlugins.map((plugin) => ({ id: `claude:${plugin.name}`, name: plugin.name, description: plugin.detail, source: "Claude Code", enabled: true, other: true }))];
 	const selected = items.find((item) => item.id === selectedId);
 	const selectedPath = selected?.skill?.path;
@@ -163,11 +163,13 @@ export function Customize({ view, folder, live, onRun, onViewChange }: {
 			<dl className="ct-facts"><dt>Source</dt><dd>{selected.source}</dd></dl>
 			{selected.skill && <>
 				<dl className="ct-facts"><dt>Command</dt><dd><code>{selected.skill.command || "Available to the model only"}</code></dd><dt>File</dt><dd><code>{selected.skill.path || "Not reported by Grok"}</code></dd><dt>Status</dt><dd>{selected.skill.disabled ? "Turned off" : "Available"}</dd></dl>
-				{excerpt?.ok && excerpt.folder && <button type="button" className="texty" onClick={() => void openFolder(excerpt.folder!)}>Open folder</button>}
-				<h4>SKILL.md preview</h4>
-				{!excerpt && <p className="meta">Reading the skill…</p>}
-				{excerpt?.error && <p className="note bad">{excerpt.error}</p>}
-				{excerpt?.ok && <pre className="ct-excerpt">{excerpt.text}</pre>}
+				{selectedPath && <>
+					{excerpt?.ok && excerpt.folder && <button type="button" className="texty" onClick={() => void openFolder(excerpt.folder!)}>Open folder</button>}
+					<h4>SKILL.md preview</h4>
+					{!excerpt && <p className="meta">Reading the skill…</p>}
+					{excerpt?.error && <p className="note bad">{excerpt.error}</p>}
+					{excerpt?.ok && <pre className="ct-excerpt">{excerpt.text}</pre>}
+				</>}
 				<p className="meta">Grok reloads skills when their files change. Move or remove this skill in its folder to manage it.</p>
 			</>}
 			{selected.connector && <>
@@ -195,14 +197,14 @@ export function Customize({ view, folder, live, onRun, onViewChange }: {
 		<div className="ct-page">
 			<header className="ct-header"><h2>Skills and tools</h2><p className="meta">Manage what Grok loads for this folder.</p></header>
 			<div className="ct-tabs" role="tablist" aria-label="Skills and tools">
-				{([['skills', 'Skills', inventory ? skills.length : "…"], ['connectors', 'Connectors', connectors.length], ['plugins', 'Plugins', installed.length + otherPlugins.length]] as const).map(([id, label, count]) => <button type="button" role="tab" aria-label={label} aria-selected={view === id} className={view === id ? "on" : ""} key={id} onClick={() => onViewChange?.(id)}>{label} ({count})</button>)}
+				{([['skills', 'Skills', skills.length], ['connectors', 'Connectors', connectors.length], ['plugins', 'Plugins', installed.length + otherPlugins.length]] as const).map(([id, label, count]) => <button type="button" role="tab" aria-label={label} aria-selected={view === id} className={view === id ? "on" : ""} key={id} onClick={() => onViewChange?.(id)}>{label} ({inventory ? count : "…"})</button>)}
 			</div>
 			{inventory?.trusted === false && <p className="note">Grok has not trusted this folder, so it skips the folder's own skills, MCP servers and hooks. <button type="button" className="texty" onClick={() => onRun("/hooks-trust")}>Trust it with /hooks-trust</button></p>}
 			{status}
 			{!inventory && <p className="note">Asking Grok what it loads in {folder}…</p>}
 			{inventory && !inventory.ok && <p className="note bad">{inventory.error}</p>}
 			<div className="ct-toolbar"><input aria-label={`Search ${view}`} placeholder={`Search ${view}`} value={filter} onChange={(event) => setFilter(event.target.value)} /><button type="button" className="texty" disabled={busy} onClick={() => void load()}>{busy ? "Working…" : "Refresh"}</button><button type="button" className="texty" disabled={!inventory?.ok} onClick={() => { setNotice(null); setSheet(view === "skills" ? "skill" : view === "connectors" ? "connector" : "plugin"); if (view === "connectors") { setAddTab("suggested"); } }}>{view === "skills" ? "New skill" : view === "connectors" ? "Add connector" : "Install plugin"}</button></div>
-			{view === "plugins" && <div className="ct-subtabs" role="tablist" aria-label="Plugin lists"><button type="button" role="tab" aria-label="Installed" aria-selected={pluginTab === "installed"} className={pluginTab === "installed" ? "on" : ""} onClick={() => setPluginTab("installed")}>Installed ({installed.length + otherPlugins.length})</button><button type="button" role="tab" aria-label="Discover" aria-selected={pluginTab === "discover"} className={pluginTab === "discover" ? "on" : ""} onClick={() => setPluginTab("discover")}>Discover ({available.length})</button><button type="button" className="texty" onClick={() => { setNotice(null); setSheet("marketplaces"); }}>Manage marketplaces</button></div>}
+			{view === "plugins" && <div className="ct-subtabs" role="tablist" aria-label="Plugin lists"><button type="button" role="tab" aria-label="Installed" aria-selected={pluginTab === "installed"} className={pluginTab === "installed" ? "on" : ""} onClick={() => setPluginTab("installed")}>Installed ({inventory ? installed.length + otherPlugins.length : "…"})</button><button type="button" role="tab" aria-label="Discover" aria-selected={pluginTab === "discover"} className={pluginTab === "discover" ? "on" : ""} onClick={() => setPluginTab("discover")}>Discover ({inventory ? available.length : "…"})</button><button type="button" className="texty" onClick={() => { setNotice(null); setSheet("marketplaces"); }}>Manage marketplaces</button></div>}
 			<div className={selected ? "ct-layout has-selection" : "ct-layout"}>
 				<div className="ct-list" aria-label={`${kind} list`}>
 					{inventory?.ok && !groups.length && <p className="meta">{filter ? "No matches." : `No ${view === "plugins" && pluginTab === "discover" ? "marketplace plugins" : view} found.`}</p>}
@@ -210,7 +212,7 @@ export function Customize({ view, folder, live, onRun, onViewChange }: {
 						const key = `${view}:${pluginTab}:${group.name}`;
 						return <section className="ct-group" key={group.name}><button type="button" className="ct-group-heading" aria-label={`Toggle ${group.name}`} aria-expanded={!collapsed[key]} onClick={() => setCollapsed((current) => ({ ...current, [key]: !current[key] }))}><span><Icon name={collapsed[key] ? "chevron-right" : "chevron-down"} /> {group.name}</span><span>{group.items.length}</span></button>
 							{view === "plugins" && pluginTab === "installed" && group.name === "Claude Code" && <p className="meta">Loaded from Claude Code. Manage these plugins in Claude Code.</p>}
-							{!collapsed[key] && group.items.map((item) => <button type="button" className={selectedId === item.id ? "ct-item on" : "ct-item"} aria-label={`Details for ${item.name}`} aria-pressed={selectedId === item.id} key={item.id} onClick={() => setSelectedId(item.id)}><span className={item.enabled ? "ct-dot on" : "ct-dot"} role="img" aria-label={item.enabled ? "On" : "Off"} /><span><b>{item.name}</b><small>{item.description || "No description provided."}</small></span></button>)}
+							{!collapsed[key] && group.items.map((item) => <button type="button" className={selectedId === item.id ? "ct-item on" : "ct-item"} aria-label={`Details for ${item.name}`} aria-pressed={selectedId === item.id} key={item.id} onClick={() => setSelectedId(item.id)}>{item.enabled === undefined ? <span /> : <span className={item.enabled ? "ct-dot on" : "ct-dot"} role="img" aria-label={item.enabled ? "On" : "Off"} />}<span><b>{item.name}</b><small>{item.description || "No description provided."}</small></span></button>)}
 						</section>;
 					})}
 				</div>

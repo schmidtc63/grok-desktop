@@ -127,6 +127,7 @@ function pageOperation(op, args, classify) {
 		if (!meta.editable) { throw new Error("The target is not editable."); }
 		return meta;
 	};
+	const formFor = (el) => el.form || (el.isContentEditable && Element.prototype.closest.call(el, "form"));
 	const limit = Number.isFinite(args.maxChars) ? Math.min(16000, Math.max(1000, Math.floor(args.maxChars))) : 12000;
 	if (op === "snapshot") {
 		const candidates = query(document, selector).filter(visible);
@@ -190,7 +191,7 @@ function pageOperation(op, args, classify) {
 		const meta = approvedField(el);
 		if (typeof args.text !== "string" || args.text.length > 2000 || (args.submit !== undefined && typeof args.submit !== "boolean")) { throw new Error("Fill requires text of at most 2000 characters and an optional submit flag."); }
 		if (meta.tagName === "select") { throw new Error("Use select to change this field."); }
-		const form = el.form || Element.prototype.closest.call(el, "form");
+		const form = args.submit ? formFor(el) : null;
 		if (args.submit && !form) { throw new Error("This field has no form to submit."); }
 		if (el.isContentEditable) { Object.getOwnPropertyDescriptor(Node.prototype, "textContent").set.call(el, args.text); }
 		else {
@@ -201,6 +202,9 @@ function pageOperation(op, args, classify) {
 		EventTarget.prototype.dispatchEvent.call(el, new Event("change", { bubbles: true }));
 		if (args.submit) {
 			target(); approvedField(el); uncovered(el);
+			if (form !== formFor(el)) { return { error: "The field moved to another form. Take a new snapshot and request approval again." }; }
+			const noValidate = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "noValidate").get.call(form);
+			if (!noValidate && !HTMLFormElement.prototype.reportValidity.call(form)) { return { error: "Form validation blocked submission. Check the required fields and their values." }; }
 			HTMLFormElement.prototype.requestSubmit.call(form);
 		}
 	} else if (op === "select") {

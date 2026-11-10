@@ -27,6 +27,14 @@ function sessionFolder(agentSessionId, root = sessionsRoot()) {
 	return "";
 }
 
+// A sandboxed session's files are in that sandbox's own Grok home, so the first root is only the fallback.
+function rootOf(agentSessionId, roots) {
+	for (const root of roots) {
+		try { if (sessionFolder(agentSessionId, root)) { return root; } } catch { /* That sandbox hasn't been used. */ }
+	}
+	return roots[0];
+}
+
 function entryText(entry) {
 	return typeof entry.content === "string" ? entry.content : JSON.stringify(entry.content || "");
 }
@@ -334,4 +342,4 @@ function openCliSession(agentSessionId, root = sessionsRoot(), limits = {}) {
 	});
 }
 
-module.exports = { contextBreakdown, recentSpend, autoCompactPercent, taskOutput, subagentTranscript, listCliSessions, listCliProjectFolders, openCliSession };
+module.exports = { rootOf, contextBreakdown, recentSpend, autoCompactPercent, taskOutput, subagentTranscript, listCliSessions, listCliProjectFolders, openCliSession };

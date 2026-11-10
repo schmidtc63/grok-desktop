@@ -1,11 +1,11 @@
 const childProcess = require("child_process");
-const { spawn } = childProcess;
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { createHash, randomUUID } = require("crypto");
 const { isUtf8 } = require("buffer");
 const { promisify } = require("util");
-const { folderProblem, killTree, OWN_GROUP } = require("./agent.cjs");
+const { folderProblem } = require("./agent.cjs");
 const { repoFiles } = require("./git.cjs");
 
 const IMAGE_MIME = new Map([[".png", "image/png"], [".jpg", "image/jpeg"], [".jpeg", "image/jpeg"], [".gif", "image/gif"], [".webp", "image/webp"], [".bmp", "image/bmp"], [".ico", "image/x-icon"], [".avif", "image/avif"]]);
@@ -17,8 +17,7 @@ const MAX_FILES = 5000;
 const MAX_DEPTH = 6;
 const MAX_FILE_BYTES = 200 * 1024;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
-const MAX_OUTPUT = 80 * 1024;
-const RUN_MS = 20000;
+const WSL_COPY_CHUNK = 64 * 1024;
 
 function inside(root, candidate) {
   const relative = path.relative(root, candidate);
@@ -149,19 +148,6 @@ function readImage(cwd, relative) {
 	}
 }
 
-function revealFile(cwd, relative) {
-  const located = locateFile(cwd, relative);
-  if (!located.ok) return { ok: false, error: located.error };
-  const explorer = path.join(process.env.SystemRoot || "C:\\Windows", "explorer.exe");
-  try {
-    const child = spawn(explorer, [`/select,${located.target}`], { stdio: "ignore" });
-    child.on("error", () => {});
-  } catch {
-    return { ok: false, error: "File Explorer is not available in this window." };
-  }
-  return { ok: true };
-}
-
 async function windowsSaveStep(command, temporary, target, expectedVersion = "") {
 	const shell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 	await promisify(childProcess.execFile)(shell, ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'; ${command}`], {
@@ -170,6 +156,137 @@ async function windowsSaveStep(command, temporary, target, expectedVersion = "")
 		stdio: "pipe",
 		env: { ...process.env, GROK_SAVE_TEMP: temporary, GROK_SAVE_TARGET: target, GROK_SAVE_VERSION: expectedVersion },
 	});
+}
+
+function isWslPath(target) {
+	return process.platform === "win32" && /^\\\\(?:\?\\UNC\\)?(?:wsl\.localhost|wsl\$)\\/i.test(target);
+}
+
+function usesWindowsAcl(target) {
+	return process.platform === "win32" && !isWslPath(target);
+}
+
+function stageWindowsSave(temporary, target, { existing = false } = {}) {
+	const stage = existing ? "[IO.File]::SetAccessControl($env:GROK_SAVE_TEMP, $security)"
+		: "$stream = [IO.FileStream]::new($env:GROK_SAVE_TEMP, [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $security); $stream.Dispose()";
+	return windowsSaveStep(`$security = [IO.File]::GetAccessControl($env:GROK_SAVE_TARGET, [Security.AccessControl.AccessControlSections]::Access); ${stage}`, temporary, target);
+}
+
+function readWslBytes(file, position, length) {
+	const bytes = Buffer.allocUnsafe(length);
+	for (let offset = 0; offset < length;) {
+		const count = fs.readSync(file, bytes, offset, length - offset, position + offset);
+		if (!count) { throw new Error("The file changed on disk during the read."); }
+		offset += count;
+	}
+	return bytes;
+}
+
+function writeWslBytes(file, bytes, position, progress) {
+	for (let offset = 0; offset < bytes.length;) {
+		const count = fs.writeSync(file, bytes, offset, bytes.length - offset, position + offset);
+		if (!count) { throw new Error("The file stopped accepting writes."); }
+		offset += count;
+		if (progress) { progress.written = position + offset; }
+	}
+}
+
+function matchesWslWrite(file, backup, originalSize, next, { written = 0, truncating = false } = {}) {
+	const { size, mtimeMs, ctimeMs } = fs.fstatSync(file);
+	const unchanged = () => {
+		const after = fs.fstatSync(file);
+		return after.size === size && after.mtimeMs === mtimeMs && after.ctimeMs === ctimeMs;
+	};
+	if (truncating && size === next.length && size < originalSize) {
+		return readWslBytes(file, 0, size).equals(next) && unchanged();
+	}
+	if (size < originalSize || size > Math.max(originalSize, next.length) || size < written) { return false; }
+	let earliest = size > originalSize ? size : written;
+	let latest = Math.min(size, next.length);
+	// A failed write can leave an unknown prefix of the new bytes, followed by the old suffix.
+	for (let position = 0; position < size; position += WSL_COPY_CHUNK) {
+		const current = readWslBytes(file, position, Math.min(WSL_COPY_CHUNK, size - position));
+		const previous = readWslBytes(backup, position, Math.max(0, Math.min(current.length, originalSize - position)));
+		const replacement = next.subarray(position, position + current.length);
+		for (let index = 0; index < replacement.length; index++) {
+			if (current[index] !== replacement[index]) { latest = Math.min(latest, position + index); }
+			if (current[index] !== previous[index]) { earliest = Math.max(earliest, position + index + 1); }
+			if (earliest > latest) { return false; }
+		}
+		if (!current.subarray(replacement.length).equals(previous.subarray(replacement.length))) { return false; }
+	}
+	return unchanged();
+}
+
+function copyWslFile(temporary, target, original, expectedVersion = "") {
+	const backupPath = `${temporary}.original`;
+	const noWrite = Buffer.alloc(0);
+	let file;
+	let backup;
+	let keepBackup = false;
+	try {
+		const bytes = fs.readFileSync(temporary);
+		file = fs.openSync(target, "r+");
+		const sameFile = (stat) => stat.dev === original.dev && stat.ino === original.ino;
+		const opened = fs.fstatSync(file);
+		if (!sameFile(opened)) { return { ok: false }; }
+		backup = fs.openSync(backupPath, "wx+", 0o600);
+		const hash = expectedVersion ? createHash("sha256") : null;
+		for (let position = 0; position < opened.size; position += WSL_COPY_CHUNK) {
+			const chunk = readWslBytes(file, position, Math.min(WSL_COPY_CHUNK, opened.size - position));
+			hash?.update(chunk);
+			writeWslBytes(backup, chunk, position);
+		}
+		fs.fsyncSync(backup);
+		const matchesOriginal = () => matchesWslWrite(file, backup, opened.size, noWrite);
+		const sameDestination = () => sameFile(fs.statSync(target));
+		if ((hash && hash.digest("hex") !== expectedVersion) || !matchesOriginal() || !sameDestination()) {
+			return { ok: false };
+		}
+		const progress = { written: 0, truncating: false };
+		try {
+			writeWslBytes(file, bytes, 0, progress);
+			progress.truncating = true;
+			fs.ftruncateSync(file, bytes.length);
+			if (!sameDestination()) { throw new Error("The file changed on disk during the write."); }
+			const closing = file;
+			file = undefined;
+			fs.closeSync(closing);
+		} catch (error) {
+			try {
+				if (file === undefined) { file = fs.openSync(target, "r+"); }
+				if (!sameFile(fs.fstatSync(file)) || !sameDestination()) { throw new Error("The file was replaced."); }
+				if (!matchesOriginal()) {
+					if (!matchesWslWrite(file, backup, opened.size, bytes, progress) || !sameDestination()) {
+						throw new Error("The file was changed by another process.");
+					}
+					for (let position = 0; position < opened.size; position += WSL_COPY_CHUNK) {
+						const chunk = readWslBytes(backup, position, Math.min(WSL_COPY_CHUNK, opened.size - position));
+						writeWslBytes(file, chunk, position);
+					}
+					fs.ftruncateSync(file, opened.size);
+					if (!matchesOriginal()) { throw new Error("Restoration could not be verified."); }
+				}
+				if (!sameDestination()) { throw new Error("The file was replaced."); }
+				const closing = file;
+				file = undefined;
+				fs.closeSync(closing);
+			} catch {
+				keepBackup = true;
+				return { ok: false, error, backup: backupPath };
+			}
+			return { ok: false, error };
+		}
+		return { ok: true };
+	} catch (error) {
+		return { ok: false, error };
+	} finally {
+		if (file !== undefined) { try { fs.closeSync(file); } catch {} }
+		if (backup !== undefined) {
+			try { fs.closeSync(backup); } catch {}
+			if (!keepBackup) { try { fs.unlinkSync(backupPath); } catch {} }
+		}
+	}
 }
 
 async function writeText(cwd, relative, text, expectedVersion) {
@@ -230,13 +347,15 @@ async function writeText(cwd, relative, text, expectedVersion) {
 		if (version !== expectedVersion) {
 			return { ok: false, error: "This file changed on disk. Your draft was not saved. Reload the file and reconcile your changes." };
 		}
-		const temporary = path.join(path.dirname(target), `.grok-save-${randomUUID()}.tmp`);
+		const windowsAcl = usesWindowsAcl(target);
+		const wsl = isWslPath(target);
+		const temporary = path.join(wsl ? os.tmpdir() : path.dirname(target), `.grok-save-${randomUUID()}.tmp`);
 		let descriptor;
 		let created = false;
-		let replaced = false;
+		let keepStage = false;
 		try {
-			if (process.platform === "win32") {
-				await windowsSaveStep("$security = [IO.File]::GetAccessControl($env:GROK_SAVE_TARGET, [Security.AccessControl.AccessControlSections]::Access); $stream = [IO.FileStream]::new($env:GROK_SAVE_TEMP, [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $security); $stream.Dispose()", temporary, target);
+			if (windowsAcl) {
+				await stageWindowsSave(temporary, target);
 				created = true;
 				descriptor = fs.openSync(temporary, "r+");
 			} else {
@@ -248,110 +367,44 @@ async function writeText(cwd, relative, text, expectedVersion) {
 			fs.closeSync(descriptor);
 			descriptor = undefined;
 			if (process.platform !== "win32") { fs.chmodSync(temporary, stat.mode); }
-			if (createHash("sha256").update(fs.readFileSync(target)).digest("hex") !== expectedVersion) {
+			if (wsl) {
+				const result = copyWslFile(temporary, target, stat, expectedVersion);
+				if (result.backup) {
+					keepStage = true;
+					return { ok: false, error: `That file could not be saved or restored. Check the file on disk. The original is saved at "${result.backup}". Your draft is saved at "${temporary}".` };
+				}
+				if (result.error) { throw result.error; }
+				if (!result.ok) { return { ok: false, error: "This file changed on disk. Your draft was not saved. Reload the file and reconcile your changes." }; }
+			} else if (createHash("sha256").update(fs.readFileSync(target)).digest("hex") !== expectedVersion) {
 				return { ok: false, error: "This file changed on disk. Your draft was not saved. Reload the file and reconcile your changes." };
-			}
-			if (process.platform === "win32") {
+			} else if (windowsAcl) {
 				await windowsSaveStep("$hash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($env:GROK_SAVE_TARGET))).Replace('-', '').ToLowerInvariant(); if ($hash -ne $env:GROK_SAVE_VERSION) { throw 'The file changed on disk before replacement.' }; [IO.File]::Replace($env:GROK_SAVE_TEMP, $env:GROK_SAVE_TARGET, [NullString]::Value)", temporary, target, expectedVersion);
+				created = false;
 			} else {
+				if (!(fs.statSync(target).mode & 0o222)) { return { ok: false, error: "This file is read-only. Your draft was not saved." }; }
+				fs.accessSync(target, fs.constants.W_OK);
 				fs.renameSync(temporary, target);
+				created = false;
 			}
-			replaced = true;
 			return { ok: true, version: createHash("sha256").update(text, "utf8").digest("hex") };
 		} catch {
+			if (wsl) {
+				let intact = false;
+				try { intact = createHash("sha256").update(fs.readFileSync(target)).digest("hex") === expectedVersion; } catch {}
+				if (!intact) {
+					return { ok: false, error: "That file could not be saved. Check the file on disk." };
+				}
+			}
 			return { ok: false, error: "That file could not be saved. The original file was not replaced." };
 		} finally {
 			if (descriptor !== undefined) { try { fs.closeSync(descriptor); } catch {} }
-			if (created && !replaced) { try { fs.chmodSync(temporary, stat.mode | 0o200); fs.unlinkSync(temporary); } catch {} }
+			if (created && !keepStage) {
+				try { fs.chmodSync(temporary, stat.mode | 0o200); } catch {}
+				try { fs.unlinkSync(temporary); } catch {}
+			}
 		}
   }
 	return { ok: false, error: "This file was removed from disk. Your draft was not saved." };
 }
 
-function decodeOutput(buf) {
-  if (buf.length >= 4 && buf[1] === 0 && buf[3] === 0) return buf.toString("utf16le");
-  return buf.toString("utf8");
-}
-
-function stopTree(child) {
-	if (!child || child.pid == null) { return Promise.resolve(false); }
-	if (process.platform !== "win32") { return Promise.resolve(killTree(child)); }
-	return new Promise((resolve) => {
-		const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-		killer.on("error", () => resolve(false));
-		killer.on("close", (code) => resolve(code === 0));
-	});
-}
-
-function runCommand(cwd, command) {
-  const problem = folderProblem(cwd);
-  if (problem) return Promise.resolve({ ok: false, error: problem });
-  const text = typeof command === "string" ? command.trim() : "";
-  if (!text) return Promise.resolve({ ok: false, error: "Type a command to run." });
-  if (text.length > 4000) return Promise.resolve({ ok: false, error: "That command is too long." });
-	const windows = process.platform === "win32";
-	// macOS and Linux run the command in bash without the user's profile, as Windows does with PowerShell's -NoProfile.
-  const shell = windows ? path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe") : "bash";
-	const args = windows ? ["-NoProfile", "-NonInteractive", "-Command", text] : ["--noprofile", "--norc", "-c", text];
-  return new Promise((resolve) => {
-    let settled = false;
-    let truncated = false;
-		let stopping = false;
-		let timedOut = false;
-    let size = 0;
-    const chunks = [];
-    const push = (buf) => {
-      size += buf.length;
-      if (size > MAX_OUTPUT) {
-        truncated = true;
-				stop(false);
-        return;
-      }
-      chunks.push(buf);
-    };
-    const finish = (value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(value);
-    };
-    const child = spawn(shell, args, {
-      ...OWN_GROUP,
-      cwd,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    child.on("error", (error) => {
-      const missing = error && error.code === "ENOENT";
-      finish({ ok: false, error: missing ? `${windows ? "PowerShell" : "bash"} is not available in this window.` : "The command could not run." });
-    });
-    child.stdout.on("data", push);
-    child.stderr.on("data", push);
-    child.on("close", (code) => {
-			if (stopping) { return; }
-      finish({
-        ok: true,
-        code: code ?? -1,
-        output: decodeOutput(Buffer.concat(chunks)),
-        truncated,
-      });
-    });
-		const stop = (timeout) => {
-			if (stopping || settled) { return; }
-			stopping = true;
-			timedOut = timeout;
-			truncated = true;
-			void stopTree(child).then((killed) => {
-				const reason = timedOut ? "Command exceeded the 20-second limit." : "Command exceeded the output limit.";
-				if (!killed) {
-					finish({ ok: false, error: `${reason} Its process tree could not be confirmed stopped.` });
-					return;
-				}
-				finish({ ok: true, code: -1, output: `${decodeOutput(Buffer.concat(chunks))}\n${reason} The process tree was stopped.\n`, truncated, timedOut });
-			});
-		};
-		const timer = setTimeout(() => stop(true), RUN_MS);
-  });
-}
-
-module.exports = { listFiles, readText, readImage, writeText, runCommand, locateFile, revealFile, DEFAULT_APP_EXT };
+module.exports = { listFiles, readText, readImage, writeText, locateFile, isWslPath, usesWindowsAcl, stageWindowsSave, copyWslFile, DEFAULT_APP_EXT };

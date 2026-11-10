@@ -5,6 +5,7 @@ const os = require("node:os");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 const { redactKeys, redactDeep, heldTail } = require("../electron/redact.cjs");
+const sandboxModule = require("../electron/sandbox.cjs");
 
 // A check whose promise never settles ends the run without the success line, so that run fails.
 process.exitCode = 1;
@@ -37,7 +38,7 @@ function makeHost(options, { tmpdir, platform = "win32", killErrors = {}, env = 
 		require: (name) => name === "child_process" ? {
 			spawn: (...args) => { spawns.push(args); return args[0] === "taskkill" ? new EventEmitter() : fakeChild(); },
 			spawnSync: (...args) => { kills.push(args); return { status: 0 }; },
-		} : (name === "./redact.cjs" ? { redactKeys, redactDeep, heldTail } : name === "os" && tmpdir ? { ...os, tmpdir: () => tmpdir } : require(name)),
+		} : (name === "./redact.cjs" ? { redactKeys, redactDeep, heldTail } : name === "./sandbox.cjs" ? sandboxModule : name === "os" && tmpdir ? { ...os, tmpdir: () => tmpdir } : require(name)),
 		// `kill` records process-group kills; killErrors maps a pid to the error code its kill throws.
 		process: { platform, env, kill: (pid, signal) => { kills.push(["kill", pid, signal]); if (killErrors[Math.abs(pid)]) { throw Object.assign(new Error("kill failed"), { code: killErrors[Math.abs(pid)] }); } } },
 		setTimeout: (callback, ms) => { const timer = {}; timers.set(timer, { callback, ms }); return timer; },
@@ -392,7 +393,7 @@ async function checkCancellation() {
 		const { host } = makeHost();
 		const waiting = deferred();
 		const calls = [];
-		host.procFor = () => ({ uiSessionId: "chat", parents: new Map(), ready: stage === "ready" ? waiting.promise : Promise.resolve() });
+		host.procFor = () => ({ uiSessionId: "chat", parents: new Map(), promptTurns: new Map(), ready: stage === "ready" ? waiting.promise : Promise.resolve() });
 		host.ensureSession = stage === "ensureSession" ? () => waiting.promise : async () => ({ sessionId: "agent-chat" });
 		host.applyConfig = stage === "applyConfig" ? () => waiting.promise : async () => {};
 		host.request = (_proc, method) => { calls.push(method); return { id: 1, promise: new Promise(() => {}) }; };
@@ -423,13 +424,13 @@ async function checkCancellation() {
 async function checkRestore() {
 	const { host, events, running } = makeHost();
 	const proc = running({ uiSessionId: "chat", promptId: null });
-	host.sessions.set("chat", { sessionId: "persisted", cwd: input.cwd, proc, model: "grok-4.7", effort: "high" });
+	host.sessions.set("chat", { sessionId: "persisted", cwd: input.cwd, proc, sandboxKey: "", model: "grok-4.7", effort: "high" });
 	host.loseProc(proc, "Exited");
 	assert.deepEqual(plain(events.shift()), { type: "bg-tasks", uiSessionId: "chat", tasks: [], reset: true });
 	assert.deepEqual(plain(events.shift()), { type: "loops", uiSessionId: "chat", loops: [], reset: true });
 	assert.equal(host.sessions.get("chat").proc, null);
 	assert.equal(host.sessions.get("chat").model, "");
-	const next = { uiSessionId: "chat", lost: false, parents: new Map() };
+	const next = { uiSessionId: "chat", lost: false, parents: new Map(), sandboxKey: "" };
 	const requests = [];
 	host.request = (target, method, params) => {
 		requests.push({ target, method, params });
@@ -455,11 +456,11 @@ async function checkRestore() {
 	host.request = () => ({ promise: Promise.reject(Object.assign(new Error("Path not found."), { fromGrok: true })) });
 	await assert.rejects(host.ensureSession(next, { ...input, agentSessionId: "missing" }), (error) => error.lostSession === true && /could not reload the earlier conversation \(Path not found\.\)/.test(error.message));
 	await assert.rejects(host.ensureSession(next, input), (error) => !error.lostSession && error.message === "Path not found.");
-	host.sessions.set("chat", { sessionId: "in-memory", cwd: input.cwd, proc: null });
+	host.sessions.set("chat", { sessionId: "in-memory", cwd: input.cwd, proc: null, sandboxKey: "" });
 	await assert.rejects(host.ensureSession(next, input), (error) => error.lostSession === true, "after a Grok restart, a session Grok cannot reload is reported as lost");
 	assert.equal(host.sessions.has("chat"), false, "the stale session is dropped so the next send starts a new one");
 	const lost = makeHost().host;
-	lost.procFor = () => ({ ready: Promise.resolve() });
+	lost.procFor = () => ({ ready: Promise.resolve(), promptTurns: new Map() });
 	lost.ensureSession = async () => { throw Object.assign(new Error("Grok could not reload the earlier conversation."), { lostSession: true }); };
 	const lostResult = await lost.prompt({ ...input, agentSessionId: "missing", turnId: "turn-lost" });
 	assert.equal(lostResult.ok, false);
@@ -519,7 +520,7 @@ function checkToolPolicy() {
 	assert.equal(events.at(-1).tool.input, JSON.stringify(mcp, null, 2), "an approval shows the tool's complete arguments");
 	assert.equal(decision("enter_plan_mode", {}), "ask");
 	assert.equal(events.at(-1).tool.input, undefined);
-	host.onPermission(proc, { id: 900, params: { toolCall: { title: "Read `x`", kind: "read" }, options: [{ kind: "allow_once", optionId: "yes" }] } });
+	host.onPermission(proc, { id: 900, params: { toolCall: { title: "Read `x`", kind: "read", locations: [{ path: path.join(input.cwd, "package.json") }] }, options: [{ kind: "allow_once", optionId: "yes" }] } });
 	assert.equal(writes.at(-1).result.outcome.optionId, "yes");
 	host.onPermission(proc, { id: 901, params: { toolCall: { title: "Execute `rm x`", kind: "execute" }, options: [{ kind: "allow_once", optionId: "yes" }] } });
 	assert.equal(events.at(-1).tool.kind, "command");
@@ -712,7 +713,7 @@ function checkPermissions() {
 	host.onHook(proc, { id: 11, params: { toolUseId: "auto-on", toolName: "run_terminal_command", toolInput: { command: "echo hi" }, permissionMode: "auto" } });
 	assert.equal(writes.at(-1).result.decision, "allow", "Auto-review leaves the call to Grok's review when that review is on");
 	host.onHook(proc, { id: 12, params: { toolUseId: "auto-read", toolName: "read_file", toolInput: { path: "a.txt" }, permissionMode: "default" } });
-	assert.equal(writes.at(-1).result.decision, "allow", "reads never ask");
+	assert.equal(writes.at(-1).result.decision, "allow", "Auto-review keeps allowing reads");
 	host.turns.get("chat").mode = "Normal";
 	host.onPermission(proc, { id: 6, params: { toolCall: { title: "write" }, options } });
 	host.cancel("chat");
@@ -741,15 +742,18 @@ async function checkAllowedFolders() {
 		const outside = path.join(fixture, "outside");
 		const extra = path.join(fixture, "extra");
 		const sibling = path.join(fixture, "project-other");
-		for (const folder of [project, outside, extra, sibling]) { fs.mkdirSync(folder); }
+		const home = path.join(fixture, "grok");
+		const temp = path.join(fixture, "temp");
+		for (const folder of [project, outside, extra, sibling, home, temp, path.join(project, "nested")]) { fs.mkdirSync(folder); }
 		const insideFile = path.join(project, "file.txt");
 		const outsideFile = path.join(outside, "file.txt");
 		fs.writeFileSync(insideFile, "inside");
 		fs.writeFileSync(outsideFile, "outside");
+		fs.writeFileSync(path.join(fixture, "file.txt"), "outside the allowed folders");
 		fs.symlinkSync(outside, path.join(project, "escape"), "junction");
 		fs.symlinkSync(path.join(fixture, "missing-outside"), path.join(project, "broken"), "junction");
 		// The fixture is in the temp folder, where edits are always allowed, so this host's temp folder is elsewhere.
-		const { host, writes, events, running } = makeHost({}, { tmpdir: path.join(taskTemp, "grokcode-other-temp") });
+		const { host, writes, events, running } = makeHost({}, { tmpdir: temp, env: { GROK_HOME: home } });
 		const proc = running({ uiSessionId: "chat", cwd: project });
 		let nextId = 100;
 		function check(toolInput, expected, toolName = "write") {
@@ -785,7 +789,10 @@ async function checkAllowedFolders() {
 			check({ path: outsideFile }, mode === "Plan" ? "deny" : mode === "Always-approve" ? "allow" : "ask");
 		}
 		host.turns.get("chat").mode = "Normal";
-		check({ path: outsideFile }, "allow", "read_file");
+		const readGate = check({ target_file: outsideFile }, "ask", "read_file");
+		assert.equal(events.at(-1).tool.always, undefined, "outside reads ask each time");
+		assert.equal(host.decide({ uiSessionId: "chat", toolId: readGate, decision: "allow" }).ok, true);
+		check({ target_file: outsideFile }, "ask", "read_file");
 		const pending = check({ path: path.join(extra, "new.txt") }, "ask");
 		const beforeUpdate = writes.length;
 		const allowedFolders = [extra];
@@ -797,6 +804,65 @@ async function checkAllowedFolders() {
 		check({ path: path.join(extra, "new.txt") }, "ask");
 		assert.equal(host.setAllowedFolders({ uiSessionId: "other", allowedFolders: [outside] }).ok, true);
 		check({ path: outsideFile }, "ask");
+		for (const mode of ["Normal", "Plan", "Auto-review", "Always-approve"]) {
+			host.turns.get("chat").mode = mode;
+			const restricted = mode === "Normal" || mode === "Plan";
+			check({ target_file: "file.txt" }, "allow", "read_file");
+			check({ target_directory: extra }, "allow", "list_dir");
+			check({ path: home }, "allow", "grep");
+			check({ path: temp }, "allow", "grep");
+			check({ pattern: "needle" }, "allow", "grep");
+			check({ pattern: "needle", path: "" }, "allow", "grep");
+			check({ path: "nested/../file.txt" }, "allow", "read_file");
+			check({ target_file: "escape/file.txt" }, restricted ? "ask" : "allow", "read_file");
+			check({ target_file: "escape/../file.txt" }, restricted ? "ask" : "allow", "read_file");
+			check({ target_file: "../outside/file.txt" }, restricted ? "ask" : "allow", "read_file");
+			check({ target_directory: outside }, restricted ? "ask" : "allow", "list_dir");
+			check({ path: outside }, restricted ? "ask" : "allow", "grep");
+			check({}, "allow", "search_tool");
+		}
+		host.turns.get("chat").mode = "Normal";
+		if (process.platform === "win32") {
+			const server = "\\\\unapproved.invalid\\share\\file.txt";
+			const { lstatSync, readlinkSync } = fs;
+			const realpath = fs.realpathSync.native;
+			let probed = false;
+			const track = (call) => (file, ...args) => {
+				if (String(file).startsWith("\\\\unapproved.invalid\\")) { probed = true; throw new Error("Unexpected network probe"); }
+				return call(file, ...args);
+			};
+			try {
+				fs.lstatSync = track(lstatSync);
+				fs.realpathSync.native = track(realpath);
+				fs.readlinkSync = (file, ...args) => file === path.join(project, "escape") ? server : readlinkSync(file, ...args);
+				check({ target_file: server }, "ask", "read_file");
+				check({ target_file: "escape/file.txt" }, "ask", "read_file");
+				assert.equal(probed, false, "an unapproved share and a link to it both ask before opening the share");
+			} finally {
+				fs.lstatSync = lstatSync;
+				fs.realpathSync.native = realpath;
+				fs.readlinkSync = readlinkSync;
+			}
+			const originalTarget = proc.target;
+			try {
+				proc.target = { guestCwd: "/project", home, toHost: (file) => file === "/tmp" ? temp : file };
+				check({ target_file: "nested\\file.txt" }, "ask", "read_file");
+			} finally {
+				proc.target = originalTarget;
+			}
+		}
+		const otherProc = running({ uiSessionId: "other-chat", cwd: project });
+		const nativeOptions = [{ kind: "allow_once", optionId: "yes" }, { kind: "reject_once", optionId: "no" }];
+		host.onPermission(otherProc, { id: "read-native-out", params: { toolCall: { toolCallId: readGate, title: "Read", kind: "read", locations: [{ path: insideFile }, { path: outsideFile }] }, options: nativeOptions } });
+		assert.equal(events.at(-1).tool.waiting, true);
+		assert.deepEqual(JSON.parse(events.at(-1).tool.input).locations, [insideFile, outsideFile]);
+		assert.equal(writes.some((message) => message.id === "read-native-out"), false);
+		host.decide({ uiSessionId: "other-chat", toolId: events.at(-1).tool.id, decision: "deny" });
+		assert.equal(writes.at(-1).result.outcome.optionId, "no");
+		host.onPermission(otherProc, { id: "read-native-unknown", params: { toolCall: { title: "grep", kind: "search" }, options: nativeOptions } });
+		assert.equal(writes.some((message) => message.id === "read-native-unknown"), false);
+		assert.equal(events.at(-1).tool.waiting, true);
+		host.decide({ uiSessionId: "other-chat", toolId: events.at(-1).tool.id, decision: "deny" });
 		const granted = check({ path: insideFile }, "ask");
 		assert.equal(host.decide({ uiSessionId: "chat", toolId: granted, decision: "always" }).ok, true);
 		check({ path: insideFile }, "allow");
@@ -910,8 +976,22 @@ async function checkSessions() {
 	assert.equal(events.at(-1).uiSessionId, "b", "subagent tool rows still show");
 	host.onHook(procA, { id: 22, params: { sessionId: "unknown", toolUseId: "hook-unknown", toolName: "write" } });
 	assert.equal(procA.child.writes.at(-1).result.decision, "deny", "an unknown Grok session is never guessed");
+	host.onMessage(procA, { method: "_x.ai/session_notification", params: { sessionId: "sid-a", update: { sessionUpdate: "subagent_spawned", parent_session_id: "sid-a", child_session_id: "sub-a" } } });
+	procA.lastTurn = turnA;
 	host.finishPrompt(turnA, 2, { stopReason: "end_turn" }, "");
 	assert.deepEqual(plain(events.at(-1)), { type: "done", stopReason: "end_turn", uiSessionId: "a", turnId: "turn-a" });
+	host.onHook(procA, { id: 23, params: { sessionId: "sub-a", toolUseId: "hook-after", toolName: "read_file", toolInput: { path: "a.txt" } } });
+	assert.equal(procA.child.writes.at(-1).result.decision, "allow", "a subagent still reads after the prompt that started it has ended");
+	host.onMessage(procA, { method: "_x.ai/session_notification", params: { sessionId: "sid-a", update: { sessionUpdate: "subagent_spawned", parent_session_id: "sid-a", child_session_id: "sub-late" } } });
+	host.onHook(procA, { id: 27, params: { sessionId: "sub-late", toolUseId: "hook-late", toolName: "read_file", toolInput: { path: "a.txt" } } });
+	assert.equal(procA.child.writes.at(-1).result.decision, "allow", "a subagent spawned after the prompt ended still reads");
+	host.onHook(procA, { id: 24, params: { sessionId: "sub-a", toolUseId: "hook-after-write", toolName: "write", toolInput: { file_path: "a.txt" } } });
+	assert.equal(procA.child.writes.at(-1).result.decision, "deny", "a subagent edit after the prompt cannot ask once the reply is finished");
+	assert.match(procA.child.writes.at(-1).result.reason, /already finished/);
+	assert.equal(events.at(-1).tool.id, "hook-after-write", "that denial is a row on the finished reply");
+	assert.equal(host.gates.has("hook-after-write"), false);
+	host.onHook(procA, { id: 25, params: { sessionId: "unknown", toolUseId: "hook-after-unknown", toolName: "read_file" } });
+	assert.equal(procA.child.writes.at(-1).result.decision, "deny", "a session the ended turn did not start is still denied");
 	assert.deepEqual([...host.turns.keys()], ["b"]);
 	assert.equal(procA.child.writes.find((item) => item.id === 20).result.decision, "deny");
 	assert.equal(host.gates.has("hook-sub"), true, "ending one session leaves the other's approval open");
@@ -945,6 +1025,166 @@ async function checkSessions() {
 	const loneProc = lone.running({ uiSessionId: "y", turnId: "turn-y", mode: "Always-approve", agentSessionId: "sid-y" });
 	lone.host.onHook(loneProc, { id: 30, params: { sessionId: "sid-replaced", toolUseId: "hook-other", toolName: "run_terminal_command" } });
 	assert.equal(lone.writes.at(-1).result.decision, "deny", "a request from another Grok session never borrows the one running turn");
+}
+
+// The mode chip calls setMode. Finish an Always-approve turn, change mode through that call, then a late tool call.
+async function checkStaleSendMode() {
+	const made = makeHost();
+	const uiSessionId = "stale-window-mode";
+	assert.equal((await made.host.setMode(uiSessionId, "Normal")).ok, true);
+	const started = made.host.prompt({ ...input, uiSessionId, turnId: "stale", mode: "Always-approve" });
+	await made.serve();
+	assert.equal((await started).ok, true);
+	const proc = made.host.procs.get(uiSessionId);
+	assert.equal(proc.lastTurn.mode, "Normal", "a stale window cannot replace a mode the host accepted");
+	const session = proc.child.writes.find((message) => message.method === "session/new");
+	assert.equal(session.params._meta.yoloMode, undefined, "Grok starts with the accepted permissions too");
+}
+
+async function checkLateMode() {
+	const answer = (child, id, message) => grokLine(child, { id, ...message });
+	const hook = (host, proc, id, sessionId, toolId, toolName, toolInput) => {
+		host.onHook(proc, { id, params: { sessionId, toolUseId: toolId, toolName, toolInput } });
+		return proc.child.writes.at(-1).result;
+	};
+	const made = makeHost();
+	const ui = "late-mode";
+	const started = made.host.prompt({ ...input, uiSessionId: ui, turnId: "late-1", mode: "Always-approve" });
+	await made.serve();
+	assert.equal((await started).ok, true);
+	const proc = made.host.procs.get(ui);
+	const turn = proc.lastTurn;
+	const sessionId = turn.agentSessionId;
+	assert.equal(turn.finished, true);
+	assert.equal(turn.mode, "Always-approve");
+	assert.equal(made.host.turns.has(ui), false);
+	assert.equal(hook(made.host, proc, 1, sessionId, "before", "run_terminal_command", { command: "git status" }).decision, "allow");
+	assert.equal(made.events.at(-1).tool.detail, "Allowed");
+	const modeCalls = () => proc.child.writes.filter((message) => message.method === "session/set_mode");
+	const beforeNarrow = modeCalls().length;
+	assert.equal((await made.host.setMode(ui, "Normal")).ok, true);
+	assert.equal(turn.mode, "Normal");
+	assert.equal(modeCalls().length, beforeNarrow, "Normal keeps Grok's default mode, so no set_mode call");
+	assert.equal(made.host.procs.get(ui), proc, "the chip does not restart Grok");
+	made.host.onMessage(proc, { method: "_x.ai/session_notification", params: { sessionId, update: { sessionUpdate: "subagent_spawned", parent_session_id: sessionId, child_session_id: "sub-late" } } });
+	const narrowed = hook(made.host, proc, 2, "sub-late", "after-command", "run_terminal_command", { command: "git status" });
+	assert.equal(narrowed.decision, "deny");
+	assert.match(narrowed.reason, /already finished/);
+	assert.equal(made.events.at(-1).type, "tool");
+	assert.equal(made.events.at(-1).tool.id, "after-command");
+	assert.equal(made.events.at(-1).tool.detail, "Not run · the reply already finished");
+	assert.equal(made.events.at(-1).uiSessionId, ui);
+	assert.equal(made.events.at(-1).turnId, "late-1");
+	assert.equal(hook(made.host, proc, 3, sessionId, "after-read", "read_file", { path: "a.txt" }).decision, "allow");
+	assert.equal(made.events.at(-1).tool.id, "after-read");
+	const planning = made.host.setMode(ui, "Plan");
+	const planCall = modeCalls().at(-1);
+	assert.equal(planCall.params.modeId, "plan");
+	answer(proc.child, planCall.id, { result: {} });
+	assert.equal((await planning).ok, true);
+	assert.equal(turn.mode, "Plan");
+	const planned = hook(made.host, proc, 4, sessionId, "plan-edit", "write", { file_path: "a.txt" });
+	assert.equal(planned.decision, "deny");
+	assert.match(planned.reason, /plan file/);
+	assert.equal(made.events.at(-1).tool.detail, "Not run · plan mode");
+
+	const failed = makeHost();
+	const failUi = "fail-mode";
+	const failStart = failed.host.prompt({ ...input, uiSessionId: failUi, turnId: "fail-1", mode: "Always-approve" });
+	await failed.serve();
+	assert.equal((await failStart).ok, true);
+	const failProc = failed.host.procs.get(failUi);
+	const failTurn = failProc.lastTurn;
+	const changing = failed.host.setMode(failUi, "Plan");
+	const rejected = failProc.child.writes.filter((message) => message.method === "session/set_mode").at(-1);
+	answer(failProc.child, rejected.id, { error: { message: "mode rejected" } });
+	const refusal = await changing;
+	assert.equal(refusal.ok, false);
+	assert.match(refusal.error, /mode rejected/);
+	assert.equal(failTurn.mode, "Always-approve");
+	assert.equal(hook(failed.host, failProc, 5, failTurn.agentSessionId, "still-allowed", "run_terminal_command", { command: "git status" }).decision, "allow");
+
+	const stopped = makeHost();
+	const stopUi = "stop-mode";
+	const stopStart = stopped.host.prompt({ ...input, uiSessionId: stopUi, turnId: "stop-1", mode: "Always-approve" });
+	await stopped.serve("session/prompt");
+	const stopProc = stopped.host.procs.get(stopUi);
+	const stopTurn = stopped.host.turns.get(stopUi);
+	stopped.host.cancel(stopUi);
+	assert.equal(stopTurn.cancelled, true);
+	const prompt = stopProc.child.writes.find((message) => message.method === "session/prompt");
+	answer(stopProc.child, prompt.id, { result: { stopReason: "end_turn" } });
+	assert.equal((await stopStart).ok, true);
+	assert.equal(stopProc.lastTurn.cancelled, true);
+	assert.equal(hook(stopped.host, stopProc, 6, stopTurn.agentSessionId, "stopped", "read_file", { path: "a.txt" }).decision, "deny");
+
+	const asked = makeHost();
+	const askUi = "ask-mode";
+	const askStart = asked.host.prompt({ ...input, uiSessionId: askUi, turnId: "ask-1", mode: "Normal" });
+	await asked.serve();
+	assert.equal((await askStart).ok, true);
+	const askProc = asked.host.procs.get(askUi);
+	const askSession = askProc.lastTurn.agentSessionId;
+	asked.host.onMessage(askProc, { method: "_x.ai/session_notification", params: { sessionId: askSession, update: { sessionUpdate: "subagent_spawned", parent_session_id: askSession, child_session_id: "sub-ask" } } });
+	const bad = await asked.host.prompt({ ...input, uiSessionId: askUi, turnId: "ask-bad", mode: "Normal", model: "no-such-model" });
+	assert.equal(bad.ok, false);
+	assert.match(bad.error, /does not support/);
+	assert.equal(asked.host.turns.has(askUi), false);
+	assert.equal(askProc.lastTurn.finished, false);
+	const late = hook(asked.host, askProc, 8, "sub-ask", "late-push", "run_terminal_command", { command: "git push" });
+	assert.equal(late.decision, "deny");
+	assert.equal(asked.host.gates.size, 0, "a send that fails after the session is known leaves no approval card");
+
+	const live = makeHost();
+	const liveUi = "live-mode";
+	const liveStart = live.host.prompt({ ...input, uiSessionId: liveUi, turnId: "live-1", mode: "Always-approve" });
+	await live.serve("session/prompt");
+	const liveProc = live.host.procs.get(liveUi);
+	const liveTurn = live.host.turns.get(liveUi);
+	assert.equal(liveTurn.finished, false);
+	const liveModes = liveProc.child.writes.filter((message) => message.method === "session/set_mode").length;
+	const during = await live.host.setMode(liveUi, "Normal");
+	assert.equal(during.ok, false);
+	assert.match(during.error, /Stop or finish this turn/);
+	assert.equal(liveTurn.mode, "Always-approve");
+	assert.equal(liveProc.child.writes.filter((message) => message.method === "session/set_mode").length, liveModes, "a live turn does not send a mode change");
+	const livePrompt = liveProc.child.writes.find((message) => message.method === "session/prompt");
+	answer(liveProc.child, livePrompt.id, { result: { stopReason: "end_turn" } });
+	assert.equal((await liveStart).ok, true);
+
+	const overlap = makeHost();
+	const overlapUi = "overlap-mode";
+	const overlapStart = overlap.host.prompt({ ...input, uiSessionId: overlapUi, turnId: "overlap-1", mode: "Plan" });
+	await overlap.serve();
+	assert.equal((await overlapStart).ok, true);
+	const overlapProc = overlap.host.procs.get(overlapUi);
+	const overlapTurn = overlapProc.lastTurn;
+	const overlapBefore = overlapProc.child.writes.filter((message) => message.method === "session/set_mode").length;
+	const narrow = overlap.host.setMode(overlapUi, "Normal");
+	const wider = overlap.host.setMode(overlapUi, "Always-approve");
+	const overlapCalls = overlapProc.child.writes.filter((message) => message.method === "session/set_mode").slice(overlapBefore);
+	assert.equal(overlapCalls.length, 2);
+	answer(overlapProc.child, overlapCalls[1].id, { result: {} });
+	answer(overlapProc.child, overlapCalls[0].id, { result: {} });
+	assert.equal((await narrow).ok, false, "the older mode change does not win");
+	assert.equal((await wider).ok, true);
+	assert.equal(overlapTurn.mode, "Always-approve", "the later click is the mode late calls use");
+	assert.equal(hook(overlap.host, overlapProc, 9, overlapTurn.agentSessionId, "overlap-command", "run_terminal_command", { command: "echo hi" }).decision, "allow");
+
+	const folder = makeHost();
+	const folderUi = "folder-mode";
+	const folderStart = folder.host.prompt({ ...input, uiSessionId: folderUi, turnId: "folder-1", mode: "Always-approve" });
+	await folder.serve();
+	assert.equal((await folderStart).ok, true);
+	const folderProc = folder.host.procs.get(folderUi);
+	folder.host.forgetSession(folderUi);
+	assert.equal(folder.host.sessions.has(folderUi), false);
+	assert.equal((await folder.host.setMode(folderUi, "Normal")).ok, true);
+	assert.equal(folderProc.lastTurn.mode, "Normal");
+	const afterFolder = hook(folder.host, folderProc, 10, folderProc.lastTurn.agentSessionId, "folder-command", "run_terminal_command", { command: "git push" });
+	assert.equal(afterFolder.decision, "deny");
+	assert.match(afterFolder.reason, /already finished/);
+	console.log("PASS a finished Always-approve turn follows the mode chip, including a refused change");
 }
 
 // Real start, session and prompt traffic through fake Grok processes.
@@ -1103,6 +1343,73 @@ async function checkIdle() {
 	assert.deepEqual(gone.events.filter((event) => event.type === "done" || event.type === "error").map((event) => event.stopReason), ["cancelled", "cancelled"], "their turns end as cancelled, not as errors");
 }
 
+async function checkUnattended() {
+	const test = makeHost();
+	const fired = { ...input, mode: "Auto-review", unattended: true };
+	const typed = { ...input, mode: "Auto-review" };
+	assert.equal(test.host.inputProblem({ ...input, unattended: "yes" }), "Unattended must be on or off.");
+	assert.equal(test.host.inputProblem(fired), "");
+	const proc = test.host.procFor(fired, { ...fired, turnId: "fired" });
+	proc.ready.catch(() => {});
+	assert.equal(test.host.procFor(fired, { ...fired, turnId: "fired" }), proc, "the same kind of turn keeps its Grok");
+	const requests = [];
+	test.host.request = (_proc, method, params) => { requests.push({ method, params }); return { promise: Promise.resolve({ sessionId: "run-session" }) }; };
+	await test.host.ensureSession(proc, fired);
+	assert.equal(requests[0].method, "session/new");
+	assert.deepEqual(plain(requests[0].params._meta.startupHints), { nonInteractive: true }, "Grok hears that nobody is watching");
+	assert.equal(requests[0].params._meta.autoMode, true);
+	const reopened = test.host.procFor(typed, { ...typed, turnId: "typed" });
+	reopened.ready.catch(() => {});
+	assert.notEqual(reopened, proc, "a message typed after the run gets a Grok that can ask");
+	assert.ok(test.events.some((event) => /^Grok restarted so it can ask you for approvals\./.test(event.text || "")));
+	await test.host.ensureSession(reopened, typed);
+	const reload = requests.find((request) => request.method === "session/load");
+	assert.equal(reload.params.sessionId, "run-session");
+	assert.equal(reload.params._meta.startupHints, undefined, "and that Grok no longer hears it");
+	const failedCard = (toolCallId, text) => test.host.toolCard({ toolCallId, status: "failed", content: [{ type: "content", content: { type: "text", text } }] }, proc).detail;
+	assert.equal(failedCard("review", "Tool `run_terminal_command` was not executed: No user is available to approve this command in this non-interactive session."), "Denied · not run", "a call Grok's review refused counts as denied");
+	assert.equal(failedCard("rule", "Tool `run_terminal_command` was not executed: Denied by permission policy: deny rule on bash."), "Denied · not run");
+	assert.equal(failedCard("hook", "Hook denied: Blocked by the Claude Code safety hook."), "Denied · not run");
+	test.host.outcomes.set("broke", "allow");
+	assert.equal(failedCard("broke", "exit 1: No such host is known."), "Failed", "a command that ran and failed does not");
+	test.host.kill();
+	console.log("PASS unattended: a routine's Auto-review turn is non-interactive, and a typed message restarts Grok so it can ask");
+}
+
+async function checkRoutineInteractionTimeout() {
+	for (const [method, fields, outcome] of [
+		["_x.ai/ask_user_question", { questions: [{ question: "Which report?" }] }, "cancelled"],
+		["_x.ai/exit_plan_mode", { planContent: "Prepare the report." }, "abandoned"],
+	]) {
+		const test = makeHost();
+		const sent = test.host.prompt({ ...input, turnId: "scheduled" }, { routine: true });
+		await test.serve("session/prompt");
+		const started = await sent;
+		assert.equal(started.ok, true);
+		const interaction = (child, sessionId) => grokLine(child, { id: 500, method, params: { sessionId, toolCallId: "routine-card", ...fields } });
+		interaction(test.children[0], started.agentSessionId);
+		const gate = test.host.gates.get("routine-card");
+		const deadline = test.timers.get(gate.timer);
+		assert.equal(deadline.ms, 8 * 60 * 1000);
+		deadline.callback();
+		assert.deepEqual(test.writes.find((message) => message.id === 500).result, { outcome });
+		assert.equal(test.events.at(-1).tool.detail, "Denied · timed out");
+		assert.equal(test.events.at(-1).tool.waiting, false);
+		assert.ok(test.writes.some((message) => message.method === "session/cancel"));
+		assert.equal(test.timers.has(gate.timer), false);
+		[...test.timers.values()].find((timer) => timer.ms === 5000).callback();
+		assert.equal(test.host.turns.has(input.uiSessionId), false, "a Grok that ignores cancel cannot hold the routine open");
+		assert.equal(test.events.at(-1).stopReason, "cancelled");
+
+		const typed = test.host.prompt({ ...input, turnId: "typed", routine: true });
+		await test.serve("session/prompt");
+		interaction(test.children.at(-1), (await typed).agentSessionId);
+		assert.equal(test.host.gates.get("routine-card").timer, null, "a later typed turn waits, even with a routine flag in its input");
+		test.host.kill();
+	}
+	console.log("PASS routine questions and plans time out after 8 minutes and end the run; typed turns still wait");
+}
+
 async function checkBrowserControl() {
 	const entry = { type: "http", name: "browser_pane", url: "http://127.0.0.1:12345/mcp", headers: [{ name: "Authorization", value: "Bearer test-token" }] };
 	const test = makeHost({ browserServer: async () => entry }, { env: { NO_PROXY: "example.test", no_proxy: "internal.test" } });
@@ -1119,7 +1426,7 @@ async function checkBrowserControl() {
 	assert.equal(requests[0].method, "session/new");
 	assert.deepEqual(plain(requests[0].params.mcpServers), [entry]);
 	assert.equal(proc.browserReady, true);
-	const reloaded = { browser: true, lost: false };
+	const reloaded = { browser: true, lost: false, sandboxKey: "" };
 	await test.host.ensureSession(reloaded, { ...input, browser: true });
 	assert.equal(requests[1].method, "session/load");
 	assert.deepEqual(plain(requests[1].params.mcpServers), [entry]);
@@ -1558,7 +1865,7 @@ async function checkParityFeatures() {
 		assert.match(host.inputProblem({ ...input, turnId: "t", attachments: [folder] }), /not a file/);
 		assert.match(host.inputProblem({ ...input, turnId: "t", attachments: Array(21).fill(image) }), /at most 20/);
 		const sent = makeHost();
-		sent.host.procFor = () => ({ ready: Promise.resolve() });
+		sent.host.procFor = () => ({ ready: Promise.resolve(), pending: new Map(), promptTurns: new Map() });
 		sent.host.ensureSession = async () => ({ sessionId: "agent-chat" });
 		sent.host.applyConfig = async () => {};
 		sent.host.applyMode = async () => {};
@@ -1692,6 +1999,157 @@ async function checkAccount() {
 	assert.equal(spawns.some((item) => item[0] === "taskkill"), true);
 }
 
+async function checkBackgroundToolCompletion() {
+	const made = makeHost();
+	const { host, events } = made;
+	const tasks = [
+		{ taskId: "a72d7aff-77e8-4df9-8a2b-835d6042dc73", toolId: "call-fd585c80-1d23-4de1-9af6-1ce6ed750b4e-2", promptId: "eadf337a-ac02-40a5-b363-613f9303479a" },
+		{ taskId: "60d680f7-9646-4e94-99ee-a1c9969dc63d", toolId: "call-1a987f3e-4367-4aa3-8cc1-7d17af2a3f44-3", promptId: "d5995042-1465-4e44-ba08-762d3bc9cbd0" },
+	];
+	for (const [index, task] of tasks.entries()) {
+		const turnId = `background-owner-${index}`;
+		const text = `Start background task ${index}`;
+		const sent = host.prompt({ ...input, turnId, text });
+		await made.serve("session/prompt");
+		const { agentSessionId } = await sent;
+		assert.ok(agentSessionId);
+		const proc = host.procs.get("chat");
+		const rpcId = host.turns.get("chat").promptId;
+		const line = (message) => proc.child.stdout.emit("data", Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`));
+		const notify = (update) => line({ method: "_x.ai/session_notification", params: { sessionId: agentSessionId, update } });
+		const stream = (update) => line({ method: "session/update", params: { sessionId: agentSessionId, update, _meta: { promptId: task.promptId } } });
+		const command = "ping -n 6 127.0.0.1";
+		const outputFile = path.join(input.cwd, "terminal", `${task.toolId}.log`);
+		line({ method: "_x.ai/queue/changed", params: { sessionId: agentSessionId, entries: [], runningPromptId: task.promptId, runningText: text, runningKind: "prompt" } });
+		stream({ sessionUpdate: "tool_call", toolCallId: task.toolId, title: "run_terminal_command", rawInput: { command, description: "Ping localhost six times in background", block_until_ms: 0 } });
+		notify({ sessionUpdate: "task_backgrounded", tool_call_id: task.toolId, task_id: task.taskId, command, cwd: input.cwd, output_file: outputFile, description: "Ping localhost six times in background", background_reason: "requested" });
+		const snapshot = { task_id: task.taskId, command, description: "Ping localhost six times in background", cwd: input.cwd, kind: "bash", status: "running", started_at: "2026-11-10T02:49:46.307490300+00:00", output_file: outputFile };
+		notify({ sessionUpdate: "background_tasks", tasks: [snapshot] });
+		stream({ sessionUpdate: "tool_call_update", toolCallId: task.toolId, kind: "execute", title: `Execute ${command}`, content: [{ type: "content", content: { type: "text", text: "Ping localhost six times in background" } }], rawInput: { variant: "Bash", command, is_background: false, block_until_ms: 0 } });
+		stream({ sessionUpdate: "tool_call_update", toolCallId: task.toolId, status: "completed", title: `[bg] ${command}`, content: [{ type: "content", content: { type: "text", text: `Background task ${task.taskId} started` } }], rawOutput: { type: "BackgroundTaskStarted", task_id: task.taskId, task_type: "bash", output_file: outputFile, status: "running", command, summary: `Background task ${task.taskId} started`, pid: 1234 + index } });
+		assert.ok(events.some((event) => event.type === "tool" && event.turnId === turnId && event.tool.id === task.toolId), "the ordinary tool stream created the original row before the command finished");
+		line({ id: rpcId, result: { stopReason: "end_turn", _meta: { sessionId: agentSessionId, promptId: task.promptId } } });
+		assert.equal(host.turns.has("chat"), false, "the parent app turn ends before the background task completes");
+		let newerRpcId;
+		if (index === 1) {
+			const newer = host.prompt({ ...input, turnId: "newer-background-turn", text: "A newer foreground prompt" });
+			await made.serve("session/prompt");
+			assert.equal((await newer).ok, true);
+			newerRpcId = host.turns.get("chat").promptId;
+		}
+		const before = events.length;
+		const reportText = "Background command report must remain suppressed";
+		if (index === 0) {
+			notify({ sessionUpdate: "task_completed", task_snapshot: { task_id: task.taskId, command, cwd: input.cwd, start_time: { secs_since_epoch: 1794278986, nanos_since_epoch: 307490300 }, end_time: { secs_since_epoch: 1794278991, nanos_since_epoch: 637032000 }, output: reportText, output_file: outputFile, truncated: false, output_total_bytes: reportText.length, exit_code: 0, signal: null, completed: true, kind: "bash", owner_session_id: agentSessionId, is_backgrounded: true }, will_wake: true });
+		} else {
+			notify({ sessionUpdate: "background_tasks", tasks: [{ ...snapshot, status: "completed", ended_at: "2026-11-10T02:49:51.637032+00:00", exit_code: 0 }] });
+		}
+		const completed = events.slice(before).filter((event) => event.type === "tool");
+		assert.deepEqual(completed.map((event) => [event.uiSessionId, event.turnId, event.tool.id, event.tool.detail, event.tool.waiting, event.tool.backgroundTask]), [
+			["chat", turnId, task.toolId, "Ran", false, true],
+		], index === 0 ? "task_completed finishes the original tool row after its app turn ended" : "a terminal background_tasks snapshot finishes the original row even when its completion notice is missing and a newer turn is active");
+		assert.equal(JSON.stringify(events.slice(before)).includes(reportText), false, "the task's command report is not reprinted into the conversation");
+		if (index === 1) {
+			assert.equal(host.turns.get("chat").turnId, "newer-background-turn", "the old command's status cannot finish or replace the newer foreground turn");
+			line({ id: newerRpcId, result: { stopReason: "end_turn" } });
+		}
+	}
+}
+
+async function startBackgroundFixtureTurn(made, turnId) {
+	const text = `Prompt for ${turnId}`;
+	const sent = made.host.prompt({ ...input, turnId, text });
+	await made.serve("session/prompt");
+	const { agentSessionId } = await sent;
+	assert.ok(agentSessionId);
+	const proc = made.host.procs.get("chat");
+	const rpcId = made.host.turns.get("chat").promptId;
+	const promptId = `${turnId}-provider-prompt`;
+	const line = (message) => proc.child.stdout.emit("data", Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`));
+	line({ method: "_x.ai/queue/changed", params: { sessionId: agentSessionId, entries: [], runningPromptId: promptId, runningText: text, runningKind: "prompt" } });
+	return { agentSessionId, proc, rpcId, promptId, line };
+}
+
+function linkBackgroundFixtureTask(line, sessionId, promptId, taskId, toolId) {
+	const command = "echo background work";
+	line({ method: "session/update", params: { sessionId, _meta: { promptId }, update: { sessionUpdate: "tool_call", toolCallId: toolId, title: "run_terminal_command", rawInput: { command, block_until_ms: 0 } } } });
+	line({ method: "_x.ai/session_notification", params: { sessionId, update: { sessionUpdate: "task_backgrounded", tool_call_id: toolId, task_id: taskId, command } } });
+	line({ method: "session/update", params: { sessionId, _meta: { promptId }, update: { sessionUpdate: "tool_call_update", toolCallId: toolId, status: "completed", rawOutput: { type: "BackgroundTaskStarted", task_id: taskId, status: "running" } } } });
+}
+
+async function checkBackgroundReportAfterStop(stopSource) {
+	const made = makeHost();
+	const { host, events } = made;
+	const source = await startBackgroundFixtureTurn(made, "background-source");
+	const { line, agentSessionId, proc, promptId } = source;
+	linkBackgroundFixtureTask(line, agentSessionId, promptId, "surviving-command", "original-command");
+	if (stopSource) { host.cancel("chat"); }
+	line({ id: source.rpcId, result: { stopReason: stopSource ? "cancelled" : "end_turn" } });
+	if (!stopSource) {
+		const unrelated = await startBackgroundFixtureTurn(made, "unrelated-source");
+		host.cancel("chat");
+		line({ id: unrelated.rpcId, result: { stopReason: "cancelled" } });
+	}
+	assert.equal(proc.lost, false, "stopping an app prompt leaves its surviving background command's process available");
+	const before = events.length;
+	const reportPromptId = "task-completed-surviving-command";
+	const reportId = `task-report-${reportPromptId}`;
+	const notify = (update) => line({ method: "_x.ai/session_notification", params: { sessionId: agentSessionId, update } });
+	const stream = (update) => line({ method: "session/update", params: { sessionId: agentSessionId, _meta: { promptId: reportPromptId }, update } });
+	notify({ sessionUpdate: "task_completed", task_snapshot: { task_id: "surviving-command", completed: true, exit_code: 1, owner_session_id: agentSessionId }, will_wake: true });
+	notify({ sessionUpdate: "hook_execution", event_name: "user_prompt_submit", prompt_id: reportPromptId, runs: [] });
+	assert.deepEqual(events.slice(before).filter((event) => event.type === "turn-start").map((event) => [event.turnId, event.background, event.parallel]), [[reportId, true, true]], "the report has an identity before its first tool or text event");
+	stream({ sessionUpdate: "tool_call", toolCallId: "read-report-output", title: "get_command_or_subagent_output", rawInput: {} });
+	stream({ sessionUpdate: "tool_call_update", toolCallId: "read-report-output", status: "completed" });
+	stream({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The background command failed." } });
+	notify({ sessionUpdate: "turn_completed", prompt_id: reportPromptId, stop_reason: "end_turn" });
+	assert.deepEqual(events.slice(before).filter((event) => ["tool", "chunk", "done"].includes(event.type)).map((event) => [event.type, event.turnId, event.tool?.id || event.text || event.stopReason]), [
+		["tool", "background-source", "original-command"],
+		["tool", reportId, "read-report-output"],
+		["tool", reportId, "read-report-output"],
+		["chunk", reportId, "The background command failed."],
+		["done", reportId, "end_turn"],
+	], `${stopSource ? "source" : "unrelated"} Stop leaves the command report and its own tool rows visible`);
+	assert.equal(host.turns.has("chat"), false, "the report does not become a new active app prompt");
+}
+
+async function checkBackgroundToolProcessLoss() {
+	const made = makeHost();
+	const { events } = made;
+	const { line, agentSessionId, proc, rpcId, promptId } = await startBackgroundFixtureTurn(made, "lost-background-owner");
+	linkBackgroundFixtureTask(line, agentSessionId, promptId, "lost-task", "lost-tool");
+	const linked = events.filter((event) => event.tool?.id === "lost-tool").at(-1);
+	assert.equal(linked.tool.detail, "Running");
+	line({ id: rpcId, result: { stopReason: "end_turn" } });
+	const before = events.length;
+	proc.child.emit("exit");
+	assert.deepEqual(events.slice(before).filter((event) => event.type === "tool").map((event) => [event.uiSessionId, event.turnId, event.tool.id, event.tool.detail, event.tool.waiting, event.tool.backgroundTask]), [
+		["chat", "lost-background-owner", "lost-tool", "Stopped", false, true],
+	], "losing Grok settles the original linked Running tool row as Stopped");
+}
+
+async function checkChildBackgroundTaskStatus() {
+	const made = makeHost();
+	const { events } = made;
+	const { line, agentSessionId, proc, rpcId } = await startBackgroundFixtureTurn(made, "child-task-owner");
+	const childSessionId = "child-background-session";
+	const notify = (sessionId, update) => line({ method: "_x.ai/session_notification", params: { sessionId, update } });
+	notify(agentSessionId, { sessionUpdate: "subagent_spawned", subagent_id: "child", child_session_id: childSessionId, parent_session_id: agentSessionId });
+	notify(agentSessionId, { sessionUpdate: "background_tasks", tasks: [{ task_id: "still-running-parent-task", status: "running" }] });
+	linkBackgroundFixtureTask(line, childSessionId, "child-provider-prompt", "child-notified-task", "child-notified-tool");
+	linkBackgroundFixtureTask(line, childSessionId, "child-provider-prompt", "child-snapshot-task", "child-snapshot-tool");
+	line({ id: rpcId, result: { stopReason: "end_turn" } });
+	const before = events.length;
+	notify(childSessionId, { sessionUpdate: "task_completed", task_snapshot: { task_id: "child-notified-task", completed: true, exit_code: 0, owner_session_id: childSessionId }, will_wake: true });
+	notify(childSessionId, { sessionUpdate: "background_tasks", tasks: [{ task_id: "child-snapshot-task", status: "completed", exit_code: 0 }] });
+	assert.deepEqual(events.slice(before).filter((event) => event.type === "tool").map((event) => [event.uiSessionId, event.turnId, event.tool.id, event.tool.detail, event.tool.backgroundTask]), [
+		["chat", "child-task-owner", "child-notified-tool", "Ran", true],
+		["chat", "child-task-owner", "child-snapshot-tool", "Ran", true],
+	], "child completion and snapshots settle linked tool rows on the parent reply");
+	assert.equal(proc.background, true, "the child snapshot cannot clear the parent process's own background-task idle hold");
+	assert.equal(events.slice(before).some((event) => event.type === "bg-tasks"), false, "child snapshots cannot replace the parent background-task list");
+}
+
 async function checkSessionEnhancements() {
 	const { host, running, events, writes } = makeHost();
 	const proc = running({ uiSessionId: "a", agentSessionId: "sid-a" });
@@ -1801,7 +2259,7 @@ async function checkSessionEnhancements() {
 async function checkPromptIndexes() {
 	for (const choice of ["two", "empty", "failed", "timeout", "slash", "side"]) {
 		const { host, timers } = makeHost();
-		const proc = { ready: Promise.resolve(), pending: new Map() };
+		const proc = { ready: Promise.resolve(), pending: new Map(), promptTurns: new Map() };
 		host.procFor = () => proc;
 		host.ensureSession = async () => ({ sessionId: "indexed" });
 		host.applyConfig = async () => {};
@@ -2003,36 +2461,54 @@ async function checkSteer() {
 	sent = writes.at(-1);
 	host.onMessage(proc, { id: sent.id, error: { message: "Failed interject" } });
 	assert.match((await result).error, /Failed interject/);
-	assert.deepEqual(plain(proc.steers), ["Keep this text"], "steers Grok refused are not remembered");
+	assert.equal(events.filter((event) => event.type === "steer").length, 1, "refused steers never appear as accepted messages");
 
 	// A steer that reaches Grok after the turn ended runs as Grok's own turn, which joins the app as a new turn.
 	const late = makeHost();
-	const lateProc = late.running({ uiSessionId: "chat", agentSessionId: "late-agent", mode: "Auto-review", allowedFolders: ["C:/extra"] });
-	late.host.sessions.set("chat", { sessionId: "late-agent", proc: lateProc });
-	lateProc.lastTurn = late.host.turns.get("chat");
-	const notify = (update, meta) => late.host.onMessage(lateProc, { method: "_x.ai/session_notification", params: { sessionId: "late-agent", update, ...(meta ? { _meta: meta } : {}) } });
-	const update = (update, meta) => late.host.onMessage(lateProc, { method: "session/update", params: { sessionId: "late-agent", update, ...(meta ? { _meta: meta } : {}) } });
+	const extraFolder = path.join(input.cwd, "extra");
+	const lateInput = { ...input, turnId: "original", mode: "Auto-review", allowedFolders: [extraFolder] };
+	const firstSend = late.host.prompt(lateInput);
+	await late.serve("session/prompt");
+	const { agentSessionId } = await firstSend;
+	assert.ok(agentSessionId);
+	const lateProc = late.host.procs.get("chat");
+	const notify = (update) => late.host.onMessage(lateProc, { method: "_x.ai/session_notification", params: { sessionId: agentSessionId, update } });
+	const update = (update, meta) => late.host.onMessage(lateProc, { method: "session/update", params: { sessionId: agentSessionId, update, ...(meta ? { _meta: meta } : {}) } });
 	const steered = late.host.steer("chat", "Also add tests");
 	const interject = late.writes.at(-1);
-	late.host.finishPrompt(late.host.turns.get("chat"), 2, { stopReason: "end_turn" }, "");
+	assert.equal((await late.host.steer("chat", "Queue this instead")).ok, false, "only one unresolved steer can claim a fallback");
+	assert.equal(late.writes.at(-1), interject, "the second steer stays with the app queue");
+	const original = late.host.turns.get("chat");
+	late.host.onMessage(lateProc, { id: original.promptId, result: { stopReason: "end_turn" } });
+	assert.equal(late.host.turns.has("chat"), false, "the original completion releases the session without waiting for a steer notice");
 	late.host.onMessage(lateProc, { id: interject.id, result: { status: "queued" } });
-	assert.equal((await steered).ok, true);
+	// Grok can write the reply and the fallback start in a single stdout chunk.
 	notify({ sessionUpdate: "hook_execution", event_name: "user_prompt_submit", prompt_id: "interject-fallback-1" });
 	const adopted = late.host.turns.get("chat");
 	assert.ok(adopted && adopted.fallback, "Grok's own turn for a late steer joins the app");
-	assert.deepEqual(plain({ mode: adopted.mode, allowedFolders: adopted.allowedFolders, agentSessionId: adopted.agentSessionId, promptId: adopted.promptId }), { mode: "Auto-review", allowedFolders: ["C:/extra"], agentSessionId: "late-agent", promptId: "interject-fallback-1" }, "it keeps the last turn's mode and folders");
-	assert.deepEqual(plain(late.events.at(-1)), { type: "turn-start", uiSessionId: "chat", turnId: adopted.turnId, text: "Also add tests" });
+	assert.equal((await steered).ok, true);
+	assert.deepEqual(plain({ mode: adopted.mode, allowedFolders: adopted.allowedFolders, agentSessionId: adopted.agentSessionId, promptId: adopted.promptId }), { mode: "Auto-review", allowedFolders: [extraFolder], agentSessionId, promptId: "interject-fallback-1" }, "it keeps the last turn's mode and folders");
+	assert.equal(late.events.at(-1).type, "turn-start");
+	assert.equal(late.events.at(-1).turnId, adopted.turnId);
+	assert.equal(late.events.at(-1).text, "Also add tests");
+	notify({ sessionUpdate: "turn_completed", prompt_id: "interject-fallback-other", stop_reason: "end_turn" });
+	assert.equal(late.events.some((event) => event.type === "done" && event.turnId === adopted.turnId), false, "a different fallback's completion cannot finish this steer");
 	update({ sessionUpdate: "user_message_chunk", content: { type: "text", text: "Also add tests" } });
 	update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Added." } }, { promptId: "interject-fallback-1" });
 	assert.deepEqual(plain(late.events.at(-1)), { type: "chunk", text: "Added.", uiSessionId: "chat", turnId: adopted.turnId });
-	assert.equal(late.events.filter((event) => event.type === "turn-start").length, 1, "the echoed steer does not start a second turn");
+	assert.equal(late.events.filter((event) => event.type === "turn-start" && event.turnId === adopted.turnId && !event.resume).length, 1, "the echoed steer does not create another transcript entry for this fallback");
 	notify({ sessionUpdate: "turn_completed", prompt_id: "interject-fallback-1", stop_reason: "end_turn", usage: { inputTokens: 10, outputTokens: 2, modelCalls: 1, costUsdTicks: 0, modelUsage: { "grok-4.7": {} } } });
 	assert.equal(late.host.turns.has("chat"), false, "turn_completed ends Grok's own turn");
 	assert.deepEqual(late.events.slice(-2).map((event) => event.type), ["usage", "done"]);
 	assert.equal(late.events.at(-1).turnId, adopted.turnId);
 	update({ sessionUpdate: "user_message_chunk", content: { type: "text", text: "Also add tests" } });
-	notify({ sessionUpdate: "hook_execution", prompt_id: "interject-fallback-2" });
-	assert.equal(late.host.turns.has("chat"), false, "with no steer waiting, Grok's messages never start a turn");
+	assert.equal(late.host.turns.has("chat"), false, "the finished steer's echo cannot start another reply");
+	const nextSend = late.host.prompt({ ...lateInput, turnId: "newer" });
+	await late.serve("session/prompt");
+	assert.equal((await nextSend).ok, true);
+	const beforeStale = late.events.length;
+	update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Stale steer reply" } }, { promptId: "interject-fallback-1" });
+	assert.equal(late.events.length, beforeStale, "tagged fallback chunks cannot spill into a new prompt");
 
 	// The echo of the steer starts the turn too; a replayed prompt does not.
 	const echo = makeHost();
@@ -2046,13 +2522,504 @@ async function checkSteer() {
 	const echoed = (text, meta) => echo.host.onMessage(echoProc, { method: "session/update", params: { sessionId: "echo-agent", update: { sessionUpdate: "user_message_chunk", content: { type: "text", text }, ...(meta ? { _meta: meta } : {}) } } });
 	echoed("Use the other file", { isReplay: true });
 	echoed("Something else");
-	assert.equal(echo.host.turns.has("chat"), false, "a replay or another text starts nothing");
+	assert.equal(echo.host.turns.has("chat"), false, "a replay or another untagged text starts nothing");
+	assert.equal(echo.events.some((event) => event.type === "turn-start"), false);
 	echoed("Use the other file");
 	assert.equal(echo.host.turns.get("chat").fallback, true);
 	assert.equal(echo.events.at(-1).text, "Use the other file");
 	echo.host.onMessage(echoProc, { method: "session/update", params: { sessionId: "echo-agent", update: { sessionUpdate: "turn_completed", prompt_id: "interject-fallback-9", stop_reason: "cancelled" } } });
 	assert.equal(echo.host.turns.has("chat"), false, "turn_completed ends it on either channel");
 	assert.equal(echo.events.at(-1).stopReason, "cancelled");
+
+	const stopped = makeHost();
+	const stoppedProc = stopped.running({ uiSessionId: "chat", agentSessionId: "stopped-agent", mode: "Always-approve" });
+	stopped.host.sessions.set("chat", { sessionId: "stopped-agent", proc: stoppedProc });
+	const stoppedTurn = stopped.host.turns.get("chat");
+	stoppedProc.lastTurn = stoppedTurn;
+	const stoppedSteer = stopped.host.steer("chat", "Write a new file");
+	const stoppedInterject = stopped.writes.at(-1);
+	stopped.host.onMessage(stoppedProc, { id: stoppedInterject.id, result: { status: "queued" } });
+	stopped.host.finishPrompt(stoppedTurn, 2, { stopReason: "end_turn" }, "");
+	stopped.host.cancel("chat");
+	assert.deepEqual(plain(await stoppedSteer), { ok: false, error: "Stopped." }, "a queued acknowledgement racing Stop returns the text to the renderer queue");
+	stopped.host.onMessage(stoppedProc, { method: "_x.ai/session_notification", params: { sessionId: "stopped-agent", update: { sessionUpdate: "hook_execution", prompt_id: "interject-fallback-1" } } });
+	assert.equal(stopped.host.turns.has("chat"), false, "Stop prevents a pending steer from starting a fallback");
+	assert.equal(stoppedProc.lost, true, "the process cannot start work for the cancelled steer later");
+}
+
+async function checkAbsorbedSteerLifecycle(action) {
+	const made = makeHost();
+	const { host, writes, events } = made;
+	const first = host.prompt({ ...input, turnId: "absorbing-original" });
+	await made.serve("session/prompt");
+	const { agentSessionId } = await first;
+	const proc = host.procs.get("chat");
+	const original = host.turns.get("chat");
+	const originalPromptId = "469b570d-6483-49c8-ad21-3c3ae38ed5ab";
+	host.onMessage(proc, { method: "_x.ai/queue/changed", params: { sessionId: agentSessionId, entries: [], runningPromptId: originalPromptId, runningText: input.text } });
+	const earlierText = "An instruction absorbed into the earlier reply";
+	const earlier = host.steer("chat", earlierText);
+	host.onMessage(proc, { id: writes.at(-1).id, result: { status: "queued" } });
+	assert.equal((await earlier).ok, true);
+	if (action !== "running-cancel") {
+		host.onMessage(proc, { method: "_x.ai/session/interjection", params: { sessionId: agentSessionId, text: earlierText } });
+	}
+	if (action === "cancel" || action === "fallback") {
+		host.onMessage(proc, { method: "session/update", params: { sessionId: agentSessionId, _meta: { promptId: originalPromptId }, update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: `The user sent a message while you were working: <user_query>${earlierText}</user_query>` } } } });
+	}
+	host.onMessage(proc, { id: original.promptId, result: { stopReason: "end_turn" } });
+	const next = host.prompt({ ...input, turnId: "after-absorbed-steer", text: "A later ordinary prompt" });
+	await made.serve("session/prompt");
+	assert.equal((await next).ok, true);
+	const nextTurn = host.turns.get("chat");
+	if (action === "submitted-fallback") {
+		const promptId = "interject-fallback-c895346e-05db-446c-8b1a-e5c31af4a18c";
+		host.onMessage(proc, { method: "session/update", params: { sessionId: agentSessionId, _meta: { promptId }, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The earlier steer's reply." } } } });
+		const started = events.find((event) => event.type === "turn-start" && !event.resume);
+		assert.equal(started?.text, earlierText, "submitting a newer prompt preserves the earlier steer's fallback candidate until the newer prompt runs");
+		assert.deepEqual(plain(events.at(-1)), { type: "chunk", uiSessionId: "chat", turnId: started.turnId, text: "The earlier steer's reply." });
+		return;
+	}
+	const nextPromptId = "2fb28c4e-fad6-4d87-88e1-74f07c59a51f";
+	host.onMessage(proc, { method: "_x.ai/queue/changed", params: { sessionId: agentSessionId, entries: [], runningPromptId: nextPromptId, runningText: "A later ordinary prompt" } });
+	if (action === "running-cancel") {
+		host.onMessage(proc, { method: "_x.ai/session/interjection", params: { sessionId: agentSessionId, text: earlierText } });
+		assert.equal(events.filter((event) => event.type === "steer" && event.text === earlierText).length, 1, "retiring a steer preserves its text once when the queue notice arrives late");
+	}
+	if (action === "cancel" || action === "running-cancel") {
+		host.cancel("chat");
+		assert.equal(proc.lost, false, "an earlier absorbed steer does not make a later ordinary Stop kill Grok");
+		assert.equal(writes.at(-1).method, "session/cancel", "ordinary cancellation still uses the session cancel request");
+		host.onMessage(proc, { id: nextTurn.promptId, result: { stopReason: "cancelled" } });
+		assert.equal(host.turns.has("chat"), false);
+		assert.equal(proc.lost, false, "Grok remains reusable after the cancelled prompt ends");
+		return;
+	}
+	const laterText = "A new steer that needs its own reply";
+	const later = host.steer("chat", laterText);
+	host.onMessage(proc, { id: writes.at(-1).id, result: { status: "queued" } });
+	assert.equal((await later).ok, true);
+	host.onMessage(proc, { method: "_x.ai/session/interjection", params: { sessionId: agentSessionId, text: laterText } });
+	host.onMessage(proc, { id: nextTurn.promptId, result: { stopReason: "end_turn" } });
+	const fallbackPromptId = "interject-fallback-f9fb81aa-30d0-4b2f-84c5-195a914c3af8";
+	host.onMessage(proc, { method: "session/update", params: { sessionId: agentSessionId, _meta: { promptId: fallbackPromptId }, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The later steer's answer." } } } });
+	const started = events.filter((event) => event.type === "turn-start" && !event.resume).at(-1);
+	assert.equal(started?.text, laterText, "the later fallback uses its sole remaining steer candidate without provider text");
+	assert.deepEqual(plain(events.at(-1)), { type: "chunk", uiSessionId: "chat", turnId: started.turnId, text: "The later steer's answer." });
+}
+
+async function checkLateSteerOrdering(noticeBefore, withHook) {
+	const label = `interjection ${noticeBefore ? "before" : "after"} prompt response, ${withHook ? "hook line" : "tagged chunk only"}`;
+	const made = makeHost();
+	const { host, events, writes } = made;
+	const firstSend = host.prompt({ ...input, turnId: "original" });
+	await made.serve("session/prompt");
+	const { agentSessionId } = await firstSend;
+	assert.ok(agentSessionId, label);
+	const proc = host.procs.get("chat");
+	const original = host.turns.get("chat");
+	const text = "Answer this late steer";
+	const steer = host.steer("chat", text);
+	host.onMessage(proc, { id: writes.at(-1).id, result: { status: "queued" } });
+	assert.equal((await steer).ok, true, label);
+	const interjection = () => host.onMessage(proc, { method: "_x.ai/session/interjection", params: { sessionId: agentSessionId, text } });
+	if (noticeBefore) { interjection(); }
+	host.onMessage(proc, { id: original.promptId, result: { stopReason: "end_turn" } });
+	if (!noticeBefore) { interjection(); }
+	const newer = host.prompt({ ...input, turnId: "newer", text: "A newer prompt" });
+	await made.serve("session/prompt");
+	assert.equal((await newer).ok, true, `${label}: normal completion admits the next prompt immediately`);
+	const newerTurn = host.turns.get("chat");
+	assert.equal(newerTurn.turnId, "newer", label);
+	const promptId = "interject-fallback-ordering";
+	const update = (method, update) => host.onMessage(proc, { method, params: { sessionId: agentSessionId, _meta: { promptId: update.prompt_id || promptId }, update } });
+	if (withHook) { update("_x.ai/session_notification", { sessionUpdate: "hook_execution", event_name: "user_prompt_submit", prompt_id: promptId }); }
+	update("session/update", { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The steer's reply." } });
+	const fallback = host.turns.get("chat");
+	assert.ok(fallback?.fallback, `${label}: the first tagged chunk starts the steer's turn`);
+	assert.notEqual(fallback.turnId, original.turnId, label);
+	const started = events.find((event) => event.type === "turn-start" && event.turnId === fallback.turnId);
+	assert.equal(started?.text, text, `${label}: the new transcript entry keeps the steer text`);
+	assert.equal(started?.parallel, true, `${label}: the steer opens beside the newer normal prompt`);
+	assert.deepEqual(plain(events.at(-1)), { type: "chunk", uiSessionId: "chat", turnId: fallback.turnId, text: "The steer's reply." }, `${label}: the first reply chunk belongs to the steer`);
+	const toolId = "late-steer-write";
+	host.onMessage(proc, { id: 9001, method: "hooks/run", params: { sessionId: agentSessionId, toolUseId: toolId, toolName: "write", toolInput: { file_path: "late-steer.txt", content: "From the steer" } } });
+	assert.equal(host.gates.get(toolId)?.turnId, fallback.turnId, `${label}: the first tool approval belongs to the steer`);
+	assert.equal(events.at(-1).turnId, fallback.turnId, label);
+	assert.equal(host.decide({ uiSessionId: "chat", toolId, decision: "deny" }).ok, true, label);
+	assert.equal((await host.prompt({ ...input, turnId: "third" })).ok, false, `${label}: a second new prompt cannot replace either running reply`);
+	update("session/update", { sessionUpdate: "turn_completed", prompt_id: "interject-fallback-another", stop_reason: "end_turn" });
+	assert.equal(events.some((event) => event.type === "done" && event.turnId === fallback.turnId), false, `${label}: a different prompt's completion cannot finish the steer`);
+	update(withHook ? "_x.ai/session_notification" : "session/update", { sessionUpdate: "turn_completed", prompt_id: promptId, stop_reason: "end_turn" });
+	assert.equal(events.some((event) => event.type === "done" && event.turnId === newerTurn.turnId), false, `${label}: the steer's completion cannot finish the newer prompt`);
+	assert.equal(events.filter((event) => event.type === "done").at(-1).turnId, fallback.turnId, `${label}: the completion names the steer even when the newer prompt resumes`);
+	host.onMessage(proc, { method: "session/update", params: { sessionId: agentSessionId, _meta: { promptId: String(newerTurn.promptId) }, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The newer reply." } } } });
+	assert.deepEqual(plain(events.at(-1)), { type: "chunk", uiSessionId: "chat", turnId: newerTurn.turnId, text: "The newer reply." }, `${label}: the newer reply keeps its own transcript target`);
+	host.onMessage(proc, { id: newerTurn.promptId, result: { stopReason: "end_turn" } });
+	assert.equal(host.turns.has("chat"), false, `${label}: only the newer prompt's RPC response finishes that reply`);
+	assert.equal(events.at(-1).turnId, newerTurn.turnId, label);
+
+	const nextSend = host.prompt({ ...input, turnId: "stoppable" });
+	await made.serve("session/prompt");
+	assert.equal((await nextSend).ok, true, label);
+	const stoppedTurn = host.turns.get("chat");
+	const stoppedSteer = host.steer("chat", text);
+	host.onMessage(proc, { id: writes.at(-1).id, result: { status: "queued" } });
+	assert.equal((await stoppedSteer).ok, true, label);
+	if (noticeBefore) { interjection(); }
+	host.cancel("chat");
+	host.onMessage(proc, { id: stoppedTurn.promptId, result: { stopReason: "cancelled" } });
+	if (!noticeBefore) { interjection(); }
+	const stoppedEvents = events.length;
+	if (withHook) { update("_x.ai/session_notification", { sessionUpdate: "hook_execution", event_name: "user_prompt_submit", prompt_id: promptId }); }
+	update("session/update", { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "After Stop" } });
+	host.onMessage(proc, { id: 9002, method: "hooks/run", params: { sessionId: agentSessionId, toolUseId: "stopped-write", toolName: "write", toolInput: { file_path: "stopped.txt", content: "Stopped" } } });
+	assert.equal(host.turns.has("chat"), false, `${label}: Stop prevents the late fallback`);
+	assert.equal(events.slice(stoppedEvents).some((event) => event.type === "turn-start" || event.text === "After Stop"), false, `${label}: no fallback reply starts after Stop`);
+	assert.equal(host.gates.has("stopped-write"), false, `${label}: Stop cannot open a late tool approval`);
+	assert.equal(writes.some((message) => message.id === 9002 && message.result?.decision === "allow"), false, `${label}: the stopped tool never gains authorization`);
+}
+
+async function checkLateSteerText(kind) {
+	const made = makeHost();
+	const { host, writes, events } = made;
+	const sent = host.prompt({ ...input, turnId: "original" });
+	await made.serve("session/prompt");
+	const { agentSessionId } = await sent;
+	const proc = host.procs.get("chat");
+	const original = host.turns.get("chat");
+	const texts = kind === "single" ? ["The only retained steer"] : ["The first retained steer", "The second retained steer"];
+	for (const text of texts) {
+		const steered = host.steer("chat", text);
+		host.onMessage(proc, { id: writes.at(-1).id, result: { status: "queued" } });
+		assert.equal((await steered).ok, true, kind);
+		if (kind !== "single") { host.onMessage(proc, { method: "_x.ai/session/interjection", params: { sessionId: agentSessionId, text } }); }
+	}
+	host.onMessage(proc, { id: original.promptId, result: { stopReason: "end_turn" } });
+	assert.equal(host.turns.has("chat"), false, `${kind}: accepted steers never hold a completed normal turn open`);
+	const promptId = "interject-fallback-text";
+	const expected = kind === "unknown" ? "A provider prompt absent from the retained steers" : texts[0];
+	if (kind === "runningText" || kind === "unknown") {
+		host.onMessage(proc, { method: "_x.ai/queue/changed", params: { sessionId: agentSessionId, entries: [], runningPromptId: promptId, runningText: expected } });
+	}
+	if (kind === "echo") {
+		host.onMessage(proc, { method: "session/update", params: { sessionId: agentSessionId, _meta: { promptId }, update: { sessionUpdate: "user_message_chunk", content: { type: "text", text: expected } } } });
+	}
+	host.onMessage(proc, { method: "session/update", params: { sessionId: agentSessionId, _meta: { promptId }, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Reply for the reported prompt." } } } });
+	const started = events.find((event) => event.type === "turn-start");
+	assert.equal(started?.text, expected, `${kind}: the fallback transcript uses the reported text without substituting another steer`);
+	const fallback = host.turns.get("chat");
+	assert.equal(fallback?.turnId, started.turnId, kind);
+	assert.deepEqual(plain(events.at(-1)), { type: "chunk", uiSessionId: "chat", turnId: started.turnId, text: "Reply for the reported prompt." }, `${kind}: the first tagged chunk is retained`);
+	host.onMessage(proc, { method: kind === "runningText" ? "_x.ai/session_notification" : "session/update", params: { sessionId: agentSessionId, _meta: { promptId }, update: { sessionUpdate: "turn_completed", stop_reason: "end_turn" } } });
+	assert.equal(host.turns.has("chat"), false, `${kind}: completion metadata finishes the matching fallback`);
+	assert.equal(events.at(-1).type, "done", kind);
+	assert.equal(events.at(-1).turnId, started.turnId, kind);
+}
+
+async function checkProviderPromptUuids(kind) {
+	const made = makeHost();
+	const { host, events } = made;
+	const uiSessionId = kind === "side" ? "side-uuid" : `uuid-${kind}`;
+	const turnId = `turn-${kind}`;
+	const text = `Prompt for ${kind}`;
+	const sent = host.prompt({ ...input, uiSessionId, turnId, text, ...(kind === "routine" ? { unattended: true } : {}) }, { routine: kind === "routine" });
+	await made.serve("session/prompt");
+	const { agentSessionId } = await sent;
+	assert.ok(agentSessionId, kind);
+	const proc = host.procs.get(uiSessionId);
+	const rpcId = host.turns.get(uiSessionId).promptId;
+	const promptId = "3f6c2a10-1111-4222-8333-444455556666";
+	assert.equal(typeof rpcId, "number", kind);
+	assert.notEqual(String(rpcId), promptId, kind);
+	const line = (message) => proc.child.stdout.emit("data", Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`));
+	line({ method: "_x.ai/queue/changed", params: { sessionId: agentSessionId, entries: [], runningPromptId: promptId, runningText: text, runningKind: "prompt" } });
+	line({ method: "_x.ai/session_notification", params: { sessionId: agentSessionId, update: { sessionUpdate: "hook_execution", event_name: "user_prompt_submit", prompt_id: promptId, runs: [] }, _meta: { eventId: "uuid-start", agentTimestampMs: 1 } } });
+	for (const update of [
+		{ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Thinking through the prompt." } },
+		{ sessionUpdate: "tool_call", toolCallId: "uuid-read", kind: "read", title: "read_file", status: "pending", rawInput: { path: "a.txt" } },
+		{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The normal reply." } },
+	]) {
+		line({ method: "session/update", params: { sessionId: agentSessionId, update, _meta: { promptId } } });
+	}
+	line({ method: "_x.ai/session_notification", params: { sessionId: agentSessionId, update: { sessionUpdate: "turn_completed", prompt_id: promptId, stop_reason: "end_turn" }, _meta: { eventId: "uuid-end", agentTimestampMs: 2 } } });
+	line({ id: rpcId, result: { stopReason: "end_turn", _meta: { sessionId: agentSessionId, promptId } } });
+	await ticks();
+	const routed = events.filter((event) => ["thought", "tool", "chunk", "done"].includes(event.type));
+	assert.deepEqual(routed.map((event) => [event.type, event.uiSessionId, event.turnId, event.text || event.tool?.id || event.stopReason]), [
+		["thought", uiSessionId, turnId, "Thinking through the prompt."],
+		["tool", uiSessionId, turnId, "uuid-read"],
+		["chunk", uiSessionId, turnId, "The normal reply."],
+		["done", uiSessionId, turnId, "end_turn"],
+	], `${kind}: recorded Grok UUID metadata routes every normal prompt event to its app turn`);
+	assert.equal(host.turns.has(uiSessionId), false, `${kind}: the numeric RPC response finishes the UUID-tagged normal reply once`);
+}
+
+async function checkProviderPromptUuidOverlap() {
+	const made = makeHost();
+	const { host, events, writes } = made;
+	const sent = host.prompt({ ...input, turnId: "uuid-original", text: "Original normal prompt" });
+	await made.serve("session/prompt");
+	const { agentSessionId } = await sent;
+	assert.ok(agentSessionId);
+	const proc = host.procs.get("chat");
+	const originalRpcId = host.turns.get("chat").promptId;
+	const originalUuid = "3f6c2a10-1111-4222-8333-444455556666";
+	const normalUuid = "c7de4210-aaaa-4bbb-8ccc-ddddeeeeffff";
+	const fallbackId = "interject-fallback-uuid-overlap";
+	const line = (message) => proc.child.stdout.emit("data", Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`));
+	line({ method: "_x.ai/queue/changed", params: { sessionId: agentSessionId, entries: [], runningPromptId: originalUuid, runningText: "Original normal prompt", runningKind: "prompt" } });
+	const steerText = "A late steer for the original prompt";
+	const steered = host.steer("chat", steerText);
+	line({ id: writes.at(-1).id, result: { status: "queued" } });
+	assert.equal((await steered).ok, true);
+	line({ id: originalRpcId, result: { stopReason: "end_turn", _meta: { sessionId: agentSessionId, promptId: originalUuid } } });
+	const newer = host.prompt({ ...input, turnId: "uuid-newer", text: "The next normal prompt" });
+	await made.serve("session/prompt");
+	assert.equal((await newer).ok, true);
+	const normalRpcId = host.turns.get("chat").promptId;
+	assert.notEqual(String(normalRpcId), normalUuid);
+	const before = events.length;
+	line({ method: "_x.ai/queue/changed", params: { sessionId: agentSessionId, entries: [], runningPromptId: fallbackId, runningText: steerText } });
+	const stream = (promptId, update) => line({ method: "session/update", params: { sessionId: agentSessionId, update, _meta: { promptId } } });
+	stream(fallbackId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Thinking about the steer." } });
+	stream(fallbackId, { sessionUpdate: "tool_call", toolCallId: "fallback-read", kind: "read", title: "read_file", status: "pending" });
+	stream(fallbackId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The steer reply." } });
+	const fallback = events.slice(before).find((event) => event.type === "turn-start" && event.text === steerText);
+	assert.ok(fallback, "the late steer keeps its own transcript entry while the newer native prompt is pending");
+	line({ method: "_x.ai/queue/changed", params: { sessionId: agentSessionId, entries: [], runningPromptId: normalUuid, runningText: "The next normal prompt", runningKind: "prompt" } });
+	line({ method: "_x.ai/session_notification", params: { sessionId: agentSessionId, update: { sessionUpdate: "hook_execution", event_name: "user_prompt_submit", prompt_id: normalUuid, runs: [] }, _meta: { eventId: "uuid-new-start", agentTimestampMs: 3 } } });
+	stream(normalUuid, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Thinking about the next prompt." } });
+	stream(normalUuid, { sessionUpdate: "tool_call", toolCallId: "normal-read", kind: "read", title: "read_file", status: "pending" });
+	stream(normalUuid, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The newer normal reply." } });
+	stream(fallbackId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The steer ending." } });
+	line({ method: "_x.ai/session_notification", params: { sessionId: agentSessionId, update: { sessionUpdate: "turn_completed", prompt_id: normalUuid, stop_reason: "end_turn" } } });
+	line({ id: normalRpcId, result: { stopReason: "end_turn", _meta: { sessionId: agentSessionId, promptId: normalUuid } } });
+	line({ method: "_x.ai/session_notification", params: { sessionId: agentSessionId, update: { sessionUpdate: "turn_completed", prompt_id: fallbackId, stop_reason: "end_turn" } } });
+	await ticks();
+	const routed = events.slice(before).filter((event) => ["thought", "tool", "chunk", "done"].includes(event.type));
+	assert.deepEqual(routed.map((event) => [event.type, event.uiSessionId, event.turnId, event.text || event.tool?.id || event.stopReason]), [
+		["thought", "chat", fallback.turnId, "Thinking about the steer."],
+		["tool", "chat", fallback.turnId, "fallback-read"],
+		["chunk", "chat", fallback.turnId, "The steer reply."],
+		["thought", "chat", "uuid-newer", "Thinking about the next prompt."],
+		["tool", "chat", "uuid-newer", "normal-read"],
+		["chunk", "chat", "uuid-newer", "The newer normal reply."],
+		["chunk", "chat", fallback.turnId, "The steer ending."],
+		["done", "chat", "uuid-newer", "end_turn"],
+		["done", "chat", fallback.turnId, "end_turn"],
+	], "Grok's normal UUID and the late fallback retain their own thought, tool, text and completion events");
+	assert.equal(host.turns.has("chat"), false, "both replies finish without leaving a registered active turn");
+}
+
+async function checkAutonomousToolUpdates(kind, state) {
+	const made = makeHost();
+	const { host, events } = made;
+	const sent = host.prompt({ ...input, turnId: "autonomous-owner" });
+	await made.serve("session/prompt");
+	const { agentSessionId } = await sent;
+	assert.ok(agentSessionId);
+	const proc = host.procs.get("chat");
+	const original = host.turns.get("chat");
+	const line = (message) => proc.child.stdout.emit("data", Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`));
+	if (state === "stopped") { host.cancel("chat"); }
+	line({ id: original.promptId, result: { stopReason: state === "stopped" ? "cancelled" : "end_turn" } });
+	assert.equal(host.turns.has("chat"), false, "the app prompt has finished before Grok wakes itself");
+	if (state === "lost") { host.loseProc(proc, "Grok exited."); }
+	const sessionId = state === "foreign" ? "another-grok-session" : agentSessionId;
+	const promptId = kind === "subagent" ? "subagent-completed-01a19cec-61d6-7ad2-a450-308fdc959e6e" : "task-completed-90833f75-824d-445d-a32d-f5ba1d820cdb";
+	const before = events.length;
+	const wake = kind === "subagent"
+		? { sessionUpdate: "subagent_finished", subagent_id: "background-agent", child_session_id: "01a19cec-61d6-7ad2-a450-308fdc959e6e", status: "completed", will_wake: true }
+		: { sessionUpdate: "task_completed", task_snapshot: { task_id: "90833f75-824d-445d-a32d-f5ba1d820cdb", completed: true, exit_code: 0, owner_session_id: agentSessionId }, will_wake: true };
+	line({ method: "_x.ai/session_notification", params: { sessionId, update: wake } });
+	line({ method: "_x.ai/session_notification", params: { sessionId, update: { sessionUpdate: "hook_execution", event_name: "user_prompt_submit", prompt_id: promptId, runs: [] } } });
+	for (const update of [
+		{ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Autonomous thinking" } },
+		{ sessionUpdate: "tool_call", toolCallId: "autonomous-command", title: "run_terminal_command", rawInput: { command: "echo background" } },
+		{ sessionUpdate: "tool_call_update", toolCallId: "autonomous-command", status: "failed", content: [{ type: "content", content: { type: "text", text: "Background command failed." } }] },
+		{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Autonomous response" } },
+	]) {
+		line({ method: "session/update", params: { sessionId, update, _meta: { promptId } } });
+	}
+	line({ method: "_x.ai/session_notification", params: { sessionId, update: { sessionUpdate: "turn_completed", prompt_id: promptId, stop_reason: "end_turn" } } });
+	const routed = events.slice(before).filter((event) => ["tool", "thought", "chunk", "done", "turn-start"].includes(event.type));
+	const showReport = kind === "task" && (state === "finished" || state === "stopped");
+	const turnId = showReport ? `task-report-${promptId}` : "autonomous-owner";
+	const expected = [];
+	if (showReport) { expected.push(["turn-start", "chat", turnId, undefined, undefined]); }
+	if (state === "finished" || showReport) {
+		expected.push(["tool", "chat", turnId, "autonomous-command", "Running"], ["tool", "chat", turnId, "autonomous-command", "Not run · failed"]);
+	}
+	if (showReport) {
+		expected.push(["chunk", "chat", turnId, undefined, undefined], ["done", "chat", turnId, undefined, undefined]);
+		assert.equal(routed.find((event) => event.type === "chunk")?.text, "Autonomous response", "the background command's response appears in its own report");
+	}
+	assert.deepEqual(routed.map((event) => [event.type, event.uiSessionId, event.turnId, event.tool?.id, event.tool?.detail]), expected, `${kind}/${state}: tool ownership and background-command report visibility follow the wake type`);
+	assert.equal(host.turns.has("chat"), false, `${kind}/${state}: the wake does not take over the app's active prompt`);
+}
+
+async function checkAutonomousPromptOverlap(kind, observedIdle) {
+	const label = `${kind}/${observedIdle ? "seen while idle" : "first seen after send"}`;
+	const made = makeHost();
+	const { host, events, writes } = made;
+	const sent = host.prompt({ ...input, turnId: "wake-owner" });
+	await made.serve("session/prompt");
+	const { agentSessionId } = await sent;
+	assert.ok(agentSessionId, label);
+	const proc = host.procs.get("chat");
+	const originalRpcId = host.turns.get("chat").promptId;
+	const line = (message) => proc.child.stdout.emit("data", Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`));
+	const autonomousId = kind === "subagent" ? "subagent-completed-01a19cec-61d6-7ad2-a450-308fdc959e6e" : "task-completed-90833f75-824d-445d-a32d-f5ba1d820cdb";
+	const reportId = `task-report-${autonomousId}`;
+	const wakeToolTurnId = kind === "task" ? reportId : "wake-owner";
+	const stream = (promptId, update) => line({ method: "session/update", params: { sessionId: agentSessionId, update, _meta: { promptId } } });
+	const wake = () => line({ method: "_x.ai/session_notification", params: { sessionId: agentSessionId, update: { sessionUpdate: "hook_execution", event_name: "user_prompt_submit", prompt_id: autonomousId, runs: [] } } });
+	const writeHook = (id, toolUseId) => line({ id, method: "hooks/run", params: { sessionId: agentSessionId, toolUseId, toolName: "write", toolInput: { file_path: "example.txt", content: "Mock file contents" } } });
+	line({ id: originalRpcId, result: { stopReason: "end_turn" } });
+	if (observedIdle) {
+		wake();
+		stream(autonomousId, { sessionUpdate: "tool_call", toolCallId: "wake-read", kind: "read", title: "read_file", status: "pending" });
+	}
+	const userText = "The user's next regular prompt";
+	const newer = host.prompt({ ...input, turnId: "new-user-turn", text: userText });
+	await made.serve("session/prompt");
+	assert.equal((await newer).ok, true, label);
+	const newerRpcId = host.turns.get("chat").promptId;
+	const before = events.length;
+	const reportOtherPrompt = () => {
+		const otherId = "00000000-1111-4222-8333-444455556666";
+		line({ method: "_x.ai/queue/changed", params: { sessionId: agentSessionId, entries: [], runningPromptId: otherId, runningText: "A different provider prompt", runningKind: "prompt" } });
+		line({ method: "_x.ai/session_notification", params: { sessionId: agentSessionId, update: { sessionUpdate: "hook_execution", event_name: "user_prompt_submit", prompt_id: otherId, runs: [] } } });
+		stream(otherId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Mismatched provider thinking" } });
+		stream(otherId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Mismatched provider reply" } });
+	};
+	if (observedIdle) { reportOtherPrompt(); }
+	wake();
+	writeHook(9301, "wake-write");
+	assert.equal(host.gates.has("wake-write"), false, `${label}: an untagged wake hook cannot open approval in the pending app turn`);
+	assert.equal(writes.find((message) => message.id === 9301)?.result?.decision, "deny", `${label}: the finished wake owner cannot approve a new write`);
+	assert.equal(events.at(-1).tool?.detail, "Not run · the reply already finished", `${label}: the wake write appears as a closed tool card`);
+	stream(autonomousId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Thinking about background work" } });
+	stream(autonomousId, { sessionUpdate: "tool_call", toolCallId: "wake-read", kind: "read", title: "read_file", status: "pending" });
+	stream(autonomousId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Background continuation" } });
+	if (!observedIdle) { reportOtherPrompt(); }
+	const promptId = "c7de4210-aaaa-4bbb-8ccc-ddddeeeeffff";
+	line({ method: "_x.ai/queue/changed", params: { sessionId: agentSessionId, entries: [], runningPromptId: promptId, runningText: userText, runningKind: "prompt" } });
+	line({ method: "_x.ai/session_notification", params: { sessionId: agentSessionId, update: { sessionUpdate: "hook_execution", event_name: "user_prompt_submit", prompt_id: promptId, runs: [] } } });
+	writeHook(9302, "user-write");
+	assert.equal(host.gates.get("user-write")?.turnId, "new-user-turn", `${label}: an untagged hook uses the confirmed normal prompt's approval gate`);
+	assert.equal(host.decide({ uiSessionId: "chat", toolId: "user-write", decision: "deny" }).ok, true, label);
+	assert.equal(writes.find((message) => message.id === 9302)?.result?.decision, "deny", `${label}: the user's gate accepts its own decision`);
+	stream(promptId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Thinking about the user prompt" } });
+	stream(promptId, { sessionUpdate: "tool_call", toolCallId: "user-read", kind: "read", title: "read_file", status: "pending" });
+	stream(promptId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The user's own reply" } });
+	stream(autonomousId, { sessionUpdate: "tool_call_update", toolCallId: "wake-read", status: "completed" });
+	stream(autonomousId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "More background continuation" } });
+	line({ method: "_x.ai/session_notification", params: { sessionId: agentSessionId, update: { sessionUpdate: "turn_completed", prompt_id: autonomousId, stop_reason: "end_turn" } } });
+	assert.equal(events.slice(before).some((event) => event.type === "done" && event.turnId === "new-user-turn"), false, `${label}: the autonomous completion cannot finish the admitted user prompt`);
+	line({ method: "_x.ai/session_notification", params: { sessionId: agentSessionId, update: { sessionUpdate: "turn_completed", prompt_id: promptId, stop_reason: "end_turn" } } });
+	line({ id: newerRpcId, result: { stopReason: "end_turn", _meta: { sessionId: agentSessionId, promptId } } });
+	await ticks();
+	const routed = events.slice(before).filter((event) => ["thought", "tool", "chunk", "done"].includes(event.type) && event.tool?.id !== "user-write");
+	assert.deepEqual(routed.map((event) => [event.type, event.uiSessionId, event.turnId, event.text || event.tool?.id || event.stopReason]), [
+		["tool", "chat", wakeToolTurnId, "wake-write"],
+		...(kind === "task" ? [["thought", "chat", reportId, "Thinking about background work"]] : []),
+		["tool", "chat", wakeToolTurnId, "wake-read"],
+		...(kind === "task" ? [["chunk", "chat", reportId, "Background continuation"]] : []),
+		["thought", "chat", "new-user-turn", "Thinking about the user prompt"],
+		["tool", "chat", "new-user-turn", "user-read"],
+		["chunk", "chat", "new-user-turn", "The user's own reply"],
+		["tool", "chat", wakeToolTurnId, "wake-read"],
+		...(kind === "task" ? [["chunk", "chat", reportId, "More background continuation"], ["done", "chat", reportId, "end_turn"]] : []),
+		["done", "chat", "new-user-turn", "end_turn"],
+	], `${label}: matching queue text binds the user's UUID and the wake retains its own reply identity`);
+	assert.equal(host.turns.has("chat"), false, `${label}: the user's matching numeric RPC response closes its reply`);
+}
+
+async function checkBackgroundCommandReports(overlap) {
+	const made = makeHost();
+	const { host, events, writes } = made;
+	const sent = host.prompt({ ...input, turnId: "report-source" });
+	await made.serve("session/prompt");
+	const { agentSessionId } = await sent;
+	assert.ok(agentSessionId);
+	const proc = host.procs.get("chat");
+	const line = (message) => proc.child.stdout.emit("data", Buffer.from(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`));
+	const notify = (update, sessionId = agentSessionId) => line({ method: "_x.ai/session_notification", params: { sessionId, update } });
+	const stream = (promptId, update, meta = {}, sessionId = agentSessionId) => line({ method: "session/update", params: { sessionId, update, _meta: { promptId, ...meta } } });
+	line({ id: host.turns.get("chat").promptId, result: { stopReason: "end_turn" } });
+	let newerRpcId;
+	const normalId = "c7de4210-aaaa-4bbb-8ccc-ddddeeeeffff";
+	if (overlap) {
+		const newer = host.prompt({ ...input, turnId: "report-overlap", text: "A foreground prompt beside the command reports" });
+		await made.serve("session/prompt");
+		assert.equal((await newer).ok, true);
+		newerRpcId = host.turns.get("chat").promptId;
+		line({ method: "_x.ai/queue/changed", params: { sessionId: agentSessionId, entries: [], runningPromptId: normalId, runningText: "A foreground prompt beside the command reports", runningKind: "prompt" } });
+	}
+	const before = events.length;
+	const taskIds = ["a72d7aff-77e8-4df9-8a2b-835d6042dc73", "60d680f7-9646-4e94-99ee-a1c9969dc63d"];
+	for (const [index, taskId] of taskIds.entries()) {
+		const promptId = `task-completed-${taskId}`;
+		notify({ sessionUpdate: "task_completed", task_snapshot: { task_id: taskId, completed: true, exit_code: 0, kind: "bash", is_backgrounded: true, owner_session_id: agentSessionId, output: "Raw task snapshot stays out of the report" }, will_wake: true });
+		notify({ sessionUpdate: "hook_execution", event_name: "user_prompt_submit", prompt_id: promptId, runs: [] });
+		stream(promptId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Thought before the report starts" } }, { eventId: `before-${index}` });
+		stream(promptId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Restored report text" } }, { eventId: `restore-${index}`, isReplay: true });
+		stream(promptId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Restored report text" }, _meta: { isReplay: true } }, { eventId: `restore-update-${index}` });
+		const update = { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `Command report ${index + 1}.` } };
+		stream(promptId, update, { eventId: `live-report-${index}` });
+		stream(promptId, update, { eventId: `live-report-${index}` });
+		assert.equal(host.turns.get("chat")?.turnId, overlap ? "report-overlap" : undefined, "the report presentation never becomes the active app prompt");
+	}
+	const reportIds = taskIds.map((taskId) => `task-report-task-completed-${taskId}`);
+	const starts = events.slice(before).filter((event) => event.type === "turn-start");
+	assert.deepEqual(starts.map((event) => [event.turnId, event.background, event.parallel, event.text]), reportIds.map((turnId) => [turnId, true, true, undefined]), "two close command completions open exactly two Grok-only messages");
+	line({ id: 9401, method: "hooks/run", params: { sessionId: agentSessionId, toolUseId: "report-write", toolName: "write", toolInput: { file_path: "example.txt", content: "Mock report write" } } });
+	assert.equal(host.gates.has("report-write"), false, "report presentation cannot authorize a write under the foreground prompt");
+	assert.equal(writes.find((message) => message.id === 9401)?.result?.decision, "deny", "report tool calls retain the finished source turn's permission policy");
+	if (overlap) {
+		stream(normalId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Foreground thought" } }, { eventId: "foreground-thought" });
+		stream(normalId, { sessionUpdate: "tool_call", toolCallId: "foreground-read", kind: "read", title: "read_file" }, { eventId: "foreground-tool" });
+		stream(normalId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Foreground reply" } }, { eventId: "foreground-message" });
+	}
+	notify({ sessionUpdate: "turn_completed", prompt_id: `task-completed-${taskIds[1]}`, stop_reason: overlap ? "cancelled" : "end_turn" });
+	notify({ sessionUpdate: "turn_completed", prompt_id: `task-completed-${taskIds[1]}`, stop_reason: overlap ? "cancelled" : "end_turn" });
+	stream(`task-completed-${taskIds[0]}`, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "First command follow-up." } }, { eventId: "first-follow-up" });
+	if (overlap) {
+		assert.equal(proc.lost, false, "a cancelled report cannot stop the foreground prompt's Grok");
+		assert.equal(host.turns.get("chat")?.turnId, "report-overlap", "report cancellation leaves the normal prompt active");
+		const beforeCancel = writes.length;
+		host.cancel("chat");
+		assert.equal(writes.slice(beforeCancel).some((message) => message.method === "session/cancel"), true, "Stop uses native cancellation while a presentation report is incomplete");
+		assert.equal(proc.lost, false, "an incomplete presentation report cannot force Stop to kill Grok");
+		line({ id: newerRpcId, result: { stopReason: "cancelled", _meta: { sessionId: agentSessionId, promptId: normalId } } });
+		assert.equal(proc.lost, false, "the normal prompt's cancellation result also leaves the report's Grok alive");
+	}
+	notify({ sessionUpdate: "turn_completed", prompt_id: `task-completed-${taskIds[0]}`, stop_reason: "end_turn" });
+	notify({ sessionUpdate: "turn_completed", prompt_id: `task-completed-${taskIds[0]}`, stop_reason: "end_turn" });
+	for (const taskId of taskIds) {
+		const promptId = `task-completed-${taskId}`;
+		stream(promptId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Duplicate completed report" } }, { eventId: `late-${taskId}` });
+		stream(promptId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Restored completed report" } }, { eventId: `restore-late-${taskId}`, isReplay: true });
+	}
+	const childSessionId = "child-own-background-task";
+	proc.parents.set(childSessionId, agentSessionId);
+	const childPromptId = "task-completed-11111111-2222-4333-8444-555555555555";
+	notify({ sessionUpdate: "hook_execution", event_name: "user_prompt_submit", prompt_id: childPromptId, runs: [] }, childSessionId);
+	stream(childPromptId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Child report must stay out of the parent chat" } }, { eventId: "child-report" }, childSessionId);
+	notify({ sessionUpdate: "turn_completed", prompt_id: childPromptId, stop_reason: "end_turn" }, childSessionId);
+	const shown = events.slice(before);
+	assert.deepEqual(shown.filter((event) => event.type === "chunk").map((event) => [event.turnId, event.text]), [
+		[reportIds[0], "Command report 1."],
+		[reportIds[1], "Command report 2."],
+		...(overlap ? [["report-overlap", "Foreground reply"]] : []),
+		[reportIds[0], "First command follow-up."],
+	], "live reports stay separate from foreground output and ignore event, restore, finished and child duplicates");
+	assert.deepEqual(shown.filter((event) => event.type === "done").map((event) => event.turnId), [reportIds[1], ...(overlap ? ["report-overlap"] : []), reportIds[0]], "each completion closes only its own report or foreground reply once");
+	assert.deepEqual(shown.filter((event) => event.type === "thought").map((event) => [event.turnId, event.text]), overlap ? [["report-overlap", "Foreground thought"]] : [], "thinking before report presentation stays hidden");
+	assert.equal(shown.filter((event) => event.type === "turn-start").length, 2, "replay and child activity cannot open another parent report");
+	assert.equal(host.turns.has("chat"), false, "the presentation reports leave the app prompt slot idle when the foreground reply finishes");
 }
 
 function checkChunkBatching() {
@@ -2248,6 +3215,126 @@ async function checkLoops() {
 	console.log("PASS scheduled loops: notifications, malformed updates, cold read, and the idle hold");
 }
 
+// A sandboxed Grok names its own paths, so the app tells it those and reads them back. A sandbox that can't be used never runs Grok unsandboxed.
+async function checkSandbox() {
+	const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "grok-agent-sandbox-"));
+	sandboxModule.setDataDir(path.join(scratch, "data"));
+	const profile = { option: "profile", profile: "workspace" };
+	const linux = makeHost({}, { platform: "linux", env: { GROK_HOME: path.join(scratch, "home") } });
+	const boxed = linux.host.start({ ...input, uiSessionId: "boxed", sandbox: profile, browser: true }, "ask");
+	boxed.ready.catch(() => {});
+	assert.deepEqual(plain(linux.spawns[0][1]).slice(0, 3), ["--sandbox", "grok-desktop", "--permission-mode"], "Mac and Linux run Grok with the app's profile");
+	assert.equal(boxed.browser, false, "the browser server can't be reached from inside a sandbox");
+	assert.ok(fs.readFileSync(path.join(scratch, "home", "sandbox.toml"), "utf8").includes("[profiles.grok-desktop]"));
+	const windows = makeHost({});
+	assert.match(windows.host.inputProblem({ ...input, sandbox: profile }), /Windows build/, "the Windows build would ignore --sandbox");
+	assert.match(windows.host.inputProblem({ ...input, sandbox: { option: "wsl" } }), /distribution/);
+	assert.equal(windows.host.inputProblem({ ...input, sandbox: { option: "docker" } }), "");
+	assert.equal(windows.host.inputProblem(input), "");
+
+	for (const signedIn of [false, true]) {
+		const home = path.join(scratch, signedIn ? "unenforced" : "signed-out");
+		const blocked = makeHost({}, { platform: "linux", env: { GROK_HOME: home } });
+		const pending = blocked.host.prompt({ ...input, turnId: "blocked", sandbox: profile });
+		const child = blocked.children[0];
+		grokLine(child, {
+			id: child.writes[0].id,
+			result: { authMethods: [{ id: signedIn ? "cached_token" : "grok.com" }] },
+		});
+		if (signedIn) {
+			await ticks();
+			assert.deepEqual(child.writes.map(({ method }) => method), ["initialize", "authenticate"]);
+			fs.writeFileSync(path.join(home, "sandbox-events.jsonl"), `${JSON.stringify({ event_type: "ApplyFailed", profile: "grok-desktop" })}\n`);
+		}
+		await blocked.serve("initialize");
+		const refused = await pending;
+		assert.match(refused.error || "", signedIn ? /couldn't apply the sandbox/ : /isn't signed in inside the sandbox/);
+		assert.equal(refused.ok, false);
+		assert.deepEqual(child.writes.map(({ method }) => method), signedIn ? ["initialize", "authenticate"] : ["initialize"]);
+		assert.equal(blocked.host.procs.size, 0, "the refused sandbox is stopped");
+		assert.equal(blocked.children.length, 1, "a refused sandbox never starts a fallback process");
+	}
+
+	const docker = makeHost({}, { env: { XAI_API_KEY: fakeKey } });
+	const choice = { option: "docker", image: "me/grok" };
+	const request = { ...input, uiSessionId: "box", turnId: "t1", sandbox: choice };
+	const sent = docker.host.prompt(request);
+	await docker.serve();
+	await sent;
+	assert.equal(docker.spawns[0][0], "docker", "Windows runs Grok through Docker, never the Windows build");
+	assert.ok(!plain(docker.spawns[0][1]).join(" ").includes(fakeKey), "the key isn't on the command line");
+	const opened = docker.writes.find((message) => message.method === "session/new");
+	const proc = docker.host.procs.get("box");
+	assert.equal(opened.params.cwd, proc.target.guestCwd, "Grok gets the folder's path inside the container");
+	assert.ok(opened.params.cwd.startsWith("/workspace/"));
+	const card = docker.host.toolCard({ toolCallId: "tool", kind: "edit", title: "Edit", rawInput: { file_path: proc.target.toGuest(path.join(input.cwd, "a.txt")) } }, proc);
+	assert.equal(card.path, path.win32.join(input.cwd, "a.txt"), "a tool card names the file on this computer");
+	const stays = docker.host.procFor(request, { mode: "Normal" });
+	assert.equal(stays, proc, "the same sandbox keeps the running Grok");
+	sandboxModule.wsbClients.add({ spec: { owner: "other" } });
+	assert.throws(() => docker.host.procFor({ ...request, sandbox: { option: "windows-sandbox" } }, { mode: "Normal", uiSessionId: "box", turnId: "t1" }), /Another session is using Windows Sandbox/, "a second session can't take Windows Sandbox");
+	assert.equal(docker.host.procs.get("box"), proc, "a refused change leaves the session's Grok running");
+	assert.equal(docker.host.procs.get("box").lost, false);
+	const refusedSend = await docker.host.prompt({ ...input, uiSessionId: "second", turnId: "t9", sandbox: { option: "windows-sandbox" } });
+	assert.match(refusedSend.error || "", /Another session is using Windows Sandbox/, "the session is told why");
+	sandboxModule.wsbClients.clear();
+	proc.child.stopRemote = () => {};
+	const moved = docker.host.procFor({ ...request, sandbox: undefined }, { mode: "Normal", uiSessionId: "box", turnId: "t1" });
+	assert.notEqual(moved, proc, "a change of sandbox never reuses a Grok");
+	assert.equal(moved.target, null);
+	moved.ready.catch(() => {});
+	const reopened = docker.host.ensureSession(moved, { ...request, sandbox: undefined, agentSessionId: undefined });
+	await docker.serve();
+	const fresh = await reopened;
+	assert.equal(docker.writes.filter((message) => message.method === "session/load").length, 0, "Grok can't change a session's sandbox, so the old session isn't reopened");
+	assert.equal(fresh.sessionId, `sid-${moved.child.pid}`, "a change of sandbox opens a new Grok session");
+
+	// An attachment is named by the path Grok can reach. One it can't reach is refused, unless its bytes travel in the prompt.
+	const attach = makeHost({}, { env: { XAI_API_KEY: fakeKey } });
+	const inside = path.join(input.cwd, "package.json");
+	const outside = path.join(scratch, "outside.txt");
+	fs.writeFileSync(outside, "x");
+	const image = path.join(scratch, "picture.png");
+	fs.writeFileSync(image, Buffer.from([1, 2, 3]));
+	const withFiles = attach.host.prompt({ ...input, uiSessionId: "files", turnId: "t2", sandbox: choice, attachments: [inside, image] });
+	await attach.serve();
+	await withFiles;
+	const blocks = plain(attach.writes.find((message) => message.method === "session/prompt").params.prompt);
+	const guestFile = attach.host.procs.get("files").target.toGuest(inside);
+	assert.ok(blocks[0].text.includes(guestFile) && !blocks[0].text.includes(image), "the text lists only what Grok can reach");
+	assert.equal(blocks.find((block) => block.type === "resource_link").uri, `file://${guestFile}`);
+	assert.equal(blocks.find((block) => block.type === "image").data, "AQID", "an image outside the folder still arrives");
+	const refused = attach.host.prompt({ ...input, uiSessionId: "files", turnId: "t3", sandbox: choice, attachments: [outside] });
+	await attach.serve();
+	const refusal = await refused;
+	assert.match(refusal.error || "", /can't reach this attachment/);
+
+	fs.rmSync(scratch, { recursive: true, force: true });
+	console.log("PASS sandboxed sessions: profile on Mac and Linux, refusals on Windows, path mapping, and no key on a command line");
+}
+
+function checkWindowsSandboxWorktreeRefusal() {
+	const { parse } = require("@babel/parser");
+	const source = fs.readFileSync(path.join(__dirname, "../src/App.tsx"), "utf8");
+	const { program } = parse(source, { sourceType: "module", plugins: ["typescript", "jsx"] });
+	const app = program.body.find((node) => node.declaration?.id?.name === "App")?.declaration;
+	const send = app?.body.body.find((node) => node.type === "FunctionDeclaration" && node.id?.name === "send");
+	const guard = send?.body.body.find((node) => node.type === "IfStatement" &&
+		source.slice(node.consequent.start, node.consequent.end).includes("WINDOWS_SANDBOX_WORKTREE"));
+	assert.ok(guard, "send refuses a sandboxed Windows worktree");
+	const dispatch = vm.runInNewContext("(function(sandbox, target, PLATFORM, setNotice, WINDOWS_SANDBOX_WORKTREE) {\n" +
+		source.slice(guard.start, guard.end) + "\nreturn true;\n})");
+	const notices = [];
+	const report = (notice) => notices.push(notice);
+	const choice = { option: "docker" };
+	const worktree = { worktreeFolder: "worktree" };
+	assert.equal(dispatch(choice, worktree, "win32", report, "sandbox and worktree"), false);
+	assert.deepEqual(notices, ["sandbox and worktree"]);
+	assert.equal(dispatch(choice, worktree, "linux", report), true);
+	assert.equal(dispatch(undefined, worktree, "win32", report), true);
+	console.log("PASS renderer dispatch refuses a sandboxed Windows worktree");
+}
+
 (async () => {
 	checkPosixProcessGroups();
 	await checkProbeGrok();
@@ -2258,11 +3345,29 @@ async function checkLoops() {
 	await checkPromptIndexes();
 	await checkBranches();
 	await checkSteer();
+	for (const action of ["cancel", "fallback", "running-cancel", "submitted-fallback"]) { await checkAbsorbedSteerLifecycle(action); }
+	for (const noticeBefore of [true, false]) {
+		for (const withHook of [true, false]) { await checkLateSteerOrdering(noticeBefore, withHook); }
+	}
+	for (const kind of ["runningText", "echo", "single", "unknown"]) { await checkLateSteerText(kind); }
+	for (const kind of ["main", "side", "routine"]) { await checkProviderPromptUuids(kind); }
+	await checkProviderPromptUuidOverlap();
+	for (const kind of ["subagent", "task"]) {
+		for (const state of ["finished", "stopped", "lost", "foreign"]) { await checkAutonomousToolUpdates(kind, state); }
+		for (const observedIdle of [true, false]) { await checkAutonomousPromptOverlap(kind, observedIdle); }
+	}
+	for (const overlap of [false, true]) { await checkBackgroundCommandReports(overlap); }
 	await checkSessionEnhancements();
+	await checkBackgroundToolCompletion();
+	for (const stopSource of [true, false]) { await checkBackgroundReportAfterStop(stopSource); }
+	await checkBackgroundToolProcessLoss();
+	await checkChildBackgroundTaskStatus();
 	await checkBillingOnce();
 	await checkBilling();
 	await checkAccount();
 	await checkSessions();
+	await checkStaleSendMode();
+	await checkLateMode();
 	await checkProcesses();
 	await checkIdle();
 	await checkLoops();
@@ -2279,7 +3384,11 @@ async function checkLoops() {
 	await checkParityFeatures();
 	checkCommandPrefixes();
 	await checkBrowserControl();
+	await checkUnattended();
+	await checkRoutineInteractionTimeout();
 	checkSavedRules();
+	await checkSandbox();
+	checkWindowsSandboxWorktreeRefusal();
 	console.log("Agent regression checks passed: one Grok per session (own folder, permission at launch, mode-change restart and its notice, folder change, Stop and crash isolation, worktree release, quit cleanup, idle stop that keeps busy and background Groks), parallel sessions, cancellation, restoration, configuration, Auto-review fail-safe, edit-folder/home boundaries, process failure cleanup/diagnostics, stdin errors, tool policy, questions, plan approval, plan mode sync, tool rows, Always allow scope, Grok commands/models/MCP, todos, usage and attachments.");
 	process.exitCode = 0;
 })().catch((error) => { console.error(error); process.exitCode = 1; });

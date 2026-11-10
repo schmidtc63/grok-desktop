@@ -28,10 +28,18 @@ class Contents extends EventEmitter {
 	isDestroyed() { return this.dead; }
 	send(channel, event) { this.events.push({ channel, ...event }); if (this.onSend) { this.onSend(event); } }
 }
+class GuestDebugger extends EventEmitter {
+	constructor() { super(); this.attached = false; this.commands = []; }
+	isAttached() { return this.attached; }
+	attach() { this.attached = true; }
+	detach() { this.attached = false; this.emit("detach"); }
+	async sendCommand(method, params = {}, sessionId) { this.commands.push({ method, params, sessionId }); return {}; }
+}
 class Guest extends Contents {
 	constructor(id, sender, session, url = "http://localhost:5173/start") {
 		super(); this.id = id; this.hostWebContents = sender; this.session = session; this.url = url; this.operations = []; this.loads = []; this.mutations = 0; this.loading = false;
 		this.meta = { ref: REF, label: "Email", name: "email", id: "email", type: "text", autocomplete: "", placeholder: "", ariaLabel: "", editable: true, tagName: "input" };
+		this.debugger = new GuestDebugger();
 		this.history = [{ url: "http://localhost:5173/previous" }, { url }]; this.historyIndex = 1;
 		this.navigationHistory = { getAllEntries: () => this.history, getActiveIndex: () => this.historyIndex, goBack: () => { void this.loadURL(this.history[--this.historyIndex].url); }, goForward: () => { void this.loadURL(this.history[++this.historyIndex].url); } };
 	}
@@ -39,13 +47,14 @@ class Guest extends Contents {
 	getURL() { return this.url; }
 	getTitle() { return "Page title"; }
 	isLoading() { return this.loading; }
+	stop() { this.loading = false; }
 	async executeJavaScriptInIsolatedWorld(world, scripts) {
 		assert.equal(world, 7301);
 		const request = JSON.parse(scripts[0].code); this.operations.push(request);
 		if (this.executeHook) { const value = this.executeHook(request); if (value !== undefined) { return value; } }
 		if (request.args.origin !== new URL(this.url).origin) { throw new Error("The page origin changed."); }
 		if (request.op === "snapshot" || request.op === "read_text") { return { text: this.pageText ?? `[${REF}] textbox Email`, url: new URL(this.url).origin + new URL(this.url).pathname }; }
-		if (request.op === "inspect") { return { ...this.meta, origin: new URL(this.url).origin }; }
+		if (request.op === "inspect") { return { ...this.meta, origin: new URL(this.url).origin, ...(request.args.submit ? { submitOrigin: this.submitOrigin || new URL(this.url).origin } : {}) }; }
 		if (request.op === "highlight") { return { ok: true }; }
 		assert.ok(Date.now() < request.args.deadline, "final action needs a live absolute deadline");
 		this.mutations += 1;
@@ -88,7 +97,25 @@ async function fixture(options = {}) {
 	const rpc = (method, params, overrides = {}) => request({ jsonrpc: "2.0", id: requestId++, method, params }, overrides);
 	const call = (name, args = {}) => rpc("tools/call", { name, arguments: args });
 	const download = (target = guest) => { const event = { prevented: false, preventDefault() { this.prevented = true; } }; session.emit("will-download", event, {}, target); return event.prevented; };
-	return { ui, sender, session, proc, turn, host, owners, contents, guest, agent, entry, asks, decisions, denied, blockedPorts, report, request, rpc, call, download, close: () => agent.close() };
+	let navigationId = 0;
+	const pausedRequest = async (params, sessionId) => {
+		guest.debugger.emit("message", {}, "Fetch.requestPaused", params, sessionId);
+		let command;
+		await until(() => {
+			command = guest.debugger.commands.find((entry) => ["Fetch.continueRequest", "Fetch.failRequest"].includes(entry.method) && entry.params.requestId === params.requestId);
+			return command;
+		});
+		return command;
+	};
+	const nativeNavigation = async ({ url, reason = "formSubmissionPost", frameId = "main", sessionId, ...extra }) => {
+		guest.debugger.emit("message", {}, "Page.frameRequestedNavigation", { frameId, reason, url }, sessionId);
+		const event = { url, frame: {}, isMainFrame: frameId === "main", prevented: false, preventDefault() { this.prevented = true; } };
+		guest.emit("will-frame-navigate", event);
+		if (!["formSubmissionGet", "formSubmissionPost"].includes(reason)) { assert.equal(event.prevented, false, "unrelated navigation was blocked as a submission"); }
+		if (event.prevented) { return { method: "blocked-by-tab-guard" }; }
+		return pausedRequest({ frameId, requestId: `native-${++navigationId}`, request: { url, method: reason === "formSubmissionPost" ? "POST" : "GET" }, ...extra }, sessionId);
+	};
+	return { ui, sender, session, proc, turn, host, owners, contents, guest, agent, entry, asks, decisions, denied, blockedPorts, report, request, rpc, call, download, pausedRequest, nativeNavigation, close: () => agent.close() };
 }
 let groups = 0;
 async function test(name, work, options) {
@@ -168,6 +195,146 @@ async function main() {
 		ok(await f.call("select", { ref: REF, option: "secretoption" })); assert.equal(f.asks.at(-1).always, undefined);
 		f.decisions.push("deny"); const mutations = f.guest.mutations; error(await f.call("fill", { ref: REF, text: "x" }), /denied/); assert.equal(f.guest.mutations, mutations);
 	}, { mode: "Always-approve" });
+	await test("all supported interaction tools gate actual native form destinations", async (f) => {
+		for (const [name, args, reason] of [
+			["click", { ref: REF }, "formSubmissionPost"],
+			["fill", { ref: REF, text: "private-value" }, "formSubmissionGet"],
+			["select", { ref: REF, option: "x" }, "formSubmissionPost"],
+		]) {
+			const card = deferred(); f.decisions.push(card);
+			let navigation;
+			f.guest.executeHook = ({ op }) => { if (op === name) { navigation = f.nativeNavigation({ url: "https://destination.test/submit?private=value", reason }); } };
+			const before = f.asks.length;
+			const action = f.call(name, args);
+			await until(() => f.asks.length > before);
+			assert.match(f.asks.at(-1).title, /submit a form to https:\/\/destination.test/);
+			assert.doesNotMatch(JSON.stringify(f.asks.at(-1)), /private|value/);
+			assert.ok(!f.guest.debugger.commands.some((entry) => entry.method === "Fetch.continueRequest" && entry.params.requestId === `native-${before + 1}`));
+			card.resolve("deny");
+			const failure = error(await action, /blocked a form submission/);
+			assert.match(failure, /This form request was not sent/);
+			assert.doesNotMatch(failure, /already sent/);
+			const refused = await navigation;
+			assert.equal(refused.method, "Fetch.failRequest");
+			assert.equal(refused.params.errorReason, "Aborted");
+		}
+	}, { mode: "Always-approve" });
+	await test("same-site form result frames, script redirects and links keep normal navigation", async (f) => {
+		const navigations = [];
+		f.guest.executeHook = ({ op }) => {
+			if (op === "fill") {
+				navigations.push(f.nativeNavigation({ url: f.guest.url }).then(async (first) => {
+					f.guest.debugger.emit("message", {}, "Page.frameNavigated", { frame: { id: "main" } });
+					const childForm = await f.nativeNavigation({ url: "https://captcha.test/submit", frameId: "result-child" });
+					assert.equal(childForm.method, "Fetch.continueRequest");
+					return first;
+				}));
+				for (const [reason, frameId] of [["initialFrameNavigation", "child"], ["scriptInitiated", "main"], ["anchorClick", "main"]]) {
+					navigations.push(f.nativeNavigation({ url: "https://result-content.test/page", reason, frameId }));
+				}
+			}
+		};
+		ok(await f.call("fill", { ref: REF, text: "x", submit: true }));
+		assert.deepEqual((await Promise.all(navigations)).map((entry) => entry.method), Array(4).fill("Fetch.continueRequest"));
+		assert.equal(f.asks.length, 0);
+	}, { mode: "Always-approve" });
+	await test("Always-approve uses the normal act policy for form destinations on other localhost ports", async (f) => {
+		let navigation;
+		f.guest.submitOrigin = "http://localhost:8100";
+		f.guest.executeHook = ({ op }) => { if (op === "fill") { navigation = f.nativeNavigation({ url: f.guest.submitOrigin + "/submit" }); } };
+		ok(await f.call("fill", { ref: REF, text: "x", submit: true }));
+		assert.equal(f.asks.length, 0);
+		assert.equal((await navigation).method, "Fetch.continueRequest");
+	}, { mode: "Always-approve" });
+	await test("an independent iframe form during the original pending form keeps its own provenance", async (f) => {
+		let original, independent;
+		f.guest.executeHook = ({ op }) => {
+			if (op === "fill") {
+				original = f.nativeNavigation({ url: f.guest.url });
+				independent = f.nativeNavigation({ url: "https://captcha.test/submit", frameId: "child", sessionId: "iframe-session" });
+			}
+		};
+		ok(await f.call("fill", { ref: REF, text: "x", submit: true }));
+		assert.equal((await original).method, "Fetch.continueRequest");
+		assert.equal((await independent).method, "Fetch.continueRequest");
+		assert.equal(f.asks.length, 0);
+	}, { mode: "Always-approve" });
+	await test("fill-and-submit reports the page's validation error", async (f) => {
+		f.guest.executeHook = ({ op }) => op === "fill" ? { error: "Form validation blocked submission." } : undefined;
+		error(await f.call("fill", { ref: REF, text: "x", submit: true }), /Form validation blocked submission/);
+	}, { mode: "Always-approve" });
+	await test("only body-preserving form redirects retain destination checks after the action ends", async (f) => {
+		let initial;
+		f.guest.executeHook = ({ op }) => {
+			if (op === "fill") { initial = f.nativeNavigation({ url: f.guest.url }); }
+		};
+		ok(await f.call("fill", { ref: REF, text: "x", submit: true }));
+		await initial;
+		await sleep(15);
+		ok(await f.call("click", { ref: REF }));
+		f.decisions.push("deny");
+		const request = { frameId: "main", redirectedRequestId: "native-1", requestId: "redirect-1", request: { url: "https://retargeted.test/next", method: "POST" } };
+		assert.equal((await f.pausedRequest(request)).method, "Fetch.failRequest");
+		ok(await f.call("fill", { ref: REF, text: "x", submit: true }));
+		await initial;
+		assert.equal((await f.pausedRequest({ ...request, requestId: "redirect-2", redirectedRequestId: "native-2", request: { ...request.request, method: "GET" } })).method, "Fetch.continueRequest");
+	}, { mode: "Always-approve" });
+	await test("a later refused iframe or POST redirect reports the original submission already sent", async (f) => {
+		for (const kind of ["same-process-frame", "307-redirect", "308-redirect"]) {
+			let refusal;
+			f.decisions.push("deny");
+			f.guest.executeHook = ({ op }) => {
+				if (op === "fill") {
+					refusal = f.nativeNavigation({ url: f.guest.url }).then((original) => kind === "same-process-frame"
+						? f.nativeNavigation({ url: "https://unrelated.test/submit", frameId: "same-process-child" })
+						: f.pausedRequest({ frameId: "main", requestId: kind, redirectedRequestId: original.params.requestId, request: { url: "https://redirected.test/submit", method: "POST" } }));
+				}
+			};
+			const failure = error(await f.call("fill", { ref: REF, text: "x", submit: true }), /original form submission was already sent and may have been processed/);
+			assert.match(failure, /Inspect its result before submitting again/);
+			assert.doesNotMatch(failure, /This form request was not sent/);
+			assert.equal((await refusal).params.errorReason, "Aborted");
+		}
+	}, { mode: "Always-approve", timings: { download: 20 } });
+	await test("allowing an iframe request after its frame disappeared reports the original submission sent", async (f) => {
+		const card = deferred(); f.decisions.push(card);
+		const send = f.guest.debugger.sendCommand.bind(f.guest.debugger);
+		f.guest.debugger.sendCommand = async (method, params, sessionId) => {
+			const value = await send(method, params, sessionId);
+			if (method === "Fetch.continueRequest" && params.requestId === "gone-frame") { throw new Error("Invalid InterceptionId"); }
+			return value;
+		};
+		let removed;
+		f.guest.executeHook = ({ op }) => {
+			if (op === "fill") {
+				removed = f.nativeNavigation({ url: f.guest.url }).then(() => f.nativeNavigation({ url: "https://unrelated.test/submit", frameId: "same-process-child", requestId: "gone-frame" }));
+			}
+		};
+		const action = f.call("fill", { ref: REF, text: "x", submit: true });
+		await until(() => f.asks.length === 1);
+		f.guest.debugger.emit("message", {}, "Page.frameDetached", { frameId: "same-process-child", reason: "remove" });
+		card.resolve("allow");
+		const failure = error(await action, /original form submission was already sent and may have been processed/);
+		assert.match(failure, /Inspect its result before submitting again/);
+		await removed;
+		assert.ok(f.guest.debugger.commands.some((entry) => entry.method === "Fetch.failRequest" && entry.params.requestId === "gone-frame" && entry.params.errorReason === "Aborted"));
+	}, { mode: "Always-approve", timings: { download: 20 } });
+	await test("browser actions fail closed when another debugger owns the tab", async (f) => {
+		f.guest.debugger.attach();
+		error(await f.call("click", { ref: REF }), /form protection is unavailable/);
+		assert.equal(f.guest.mutations, 0);
+		assert.equal(f.guest.debugger.isAttached(), true);
+	}, { mode: "Always-approve" });
+	await test("open DevTools alone does not block a successful form-protection attachment", async (f) => {
+		f.guest.isDevToolsOpened = () => true;
+		ok(await f.call("click", { ref: REF }));
+		assert.equal(f.guest.mutations, 1);
+	}, { mode: "Always-approve" });
+	await test("losing form protection stops an armed browser action before mutation", async (f) => {
+		f.guest.executeHook = ({ op }) => { if (op === "highlight") { f.guest.debugger.detach(); } };
+		error(await f.call("click", { ref: REF }), /form protection disconnected/);
+		assert.equal(f.guest.mutations, 0);
+	}, { mode: "Always-approve" });
 	await test("foreign guests, ownership and hidden panes are refused", async (f) => {
 		f.guest.hostWebContents = new Contents(); error(await f.call("snapshot")); assert.equal(f.guest.operations.length, 0);
 		f.guest.hostWebContents = f.sender; f.owners.set(f.ui, { contents: new Contents(), turn: f.turn }); error(await f.call("snapshot"));
@@ -230,7 +397,13 @@ async function main() {
 		for (const kind of ["navigation", "destroyed"]) {
 			const action = deferred(); const current = f.contents.get(1); current.executeHook = ({ op }) => op === "click" ? action.promise : undefined;
 			error(await f.call("click", { ref: REF }), UNCERTAIN);
-			if (kind === "navigation") { current.emit("did-start-navigation", {}, current.url, false, true); } else {
+			if (kind === "navigation") {
+				current.emit("did-start-navigation", { isMainFrame: true, isSameDocument: true });
+				error(await f.call("snapshot"), HELD);
+				current.emit("did-start-navigation", {}, current.url + "#anchor", true, true);
+				error(await f.call("snapshot"), HELD);
+				current.emit("did-start-navigation", { isMainFrame: true, isSameDocument: false });
+			} else {
 				current.destroy(); const replacement = new Guest(1, f.sender, f.session); f.contents.set(1, replacement); f.agent.guestSession(f.session, replacement); f.report();
 			}
 			ok(await f.call("snapshot")); action.resolve({ ok: true }); await sleep(3);
@@ -284,6 +457,21 @@ async function main() {
 		const response = ok(await f.call("navigate", { url: "http://localhost:5173/path?token=hidden#secret" })); assert.match(response, /HTTP status: 200/); assert.match(response, /Path: \/path/); assert.ok(!response.includes("hidden"));
 		ok(await f.call("navigate", { go: "back" })); assert.equal(f.guest.url, "http://localhost:5173/previous");
 		ok(await f.call("navigate", { go: "forward" })); ok(await f.call("navigate", { go: "reload" }));
+	});
+	await test("navigation approvals disclose the URL username and password presence", async (f) => {
+		const url = "https://example-user:sample-secret@remote.test/path";
+		const card = deferred(); f.decisions.push(card);
+		const navigation = f.call("navigate", { url });
+		await until(() => f.asks.length === 1);
+		assert.equal(f.guest.loads.length, 0, "navigation waits for approval");
+		assert.match(f.asks[0].summary, /The URL username is "example-user"/);
+		assert.match(f.asks[0].summary, /The URL includes a password/);
+		assert.doesNotMatch(JSON.stringify(f.asks[0]), /sample-secret/);
+		card.resolve("allow");
+		assert.doesNotMatch(ok(await navigation), /sample-secret/);
+		assert.deepEqual(f.guest.loads, [url]);
+		ok(await f.call("navigate", { url: "https://remote.test/next" }));
+		assert.equal(f.asks[1].summary, "Read and act on https://remote.test in the active Browser tab.");
 	});
 	await test("navigation titles and native errors redact URL credentials and queries", async (f) => {
 		f.guest.getTitle = () => "Loaded https://user:password@remote.test/path?secret=token#fragment";

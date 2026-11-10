@@ -48,6 +48,15 @@ export function historyStep(history: string[], index: number, direction: -1 | 1)
 	return { index: next, value: next === history.length ? "" : history[next] };
 }
 
+export function terminalOptions(element: HTMLElement) {
+	const style = window.getComputedStyle(element);
+	const property = (name: string) => style.getPropertyValue(name).trim();
+	const fontSize = parseFloat(property("--terminal-font-size")) || 13 * (parseFloat(property("--mono-scale")) || 1);
+	const linePx = parseFloat(property("--terminal-line-height"));
+	const fontFamily = property("--terminal-font") || property("--mono-font") || 'Consolas, "Cascadia Mono", ui-monospace, Menlo, monospace';
+	return { fontFamily, fontSize, lineHeight: linePx ? Math.max(1, linePx / fontSize) : 1.45 };
+}
+
 function terminalTheme(element: HTMLElement): ITheme {
 	const style = window.getComputedStyle(element);
 	const color = (name: string) => style.getPropertyValue(name).trim();
@@ -59,19 +68,34 @@ function terminalTheme(element: HTMLElement): ITheme {
 	};
 }
 
-function NativeTerminal({ tab, onInput, onResize, screenReaderMode }: { tab: TerminalTab; onInput: TerminalPaneProps["onInput"]; onResize: TerminalPaneProps["onResize"]; screenReaderMode: boolean }) {
+function NativeTerminal({ tab, onInput, onResize, onClose, screenReaderMode }: { tab: TerminalTab; onInput: TerminalPaneProps["onInput"]; onResize: TerminalPaneProps["onResize"]; onClose: TerminalPaneProps["onClose"]; screenReaderMode: boolean }) {
 	const container = useRef<HTMLDivElement>(null);
 	const terminal = useRef<Terminal | null>(null);
 	const written = useRef(0);
-	const latest = useRef({ tab, onInput, onResize, screenReaderMode });
-	useLayoutEffect(() => { latest.current = { tab, onInput, onResize, screenReaderMode }; });
+	const latest = useRef({ tab, onInput, onResize, onClose, screenReaderMode });
+	useLayoutEffect(() => { latest.current = { tab, onInput, onResize, onClose, screenReaderMode }; });
 	useLayoutEffect(() => {
 		const element = container.current;
 		if (!element) { return; }
-		const term = new Terminal({ scrollback: 5000, fontFamily: 'Consolas, "Cascadia Mono", ui-monospace, Menlo, monospace', fontSize: 13, lineHeight: 1.45, theme: terminalTheme(element), disableStdin: !latest.current.tab.running, screenReaderMode: latest.current.screenReaderMode });
+		const term = new Terminal({ scrollback: 5000, ...terminalOptions(element), theme: terminalTheme(element), disableStdin: !latest.current.tab.running, screenReaderMode: latest.current.screenReaderMode });
 		const fit = new FitAddon();
 		term.loadAddon(fit);
 		term.open(element);
+		term.textarea?.setAttribute("aria-description", "Press Shift+F6 to move focus to the terminal tab.");
+		term.attachCustomKeyEventHandler((event) => {
+			if (event.type !== "keydown" || event.altKey || event.metaKey) { return true; }
+			const close = event.ctrlKey && !event.shiftKey && (event.code === "Backquote" || event.key === "`");
+			const exit = !event.ctrlKey && event.shiftKey && event.key === "F6";
+			if (!close && !exit) { return true; }
+			event.preventDefault();
+			event.stopPropagation();
+			if (close) {
+				if (!event.repeat) { latest.current.onClose(); }
+			} else {
+				element.closest(".tp-pane")?.querySelector<HTMLButtonElement>(".tp-tab-name[aria-current='true']")?.focus();
+			}
+			return false;
+		});
 		terminal.current = term;
 		const initial = latest.current.tab;
 		written.current = initial.received ?? initial.output.length;
@@ -90,9 +114,13 @@ function NativeTerminal({ tab, onInput, onResize, screenReaderMode }: { tab: Ter
 		};
 		const resize = new ResizeObserver(refit);
 		resize.observe(element);
-		const theme = () => { term.options.theme = terminalTheme(element); };
+		const theme = () => {
+			term.options.theme = terminalTheme(element);
+			Object.assign(term.options, terminalOptions(element));
+			refit();
+		};
 		const appearance = new MutationObserver(theme);
-		appearance.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme", "class", "style"] });
+		appearance.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme", "class", "style", "data-ui-config"] });
 		const scheme = window.matchMedia("(prefers-color-scheme: dark)");
 		scheme.addEventListener("change", theme);
 		refit();
@@ -205,7 +233,7 @@ export function TerminalPane({ layout, tabs, activeId, terminalScreenReader, err
 			)}
 			{active && (
 				<>
-					{native ? !waitingForDetection && <NativeTerminal key={active.id} tab={active} onInput={onInput} onResize={onResize} screenReaderMode={terminalScreenReader || detected === true} /> : <pre
+					{native ? !waitingForDetection && <NativeTerminal key={active.id} tab={active} onInput={onInput} onResize={onResize} onClose={onClose} screenReaderMode={terminalScreenReader || detected === true} /> : <pre
 						className="tp-out"
 						ref={outRef}
 						onScroll={(event) => {
@@ -215,13 +243,11 @@ export function TerminalPane({ layout, tabs, activeId, terminalScreenReader, err
 					>
 						{text}
 					</pre>}
-					{(error || !active.running || !native) && (
-						<div className="tp-notes">
-							{!native && <p className="note">Basic terminal fallback: interactive programs and terminal resizing are unavailable.</p>}
-							{error && <p className="note">{error}</p>}
-							{!active.running && <p className="note">This terminal has exited.</p>}
-						</div>
-					)}
+					<div className="tp-notes">
+						<p className="note">{native ? "Press Shift+F6 to move focus to the terminal tab." : "Basic terminal fallback: interactive programs and terminal resizing are unavailable."}</p>
+						{error && <p className="note">{error}</p>}
+						{!active.running && <p className="note">This terminal has exited.</p>}
+					</div>
 					{!native && <form
 						className="tp-row"
 						onSubmit={(event) => {

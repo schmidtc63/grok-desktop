@@ -40,6 +40,7 @@ const paths = {
 	help: "M5.5 5.5a2.5 2.5 0 1 1 3.75 2.16C8.5 8.1 8 8.5 8 9.5M8 12h.01",
 	info: "M8 2.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11ZM8 7.5v3M8 5.5h.01",
 	dot: "M8 8h.01",
+	clock: "M8 2.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11ZM8 5v3.2l2 1.3",
 };
 
 export type IconName = keyof typeof paths;

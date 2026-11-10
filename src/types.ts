@@ -101,8 +101,13 @@ export interface Session {
 	prWatch?: { number: number; failing: string[]; seenAt: string; alert?: { failed: string[]; feedback: number; from: string[] } };
 	sectionId?: string;
 	worktreeFolder?: string;
+	sandbox?: GrokSandboxChoice;
+	sandboxOn?: boolean;
+	sandboxChoice?: GrokSandboxChoice;
+	sandboxContextPending?: boolean;
 	usage?: GrokUsage;
 	costUsd?: number;
+	routineId?: string;
 }
 
 export interface ToolCard {
@@ -115,6 +120,7 @@ export interface ToolCard {
 	label?: string;
 	description?: string;
 	command?: string;
+	backgroundTask?: boolean;
 	input?: string;
 	path?: string;
 	output?: string;
@@ -170,7 +176,7 @@ export const MODES: { id: PermissionMode; detail: string }[] = [
   { id: "Normal", detail: "Ask before edits and commands." },
 	{ id: "Plan", detail: "Explore and write a plan. Commands ask, unless you chose Always allow earlier in this session. Only the plan file can be edited." },
   { id: "Auto-review", detail: "Grok's safety check runs the call. A call it will not allow asks you." },
-  { id: "Always-approve", detail: "Run tools without asking. Deny rules and safety hooks still apply." },
+  { id: "Always-approve", detail: "Skip ordinary tool approvals. Browser permissions, deny rules and safety hooks still apply." },
 ];
 
 export const MODELS: string[] = ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"];

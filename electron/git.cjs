@@ -3,8 +3,9 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { createHash } = require("crypto");
+const { URL } = require("url");
 const { folderProblem, killTree, OWN_GROUP } = require("./agent.cjs");
-const { readDiff, parseUnified, parseGitDiff: parseWorkingDiff, parseInventory, mergeFiles, untrackedHunk, checkRevertible, localFilterOff, FILTER_NOT_OFF } = require("./diff.cjs");
+const { readDiff, parseUnified, parseGitDiff: parseWorkingDiff, parseInventory, mergeFiles, assignIds, untrackedHunk, checkRevertible, localFilterOff, FILTER_NOT_OFF } = require("./diff.cjs");
 
 const GIT_TIMEOUT = 20000;
 const SLOW_TIMEOUT = 60000;
@@ -14,12 +15,18 @@ const CHANGE_LIST_BYTES = 2 * 1024 * 1024;
 const CHANGE_LIST_FILES = 5000;
 const FULL_DIFF_BYTES = 2 * 1024 * 1024;
 const FULL_DIFF_LINES = 6000;
+const SNAPSHOT_BYTES = 8 * 1024 * 1024;
+const SNAPSHOT_ENTRIES = 512;
 const NOT_REPO = "This folder is not a git checkout.";
 const GH_MISSING = "GitHub CLI (gh) is not installed.";
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/;
 const SHA_PATTERN = /^[0-9a-f]{7,40}$/i;
 const EXCLUDE_LINE = ".grok/worktrees/";
 const committing = new Set();
+const HOST_WRITE_HOOKS = [
+	"pre-commit", "prepare-commit-msg", "commit-msg", "post-commit", "post-rewrite", "pre-push", "post-checkout", "reference-transaction", "pre-auto-gc",
+	"pre-receive", "update", "proc-receive", "post-receive", "post-update", "push-to-checkout",
+];
 // A dirty-submodule check runs git status inside the submodule, which loads that submodule's own filters.
 const DIFF_READ_ARGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", "--submodule=short", "--ignore-submodules=dirty", "--relative", "--raw", "-z"];
 const DIFF_ARGS = [...DIFF_READ_ARGS, "-p", "-U3"];
@@ -39,7 +46,7 @@ function run(command, args, cwd, timeout, maxBytes = MAX_BYTES, options = {}) {
 		let size = 0;
 		let err = "";
 		const chunks = [];
-		const result = (extra) => ({ code: -1, out: Buffer.concat(chunks).toString("utf8"), err, truncated: size > maxBytes, timedOut: false, missing: false, ...extra });
+		const result = (extra) => ({ code: -1, out: Buffer.concat(chunks).toString(options.encoding ?? "utf8"), err, truncated: size > maxBytes, timedOut: false, missing: false, ...extra });
 		const signal = options.signal;
 		if (signal?.aborted) { resolve(result()); return; }
 		const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1", NO_COLOR: "1", GROK_CODE_EMPTY: "", GROK_CODE_FALSE: "false", ...options.env };
@@ -87,7 +94,11 @@ function run(command, args, cwd, timeout, maxBytes = MAX_BYTES, options = {}) {
 // A repo's own core.fsmonitor program never runs from here.
 // core.hooksPath stops hook files only; a hook set in config ignores it, so the event an index refresh fires is off too.
 function git(args, cwd, timeout = GIT_TIMEOUT, options = {}) {
-	return run("git", ["-c", "core.fsmonitor=false", "-c", "log.showSignature=false", "-c", "diff.suppressBlankEmpty=false", ...(!options.hooks ? ["-c", `core.hooksPath=${os.devNull}`, "-c", "hook.post-index-change.enabled=false"] : []), ...args], cwd, timeout, options.maxBytes, options);
+	const hookArgs = options.hooks ? [] : ["-c", `core.hooksPath=${os.devNull}`, "-c", "hook.post-index-change.enabled=false"];
+	if (options.hooks === false) {
+		for (const hook of HOST_WRITE_HOOKS) { hookArgs.push("-c", `hook.${hook}.enabled=false`); }
+	}
+	return run("git", ["-c", "core.fsmonitor=false", "-c", "log.showSignature=false", "-c", "diff.suppressBlankEmpty=false", ...hookArgs, ...args], cwd, timeout, options.maxBytes, options);
 }
 
 // Tracked and untracked files, relative to cwd; ignored and deleted files are left out.
@@ -104,13 +115,44 @@ async function repoFiles(cwd) {
 	return files.length ? { files, truncated: listed.truncated } : null;
 }
 
-function gh(args, cwd) {
-	return run("gh", args, cwd, SLOW_TIMEOUT);
+function gh(args, cwd, options) {
+	return run("gh", args, cwd, SLOW_TIMEOUT, MAX_BYTES, options);
+}
+
+async function prRepository(cwd, target) {
+	const args = ["repo", "view", "--json", "id,nameWithOwner,url,defaultBranchRef"];
+	let env;
+	if (target) {
+		const remotes = await git(["remote"], cwd);
+		if (remotes.code !== 0 || remotes.truncated) { return failure(remotes, "Reading Git remotes"); }
+		const names = remotes.out.split(/\r?\n/).filter(Boolean);
+		let selected = "grok-pr-target";
+		while (names.includes(selected)) { selected += "-"; }
+		const config = [];
+		for (const name of names) {
+			config.push([`remote.${name}.gh-resolved`, ""]);
+		}
+		config.push([`remote.${selected}.url`, target], [`remote.${selected}.gh-resolved`, "base"]);
+		const quote = (value) => `'${value.replace(/'/g, "'\\''")}'`;
+		const parameters = config.map(([key, value]) => `${quote(key)}=${quote(value)}`).join(" ");
+		env = { GH_REPO: "", GIT_CONFIG_PARAMETERS: `${process.env.GIT_CONFIG_PARAMETERS || ""} ${parameters}`.trim() };
+	}
+	const result = await gh(args, cwd, { env });
+	if (result.missing) { return { ok: false, error: GH_MISSING }; }
+	if (result.code !== 0) { return failure(result, "GitHub CLI"); }
+	try {
+		const repository = JSON.parse(result.out);
+		const url = new URL(repository.url);
+		if (typeof repository.id !== "string" || !repository.id || typeof repository.nameWithOwner !== "string" || !["https:", "http:"].includes(url.protocol) || url.pathname.replace(/\/$/, "").toLowerCase() !== `/${repository.nameWithOwner}`.toLowerCase()) { throw new Error(); }
+		return { ok: true, repository: { ...repository, host: url.host } };
+	} catch {
+		return { ok: false, error: "GitHub did not return the repository details." };
+	}
 }
 
 function failure(result, what) {
 	if (result.timedOut) { return { ok: false, error: `${what} timed out.` }; }
-	const line = result.err.split(/\r?\n/).map((text) => text.trim()).filter((text) => text && !/^warning:/i.test(text)).find((text, index, lines) => /^(fatal|error):/i.test(text) || index === lines.length - 1) || `${what} failed.`;
+	const line = result.err.split(/\r?\n/).map((text) => text.trim()).filter((text) => text && !/^warning:/i.test(text)).find((text, index, lines) => /^(fatal|error):/i.test(text) || (what === "GitHub CLI" && /^To get started with GitHub CLI,.*\bgh auth login\b/.test(text)) || index === lines.length - 1) || `${what} failed.`;
 	return { ok: false, error: line.replace(/^(fatal|error):\s*/i, "").slice(0, 300) };
 }
 
@@ -123,6 +165,103 @@ async function repoProblem(cwd) {
 	return probe.code === 0 && probe.out.trim() === "true" ? "" : NOT_REPO;
 }
 
+async function fingerprintGitPath(file, hash, budget, depth = 0) {
+	if (--budget.entries < 0 || depth > 12) { throw new Error("Git snapshot is too large"); }
+	let info;
+	try {
+		info = await fs.promises.lstat(file);
+	} catch (error) {
+		if (depth === 0 && error.code === "ENOENT") { hash.update(`${file}\0missing\0`); return; }
+		throw error;
+	}
+	hash.update(`${file}\0${info.mode}\0`);
+	if (info.isSymbolicLink()) {
+		hash.update(`${await fs.promises.readlink(file)}\0`);
+		info = await fs.promises.stat(file);
+		hash.update(`${info.mode}\0`);
+	}
+	if (info.isDirectory()) {
+		const children = [];
+		for await (const entry of await fs.promises.opendir(file)) {
+			if (children.length >= budget.entries) { throw new Error("Git snapshot is too large"); }
+			children.push(entry.name);
+		}
+		for (const name of children.sort()) { await fingerprintGitPath(path.join(file, name), hash, budget, depth + 1); }
+		const after = await fs.promises.stat(file);
+		if (after.ino !== info.ino || after.mtimeMs !== info.mtimeMs || after.ctimeMs !== info.ctimeMs) { throw new Error("Git directory changed during the snapshot"); }
+		return;
+	}
+	if (!info.isFile() || info.size > budget.bytes) { throw new Error("Git path cannot be fingerprinted"); }
+	const handle = await fs.promises.open(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+	try {
+		const before = await handle.stat();
+		if (!before.isFile() || before.ino !== info.ino || before.size > budget.bytes) { throw new Error("Git file changed during the snapshot"); }
+		const content = Buffer.alloc(before.size + 1);
+		const { bytesRead } = await handle.read(content, 0, content.length, 0);
+		const after = await handle.stat();
+		if (bytesRead !== before.size || after.mode !== before.mode || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) { throw new Error("Git file changed during the snapshot"); }
+		hash.update(`${before.mode}\0${bytesRead}\0`).update(content.subarray(0, bytesRead));
+		budget.bytes -= bytesRead;
+	} finally {
+		await handle.close();
+	}
+}
+
+function upstreamSnapshot(top, commonConfig, effective, base) {
+	const entries = effective.split("\0");
+	return (branch) => {
+		const encode = (value) => Buffer.from(value).toString("latin1");
+		const remote = encode(`branch.${branch}.remote`);
+		const merge = encode(`branch.${branch}.merge`);
+		const hash = createHash("sha256").update(base);
+		const expected = new Set();
+		let ignored = 0;
+		for (let index = 0; index + 1 < entries.length; index += 2) {
+			const [origin, entry] = [entries[index], entries[index + 1]];
+			const key = entry.split("\n", 1)[0];
+			if ((key === remote || key === merge) && origin.startsWith("file:") &&
+				path.relative(commonConfig, path.resolve(top, Buffer.from(origin.slice(5), "latin1").toString("utf8"))) === "") {
+				ignored += 1;
+				if (entry === (key === remote ? `${remote}\norigin` : `${merge}\n${encode(`refs/heads/${branch}`)}`)) { expected.add(key); }
+			} else {
+				hash.update(`${origin}\0${entry}\0`, "latin1");
+			}
+		}
+		return { config: hash.digest("hex"), established: ignored === 2 && expected.size === 2 };
+	};
+}
+
+async function gitSecuritySnapshot(cwd, compareUpstream = false) {
+	const unavailable = { ok: false, error: "The repository's Git config and hooks could not be checked." };
+	if (await repoProblem(cwd)) { return unavailable; }
+	const [paths, effective] = await Promise.all([
+		git(["rev-parse", "--path-format=absolute", "--git-common-dir", "--git-path", "config.worktree", "--git-path", "hooks", "--show-toplevel"], cwd, GIT_TIMEOUT, { hooks: true }),
+		git(["config", "--includes", "--null", "--show-origin", "--list"], cwd, GIT_TIMEOUT, { hooks: true, maxBytes: SNAPSHOT_BYTES, encoding: "latin1" }),
+	]);
+	const [common, worktree, configuredHooks, top, extra] = paths.out.replace(/\r?\n$/, "").split(/\r?\n/);
+	if (paths.code !== 0 || paths.truncated || effective.code !== 0 || effective.truncated || extra !== undefined || ![common, worktree, configuredHooks, top].every((entry) => entry && path.isAbsolute(entry))) { return unavailable; }
+	const budget = { bytes: SNAPSHOT_BYTES - effective.out.length, entries: SNAPSHOT_ENTRIES };
+	const config = createHash("sha256").update(effective.out, "latin1");
+	const hooks = createHash("sha256");
+	try {
+		const commonConfig = path.join(common, "config");
+		for (const file of [commonConfig, worktree]) { await fingerprintGitPath(file, config, budget); }
+		for (const folder of new Set([path.join(common, "hooks"), path.resolve(configuredHooks)])) { await fingerprintGitPath(folder, hooks, budget); }
+		const result = { ok: true, config: config.digest("hex"), hooks: hooks.digest("hex") };
+		if (compareUpstream) {
+			const info = await fs.promises.lstat(commonConfig);
+			if (info.isFile()) {
+				const base = createHash("sha256").update(`${await fs.promises.realpath(commonConfig)}\0${info.mode}\0`);
+				await fingerprintGitPath(worktree, base, { bytes: SNAPSHOT_BYTES, entries: SNAPSHOT_ENTRIES });
+				result.upstream = upstreamSnapshot(top, commonConfig, effective.out, base.digest("hex"));
+			}
+		}
+		return result;
+	} catch {
+		return unavailable;
+	}
+}
+
 async function currentBranch(cwd) {
 	const head = await git(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
 	if (head.code === 0) { return head.out.trim(); }
@@ -131,15 +270,17 @@ async function currentBranch(cwd) {
 
 async function resolveBase(cwd, read = (args) => git(args, cwd)) {
 	const remote = await read(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]);
-	const name = remote.out.trim().replace(/^refs\/remotes\/origin\//, "");
-	if (remote.code === 0 && name) { return { name, ref: `refs/remotes/origin/${name}` }; }
+	const ref = remote.out.trim();
+	if (remote.code === 0 && ref.startsWith("refs/remotes/origin/") && (await read(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])).code === 0) {
+		return { name: ref.slice("refs/remotes/origin/".length), ref };
+	}
 	for (const local of ["main", "master"]) {
 		if ((await read(["rev-parse", "--verify", "--quiet", `refs/heads/${local}`])).code === 0) { return { name: local, ref: `refs/heads/${local}` }; }
 	}
 	return null;
 }
 
-// Copied from diff.cjs (not exported there): raw -z inventory plus unified patch parsing, and hunk ids.
+// Copied from diff.cjs: raw -z inventory plus unified patch parsing.
 function parseNames(text) {
 	const parts = text.split("\0");
 	const names = [];
@@ -169,15 +310,6 @@ function parseGitDiff(text, label) {
 		parsed.files.push({ path: file, additions: 0, deletions: 0, conflicted: true, hunks: [{ id: "", loc: "Unresolved merge conflict", reviewable: false, lines: [{ kind: "context", text: "Unresolved merge conflict. Combined conflict content is not shown here; resolve it in the editor or a Git merge tool." }] }] });
 	}
 	return parsed;
-}
-
-function assignIds(files) {
-	for (const file of files) {
-		for (const hunk of file.hunks) {
-			const hash = createHash("sha256").update(JSON.stringify([file.path, hunk.id, hunk.loc, hunk.lines])).digest("hex");
-			hunk.id = `${file.path}:${hash}`;
-		}
-	}
 }
 
 async function branchInfo(cwd) {
@@ -417,36 +549,72 @@ async function prStatus(cwd, number) {
 }
 
 async function prCreate(cwd, options) {
-	const { title, body, draft, expected } = options || {};
+	const { title, body, draft, expected, hooks, onUpstream } = options || {};
 	const problem = await repoProblem(cwd);
 	if (problem) { return { ok: false, error: problem }; }
-	const [branch, base] = await Promise.all([currentBranch(cwd), resolveBase(cwd)]);
-	if (!branch || branch === "HEAD" || (base && branch === base.name)) { return { ok: false, error: "Switch to a branch before creating a pull request." }; }
-	if (expected && branch !== expected) { return { ok: false, error: `The checkout changed to ${branch}. Refresh, then create the pull request again.` }; }
-	// origin/HEAD can be stale after a rename, and a local main or master may not be the default, so GitHub names it before the push.
-	const remote = await gh(["repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"], cwd);
-	if (remote.missing) { return { ok: false, error: GH_MISSING }; }
-	if (remote.code !== 0) { return failure(remote, "GitHub CLI"); }
-	if (!remote.out.trim()) { return { ok: false, error: "GitHub did not say which branch is the default, so nothing was pushed." }; }
-	if (remote.out.trim() === branch) { return { ok: false, error: "Switch to a branch before creating a pull request." }; }
-	// Pre-push hooks (git-lfs, husky, secret scanners) run as they would in a terminal push, so they get a long limit.
-	const push = await git(["push", "-u", "origin", "HEAD"], cwd, 10 * 60 * 1000, { hooks: true });
-	if (push.code !== 0) { return failure(push, "The push"); }
-	const args = ["pr", "create"];
-	if (typeof title === "string" && title.trim()) {
-		args.push(`--title=${title.trim()}`, `--body=${typeof body === "string" ? body : ""}`);
-	} else {
-		args.push("--fill");
+	const [head, base] = await Promise.all([git(["symbolic-ref", "--quiet", "HEAD"], cwd), resolveBase(cwd)]);
+	const ref = head.out.trim();
+	const branch = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : "";
+	if (head.code !== 0 || !branch || (base && branch === base.name)) { return { ok: false, error: "Switch to a branch before creating a pull request." }; }
+	if (expected && branch !== expected) {
+		const display = await git(["rev-parse", "--abbrev-ref", ref], cwd);
+		if (display.code !== 0 || display.out.trim() !== expected) {
+			return { ok: false, error: `The checkout changed to ${branch}. Refresh, then create the pull request again.` };
+		}
 	}
+	// origin/HEAD can be stale after a rename, and a local main or master may not be the default, so GitHub names it before the push.
+	const remote = await prRepository(cwd);
+	if (!remote.ok) { return remote; }
+	const baseRepository = remote.repository;
+	if (!baseRepository.defaultBranchRef?.name) { return { ok: false, error: "GitHub did not say which branch is the default, so nothing was pushed." }; }
+	if (baseRepository.defaultBranchRef.name === branch) { return { ok: false, error: "Switch to a branch before creating a pull request." }; }
+	const pushUrl = await git(["remote", "get-url", "--push", "origin"], cwd);
+	if (pushUrl.code !== 0 || pushUrl.truncated || !pushUrl.out.trim()) { return failure(pushUrl, "Git"); }
+	const destination = await prRepository(cwd, pushUrl.out.trim());
+	if (!destination.ok) { return destination; }
+	const headRepository = destination.repository;
+	if (headRepository.host !== baseRepository.host) { return { ok: false, error: "The push destination and pull request repository are on different GitHub hosts." }; }
+	// Pre-push hooks (git-lfs, husky, secret scanners) run as they would in a terminal push, so they get a long limit.
+	const push = await git(["push", "-u", "origin", `${ref}:${ref}`], cwd, 10 * 60 * 1000, { hooks: hooks !== false });
+	if (push.code !== 0) { return failure(push, "The push"); }
+	onUpstream?.(branch);
+	const notCreated = (error) => ({ ok: false, error: `The branch was pushed, but the pull request was not created: ${error}` });
+	const configuredBase = await git(["config", "--get", `branch.${branch}.gh-merge-base`], cwd);
+	const baseBranch = configuredBase.code === 0 && configuredBase.out.trim() ? configuredBase.out.trim() : baseRepository.defaultBranchRef.name;
+	let prTitle = typeof title === "string" ? title.trim() : "";
+	let prBody = typeof body === "string" ? body : "";
+	if (!prTitle) {
+		const remotes = await git(["remote", "-v"], cwd);
+		if (remotes.code !== 0 || remotes.truncated) { return notCreated(failure(remotes, "Reading Git remotes").error); }
+		let baseRemote;
+		for (const line of remotes.out.split(/\r?\n/)) {
+			const entry = /^(\S+)\s+(.+)\s+\(fetch\)$/.exec(line);
+			if (!entry) { continue; }
+			const candidate = entry[2].trim() === pushUrl.out.trim() ? destination : await prRepository(cwd, entry[2].trim());
+			if (candidate.ok && candidate.repository.id === baseRepository.id && candidate.repository.host === baseRepository.host) { baseRemote = entry[1]; break; }
+		}
+		const baseRef = baseRemote ? `refs/remotes/${baseRemote}/${baseBranch}` : `refs/heads/${baseBranch}`;
+		const log = await git(["log", "--no-show-signature", "--format=%s%x00%b%x00", "--cherry", `${baseRef}...${ref}`, "--"], cwd);
+		if (log.code !== 0 || log.truncated) { return notCreated(failure(log, "Reading pull request commits").error); }
+		const parts = log.out.split("\0");
+		const commits = [];
+		for (let i = 0; i + 1 < parts.length; i += 2) { commits.push({ title: parts[i].trim(), body: parts[i + 1].trim() }); }
+		if (!commits.length) { return notCreated("There are no commits to use for the pull request title and body."); }
+		prTitle = commits.length === 1 ? commits[0].title : branch.replace(/[_-]/g, " ");
+		prBody = commits.length === 1 ? commits[0].body : commits.reverse().map((commit) => `- **${commit.title}**\n`).join("");
+	}
+	const prHead = headRepository.id === baseRepository.id ? branch : `${headRepository.nameWithOwner.split("/")[0]}:${branch}`;
+	const args = ["pr", "create", "--repo", baseRepository.url, "--head", prHead, "--base", baseBranch, `--title=${prTitle}`, `--body=${prBody}`];
 	if (draft) { args.push("--draft"); }
 	const created = await gh(args, cwd);
 	const urls = (created.code === 0 ? created.out : created.err).match(/https?:\/\/\S+/g);
+	if (created.code === 0 && !urls) { return notCreated("GitHub did not return a pull request URL. Check GitHub before trying again."); }
 	if (created.code === 0 || (urls && /already exists/i.test(created.err))) {
 		const status = await git(["status", "--porcelain"], cwd);
 		const count = status.out.split(/\r?\n/).filter(Boolean).length;
 		return { ok: true, url: urls ? urls.pop() : "", message: `Pull request opened.${count ? ` ${count} uncommitted files are not in this pull request.` : ""}` };
 	}
-	return { ok: false, error: `The branch was pushed, but the pull request was not created: ${created.missing ? GH_MISSING : failure(created, "GitHub CLI").error}` };
+	return notCreated(created.missing ? GH_MISSING : failure(created, "GitHub CLI").error);
 }
 
 async function commitFiles(cwd, options, limits = {}) {
@@ -454,6 +622,7 @@ async function commitFiles(cwd, options, limits = {}) {
 	if (!Array.isArray(options.paths) || options.paths.length < 1 || options.paths.length > 1000) { return { ok: false, error: "Choose between 1 and 1000 files to commit." }; }
 	if (typeof cwd !== "string" || !cwd) { return { ok: false, error: "Choose a folder to commit from." }; }
 	const folder = path.resolve(cwd);
+	const hooks = options.hooks !== false;
 	const paths = [];
 	for (const file of options.paths) {
 		if (typeof file !== "string" || !file || /[\0\r\n]/.test(file) || path.isAbsolute(file)) { return { ok: false, error: "Commit paths must be relative files inside this folder." }; }
@@ -470,7 +639,8 @@ async function commitFiles(cwd, options, limits = {}) {
 	if (options.push && (!branch || branch === "HEAD")) { return { ok: false, error: "Switch to a branch before pushing." }; }
 	const top = await git(["rev-parse", "--show-toplevel"], cwd);
 	if (top.code !== 0 || !top.out.trim()) { return failure(top, "Git"); }
-	const repository = process.platform === "win32" ? path.resolve(top.out.trim()).toLowerCase() : path.resolve(top.out.trim());
+	const repo = path.resolve(top.out.trim());
+	const repository = process.platform === "win32" ? repo.toLowerCase() : repo;
 	if (committing.has(repository)) { return { ok: false, error: "A commit is already running in this repository." }; }
 	committing.add(repository);
 	let temporary;
@@ -486,10 +656,31 @@ async function commitFiles(cwd, options, limits = {}) {
 		fs.writeFileSync(message, options.message.trim());
 		const key = (file) => process.platform === "win32" ? file.toLowerCase() : file;
 		const selected = new Set(paths.map(key));
-		const deletions = await git(["diff", "--cached", "--relative", "--no-renames", "--diff-filter=D", "--name-only", "-z"], cwd);
-		if (deletions.code !== 0 || deletions.truncated) { return failure(deletions, "Checking staged deletions"); }
-		for (const file of deletions.out.split("\0").filter((entry) => selected.has(key(entry)))) {
-			if (fs.existsSync(path.resolve(cwd, file))) { return { ok: false, error: `${file} is staged to be deleted but is still on disk, so committing it here would commit the file. Commit it from a terminal.` }; }
+		const includes = (file) => selected.has(key(file)) || paths.some((entry) => entry === "." || key(file).startsWith(`${key(entry)}/`));
+		const unmerged = await git(["ls-files", "--unmerged", "-z"], cwd, GIT_TIMEOUT, { maxBytes: 2 * 1024 * 1024 });
+		if (unmerged.code !== 0 || unmerged.truncated) { return failure(unmerged, "Checking unmerged files"); }
+		const unmergedPaths = new Set(unmerged.out.split("\0").filter(Boolean).map((entry) => entry.slice(entry.indexOf("\t") + 1)));
+		for (const file of unmergedPaths) {
+			if (!includes(file)) { continue; }
+			const attr = await git(["check-attr", "-z", "conflict-marker-size", "--", file], cwd);
+			if (attr.code !== 0 || attr.truncated) { return failure(attr, "Checking conflict marker size"); }
+			const size = Number(attr.out.split("\0")[2]);
+			const count = Number.isSafeInteger(size) && size > 0 ? size : 7;
+			const markers = await git(["--literal-pathspecs", "grep", "-q", "-I", "-E", "--no-textconv", "--no-recurse-submodules", `^(<{${count}}|>{${count}}|={${count}}|[|]{${count}})([[:space:]]|$)`, "--", file], cwd);
+			if (markers.code === 0) { return { ok: false, error: `Resolve the conflict markers in ${file} before committing.` }; }
+			if (markers.code !== 1 || markers.timedOut) { return failure(markers, "Checking conflict markers"); }
+		}
+		const staged = await git(["diff", "--cached", "--relative", "--raw", "--no-renames", "-z"], cwd, GIT_TIMEOUT, { maxBytes: 2 * 1024 * 1024 });
+		if (staged.code !== 0 || staged.truncated) { return failure(staged, "Checking staged files"); }
+		const modes = new Map();
+		for (const [, oldMode, mode, status, file] of staged.out.matchAll(/(?:^|\0):(\d+) (\d+) \w+ \w+ (\w)\0([^\0]+)(?=\0)/g)) {
+			if (status === "D" && selected.has(key(file)) && fs.existsSync(path.resolve(cwd, file))) { return { ok: false, error: `${file} is staged to be deleted but is still on disk, so committing it here would commit the file. Commit it from a terminal.` }; }
+			if (oldMode !== mode && (mode === "100755" || (oldMode === "100755" && mode === "100644")) && includes(file) && fs.lstatSync(path.resolve(cwd, file), { throwIfNoEntry: false })?.isFile()) { modes.set(file, mode); }
+		}
+		if (modes.size) {
+			const fileMode = await git(["config", "--type=bool", "--get", "core.fileMode"], cwd);
+			if (fileMode.code !== 0 && (fileMode.code !== 1 || fileMode.timedOut)) { return failure(fileMode, "Checking the file mode setting"); }
+			if (fileMode.out.trim() !== "false") { modes.clear(); }
 		}
 		const untracked = await git(["ls-files", "--others", "--exclude-standard", "-z"], cwd, GIT_TIMEOUT, { maxBytes: 2 * 1024 * 1024 });
 		if (untracked.truncated) { return { ok: false, error: "This folder has too many untracked files to check. Commit from a terminal." }; }
@@ -509,23 +700,72 @@ async function commitFiles(cwd, options, limits = {}) {
 		}
 		const before = await git(["rev-parse", "--verify", "--quiet", "HEAD"], cwd);
 		const timeout = limits.timeout ?? 10 * 60 * 1000;
-		const committed = await git(["commit", "--only", "-F", message, `--pathspec-from-file=${list}`, "--pathspec-file-nul"], cwd, timeout, { hooks: true });
+		const commitIdArgs = modes.size ? ["-c", "core.abbrev=no"] : [];
+		const modeRef = modes.size ? (await git(["symbolic-ref", "--quiet", "HEAD"], cwd)).out.trim() : "";
+		const modeConfig = modes.size ? await git(["config", "--includes", "--null", "--get-regexp", "^(commit\\.gpgsign|i18n\\.commitencoding|user\\.(name|email|signingkey|useconfigonly)|committer\\.(name|email)|gpg\\..*)$"], cwd) : null;
+		if (modeConfig && (modeConfig.truncated || (modeConfig.code !== 0 && modeConfig.code !== 1))) { return await rollback(failure(modeConfig, "Reading commit settings").error); }
+		const committed = await git([...commitIdArgs, "commit", "--only", ...(modes.size ? ["--allow-empty"] : []), "-F", message, `--pathspec-from-file=${list}`, "--pathspec-file-nul"], cwd, timeout, { hooks });
 		if (committed.code !== 0) {
 			const after = await git(["rev-parse", "--verify", "--quiet", "HEAD"], cwd);
-			const reason = `${failure(committed, "Git").error}${committed.timedOut ? " Git was stopped. If git later says .git/index.lock exists and no git program is running, delete that file." : ""}`;
+			const error = failure(committed, "Git").error;
+			const detail = error === "Git failed." ? committed.out.match(/^(?:nothing to commit|no changes added to commit|nothing added to commit)\b[^\r\n]*/m)?.[0] ?? error : error;
+			const reason = `${detail}${committed.timedOut ? " Git was stopped. If git later says .git/index.lock exists and no git program is running, delete that file." : ""}`;
 			if (after.code === 0 && after.out.trim() !== before.out.trim()) {
 				const short = await git(["rev-parse", "--short", "HEAD"], cwd);
 				const sha = short.out.trim() || after.out.trim();
-				return { ok: false, committed: true, sha, error: `Committed ${sha}, but git did not finish cleanly: ${reason}` };
+				return { ok: false, committed: true, sha, error: `Committed ${sha}, but git did not finish cleanly: ${reason}${modes.size ? " The staged executable modes could not be checked." : ""}` };
 			}
 			return await rollback(reason);
+		}
+		if (modes.size) {
+			const commitId = (result) => [...result.out.matchAll(/^\[[^\r\n]* ([0-9a-f]{40}|[0-9a-f]{64})\] /gm)].at(-1)?.[1];
+			const first = commitId(committed);
+			const incomplete = (reason) => ({ ok: false, committed: true, sha: first?.slice(0, 12), error: `The commit landed, but the staged executable modes could not be included. ${reason}` });
+			if (!modeRef.startsWith("refs/heads/")) { return incomplete("An attached branch is required to preserve the modes safely."); }
+			const dirs = await git(["rev-parse", "--path-format=absolute", "--git-common-dir", "--git-path", "config.worktree"], cwd);
+			const [common, worktreeConfig] = dirs.out.trimEnd().split(/\r?\n/);
+			if (!first || dirs.code !== 0 || !common || !worktreeConfig) { return incomplete("The temporary checkout could not be prepared."); }
+			try {
+				fs.writeFileSync(path.join(temporary, "HEAD"), `${first}\n`);
+				fs.mkdirSync(path.join(temporary, "reftable"));
+				if (fs.existsSync(worktreeConfig)) { fs.writeFileSync(path.join(temporary, "config.worktree"), `[include]\n\tpath = ${JSON.stringify(worktreeConfig)}\n`); }
+			} catch (error) { return incomplete(error.message); }
+			const env = { GIT_DIR: temporary, GIT_COMMON_DIR: common, GIT_WORK_TREE: repo, GIT_INDEX_FILE: path.join(temporary, "mode-index") };
+			const refHooksOff = ["-c", "hook.reference-transaction.enabled=false"];
+			if ((await git([...refHooksOff, "update-ref", "--no-deref", "HEAD", first], repo, GIT_TIMEOUT, { env })).code !== 0) { return incomplete("The temporary checkout could not be prepared."); }
+			if ((await git(["read-tree", first], repo, GIT_TIMEOUT, { env })).code !== 0) { return incomplete("The temporary index could not be prepared."); }
+			for (const [file, mode] of modes) {
+				const tree = await git(["--literal-pathspecs", "ls-tree", "-z", first, "--", file], cwd);
+				const blob = /^100(?:644|755) blob ([0-9a-f]+)\t/.exec(tree.out)?.[1];
+				if (tree.code !== 0 || !blob) { return incomplete(`The committed file at ${file} could not be read.`); }
+				const relative = path.relative(repo, path.resolve(cwd, file)).split(path.sep).join("/");
+				const updated = await git(["update-index", "--cacheinfo", `${mode},${blob},${relative}`], repo, GIT_TIMEOUT, { env });
+				if (updated.code !== 0) { return incomplete(failure(updated, "Updating the executable mode").error); }
+			}
+			const commitSettings = modeConfig.out.split("\0").filter(Boolean).flatMap((entry) => ["-c", entry.replace("\n", "=")]);
+			const amended = await git([...commitIdArgs, ...commitSettings, ...refHooksOff, "-c", "hook.prepare-commit-msg.enabled=false", "-c", "hook.post-commit.enabled=false", "commit", "--amend", "--no-edit", "--no-verify", "--no-post-rewrite", "--cleanup=verbatim"], repo, timeout, hooks ? { env } : { env, hooks: false });
+			const corrected = commitId(amended);
+			if (amended.code !== 0 || !corrected) { return incomplete(failure(amended, "Amending the executable modes").error); }
+			const activeRef = async () => (await git(["symbolic-ref", "--quiet", "HEAD"], cwd)).out.trim();
+			const head = async () => (await git(["rev-parse", "--verify", "HEAD"], cwd)).out.trim();
+			if (await activeRef() !== modeRef || await head() !== first) { return incomplete("The checkout changed after committing."); }
+			const published = await git([...refHooksOff, "update-ref", "--no-deref", "-m", "commit (amend): preserve executable modes", modeRef, corrected, first], cwd);
+			if (published.code !== 0) { return incomplete(failure(published, "Updating the branch").error); }
+			if (await activeRef() !== modeRef || await head() !== corrected) {
+				return { ok: false, committed: true, sha: corrected.slice(0, 12), error: "The executable modes were committed, but the checkout changed before the operation finished." };
+			}
 		}
 		const short = await git(["rev-parse", "--short", "HEAD"], cwd);
 		const sha = short.out.trim();
 		if (options.push) {
 			const upstream = await git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd);
-			const pushed = await git(upstream.code === 0 ? ["push"] : ["push", "-u", "origin", "HEAD"], cwd, timeout, { hooks: true });
+			const head = upstream.code !== 0 && typeof options.onUpstream === "function" ? await git(["symbolic-ref", "--quiet", "HEAD"], cwd) : null;
+			const pushed = await git(upstream.code === 0 ? ["push"] : ["push", "-u", "origin", "HEAD"], cwd, timeout, { hooks });
 			if (pushed.code !== 0) { return { ok: false, committed: true, sha, error: `Committed ${sha}, but the push failed: ${failure(pushed, "Git").error}` }; }
+			if (head?.code === 0 && head.out.trim().startsWith("refs/heads/")) {
+				const after = await git(["symbolic-ref", "--quiet", "HEAD"], cwd);
+				if (after.code === 0 && after.out === head.out) { options.onUpstream(head.out.trim().slice("refs/heads/".length)); }
+			}
 		}
 		const status = await git(["status", "--porcelain"], cwd);
 		const count = status.out.split(/\r?\n/).filter(Boolean).length;
@@ -568,7 +808,17 @@ async function prMergeWhenReady(cwd, number) {
 	const merged = await gh(["pr", "merge", String(number), "--auto", method], cwd);
 	if (merged.missing) { return { ok: false, error: GH_MISSING }; }
 	if (merged.code !== 0) { return failure(merged, "GitHub CLI"); }
-	return { ok: true, message: pr.mergeStateStatus === "BLOCKED" ? "Auto-merge is on. GitHub merges this pull request when its required checks and reviews pass." : "Merged." };
+	const latest = await gh(["pr", "view", String(number), "--json", "state,autoMergeRequest"], cwd);
+	if (latest.code === 0) {
+		try {
+			const state = JSON.parse(latest.out);
+			if (state?.state === "MERGED") { return { ok: true, message: "Merged." }; }
+			if (state?.state === "OPEN" && state.autoMergeRequest) {
+				return { ok: true, message: "Auto-merge is on. GitHub merges this pull request when its required checks and reviews pass." };
+			}
+		} catch { /* The merge command succeeded, but the current PR state is unknown. */ }
+	}
+	return { ok: true, message: "Merge command completed. Refresh to check the pull request." };
 }
 
 function validName(text) {
@@ -576,31 +826,53 @@ function validName(text) {
 }
 
 async function addWorktree(cwd, options) {
-	const { name, prefix } = options || {};
+	const { name, prefix, hooks } = options || {};
 	if (!validName(name) || !validName(prefix)) { return { ok: false, error: "Use up to 40 letters, numbers, dots, dashes or underscores, starting with a letter or number." }; }
 	const problem = await repoProblem(cwd);
 	if (problem) { return { ok: false, error: problem }; }
-	const [top, exclude] = await Promise.all([git(["rev-parse", "--show-toplevel"], cwd), git(["rev-parse", "--git-path", "info/exclude"], cwd)]);
-	if (top.code !== 0 || exclude.code !== 0 || !top.out.trim()) { return { ok: false, error: NOT_REPO }; }
-	const folder = path.join(path.resolve(top.out.trim()), ".grok", "worktrees", name);
+	const dirs = await git(["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"], cwd);
+	const [top, common, extra] = dirs.out.replace(/\r?\n$/, "").split(/\r?\n/);
+	if (dirs.code !== 0 || dirs.truncated || extra !== undefined || !top || !common || !path.isAbsolute(top) || !path.isAbsolute(common)) { return { ok: false, error: NOT_REPO }; }
+	const folder = path.join(top, ".grok", "worktrees", name);
 	const branch = `${prefix}/${name}`;
 	if (fs.existsSync(folder)) { return { ok: false, error: "A worktree with that name already exists." }; }
+	const unsafeExclude = { ok: false, error: "Git info/exclude must be a regular file inside the repository's Git folder." };
+	const hardlinkedExclude = { ok: false, error: "Git info/exclude has more than one link and cannot be updated safely." };
 	try {
-		const file = path.resolve(cwd, exclude.out.trim());
-		const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+		const gitFolder = fs.realpathSync.native(common);
+		const info = path.join(gitFolder, "info");
+		if (!fs.lstatSync(info, { throwIfNoEntry: false })) { fs.mkdirSync(info); }
+		const resolvedInfo = fs.realpathSync.native(info);
+		const relative = path.relative(gitFolder, resolvedInfo);
+		if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) { return unsafeExclude; }
+		const file = path.join(resolvedInfo, "exclude");
+		const existing = fs.lstatSync(file, { throwIfNoEntry: false, bigint: true });
+		if (existing && !existing.isFile()) { return unsafeExclude; }
+		if (existing && existing.nlink > 1n) { return hardlinkedExclude; }
+		const { O_NOFOLLOW = 0, O_RDONLY, O_WRONLY, O_APPEND, O_CREAT, O_EXCL } = fs.constants;
+		const text = existing ? fs.readFileSync(file, { encoding: "utf8", flag: O_RDONLY | O_NOFOLLOW }) : "";
 		if (!text.split(/\r?\n/).some((line) => line.trim() === EXCLUDE_LINE)) {
-			fs.mkdirSync(path.dirname(file), { recursive: true });
-			fs.appendFileSync(file, `${text && !text.endsWith("\n") ? "\n" : ""}${EXCLUDE_LINE}\n`);
+			const fd = fs.openSync(file, O_WRONLY | O_APPEND | O_NOFOLLOW | (existing ? 0 : O_CREAT | O_EXCL));
+			try {
+				const opened = fs.fstatSync(fd, { bigint: true });
+				if (!opened.isFile()) { return unsafeExclude; }
+				if (opened.nlink > 1n) { return hardlinkedExclude; }
+				if (existing && (opened.dev !== existing.dev || opened.ino !== existing.ino)) { return unsafeExclude; }
+				if (path.relative(file, fs.realpathSync.native(file)) !== "") { return unsafeExclude; }
+				fs.appendFileSync(fd, `${text && !text.endsWith("\n") ? "\n" : ""}${EXCLUDE_LINE}\n`);
+			} finally {
+				fs.closeSync(fd);
+			}
 		}
 	} catch {
 		return { ok: false, error: "The git exclude file could not be updated." };
 	}
 	// ponytail: checkout of a large repo can exceed the 20 s git limit, so worktree add gets the 60 s push limit.
-	const added = await git(["worktree", "add", "-b", branch, folder, "HEAD"], cwd, SLOW_TIMEOUT, { hooks: true });
+	const added = await git(["worktree", "add", "-b", branch, folder, "HEAD"], cwd, SLOW_TIMEOUT, { hooks: hooks !== false });
 	return added.code === 0 ? { ok: true, folder, branch } : failure(added, "Git");
 }
 
-async function restoreWorktree(folder, branch) {
+async function restoreWorktree(folder, branch, confirm) {
 	const [prefix, name, extra] = typeof branch === "string" ? branch.split("/") : [];
 	if (!validName(name) || !validName(prefix) || extra !== undefined || typeof folder !== "string" || path.basename(folder) !== name || path.basename(path.dirname(folder)) !== "worktrees" || path.basename(path.dirname(path.dirname(folder))) !== ".grok") {
 		return { ok: false, error: "Choose a session worktree with a valid branch name." };
@@ -609,8 +881,15 @@ async function restoreWorktree(folder, branch) {
 	const problem = await repoProblem(cwd);
 	if (problem) { return { ok: false, error: problem }; }
 	if (fs.existsSync(path.join(folder, ".git"))) { return { ok: true, folder, branch }; }
-	const restored = await git(["worktree", "add", ...(fs.existsSync(folder) ? ["--force"] : []), folder, branch], cwd, SLOW_TIMEOUT);
-	return restored.code === 0 ? { ok: true, folder, branch } : failure(restored, "Git");
+	const listed = await git(["worktree", "list", "--porcelain"], cwd);
+	const registrations = listed.out.split(/\r?\n\r?\n/).map((record) => record.split(/\r?\n/)).filter((record) => record.includes(`branch refs/heads/${branch}`));
+	const stale = listed.code === 0 && !listed.truncated && registrations.length === 1 && registrations[0][0].startsWith("worktree ")
+		&& path.relative(folder, registrations[0][0].slice("worktree ".length)) === "" && !registrations[0].some((line) => /^locked(?: |$)/.test(line));
+	const add = async (hooks) => {
+		const restored = await git(["worktree", "add", ...(stale ? ["--force"] : []), folder, branch], cwd, SLOW_TIMEOUT, { hooks });
+		return restored.code === 0 ? { ok: true, folder, branch } : failure(restored, "Git");
+	};
+	return confirm ? confirm(cwd, add) : add();
 }
 
 async function removeWorktree(cwd, folder, options) {
@@ -636,8 +915,14 @@ async function removeWorktree(cwd, folder, options) {
 	const dirty = entries.some((entry) => !entry.startsWith("!! ")) || ignored.length > 0;
 	const force = Boolean(options && options.force);
 	if (dirty && !force) { return { ok: false, dirty: true, ...(ignored.length ? { ignored: ignored.slice(0, 5) } : {}), error: "This worktree has uncommitted changes." }; }
+	if (!force) {
+		if (!options?.branch) { return { ok: false, dirty: true, error: "The session branch could not be verified." }; }
+		const head = await git(["symbolic-ref", "--quiet", "HEAD"], folder);
+		if (head.code !== 0 || head.out.trim() !== `refs/heads/${options.branch}`) { return { ok: false, dirty: true, error: "This worktree is not on its session branch." }; }
+	}
 	// A non-force remove runs its own git status, which inherits these settings.
 	// Removing a large ignored node_modules can take minutes, and killing git part-way leaves a half-deleted worktree.
+	if (options?.beforeRemove?.() === false) { return { ok: false, skipped: true }; }
 	const removed = await git([...filterOff, "worktree", "remove", ...(force ? ["--force"] : []), folder], cwd, 10 * 60 * 1000);
 	return removed.code === 0 ? { ok: true, dirty } : { ...failure(removed, "Git"), dirty };
 }
@@ -660,4 +945,4 @@ function useBundledGit() {
 	if (dir && !(process.env.PATH || "").split(path.delimiter).includes(dir)) { process.env.PATH = `${process.env.PATH}${path.delimiter}${dir}`; }
 }
 
-module.exports = { branchInfo, readScopedDiff, readChanges, listCommits, repoFiles, prStatus, prCreate, commitFiles, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, run, git, bundledGitDir, useBundledGit };
+module.exports = { branchInfo, readScopedDiff, readChanges, listCommits, repoFiles, prStatus, prCreate, commitFiles, prMergeWhenReady, addWorktree, restoreWorktree, removeWorktree, gitSecuritySnapshot, run, git, bundledGitDir, useBundledGit };

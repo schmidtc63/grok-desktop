@@ -81,7 +81,7 @@ const props = {
 	onQuery() {}, onSelect: (id, find) => calls.push(find ? `select:${id}:${find}` : `select:${id}`), onNew() {}, onNewIn() {}, onPin() {}, onArchive() {}, onNotice: (text) => calls.push(`notice:${text}`),
 	onRename: (id, title) => calls.push(`rename:${id}:${title}`), onDelete: (id) => calls.push(`delete:${id}`),
 	onMarkUnread: (id, unread) => calls.push(`unread:${id}:${unread}`), onMarkCompleted: (id, done) => calls.push(`completed:${id}:${done}`),
-	onMove: (id, section) => calls.push(`move:${id}:${section}`), onSettings() {}, onCollapse() {},
+	onMove: (id, section) => calls.push(`move:${id}:${section}`), onSettings() {}, onRoutines: () => calls.push("routines"), onCollapse() {},
 	onOpenWindow: (id) => { opened = id; },
 	update: null, onUpdate: () => calls.push("update"), recentUsd: null,
 };
@@ -122,6 +122,14 @@ findAll(tree, (node) => node.type === "input" && node.props["aria-label"] === "S
 tree = render();
 assert.equal(findAll(tree, (node) => node.type === "input" && node.props["aria-label"] === "Search sessions").length, 0);
 assert.ok(searchFocused, "Escape returns focus to the sidebar search button");
+const routinesButtons = findAll(tree, (node) => node.type === "button" && node.props["aria-label"] === "Routines");
+assert.equal(routinesButtons.length, 1);
+assert.equal(routinesButtons[0].props.className, "side-icon");
+assert.equal(findAll(routinesButtons[0], (node) => node.type === "path" && node.props.d.startsWith("M8 2.5a5.5") && node.props.d.endsWith("2 1.3")).length, 1, "the Routines button shows the clock icon");
+const tools = findAll(tree, (node) => node.props?.className === "side-tools")[0].props.children;
+assert.equal(tools.indexOf(routinesButtons[0]) + 1, tools.indexOf(findAll(tree, (node) => node.type === "button" && node.props["aria-label"] === "Search sessions")[0]), "Routines sits just before the search button");
+routinesButtons[0].props.onClick();
+assert.deepEqual(calls.splice(0), ["routines"]);
 const ago = loaded.exports.ago;
 assert.equal(ago(now - 30000, now), "now");
 assert.equal(ago(now - 5 * 60000, now), "5m");
@@ -165,12 +173,17 @@ function checkFailedState() {
 	assert.equal(findAll(tree, (node) => node.props?.className === "project-toggle").length, 0, "only project grouping has disclosure buttons");
 	props.sessions = props.sessions.map((item) => item.id === "second" ? { ...item, completed: true } : item);
 	tree = render();
-	assert.equal(findAll(tree, (node) => node.props?.className === "dot completed").length, 1, "marking a failed session completed shows Completed");
-	assert.equal(findAll(tree, (node) => node.props?.className === "failed").length, 0);
+	assert.equal(findAll(tree, (node) => node.props?.className === "dot failed").length, 1, "completion keeps the failure visible");
+	props.sessions = props.sessions.map((item) => item.id === "second" ? { ...item, failed: false } : item);
+	tree = render();
+	assert.equal(findAll(tree, (node) => node.props?.className === "dot unread").length, 1, "completion keeps unread visible after the failure clears");
+	props.sessions = props.sessions.map((item) => item.id === "second" ? { ...item, unread: false } : item);
+	tree = render();
+	assert.equal(findAll(tree, (node) => node.props?.className === "dot completed").length, 1);
 	assert.equal(findAll(tree, (node) => node.props?.className === "group-label" && text(node) === "Completed").length, 1);
 	props.sessions = sessions;
 	groupBy("Project");
-	console.log("PASS failed sidebar state: dot, error label, live activity, grouping and completed precedence");
+	console.log("PASS sidebar state: live activity, failure, unread and completion precedence");
 }
 checkFailedState();
 
@@ -194,9 +207,13 @@ function checkProjectCollapse() {
 	assert.equal(rows().length, 1);
 	assert.match(text(rows()[0]), /^First chat/, "pinned sessions stay visible when their project is collapsed");
 	assert.equal(dot().props["aria-label"], "Working");
+	assert.equal(dot().props.className, "dot running");
 	props.activity = { second: "needs-you" };
 	tree = render();
 	assert.equal(dot().props["aria-label"], "Needs you");
+	assert.equal(dot().props.className, "dot needs-you");
+	const styles = fs.readFileSync(path.join(__dirname, "../src/styles.css"), "utf8");
+	assert.match(styles, /\.group-head:not\(\.scheduled-head\) \.project-toggle \.dot\.needs-you\s*\{\s*border-radius: 0;\s*transform: rotate\(45deg\);/, "the project approval dot is a diamond, distinct from the round working dot");
 	tree = remount();
 	assert.equal(toggle().props["aria-expanded"], false, "a fresh sidebar restores the collapse from storage");
 	props.query = "second";
@@ -298,7 +315,157 @@ function checkChildSessions() {
 }
 checkChildSessions();
 
-const scroller = findAll(tree, (node) => node.props?.className === "session-scroll")[0];
+function checkScheduled() {
+	const viewKey = "grok-code.sidebar.v1";
+	const originalView = storage.get(viewKey);
+	const originalArchive = props.onArchive;
+	const run = (id, routineId, title, minutesAgo, extra = {}) => ({ ...sessions[1], id, routineId, title, folder: `C:/routines/${routineId}`, project: "shared-folder", worktreeFolder: undefined, branch: "main", lastActivityAt: now - minutesAgo * 60000, ...extra });
+	const older = run("a-old", "a", "Alpha · Nov 7", 90);
+	const newer = run("a-new", "a", "Alpha · Nov 8", 30);
+	const beta = run("b-new", "b", "Beta · gamma · Nov 8", 60);
+	const head = () => findAll(tree, (node) => node.props?.className === "group-head scheduled-head")[0];
+	const toggle = () => findAll(head(), (node) => node.type === "button")[0];
+	const headDot = () => findAll(head(), (node) => node.props?.role === "img")[0]?.props["aria-label"];
+	const rowsIn = () => findAll(tree, (node) => node.props?.className === "scheduled-rows").flatMap((box) => findAll(box, (node) => node.props?.className === "session-hit"));
+	const names = () => rowsIn().map((row) => text(findAll(row, (node) => node.type === "b")[0]));
+	const useRuns = (...list) => { props.sessions = [sessions[1], ...list]; tree = render(); };
+
+	storage.set(viewKey, JSON.stringify({ groupBy: "project", collapsedProjects: [] }));
+	useRuns(older, newer, beta);
+	tree = remount();
+	assert.equal(text(head()).trim(), "Scheduled");
+	assert.equal(toggle().props["aria-expanded"], false, "a view saved before this section starts with it closed");
+	assert.deepEqual(names(), []);
+	assert.deepEqual(findAll(tree, (node) => node.props?.className === "project-toggle" && !findAll(head(), (inner) => inner === node).length).map((node) => node.props.title), [sessions[1].folder], "routine runs leave the project lists, and leave no empty heading");
+	toggle().props.onClick();
+	tree = render();
+	assert.deepEqual(names(), ["Alpha", "Beta · gamma"], "one row per routine, named after it, whatever its folder is called");
+	calls.length = 0;
+	rowsIn()[0].props.onClick({});
+	assert.deepEqual(calls, ["select:a-new"], "a row opens the routine's latest run");
+	assert.equal(findAll(head(), (node) => node.props?.role === "img").length, 0, "an open heading leaves the dots to its rows");
+	tree = remount();
+	assert.deepEqual(names(), ["Alpha", "Beta · gamma"], "the open section survives a restart");
+	toggle().props.onClick();
+	tree = render();
+
+	const dots = [
+		[{}, { "a-new": "needs-you", "b-new": "running" }, "Needs you", "amber first"],
+		[{ failed: true, unread: true }, { "b-new": "running" }, "Failed", "then an unread failure"],
+		[{ unread: true }, { "b-new": "running" }, "Unread", "then an unread finish"],
+		[{}, { "b-new": "running" }, "Working", "then a run still going"],
+		[{ failed: true }, {}, undefined, "a failure that was read stops asking"],
+		[{ completed: true }, {}, undefined, "a completed run asks for nothing"],
+	];
+	for (const [patch, activity, expected, why] of dots) {
+		useRuns(older, { ...newer, ...patch }, beta);
+		props.activity = activity;
+		tree = render();
+		assert.equal(headDot(), expected, why);
+	}
+	props.activity = {};
+	useRuns({ ...older, failed: true, unread: true }, newer, beta);
+	assert.equal(headDot(), undefined, "an older run's failure does not color the routine once a newer run came");
+	useRuns(older, { ...newer, failed: true }, beta);
+	toggle().props.onClick();
+	tree = render();
+	assert.equal(findAll(findAll(tree, (node) => node.props?.className === "scheduled-rows")[0], (node) => node.props?.className === "dot failed").length, 1, "a read failure still shows red on its row");
+	useRuns(older, newer, beta);
+
+	props.activity = { "a-old": "needs-you" };
+	tree = render();
+	assert.deepEqual(names(), ["Alpha", "Beta · gamma", "Alpha · Nov 7"], "an older run that needs you keeps its own dated row");
+	props.activity = {};
+	tree = render();
+
+	toggle().props.onClick();
+	tree = render();
+	assert.equal(toggle().props["aria-expanded"], false);
+	props.activeId = "a-old";
+	render();
+	tree = render();
+	assert.equal(toggle().props["aria-expanded"], true, "opening a run from a notice or the history opens the section");
+	assert.deepEqual(names(), ["Alpha", "Beta · gamma", "Alpha · Nov 7"], "the open older run has a row while it is on screen");
+	assert.equal(findAll(tree, (node) => node.props?.className === "session active").length, 1);
+	props.activeId = sessions[1].id;
+	render();
+	tree = render();
+	assert.deepEqual(names(), ["Alpha", "Beta · gamma"], "and goes back to one row after");
+
+	toggle().props.onClick();
+	tree = render();
+	props.query = "Nov 7";
+	tree = render();
+	assert.equal(toggle().props["aria-expanded"], true, "search looks inside a closed section");
+	assert.deepEqual(names(), ["Alpha · Nov 7"], "search finds older runs, under their dated titles");
+	toggle().props.onClick();
+	props.query = "";
+	tree = render();
+	assert.equal(toggle().props["aria-expanded"], false, "search leaves the choice alone");
+	toggle().props.onClick();
+	tree = render();
+
+	const menuFor = (index) => {
+		findAll(findAll(tree, (node) => node.props?.className === "scheduled-rows")[0], (node) => node.props?.onContextMenu)[index].props.onContextMenu({ preventDefault() {}, stopPropagation() {}, currentTarget: { getBoundingClientRect: () => ({ top: 10, left: 10, bottom: 30 }), querySelector: () => null, focus() {} } });
+		tree = render();
+	};
+	const menuItem = (label) => findAll(tree, (node) => node.type === "button" && node.props.role === "menuitem" && text(node).startsWith(label))[0];
+	const archived = [];
+	props.onArchive = (id) => archived.push(id);
+	useRuns(older, newer, { ...run("a-pin", "a", "Alpha · Nov 6", 200), pinned: true }, { ...run("a-gone", "a", "Alpha · Nov 5", 300), archived: true }, beta);
+	menuFor(0);
+	assert.equal(menuItem("Rename"), undefined, "a routine's name is changed on the Routines page");
+	assert.equal(menuItem("Move to section"), undefined, "a routine's runs stay in this section");
+	menuItem("Archive all runs").props.onClick();
+	assert.deepEqual(archived.sort(), ["a-new", "a-old"], "archiving a row clears the routine's other runs too, except pinned ones");
+	tree = render();
+	const rows = findAll(findAll(tree, (node) => node.props?.className === "scheduled-rows")[0], (node) => node.props?.className === "session-hit");
+	assert.equal(rows[0].props.onDoubleClick, undefined, "a double click does not start a rename");
+	assert.deepEqual(findAll(tree, (node) => node.props?.className === "session-hit" && node.props.title.startsWith("Alpha · Nov 6")).map((row) => text(findAll(row, (inner) => inner.type === "b")[0])), ["Alpha · Nov 6"], "a pinned run stays pinned under its dated title");
+
+	archived.length = 0;
+	storage.set(viewKey, JSON.stringify({ ...JSON.parse(storage.get(viewKey)), status: "archived", scheduledOpen: true }));
+	useRuns({ ...older, archived: true }, { ...newer, archived: true }, beta);
+	tree = remount();
+	assert.deepEqual(names(), ["Alpha · Nov 8", "Alpha · Nov 7"], "the archive lists every run");
+	menuFor(1);
+	menuItem("Unarchive").props.onClick();
+	assert.deepEqual(archived, ["a-old"], "and acts on one run");
+
+	storage.set(viewKey, JSON.stringify({ groupBy: "project", collapsedProjects: [], scheduledOpen: true }));
+	const parentRun = { ...newer };
+	const child = { ...sessions[0], id: "child", title: "Child chat", pinned: false, parentId: parentRun.id, folder: "C:/elsewhere", project: "Elsewhere" };
+	props.sessions = [parentRun, child];
+	tree = remount();
+	assert.deepEqual(names(), ["Alpha"]);
+	assert.equal(findAll(tree, (node) => node.props?.className === "session-children").length, 0, "a chat started from a run stays visible on its own");
+	assert.ok(findAll(tree, (node) => node.props?.className === "session-hit" && node.props.title.startsWith("Child chat")).length, "in its project");
+
+	for (const groupBy of ["date", "state", "section", "none"]) {
+		storage.set(viewKey, JSON.stringify({ groupBy, collapsedProjects: [], scheduledOpen: false }));
+		useRuns(older, newer);
+		tree = remount();
+		assert.equal(toggle().props["aria-expanded"], false);
+		assert.equal(findAll(tree, (node) => node.props?.className === "session-hit" && node.props.title.startsWith("Alpha")).length, 0, `${groupBy} grouping keeps runs in the section`);
+	}
+	props.sessions = sessions;
+	tree = render();
+	assert.equal(head(), undefined, "no routine runs, no section");
+	props.sessions = [older];
+	tree = render();
+	assert.equal(findAll(tree, (node) => node.props?.className === "note").length, 0, "a list of only routine runs is not called empty");
+
+	props.sessions = sessions;
+	props.activeId = "first";
+	props.activity = {};
+	props.onArchive = originalArchive;
+	storage.set(viewKey, originalView);
+	tree = remount();
+	console.log("PASS scheduled section: one row per routine, heading dot order, restart, reveal, search, row actions and archive list");
+}
+checkScheduled();
+
+const scroller =findAll(tree, (node) => node.props?.className === "session-scroll")[0];
 let focused = 0;
 let prevented = 0;
 const buttons = [0, 1].map((index) => ({ matches: (selector) => selector === "button.session-hit", focus: () => { focused = index; } }));
@@ -385,7 +552,9 @@ async function checkActions() {
 	const sessionsWithSection = sessions.map((item) => item.id === "second" ? { ...item, sectionId: calls.at(-1).split(":")[2] } : item);
 	props.sessions = sessionsWithSection;
 	tree = render();
-	findAll(tree, (node) => node.props?.["aria-label"] === "Section name")[0].props.onBlur({ target: { value: "Reviews" } });
+	const nameInput = findAll(tree, (node) => node.props?.["aria-label"] === "Section name")[0];
+	nameInput.props.onKeyDown({ key: "Enter", nativeEvent: { isComposing: true }, target: { blur() { assert.fail("IME Enter submitted the section name"); } } });
+	nameInput.props.onBlur({ target: { value: "Reviews" } });
 	tree = render();
 	assert.ok(findAll(tree, (node) => node.props?.className === "group-label" && text(node) === "Reviews").length === 1, "a renamed section groups its sessions");
 	storage.set("grok-code.sections.v1", JSON.stringify([{ id: "shared", name: "Shared reviews" }]));

@@ -79,7 +79,13 @@ function fixture() {
 		set selectedIndex(value) { this._selectedIndex = value; this.value = this.options[value].value; }
 	}
 	Object.defineProperty(HTMLSelectElement.prototype, "value", Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value"));
-	class HTMLFormElement extends HTMLElement { requestSubmit() { this.submissions = (this.submissions || 0) + 1; } }
+	class HTMLFormElement extends HTMLElement {
+		get action() { return new URL(this.attrs.action || this.ownerDocument.location.href, this.ownerDocument.baseURI || this.ownerDocument.location.href).href; }
+		get method() { return this.attrs.method || "get"; }
+		get noValidate() { return this.hasAttribute("novalidate"); }
+		reportValidity() { return this.ownerDocument.elements.every((el) => el.form !== this || !el.hasAttribute("required") || !!el.value); }
+		requestSubmit() { this.submissions = (this.submissions || 0) + 1; }
+	}
 	class Document {
 		constructor() { this.elements = []; this.body = this.add("body"); }
 		add(tag, attrs = {}, text = "", parent = this.body) {
@@ -102,11 +108,12 @@ function fixture() {
 		CSSStyleDeclaration, EventTarget, Event: FakeEvent, innerWidth: 800, innerHeight: 600,
 		Date: class extends Date { static now() { return now; } }, setTimeout: (callback, delay) => { timers.push({ callback, delay }); },
 	});
+	document.location = context.location;
 	const plain = (value) => JSON.parse(JSON.stringify(value));
 	const run = (op, args = {}) => plain(vm.runInContext(pageScript(op, { origin: new URL(context.location.href).origin, navigationEpoch, ...args }), context, { timeout: 1000 }));
 	const actionArgs = (ref, extra = {}) => ({ ref, origin: new URL(context.location.href).origin, navigationEpoch, deadline: now + 5000, ...extra });
 	const ref = (el) => run("snapshot").entries.find((entry) => entry.ref && context.__grokBrowserPageState.refs.get(entry.ref) === el).ref;
-	const inspect = (el) => run("inspect", actionArgs(ref(el)));
+	const inspect = (el, extra = {}) => run("inspect", actionArgs(ref(el), extra));
 	return { document, context, timers, run, actionArgs, ref, inspect, plain,
 		add: (...args) => document.add(...args), setNow: (value) => { now = value; }, setEpoch: (value) => { navigationEpoch = value; },
 		navigate: () => { context.document = new Document(); return context.document; } };
@@ -237,7 +244,7 @@ check("highlight returns immediately, uses 400ms cleanup and preserves prior out
 
 check("fill uses native setters and bubbling input/change, then native requestSubmit", () => {
 	const f = fixture(), form = f.add("form"), input = f.add("input", { name: "message" }, "", form); input.form = form;
-	const expectedMeta = f.inspect(input); input.value = "old";
+	const expectedMeta = f.inspect(input, { submit: true }); input.value = "old";
 	Object.defineProperty(input, "value", { get: () => input._value, set: () => { throw new Error("Own value setter"); } });
 	input.dispatchEvent = () => { throw new Error("Own dispatch wrapper"); }; form.requestSubmit = input.dispatchEvent;
 	f.run("fill", f.actionArgs(expectedMeta.ref, { expectedMeta, text: "new", submit: true }));
@@ -246,6 +253,34 @@ check("fill uses native setters and bubbling input/change, then native requestSu
 	const textarea = f.add("textarea", { "aria-label": "Note" }), editable = f.add("div", { contenteditable: "true", "aria-label": "Note" });
 	for (const el of [textarea, editable]) { const meta = f.inspect(el); f.run("fill", f.actionArgs(meta.ref, { expectedMeta: meta, text: "hello" })); }
 	assert.equal(textarea.value, "hello"); assert.equal(editable.textContent, "hello");
+});
+
+check("fill leaves native action resolution and changes to request-level authorization", () => {
+	const f = fixture(), form = f.add("form", { action: "submit?token=private" }), input = f.add("input", { name: "action" });
+	input.form = form; f.document.baseURI = "https://destination.test/relative/";
+	Object.defineProperty(form, "action", { value: input });
+	const expectedMeta = f.inspect(input, { submit: true });
+	const args = f.actionArgs(expectedMeta.ref, { expectedMeta, text: "private", submit: true });
+	form.attrs.action = "https://unexpected.test/other";
+	assert.equal(f.run("fill", args).ok, true);
+	assert.equal(input.value, "private");
+	form.attrs.action = "submit";
+	input.onDispatch = () => { form.attrs.action = "https://unexpected.test/other"; };
+	assert.equal(f.run("fill", args).ok, true);
+	assert.equal(form.submissions, 2);
+});
+
+check("fill reports native form validation failure and honors novalidate", () => {
+	const f = fixture(), form = f.add("form"), input = f.add("input", {}, "", form), required = f.add("input", { required: "" }, "", form);
+	input.form = form; required.form = form;
+	const expectedMeta = f.inspect(input, { submit: true });
+	const args = f.actionArgs(expectedMeta.ref, { expectedMeta, text: "new", submit: true });
+	assert.match(f.run("fill", args).error, /Form validation blocked submission/);
+	assert.equal(input.value, "new");
+	assert.equal(form.submissions, undefined);
+	form.attrs.novalidate = "";
+	assert.equal(f.run("fill", args).ok, true);
+	assert.equal(form.submissions, 1);
 });
 
 check("fill refuses changed field metadata, missing sensitive approval and noneditable targets before mutation", () => {
@@ -292,4 +327,4 @@ check("scroll is bounded, origin checked and supports validated refs without cli
 	const button = f.add("button", {}, "Go"); f.run("scroll", f.actionArgs(f.ref(button))); assert.equal(button.scrolls, 1); assert.equal(button.clicks, 0);
 });
 
-console.log("Browser page: 14 test groups passed.");
+console.log("Browser page: 16 test groups passed.");

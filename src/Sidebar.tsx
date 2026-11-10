@@ -17,12 +17,12 @@ type CliPick = { id: string; title: string; folder: string; lastActive: number }
 type MenuAnchor = { top: number; left: number; opener: HTMLElement };
 type SubmenuAnchor = MenuAnchor & { kind: Submenu; focusOnOpen: boolean };
 type CliList = MenuAnchor & { token: object; loading: boolean; error: string; sessions: CliPick[] };
-interface SidebarView { groupBy: GroupBy; sortBy: SortBy; status: StatusFilter; days: number; collapsedProjects: string[]; collapsedParents: string[] }
+interface SidebarView { groupBy: GroupBy; sortBy: SortBy; status: StatusFilter; days: number; collapsedProjects: string[]; collapsedParents: string[]; scheduledOpen: boolean }
 
 const viewKey = "grok-code.sidebar.v1";
 const sectionsKey = "grok-code.sections.v1";
 const DAY = 24 * 60 * 60 * 1000;
-const DEFAULT_VIEW: SidebarView = { groupBy: "project", sortBy: "recency", status: "active", days: 0, collapsedProjects: [], collapsedParents: [] };
+const DEFAULT_VIEW: SidebarView = { groupBy: "project", sortBy: "recency", status: "active", days: 0, collapsedProjects: [], collapsedParents: [], scheduledOpen: false };
 const GROUP_LABEL: Record<GroupBy, string> = { date: "Date", project: "Project", state: "State", section: "Section", none: "None" };
 const SORT_LABEL: Record<SortBy, string> = { recency: "Recency", name: "Name", created: "Created" };
 const STATUS_LABEL: Record<StatusFilter, string> = { active: "Active", archived: "Archived", all: "All" };
@@ -81,9 +81,9 @@ export function ago(time: number, now = Date.now()): string {
 function stateOf(session: Session, activity: Activity): RowState {
 	const live = activity[session.id];
 	if (live) { return live; }
-	if (session.completed) { return "completed"; }
 	if (session.failed) { return "failed"; }
-	return session.unread ? "unread" : "idle";
+	if (session.unread) { return "unread"; }
+	return session.completed ? "completed" : "idle";
 }
 
 function hiddenActivity(items: Session[], activity: Activity): Activity[string] {
@@ -94,6 +94,29 @@ function hiddenActivity(items: Session[], activity: Activity): Activity[string] 
 		if (status === "running") { running = true; }
 	}
 	return running ? "running" : undefined;
+}
+
+// A run's title is "<routine name> · <date>".
+function routineName(run: Session) {
+	return run.title.replace(/ · [^·]*$/, "");
+}
+
+function newestRuns(runs: Session[]) {
+	const newest = new Map<Session["routineId"], Session>();
+	for (const run of runs) {
+		const kept = newest.get(run.routineId);
+		if (!kept || stamp(run) > stamp(kept)) { newest.set(run.routineId, run); }
+	}
+	return new Set(newest.values());
+}
+
+// The dot on a closed Scheduled heading. A failure stops asking for attention once it is read, though its row stays red.
+function scheduledStatus(runs: Session[], activity: Activity) {
+	const states = runs.map((run) => {
+		const state = stateOf(run, activity);
+		return state === "failed" && !run.unread ? "idle" : state;
+	});
+	return (["needs-you", "failed", "unread", "running"] as const).find((state) => states.includes(state));
 }
 
 function dateBucket(session: Session) {
@@ -137,9 +160,9 @@ function projectParents(sessions: Session[]) {
 	const byId = new Map(sessions.map((session) => [session.id, session]));
 	const parents = new Map<string, Session>();
 	for (const child of sessions) {
-		if (!child.parentId || (child.pinned && !child.archived)) { continue; }
+		if (!child.parentId || child.routineId || (child.pinned && !child.archived)) { continue; }
 		const parent = byId.get(child.parentId);
-		if (parent && !parent.archived && parent.id !== child.id) { parents.set(child.id, parent); }
+		if (parent && !parent.routineId && !parent.archived && parent.id !== child.id) { parents.set(child.id, parent); }
 	}
 	return new Map([...parents].filter(([, parent]) => !parents.has(parent.id)));
 }
@@ -224,6 +247,7 @@ export function Sidebar({
 	onOpenCliSession,
 	loopCounts,
 	onSettings,
+	onRoutines,
 	onCollapse,
 	onNotice,
 	account,
@@ -239,8 +263,10 @@ export function Sidebar({
 	onSignOut,
 	update,
 	onUpdate,
+	grokBot,
 }: {
 	inert?: boolean;
+	grokBot?: { open: boolean; running: boolean; onOpen: () => void };
 	sessions: Session[];
 	chats: Record<string, ChatMessage[]>;
 	activeId: string;
@@ -265,6 +291,7 @@ export function Sidebar({
 	onOpenCliSession: (agentSessionId: string) => void;
 	loopCounts?: Record<string, number>;
 	onSettings: () => void;
+	onRoutines: () => void;
 	onCollapse: () => void;
 	onNotice: (text: string) => void;
 	account: GrokAccount | null | undefined;
@@ -355,11 +382,17 @@ export function Sidebar({
 			nested.add(session.id);
 		}
 	}
-	const topLevel = (list: Session[]) => nested.size ? list.filter((session) => !nested.has(session.id)) : list;
+	const topLevel = (list: Session[]) => list.filter((session) => !nested.has(session.id) && !session.routineId);
 	const grouped = groupSessions(topLevel(rest), topLevel(visible), view, activity, sections);
+	const runs = rest.filter((session) => session.routineId);
+	// One row per routine. Search and the archive list show every run, and a run that is open or working elsewhere keeps its own row.
+	const newest = !searching && view.status === "active" ? newestRuns(runs) : undefined;
+	const scheduled = newest ? runs.filter((run) => newest.has(run) || run.id === activeId || activity[run.id]) : runs;
+	const scheduledExpanded = searching || view.scheduledOpen;
 	const activeParent = parents?.get(activeId);
 	const activeSession = activeParent ?? sessions.find((session) => session.id === activeId);
-	const activeProject = activeSession && pathKey(activeSession.folder);
+	const activeScheduled = !!activeSession?.routineId && !activeSession.pinned;
+	const activeProject = activeSession && !activeSession.routineId ? pathKey(activeSession.folder) : undefined;
 	const activeParentId = activeParent?.id;
 	useEffect(() => {
 		if (previousActive.current === activeId) { return; }
@@ -367,14 +400,15 @@ export function Sidebar({
 		setView((current) => {
 			const revealProject = activeProject !== undefined && current.collapsedProjects.includes(activeProject);
 			const revealParent = activeParentId !== undefined && current.collapsedParents.includes(activeParentId);
-			if (!revealProject && !revealParent) { return current; }
+			if (!revealProject && !revealParent && (!activeScheduled || current.scheduledOpen)) { return current; }
 			return {
 				...current,
 				collapsedProjects: revealProject ? current.collapsedProjects.filter((key) => key !== activeProject) : current.collapsedProjects,
 				collapsedParents: revealParent ? current.collapsedParents.filter((id) => id !== activeParentId) : current.collapsedParents,
+				scheduledOpen: current.scheduledOpen || activeScheduled,
 			};
 		});
-	}, [activeId, activeProject, activeParentId]);
+	}, [activeId, activeProject, activeParentId, activeScheduled]);
 
 	function closeAll() {
 		setMenu(null);
@@ -490,7 +524,7 @@ export function Sidebar({
 	}
 
 	const rowSession = rowMenu ? sessions.find((session) => session.id === rowMenu.id) : undefined;
-	const nothing = pinned.length === 0 && grouped.every((group) => group.items.length === 0);
+	const nothing = pinned.length === 0 && scheduled.length === 0 && grouped.every((group) => group.items.length === 0);
 
 	return (
 		<aside className="sidebar" inert={inert}>
@@ -503,6 +537,9 @@ export function Sidebar({
 					<span className="cli-label-short">CLI…</span>
 				</button>
 				<span className="spacer" />
+				<button className="side-icon" aria-label="Routines" title="Routines" onClick={onRoutines}>
+					<Icon name="clock" />
+				</button>
 				<button ref={searchButton} className="side-icon" aria-label="Search sessions" title="Search sessions" onClick={() => setSearchOpen((value) => !value || !!query)}>
 					<Icon name="search" />
 				</button>
@@ -510,6 +547,7 @@ export function Sidebar({
 					<Icon name="sliders" />
 				</button>
 			</div>
+			{grokBot && <div className={`session${grokBot.open ? " active" : ""}`}><button className="session-hit" aria-current={grokBot.open ? "page" : undefined} onClick={grokBot.onOpen}><span>Grok Bot</span>{grokBot.running && <small> Working</small>}</button></div>}
 			{cli && (
 				<>
 					<button className="menu-back" aria-label="Close CLI sessions" tabIndex={-1} onClick={() => setCli(null)} />
@@ -534,7 +572,7 @@ export function Sidebar({
 						value={query}
 						autoFocus
 						onChange={(event) => onQuery(event.target.value)}
-						onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); onQuery(""); setSearchOpen(false); searchButton.current?.focus(); } }}
+						onKeyDown={(event) => { if (event.key === "Escape" && !event.nativeEvent?.isComposing) { event.stopPropagation(); onQuery(""); setSearchOpen(false); searchButton.current?.focus(); } }}
 					/>
 				</div>
 			)}
@@ -554,6 +592,12 @@ export function Sidebar({
 				event.preventDefault();
 				rows[Math.min(Math.max(index + (event.key === "ArrowDown" ? 1 : -1), 0), rows.length - 1)].focus();
 			}}>
+				{scheduled.length > 0 && (
+					<div>
+						<ProjectHead label="Scheduled" onNewIn={onNewIn} onRoutines={onRoutines} expanded={scheduledExpanded} searching={searching} status={scheduledExpanded ? undefined : scheduledStatus(scheduled, activity)} onToggle={() => { if (!searching) { setView((current) => ({ ...current, scheduledOpen: !current.scheduledOpen })); } }} />
+						{scheduledExpanded && <div className="scheduled-rows">{scheduled.map((run) => <Row key={run.id} {...rowProps(run)} label={newest?.has(run) ? routineName(run) : undefined} />)}</div>}
+					</div>
+				)}
 				{pinned.length > 0 && <div className="group-label">Pinned</div>}
 				{pinned.map(renderRow)}
 				{grouped.map((group) => {
@@ -671,11 +715,11 @@ export function Sidebar({
 			)}
 			{rowMenu && rowSession && (
 				<PopupMenu className="row-pop" style={{ top: rowMenu.top, left: rowMenu.left }} aria-label="Session actions" opener={rowMenu.opener} onDismiss={closeAll}>
-					<button role="menuitem" onMouseEnter={() => setSub(null)} onClick={() => { setRenaming(rowSession.id); closeAll(); }}>Rename</button>
-					{!rowSession.archived && <button role="menuitem" onMouseEnter={() => setSub(null)} onClick={() => { onPin(rowSession.id); closeAll(); }}>{rowSession.pinned ? "Unpin" : "Pin"}</button>}
+					{!rowSession.routineId && <button role="menuitem" onMouseEnter={() => setSub(null)} onClick={() => { setRenaming(rowSession.id); closeAll(); }}>Rename</button>}
+					{!rowSession.archived &&<button role="menuitem" onMouseEnter={() => setSub(null)} onClick={() => { onPin(rowSession.id); closeAll(); }}>{rowSession.pinned ? "Unpin" : "Pin"}</button>}
 					<button role="menuitem" onMouseEnter={() => setSub(null)} onClick={() => { onMarkUnread(rowSession.id, !rowSession.unread); closeAll(); }}>{rowSession.unread ? "Mark as read" : "Mark as unread"}</button>
 					<button role="menuitem" onMouseEnter={() => setSub(null)} onClick={() => { onMarkCompleted(rowSession.id, !rowSession.completed); closeAll(); }}>{rowSession.completed ? "Mark as not completed" : "Mark as completed"}</button>
-					<Cascade label="Move to section" value="" open={sub?.kind === "move"} onOpen={(opener, focus) => openSub("move", opener, focus)} />
+					{!rowSession.routineId && <Cascade label="Move to section" value="" open={sub?.kind === "move"} onOpen={(opener, focus) => openSub("move", opener, focus)} />}
 					{sub?.kind === "move" && (
 						<PopupMenu className="row-pop" style={{ top: sub.top, left: sub.left }} aria-label="Move to section" opener={sub.opener} focusOnOpen={sub.focusOnOpen} onDismiss={() => setSub(null)} onBack={() => setSub(null)}>
 							{sections.map((section) => (
@@ -693,7 +737,9 @@ export function Sidebar({
 					{rowSession.agentSessionId && <button role="menuitem" onMouseEnter={() => setSub(null)} onClick={() => { onCopySessionId(rowSession.agentSessionId!); closeAll(); }}>Copy Grok session ID</button>}
 					{rowSession.agentSessionId && <button role="menuitem" onMouseEnter={() => setSub(null)} onClick={() => { onExportMarkdown(rowSession.agentSessionId!, rowSession.title); closeAll(); }}>Export as Markdown…</button>}
 					<hr />
-					<button role="menuitem" onMouseEnter={() => setSub(null)} onClick={() => { onArchive(rowSession.id); closeAll(); }}>{rowSession.archived ? "Unarchive" : "Archive"}</button>
+					{newest?.has(rowSession)
+						? <button role="menuitem" onMouseEnter={() => setSub(null)} onClick={() => { sessions.filter((item) => item.routineId === rowSession.routineId && !item.archived && !item.pinned).forEach((run) => onArchive(run.id)); closeAll(); }}>Archive all runs</button>
+						: <button role="menuitem" onMouseEnter={() => setSub(null)} onClick={() => { onArchive(rowSession.id); closeAll(); }}>{rowSession.archived ? "Unarchive" : "Archive"}</button>}
 					<button
 						role="menuitem"
 						className="danger"
@@ -764,6 +810,7 @@ function InlineName({ label, value, onDone }: { label: string; value: string; on
 			onFocus={(event) => event.target.select()}
 			onBlur={(event) => onDone(event.target.value.trim() || null)}
 			onKeyDown={(event) => {
+				if (event.nativeEvent?.isComposing) { return; }
 				if (event.key === "Enter") { (event.target as HTMLInputElement).blur(); }
 				if (event.key === "Escape") { event.stopPropagation(); onDone(null); }
 			}}
@@ -771,31 +818,40 @@ function InlineName({ label, value, onDone }: { label: string; value: string; on
 	);
 }
 
-function ProjectHead({ label, seed, onNewIn, expanded, searching, status, onToggle }: {
+function ProjectHead({ label, seed, onNewIn, onRoutines, expanded, searching, status, onToggle }: {
 	label: string;
-	seed: ProjectSeed;
+	seed?: ProjectSeed;
 	onNewIn: (seed: ProjectSeed) => void;
+	onRoutines?: () => void;
 	expanded: boolean;
 	searching: boolean;
-	status?: Activity[string];
+	status?: RowState;
 	onToggle: () => void;
 }) {
 	return (
-		<div className="group-head">
-			<button type="button" className="project-toggle" title={seed.folder} aria-expanded={expanded} aria-disabled={searching || undefined} onClick={onToggle}>
+		<div className={seed ? "group-head" : "group-head scheduled-head"}>
+			<button type="button" className="project-toggle" title={seed?.folder} aria-expanded={expanded} aria-disabled={searching || undefined} onClick={onToggle}>
 				<span className="group-label">{label}</span>
 				<Icon name={expanded ? "chevron-down" : "chevron-right"} />
 				{status && <span className={`dot ${status}`} role="img" aria-label={STATE_LABEL[status]} title={STATE_LABEL[status]} />}
 			</button>
-			<button className="side-icon project-add" aria-label={`New session in ${label}`} title={`New session in ${seed.folder}`} onClick={() => onNewIn(seed)}>
-				<Icon name="plus" />
-			</button>
+			{seed && (
+				<button className="side-icon project-add" aria-label={`New session in ${label}`} title={`New session in ${seed.folder}`} onClick={() => onNewIn(seed)}>
+					<Icon name="plus" />
+				</button>
+			)}
+			{onRoutines && (
+				<button className="side-icon project-add" aria-label="Open Routines" title="Open Routines" onClick={onRoutines}>
+					<Icon name="clock" />
+				</button>
+			)}
 		</div>
 	);
 }
 
 function Row({
 	session,
+	label,
 	now,
 	excerpt,
 	state,
@@ -810,6 +866,7 @@ function Row({
 	loops = 0,
 }: {
 	session: Session;
+	label?: string;
 	now: number;
 	excerpt?: string;
 	state: RowState;
@@ -844,8 +901,8 @@ function Row({
 			{renaming ? (
 				<InlineName label="Session title" value={session.title} onDone={onRename} />
 			) : (
-				<button className="session-hit" title={`${session.title}\n${session.folder}${time ? `\n${new Date(time).toLocaleString()}` : ""}`} onClick={(event) => onSelect(session.id, event)} onDoubleClick={onStartRename}>
-					<b>{session.title}</b>
+				<button className="session-hit" title={`${session.title}\n${session.folder}${time ? `\n${new Date(time).toLocaleString()}` : ""}`} onClick={(event) => onSelect(session.id, event)} onDoubleClick={session.routineId ? undefined : onStartRename}>
+					<b>{label ?? session.title}</b>
 					{state === "needs-you" ? <small className="needs-you">Needs you</small> : state === "failed" ? <small className="failed">Stopped with an error</small> : excerpt !== undefined ? <small className="session-meta">{excerpt}</small> : meta && <small className="session-meta">{meta}</small>}
 				</button>
 			)}

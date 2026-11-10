@@ -96,7 +96,6 @@ function fakePage() {
 			this.previousElementSibling = previousElementSibling;
 			this.style = {};
 			this.outerHTML = `<${localName}>`;
-			this.innerText = localName;
 			this.removed = false;
 		}
 		getBoundingClientRect() {
@@ -114,7 +113,6 @@ function fakePage() {
 	const first = new Element("p", app);
 	const second = new Element("p", app, "", first);
 	second.outerHTML = "x".repeat(5000);
-	second.innerText = "y".repeat(800);
 	const page = {
 		Element,
 		CSS: { escape: (value) => value },
@@ -202,9 +200,12 @@ function browserHarness() {
 	let resumes = 0;
 	let networkListener;
 	let unsubscribed = 0;
+	const document = { activeElement: null, addEventListener() {}, removeEventListener() {} };
 	const { BrowserPane } = load("BrowserPane.tsx", {
 		window: { grokCode: { browserTabs: async (payload) => { reports.push(JSON.parse(JSON.stringify(payload))); return { ok: true }; }, onBrowserProblem(listener) { networkListener = listener; return () => { unsubscribed++; networkListener = undefined; }; } } },
-		document: { activeElement: null, addEventListener() {}, removeEventListener() {} },
+		document,
+		Node: { COMMENT_NODE: 8 },
+		NodeFilter: { SHOW_TEXT: 4, SHOW_COMMENT: 128 },
 	});
 	const state = { cursor: 0, values: [], effects: [] };
 	const props = {
@@ -250,7 +251,7 @@ function browserHarness() {
 		views.set(props.tabs[offset].id, view);
 	}
 	return {
-		props, views, render, appended, reports, stops: () => stops, resumes: () => resumes,
+		props, views, render, document, appended, reports, stops: () => stops, resumes: () => resumes,
 		network(entry) { networkListener?.(entry); },
 		problems(id) { return props.tabs.find((tab) => tab.id === id)?.problems ?? []; },
 		unmount() {
@@ -338,7 +339,7 @@ function browserHarness() {
 		const picked = await result;
 		assert.equal(picked.selector, "#app > p:nth-of-type(2)");
 		assert.equal(picked.html.length, 4000);
-		assert.equal(picked.text.length, 500);
+		assert.ok(!("text" in picked));
 		assert.equal(listeners.size, 0);
 		assert.equal(body.child.removed, true);
 		assert.equal(page.__grokPickerStop, undefined);
@@ -359,20 +360,25 @@ function browserHarness() {
 		assert.equal(await newer, null);
 		assert.equal(listeners.size, 0);
 	});
-	await check("native terminal forwards raw input, fits, appends output, follows theme and accessibility, and disposes", async () => {
+	await check("native terminal forwards raw input, fits, appends output, follows appearance and accessibility, and disposes", async () => {
 		const instances = [];
 		const resizes = [];
 		const inputs = [];
+		let paneCloses = 0;
+		let tabFocused = 0;
+		const terminalCss = fs.readFileSync(path.join(__dirname, "../src/terminal-browser.css"), "utf8");
+		assert.doesNotMatch(terminalCss, /\.tp-native\s*\{[^}]*padding/, "the fit addon counts this padding as room for rows, which cuts off the last row");
+		assert.match(terminalCss, /\.tp-native > \.xterm\s*\{[^}]*padding/);
 		const resizeObservers = [];
 		const appearanceObservers = [];
 		const schemeListeners = new Map();
-		let background = "#100f0d";
-		let foreground = "#e7e1d6";
+		const style = { "--code": "#100f0d", "--code-text": "#e7e1d6" };
 		let accessibilityListener;
 		class FakeTerminal {
 			constructor(options) { this.options = options; this.writes = []; this.cols = 80; this.rows = 24; instances.push(this); }
 			loadAddon(addon) { addon.term = this; }
 			open(element) { this.element = element; }
+			attachCustomKeyEventHandler(handler) { this.keyHandler = handler; }
 			write(text) { this.writes.push(text); }
 			onData(listener) { this.input = listener; return { dispose: () => { this.input = undefined; this.inputDisposed = true; } }; }
 			focus() { this.focused = true; }
@@ -380,7 +386,11 @@ function browserHarness() {
 			dispose() { this.disposed = true; }
 		}
 		class FakeFitAddon {
-			fit() { this.term.cols = Math.floor(this.term.element.clientWidth / 10); this.term.rows = Math.floor(this.term.element.clientHeight / 20); }
+			fit() {
+				this.term.fits = (this.term.fits ?? 0) + 1;
+				this.term.cols = Math.floor(this.term.element.clientWidth / 10);
+				this.term.rows = Math.floor(this.term.element.clientHeight / 20);
+			}
 		}
 		class FakeResizeObserver {
 			constructor(callback) { this.callback = callback; resizeObservers.push(this); }
@@ -389,7 +399,7 @@ function browserHarness() {
 		}
 		class FakeMutationObserver {
 			constructor(callback) { this.callback = callback; appearanceObservers.push(this); }
-			observe(target) { this.target = target; }
+			observe(target, options) { this.target = target; this.options = options; }
 			disconnect() { this.disconnected = true; }
 		}
 		const { TerminalPane } = load("TerminalPane.tsx", {
@@ -401,11 +411,11 @@ function browserHarness() {
 					accessibilitySupport: async () => true,
 					onEvent: (listener) => { accessibilityListener = listener; return () => { accessibilityListener = undefined; }; },
 				},
-				getComputedStyle: () => ({ getPropertyValue: (name) => name === "--code" ? background : foreground }),
+				getComputedStyle: () => ({ getPropertyValue: (name) => style[name] ?? "" }),
 				matchMedia: () => ({ addEventListener: (name, callback) => schemeListeners.set(name, callback), removeEventListener: (name, callback) => { if (schemeListeners.get(name) === callback) { schemeListeners.delete(name); } } }),
 			},
 		});
-		const paneProps = { tabs: [{ id: "native", title: "Shell", cwd: "C:/project", running: true, backend: "pty", output: "ABCDEF", received: 6 }], activeId: "native", terminalScreenReader: false, onInput: (...args) => inputs.push(args), onResize: (...args) => resizes.push(args), onActivate() {}, onNew() {}, onCloseTab() {}, onInterrupt() {}, onClose() {} };
+		const paneProps = { tabs: [{ id: "native", title: "Shell", cwd: "C:/project", running: true, backend: "pty", output: "ABCDEF", received: 6 }], activeId: "native", terminalScreenReader: false, onInput: (...args) => inputs.push(args), onResize: (...args) => resizes.push(args), onActivate() {}, onNew() {}, onCloseTab() {}, onInterrupt() {}, onClose() { paneCloses++; } };
 		const renderWithHooks = (state, component, props, element) => {
 			hooks = state;
 			state.cursor = 0;
@@ -426,13 +436,20 @@ function browserHarness() {
 		await Promise.resolve();
 		const native = findNative(renderPane());
 		const props = { ...native.props };
-		const element = { clientWidth: 1000, clientHeight: 600 };
+		const element = { clientWidth: 1000, clientHeight: 600, closest(selector) {
+			assert.equal(selector, ".tp-pane");
+			return { querySelector(query) {
+				assert.equal(query, ".tp-tab-name[aria-current='true']");
+				return { focus() { tabFocused++; } };
+			} };
+		} };
 		const state = { values: [] };
 		const render = () => renderWithHooks(state, native.type, props, element);
 		render();
 		const term = instances[0];
 		assert.equal(term.options.fontSize, 13);
 		assert.equal(term.options.lineHeight, 1.45);
+		assert.equal(term.options.fontFamily, 'Consolas, "Cascadia Mono", ui-monospace, Menlo, monospace');
 		assert.equal(term.options.screenReaderMode, true, "system detection enables support at construction");
 		accessibilityListener({ type: "accessibility-support-changed", active: false });
 		props.screenReaderMode = findNative(renderPane()).props.screenReaderMode;
@@ -448,6 +465,19 @@ function browserHarness() {
 		assert.deepEqual(term.writes, ["ABCDEF"], "initial output is replayed once");
 		term.input("\x1b[A\x03");
 		assert.deepEqual(inputs, [["native", "\x1b[A\x03"]], "arrow keys and Ctrl+C stay raw");
+		for (const [key, modifiers] of [["Tab", {}], ["r", { ctrlKey: true }]]) {
+			const event = Object.assign(fakeEvent(element, key), { type: "keydown", ...modifiers });
+			assert.equal(term.keyHandler(event), true, `${key} stays with xterm`);
+			assert.equal(event.blocked, 0);
+		}
+		const leave = Object.assign(fakeEvent(element, "F6"), { type: "keydown", shiftKey: true });
+		assert.equal(term.keyHandler(leave), false);
+		assert.equal(leave.blocked, 1);
+		assert.equal(tabFocused, 1, "Shift+F6 returns keyboard focus to the active terminal tab");
+		const closePane = Object.assign(fakeEvent(element, "`"), { type: "keydown", ctrlKey: true, code: "Backquote" });
+		assert.equal(term.keyHandler(closePane), false);
+		assert.equal(closePane.blocked, 1);
+		assert.equal(paneCloses, 1, "Ctrl+backtick closes the terminal pane");
 		props.tab = { ...props.tab, output: "CDEFGH", received: 8 };
 		props.onInput = (...args) => inputs.push(["updated", ...args]);
 		props.onResize = (...args) => resizes.push(["updated", ...args]);
@@ -461,12 +491,29 @@ function browserHarness() {
 		element.clientHeight = 400;
 		resizeObservers[0].callback();
 		assert.deepEqual(resizes.at(-1), ["updated", "native", 80, 20]);
-		background = "#f3f1ea";
-		foreground = "#2b2722";
-		appearanceObservers[0].callback();
-		assert.equal(term.options.theme.background, background);
-		assert.equal(term.options.theme.foreground, foreground);
-		assert.equal(term.options.theme.cursor, foreground);
+		const appearance = appearanceObservers[0];
+		assert.ok(appearance.options.attributeFilter.includes("data-ui-config"));
+		Object.assign(style, {
+			"--code": "#f3f1ea", "--code-text": "#2b2722",
+			"--terminal-font-size": "16px", "--terminal-line-height": "24px",
+			"--terminal-font": "Courier, monospace", "--mono-font": "Cascadia Mono, monospace",
+		});
+		const previousFits = term.fits;
+		appearance.callback();
+		assert.equal(term.options.theme.background, style["--code"]);
+		assert.equal(term.options.theme.foreground, style["--code-text"]);
+		assert.equal(term.options.theme.cursor, style["--code-text"]);
+		assert.equal(term.options.fontSize, 16);
+		assert.equal(term.options.lineHeight, 1.5);
+		assert.equal(term.options.fontFamily, style["--terminal-font"]);
+		assert.equal(term.fits, previousFits + 1, "UI configuration changes refit the existing terminal");
+		Object.assign(style, { "--terminal-font-size": "20px", "--terminal-line-height": "10px", "--terminal-font": "" });
+		appearance.callback();
+		assert.equal(term.options.fontSize, 20);
+		assert.equal(term.options.lineHeight, 1);
+		assert.equal(term.options.fontFamily, style["--mono-font"]);
+		assert.equal(instances.length, 1);
+		assert.deepEqual(term.writes, ["ABCDEF", "GH"]);
 		assert.equal(schemeListeners.has("change"), true);
 		for (const value of state.values) { value?.cleanup?.(); }
 		for (const value of paneState.values) { value?.cleanup?.(); }
@@ -476,6 +523,70 @@ function browserHarness() {
 		assert.equal(schemeListeners.size, 0);
 		assert.equal(term.inputDisposed, true);
 		assert.equal(term.disposed, true);
+	});
+	await check("browser element picks redact the page URL and markup before appending to the draft", async () => {
+		const browser = browserHarness();
+		const view = browser.views.get("one");
+		view.url = "https://user:password@one.test/callback?token=query-secret#fragment-secret";
+		function input(attributes) {
+			return {
+				getAttributeNames() { return Object.keys(attributes); },
+				getAttribute(name) { return attributes[name]; },
+				removeAttribute(name) { delete attributes[name]; },
+				remove() { this.removed = true; },
+				get html() { return this.removed ? "" : `<input${Object.entries(attributes).map(([name, value]) => ` ${name}="${value}"`).join("")}>`; },
+			};
+		}
+		const hidden = input({ type: "HIDDEN", value: "hidden-secret" });
+		const visible = input({ type: "password", value: "input-secret", "data-session": "attr-secret", id: "password", class: "bg-[url(https://one.test/callback?class-secret)]" });
+		const text = { nodeType: 3, nodeValue: "See https://user:visible-password@one.test/help?visible-token=x#visible-fragment for details #help." };
+		const rawHtml = `<form>${hidden.html}${visible.html}<p>${text.nodeValue}</p></form>`;
+		const template = {
+			content: { querySelectorAll(selector) {
+				if (selector === "*") { return [hidden, visible].filter((element) => !element.removed); }
+				assert.ok(selector.includes("input[type=hidden i]"));
+				return [hidden];
+			} },
+			set innerHTML(html) { assert.equal(html, rawHtml); },
+			get innerHTML() { return `<form>${hidden.html}${visible.html}<p>${text.nodeValue}</p></form>`; },
+		};
+		browser.document.createElement = (name) => {
+			assert.equal(name, "template");
+			return template;
+		};
+		browser.document.createTreeWalker = () => {
+			const nodes = [text];
+			return { nextNode() { this.currentNode = nodes.shift(); return this.currentNode; } };
+		};
+		view.executeJavaScript = async () => ({ selector: "form", html: rawHtml, text: "Sign in" });
+		browser.props.onPicked = (pick) => browser.appended.push(`${pick.url}\n${pick.html}`);
+		browser.props.selectTick = 1;
+		browser.render();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(browser.appended, ['https://one.test/callback\n<form><input type="password" id="password"><p>See https://one.test/help for details #help.</p></form>']);
+		browser.unmount();
+	});
+	await check("browser address follows a submitted navigation and redirect", () => {
+		const browser = browserHarness();
+		const addressInput = (tree) => findNode(tree, (node) => node.props["aria-label"] === "Address");
+		const tree = browser.render();
+		const address = addressInput(tree);
+		const focused = { blur() { browser.document.activeElement = null; } };
+		address.props.ref.current = focused;
+		browser.document.activeElement = focused;
+		address.props.onChange({ target: { value: "https://one.test/typed" } });
+		browser.props.onNavigate = browser.props.onPageChanged;
+		const form = findNode(browser.render(), (node) => node.type === "form");
+		form.props.onSubmit(fakeEvent(focused, "Enter"));
+		assert.equal(browser.document.activeElement, null);
+		browser.render();
+		assert.equal(addressInput(browser.render()).props.value, "https://one.test/typed");
+		const view = browser.views.get("one");
+		view.url = "https://redirect.test/actual";
+		view.emit("did-navigate");
+		browser.render();
+		assert.equal(addressInput(browser.render()).props.value, "https://redirect.test/actual");
+		browser.unmount();
 	});
 	await check("browser control reports real guests, sanitized evidence, active tab and unmount; Stop and resume stay explicit", () => {
 		const browser = browserHarness();
@@ -610,6 +721,15 @@ function browserHarness() {
 		assert.ok(panel);
 		assert.ok(textOf(panel).includes("×3"), "the repeated warning displays its occurrence count");
 		assert.equal(findNodes(panel, (node) => node.type === "li").length, 2, "duplicates share one row");
+		browser.unmount();
+	});
+	await check("browser diagnostics cap a 200,000-character console line before cleaning URLs", () => {
+		const browser = browserHarness();
+		const prefix = "Fetch failed: https://user:secret";
+		const suffix = "@one.test/api after input cap";
+		const message = prefix + "x".repeat(200_000 - prefix.length - suffix.length) + suffix;
+		browser.views.get("one").emit("console-message", { level: 3, message });
+		assert.equal(browser.problems("one")[0].message, "Fetch failed: [omitted URL]");
 		browser.unmount();
 	});
 	await check("browser diagnostics strip URL secrets and omit body, header and cookie fields", () => {

@@ -35,8 +35,12 @@ export function cleanUrl(value: unknown): string {
 
 export function cleanMessage(value: unknown): string {
 	if (typeof value !== "string") { return ""; }
-	return value
-		.replace(/(?:[a-z][a-z0-9+.-]*:\/\/|\/\/|data:|blob:|javascript:)[^\s<>"'`]+/gi, (url) => cleanUrl(url))
+	const clipped = value.slice(0, 500);
+	return clipped
+		.replace(/(?:[a-z][a-z0-9+.-]*:\/\/|\/\/|data:|blob:|javascript:)[^\s<>"'`]+/gi, (url, offset: number) => {
+			if (offset + url.length === clipped.length && /[^\s<>"'`]/.test(value.charAt(clipped.length))) { return "[omitted URL]"; }
+			return cleanUrl(url);
+		})
 		.replace(/(^|[\s("'`])([^\s<>"'`]*[?#][^\s<>"'`]*)/g, (_match, prefix: string, url: string) => prefix + cleanUrl(url))
 		.replace(/[\r\n]+/g, " ")
 		.slice(0, 500);

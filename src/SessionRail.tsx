@@ -1,6 +1,8 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Icon } from "./Icon";
 import { PopupMenu } from "./PopupMenu";
+import { sandboxStatus } from "./sandbox";
+import type { AppSettings } from "./Settings";
 import type { Session } from "./types";
 
 const CHECK_LABEL: Record<PrCheck["state"], string> = { pass: "passed", fail: "failed", run: "running", wait: "waiting", skip: "skipped" };
@@ -42,6 +44,7 @@ export function contextRows(usage: GrokUsage, breakdown: ContextBreakdown | unde
 
 export function SessionRail({
 	session,
+	sandboxSettings,
 	folderMissing = false,
 	diff,
 	branch,
@@ -57,6 +60,7 @@ export function SessionRail({
 	onMergeWhenReady,
 }: {
 	session: Session;
+	sandboxSettings?: Pick<AppSettings, "sandboxProfile">;
 	folderMissing?: boolean;
 	diff: DiffSnapshot | undefined;
 	branch: BranchInfo | undefined;
@@ -74,6 +78,26 @@ export function SessionRail({
 	const [prMenu, setPrMenu] = useState<HTMLButtonElement | null>(null);
 	const [prNote, setPrNote] = useState("");
 	const [working, setWorking] = useState(false);
+	useEffect(() => {
+		if (!prMenu) { return; }
+		const doc = prMenu.ownerDocument;
+		const outside = (event: PointerEvent) => {
+			const target = event.target as Element | null;
+			if (!prMenu.contains(target) && !target?.closest?.(".rail-menu")) { setPrMenu(null); }
+		};
+		const escape = (event: KeyboardEvent) => {
+			if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) { return; }
+			event.preventDefault();
+			event.stopPropagation();
+			setPrMenu(null);
+		};
+		doc.addEventListener("pointerdown", outside);
+		doc.addEventListener("keydown", escape);
+		return () => {
+			doc.removeEventListener("pointerdown", outside);
+			doc.removeEventListener("keydown", escape);
+		};
+	}, [prMenu]);
 	const files = diff?.files ?? [];
 	const hasCounts = files.every((file) => file.additions !== undefined && file.deletions !== undefined);
 	const additions = files.reduce((sum, file) => sum + (file.additions ?? 0), 0);
@@ -179,6 +203,7 @@ export function SessionRail({
 					</div>
 				)}
 				{session.worktreeFolder && <div className="rail-row meta">Worktree session</div>}
+				{sandboxStatus(session, sandboxSettings) && <div className="rail-row rail-wrap meta">{sandboxStatus(session, sandboxSettings)}</div>}
 			</RailCard>
 			<RailCard title="Context" extra={percent !== null ? <span className="meta">{percent}%</span> : null}>
 				{!usage && plan}

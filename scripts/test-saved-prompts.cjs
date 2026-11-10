@@ -95,9 +95,9 @@ function button(tree, label) {
 	return element;
 }
 
-function press(element, key) {
+function press(element, key, isComposing = false) {
 	let prevented = false;
-	element.props.onKeyDown({ key, preventDefault() { prevented = true; }, stopPropagation() {} });
+	element.props.onKeyDown({ key, nativeEvent: { isComposing }, preventDefault() { prevented = true; }, stopPropagation() {} });
 	return prevented;
 }
 
@@ -212,6 +212,9 @@ async function main() {
 		change(labelled(tree, "Search saved prompts"), "COVERAGE");
 		tree = picker.render();
 		assert.equal(tree.elements.filter((element) => element.props.role === "option").length, 1);
+		assert.equal(press(labelled(tree, "Search saved prompts"), "Enter", true), false);
+		assert.deepEqual(inserted, []);
+		assert.equal(closed, 0);
 		assert.equal(press(labelled(tree, "Search saved prompts"), "Enter"), true);
 		assert.deepEqual(inserted, [examples[1].text]);
 		assert.equal(closed, 1);

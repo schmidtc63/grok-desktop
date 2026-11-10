@@ -6,7 +6,6 @@ const { folderProblem, killTree, OWN_GROUP } = require("./agent.cjs");
 
 const MAX_TABS = 12;
 const MAX_WRITE = 20000;
-const MAX_HISTORY = 200000;
 let pty;
 try { pty = require("node-pty"); } catch { /* A missing native module keeps the pipe terminal available. */ }
 const PIPE_WARNING = "Interactive terminal unavailable. Using the basic pipe terminal.";
@@ -70,7 +69,7 @@ class TerminalHost {
 		} catch {
 			return { ok: false, error: `${windows ? "PowerShell" : "bash"} could not start.` };
 		}
-		const tab = { id: randomUUID(), cwd, child, backend: pty ? "pty" : "pipe", history: "", done: false, input: "" };
+		const tab = { id: randomUUID(), cwd, child, backend: pty ? "pty" : "pipe", done: false, input: "" };
 		this.tabs.set(tab.id, tab);
 		if (pty) {
 			tab.listeners = [child.onData((data) => this.output(tab, data)), child.onExit(({ exitCode }) => this.finish(tab, exitCode))];
@@ -92,8 +91,6 @@ class TerminalHost {
 
 	output(tab, data) {
 		if (!data || tab.done) { return; }
-		tab.history += data;
-		if (tab.history.length > MAX_HISTORY * 2) { tab.history = tab.history.slice(-MAX_HISTORY); }
 		if (!this.flushMs) { this.emit({ type: "terminal-data", id: tab.id, data }); return; }
 		tab.pending = (tab.pending || "") + data;
 		if (!tab.flushTimer) { tab.flushTimer = setTimeout(() => this.flushOutput(tab), this.flushMs); }
@@ -237,11 +234,6 @@ class TerminalHost {
 
 	list() {
 		return Array.from(this.tabs.values(), (tab) => ({ id: tab.id, cwd: tab.cwd, running: !tab.done, backend: tab.backend }));
-	}
-
-	history(id) {
-		const tab = this.tabs.get(id);
-		return tab ? tab.history.slice(-MAX_HISTORY) : "";
 	}
 }
 

@@ -1,10 +1,20 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { askConfirm } from "./confirm";
-import { MAX_PROMPT_NAME, MAX_PROMPT_TEXT, promptNameError, type SavedPrompt } from "./saved-prompts";
+import { MAX_PROMPT_NAME, MAX_PROMPT_TEXT, normalizeSavedPrompts, promptNameError, type SavedPrompt } from "./saved-prompts";
+
+function readStoredPrompts(): SavedPrompt[] | undefined {
+	// Another window's save can reach storage before its event has been rendered here.
+	try {
+		const stored = JSON.parse(localStorage.getItem("grok-code.settings.v1") ?? "null")?.savedPrompts;
+		return Array.isArray(stored) ? normalizeSavedPrompts(stored) : undefined;
+	} catch { return undefined; }
+}
 
 function SavedPromptRow({ prompt, prompts, onChange }: { prompt: SavedPrompt; prompts: SavedPrompt[]; onChange: (prompts: SavedPrompt[]) => void }) {
 	const [draft, setDraft] = useState<{ name: string; text: string } | null>(null);
 	const [error, setError] = useState("");
+	const latestPrompts = useRef(prompts);
+	latestPrompts.current = prompts;
 	const name = draft?.name ?? prompt.name;
 	const text = draft?.text ?? prompt.text;
 	const changed = name !== prompt.name || text !== prompt.text;
@@ -28,7 +38,10 @@ function SavedPromptRow({ prompt, prompts, onChange }: { prompt: SavedPrompt; pr
 						<button type="submit" className="texty" aria-label={`Save changes to ${prompt.name}`} disabled={!changed}>Save changes</button>
 						<button type="button" className="texty" aria-label={`Delete ${prompt.name}`} onClick={() => {
 							void askConfirm({ title: `Delete "${prompt.name}"?`, body: `This saved prompt is removed from every window and cannot be restored.`, ok: `Delete`, danger: true }).then((yes) => {
-								if (yes) { onChange(prompts.filter((item) => item.id !== prompt.id)); }
+								if (!yes) { return; }
+								const latest = readStoredPrompts() ?? latestPrompts.current;
+								const remaining = latest.filter((item) => item.id !== prompt.id);
+								if (remaining.length < latest.length) { onChange(remaining); }
 							});
 						}}>Delete</button>
 					</div>

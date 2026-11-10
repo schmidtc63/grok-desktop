@@ -2,7 +2,10 @@ name: test
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
+permissions:
+  contents: read
 jobs:
   test:
     strategy:
@@ -10,14 +13,15 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    env:
-      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: npm ci
+      - name: Install Electron for diagram security
+        if: runner.os != 'Linux'
+        run: node node_modules/electron/install.js
       - run: npm run build
       - run: npm run typecheck
       - run: npm test

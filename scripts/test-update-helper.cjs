@@ -1,9 +1,10 @@
 const assert = require("assert/strict");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const { execFileSync } = require("child_process");
 const { EventEmitter } = require("events");
-const { main, markerLive, readMarker, findNode, writeAtomic, run } = require("./update-helper.cjs");
+const { main, markerLive, readMarker, findNode, writeAtomic, renameRetry, run } = require("./update-helper.cjs");
 
 // The helper stops and relaunches the app with Windows tools, and updatePrepare offers it only on Windows (test-updates checks that).
 if (process.platform !== "win32") {
@@ -11,8 +12,7 @@ if (process.platform !== "win32") {
 	process.exit(0);
 }
 
-const tempBase = path.resolve("C:/Claude/temp", process.env.CODEX_THREAD_ID || "grokcode-updates");
-fs.mkdirSync(tempBase, { recursive: true });
+const tempBase = os.tmpdir();
 const root = fs.mkdtempSync(path.join(tempBase, "codex-update-helper-tests-"));
 let serial = 0;
 
@@ -38,20 +38,22 @@ function fixture() {
 	git(appDir, ["add", "."]);
 	git(appDir, ["commit", "--quiet", "--no-gpg-sign", "-m", "original"]);
 	const from = git(appDir, ["rev-parse", "HEAD"]);
+	git(appDir, ["switch", "--quiet", "-c", "release"]);
 	write(path.join(appDir, "package.json"), "{\"version\":\"0.2.1\"}");
 	git(appDir, ["commit", "--quiet", "--no-gpg-sign", "-am", "release"]);
 	git(appDir, ["tag", "v0.2.1"]);
 	const target = git(appDir, ["rev-parse", "HEAD"]);
-	git(appDir, ["reset", "--quiet", "--hard", from]);
+	git(appDir, ["switch", "--quiet", "main"]);
 	write(path.join(appDir, "node_modules", "sentinel"), "original packages");
 	write(path.join(appDir, "node_modules", "electron", "dist", "electron.exe"), "original binary");
-	write(path.join(appDir, "dist", "sentinel"), "original page");
+	write(path.join(appDir, "dist", "index.html"), "original page");
 	const options = { appDir, userData, tag: "v0.2.1", from, fromVersion: "0.2.0", waitPid: 987654, args: [path.join(root, "wrapper.cjs"), "--build-if-stale"], cwd: root };
 	return { appDir, userData, from, target, options };
 }
 
 function dependencies(item, failure = "") {
 	const launches = [];
+	const notices = [];
 	const operations = [];
 	let time = Date.now();
 	const fileSystem = new Proxy(fs, { get(target, key) {
@@ -66,7 +68,12 @@ function dependencies(item, failure = "") {
 		sleep: async (ms) => { time += ms; },
 		markerLive: async (marker) => !!marker && marker.pid === process.pid,
 		spawn(exe, args, options) {
-			launches.push({ exe, args, options });
+			if (exe === "powershell.exe") {
+				assert.equal(args.at(-2), "-EncodedCommand");
+				const script = Buffer.from(args.at(-1), "base64").toString("utf16le");
+				assert.match(script, /WScript\.Shell\)\.Popup/);
+				notices.push(Buffer.from(script.match(/FromBase64String\('([^']+)'\)/)[1], "base64").toString("utf8"));
+			} else { launches.push({ exe, args, options }); }
 			const child = new EventEmitter();
 			child.unref = () => {};
 			process.nextTick(() => child.emit("spawn"));
@@ -76,8 +83,8 @@ function dependencies(item, failure = "") {
 			if (command === "git" || args.some((arg) => arg.endsWith("windows-name.mjs"))) { return run(command, args, cwd, timeout); }
 			if (command === "cmd.exe" || args.includes("ci")) {
 				assert.ok(args.some((arg) => arg.includes("--no-audit")));
-				if (failure === "npm ci") { return { code: 1, out: "", err: "fixture npm failure" }; }
 				write(path.join(item.appDir, "node_modules", "new"), "new packages");
+				if (failure === "npm ci") { return { code: 1, out: "", err: "fixture npm failure" }; }
 				return { code: 0, out: "installed", err: "" };
 			}
 			if (args[0].endsWith("install.js")) {
@@ -86,22 +93,22 @@ function dependencies(item, failure = "") {
 				return { code: 0, out: "binary", err: "" };
 			}
 			assert.ok(args[0].endsWith("vite.js"));
+			write(path.join(item.appDir, "dist", "index.html"), "new page");
 			if (failure === "build") { return { code: 1, out: "", err: "fixture build failure" }; }
-			write(path.join(item.appDir, "dist", "new"), "new page");
 			return { code: 0, out: "built", err: "" };
 		},
 	};
-	return { deps, launches, operations };
+	return { deps, launches, notices, operations };
 }
 
 function originals(item) {
 	assert.equal(git(item.appDir, ["rev-parse", "HEAD"]), item.from);
 	assert.equal(fs.readFileSync(path.join(item.appDir, "node_modules", "sentinel"), "utf8"), "original packages");
-	assert.equal(fs.readFileSync(path.join(item.appDir, "dist", "sentinel"), "utf8"), "original page");
+	assert.equal(fs.readFileSync(path.join(item.appDir, "dist", "index.html"), "utf8"), "original page");
 }
 
-function stale(item, phase = "updating") {
-	const marker = { ...item.options, pid: 987654, pidStart: 1, beatAt: 1, phase, toVersion: "0.2.1" };
+function stale(item, extra = {}) {
+	const marker = { ...item.options, pid: 987654, pidStart: 1, beatAt: 1, phase: "updating", mergeStarted: false, writerPending: null, target: item.target, toVersion: "0.2.1", ...extra };
 	writeAtomic(path.join(item.userData, "update-running.json"), marker);
 	return marker;
 }
@@ -161,6 +168,18 @@ async function checks() {
 	assert.equal(await findNode({ run: async () => ({ code: 0, out: `relative/node.exe\r\n${process.execPath}\r\n` }) }), process.execPath);
 	assert.equal(await findNode({ run: async () => ({ code: 1, out: "" }) }), null);
 
+	const held = path.join(root, "held.json");
+	const denial = (code) => Object.assign(new Error(`fixture ${code}`), { code });
+	let denials = 0;
+	writeAtomic(held, { saved: true }, { ...fs, renameSync(source, target) {
+		const code = ["EPERM", "EBUSY", "EACCES"][denials++];
+		if (code) { throw denial(code); }
+		fs.renameSync(source, target);
+	} });
+	assert.deepEqual(JSON.parse(fs.readFileSync(held, "utf8")), { saved: true }, "a brief hold on the file doesn't lose the write");
+	assert.throws(() => renameRetry(held, held, { renameSync() { denials++; throw denial("ENOENT"); } }), /ENOENT/);
+	assert.equal(denials, 5, "only a held file is retried");
+
 	const success = fixture();
 	const clean = dependencies(success);
 	const result = await main(success.options, clean.deps);
@@ -175,12 +194,107 @@ async function checks() {
 	assert.equal(JSON.parse(fs.readFileSync(path.join(success.userData, "update-result.json"))).ok, true);
 	for (const failure of ["npm ci", "Electron install", "missing exe", "build"]) {
 		const item = fixture();
+		const note = path.join(item.appDir, "personal", "notes.txt");
+		if (failure === "npm ci") { write(note, "keep my notes"); }
+		const originalStatus = git(item.appDir, ["status", "--porcelain", "--untracked-files=all"]);
 		const probe = dependencies(item, failure);
 		const failed = await main(item.options, probe.deps);
 		assert.equal(failed.ok, false);
-		assert.match(failed.message, /previous version was restored/);
+		assert.match(failed.message, /The previous version is ready/);
 		originals(item);
+		assert.equal(git(item.appDir, ["status", "--porcelain", "--untracked-files=all"]), originalStatus);
+		if (failure === "npm ci") { assert.equal(fs.readFileSync(note, "utf8"), "keep my notes"); }
 		assert.equal(probe.launches.length, 1);
+		assert.equal(probe.notices.length, 0);
+	}
+	for (const race of ["commit", "edit", "disk", "disk before staging"]) {
+		const item = fixture();
+		const probe = dependencies(item, "npm ci");
+		const normalRun = probe.deps.run;
+		const tracked = path.join(item.appDir, "package.json");
+		let expected = item.from;
+		let diskFull = false;
+		const failedWrites = new Set();
+		probe.deps.fs = new Proxy(probe.deps.fs, { get(target, key) {
+			if (key !== "appendFileSync" && key !== "openSync") { return target[key]; }
+			return (file, ...args) => {
+				const name = path.basename(file);
+				if (diskFull && (name === "update.log" || name.endsWith(".json.tmp"))) {
+					failedWrites.add(name);
+					throw denial("ENOSPC");
+				}
+				return target[key](file, ...args);
+			};
+		} });
+		probe.deps.run = async (command, args, cwd, timeout) => {
+			if (race === "commit" && args.includes("update-ref")) {
+				write(tracked, "concurrent commit after verification");
+				git(item.appDir, ["commit", "--quiet", "--no-gpg-sign", "-am", "concurrent rollback commit"]);
+				expected = git(item.appDir, ["rev-parse", "HEAD"]);
+				diskFull = true;
+			}
+			if (race === "edit" && args.includes("read-tree")) { write(tracked, "edit after verification"); }
+			if (race === "disk" && (command === "cmd.exe" || args.includes("ci"))) { diskFull = true; }
+			if (race === "disk before staging" && args.includes("--verify")) { diskFull = true; }
+			return normalRun(command, args, cwd, timeout);
+		};
+		const failed = await main(item.options, probe.deps);
+		assert.equal(git(item.appDir, ["rev-parse", "HEAD"]), expected);
+		assert.deepEqual(probe.notices, [failed.message], "the native dialog receives the actual result even when disk writes fail");
+		if (diskFull) {
+			for (const name of ["update.log", "update-running.json.tmp", "update-result.json.tmp"]) { assert.ok(failedWrites.has(name), name); }
+		}
+		if (race.startsWith("disk")) {
+			assert.match(failed.message, /The previous version is ready/);
+			originals(item);
+			assert.equal(probe.launches.length, 1);
+			if (race === "disk before staging") { assert.equal(probe.operations.some((operation) => operation[2]?.endsWith(".update-old")), false); }
+		} else {
+			assert.match(failed.message, race === "commit" ? /main branch changed before rollback/ : /couldn't restore a clean checkout/);
+			assert.equal(fs.readFileSync(tracked, "utf8"), race === "commit" ? "concurrent commit after verification" : "edit after verification");
+			assert.ok(fs.existsSync(path.join(item.appDir, "dist.update-old", "index.html")));
+			assert.equal(probe.launches.length, 0);
+			const repeated = await main({ recover: true, userData: item.userData }, probe.deps);
+			assert.equal(repeated.message.split("\n\n").at(-1), failed.message.split("\n\n").at(-1), "manual steps can be repeated even if recovery text couldn't be saved");
+		}
+	}
+	for (const race of ["stale before merge", "commit before merge", "partial merge", "edit before relaunch"]) {
+		const item = fixture();
+		const probe = dependencies(item);
+		const normalRun = probe.deps.run;
+		const tracked = path.join(item.appDir, "package.json");
+		let merged = false;
+		let expected = race === "edit before relaunch" ? item.target : item.from;
+		probe.deps.run = async (command, args, cwd, timeout) => {
+			if (race === "stale before merge" && args.includes("status") && fs.existsSync(path.join(item.appDir, "dist.update-old"))) {
+				write(tracked, "edit made after staging");
+			}
+			if (race === "edit before relaunch" && args.includes("status") && fs.readdirSync(item.appDir).some((name) => name.startsWith("dist.update-trash-"))) {
+				write(tracked, "edit made before relaunch");
+			}
+			if (args.includes("merge")) {
+				merged = true;
+				if (race === "commit before merge") {
+					write(tracked, "someone else's commit");
+					git(item.appDir, ["commit", "--quiet", "--no-gpg-sign", "-am", "concurrent change"]);
+					expected = git(item.appDir, ["rev-parse", "HEAD"]);
+				}
+				if (race === "partial merge") {
+					write(tracked, "changed by a partial merge");
+					return { code: 1, out: "", err: "fixture interrupted checkout" };
+				}
+			}
+			return normalRun(command, args, cwd, timeout);
+		};
+		const failed = await main(item.options, probe.deps);
+		assert.match(failed.message, /1\. Open PowerShell/);
+		assert.deepEqual(probe.notices, [failed.message]);
+		assert.equal(merged, race !== "stale before merge");
+		assert.equal(git(item.appDir, ["rev-parse", "HEAD"]), expected);
+		assert.equal(fs.readFileSync(tracked, "utf8"), { "stale before merge": "edit made after staging", "commit before merge": "someone else's commit", "partial merge": "changed by a partial merge", "edit before relaunch": "edit made before relaunch" }[race]);
+		const backup = fs.readdirSync(item.appDir).find((name) => name.startsWith("dist.update-"));
+		assert.equal(fs.readFileSync(path.join(item.appDir, backup, "index.html"), "utf8"), "original page");
+		assert.equal(probe.launches.length, 0);
 	}
 	const divergent = fixture();
 	git(divergent.appDir, ["tag", "-d", "v0.2.1"]);
@@ -189,7 +303,8 @@ async function checks() {
 	git(divergent.appDir, ["commit", "--quiet", "--no-gpg-sign", "-m", "diverged"]);
 	divergent.from = divergent.options.from = git(divergent.appDir, ["rev-parse", "HEAD"]);
 	git(divergent.appDir, ["tag", "v0.2.1", divergent.target]);
-	assert.match((await main(divergent.options, dependencies(divergent).deps)).message, /Git couldn't move/);
+	assert.match((await main(divergent.options, dependencies(divergent).deps)).message, /Git couldn't move.*The previous version is ready/);
+	assert.equal(git(divergent.appDir, ["rev-parse", "HEAD"]), divergent.from);
 	originals(divergent);
 
 	const locked = fixture();
@@ -207,31 +322,60 @@ async function checks() {
 	await main(movedArgs.options, movedProbe.deps);
 	assert.equal(movedProbe.launches[0].exe, path.join(movedArgs.appDir, "node_modules", "electron", "dist", "electron.exe"));
 
-	for (const interrupted of ["untouched", "missing exe", "committed", "partial restore"]) {
+	for (const interrupted of ["untouched", "before merge", "after merge", "committed", "partial restore", "partial checkout", "pending installer", "rebooted merge", "rebooted with stale lock"]) {
 		const item = fixture();
 		const probe = dependencies(item);
-		stale(item, interrupted === "committed" ? "committed" : "updating");
+		const merged = ["after merge", "committed", "pending installer", "rebooted with stale lock"].includes(interrupted);
+		probe.deps.uptime = () => interrupted.startsWith("rebooted") ? 10 : 2000;
+		stale(item, {
+			phase: interrupted === "committed" ? "committed" : "updating",
+			asidesReady: interrupted !== "untouched",
+			mergeStarted: merged || ["before merge", "partial checkout", "rebooted merge"].includes(interrupted),
+			writerPending: interrupted === "rebooted merge" ? "Git merge" : interrupted === "pending installer" ? "npm ci" : null,
+			systemUptime: 1000,
+		});
+		if (interrupted === "rebooted with stale lock") {
+			writeAtomic(path.join(item.userData, "update-recover.lock"), { pid: 987654, pidStart: 1, beatAt: 1, systemUptime: 5 });
+		}
 		if (interrupted !== "untouched") {
-			fs.renameSync(path.join(item.appDir, "node_modules"), path.join(item.appDir, "node_modules.update-old"));
-			if (interrupted !== "partial restore") { fs.renameSync(path.join(item.appDir, "dist"), path.join(item.appDir, "dist.update-old")); }
-			git(item.appDir, ["merge", "--quiet", "--ff-only", "v0.2.1"]);
+			renameRetry(path.join(item.appDir, "node_modules"), path.join(item.appDir, "node_modules.update-old"));
+			if (interrupted !== "partial restore") { renameRetry(path.join(item.appDir, "dist"), path.join(item.appDir, "dist.update-old")); }
+			if (merged) { git(item.appDir, ["merge", "--quiet", "--ff-only", "v0.2.1"]); }
+			if (interrupted === "partial checkout") { write(path.join(item.appDir, "new-source.cjs"), "partially checked out"); }
 			if (interrupted === "committed") {
 				write(path.join(item.appDir, "node_modules", "electron", "dist", "electron.exe"), "new binary");
-				write(path.join(item.appDir, "dist", "new"), "new page");
+				write(path.join(item.appDir, "dist", "index.html"), "new page");
 			}
 		}
 		let aliveCalls = 0;
 		probe.deps.alive = () => ++aliveCalls < 2;
 		const recovered = await main({ recover: true, userData: item.userData, waitPid: 456 }, probe.deps);
-		assert.equal(readMarker(item.userData), null);
+		const pending = ["pending installer", "rebooted with stale lock"].includes(interrupted);
+		assert.equal(Boolean(readMarker(item.userData)), pending);
 		assert.equal(fs.existsSync(path.join(item.userData, "update-recover.lock")), false);
-		assert.equal(probe.launches.length, 1);
+		const manual = interrupted === "partial checkout" || pending;
+		assert.equal(probe.launches.length, manual ? 0 : 1);
 		assert.equal(aliveCalls, 2);
 		if (interrupted === "committed") {
 			assert.equal(recovered.ok, true);
 			assert.equal(git(item.appDir, ["rev-parse", "HEAD"]), item.target);
 			assert.equal(fs.existsSync(path.join(item.appDir, "node_modules.update-old")), false);
-		} else { assert.match(recovered.message, /interrupted/); originals(item); }
+		} else if (manual) {
+			assert.match(recovered.message, merged ? /may still be writing/ : /The app stayed closed/);
+			assert.equal(git(item.appDir, ["rev-parse", "HEAD"]), merged ? item.target : item.from);
+			assert.ok(fs.existsSync(path.join(item.appDir, "dist.update-old", "index.html")));
+			if (!merged) { assert.equal(fs.readFileSync(path.join(item.appDir, "new-source.cjs"), "utf8"), "partially checked out"); }
+			assert.deepEqual(probe.notices, [recovered.message]);
+			if (interrupted === "pending installer") {
+				assert.match(recovered.message, /1\. Restart Windows/);
+				probe.deps.markerLive = async () => false;
+				probe.deps.uptime = () => 10;
+				assert.match((await main({ recover: true, userData: item.userData }, probe.deps)).message, /The previous version is ready/);
+				assert.equal(readMarker(item.userData), null);
+				assert.equal(probe.launches.length, 1);
+				originals(item);
+			}
+		} else { assert.match(recovered.message, /The previous version is ready/); originals(item); }
 	}
 	const live = fixture();
 	const liveMarker = { ...stale(live), pid: process.pid };
@@ -247,16 +391,26 @@ async function checks() {
 	const damaged = fixture();
 	write(path.join(damaged.userData, "update-running.json"), "broken JSON");
 	assert.deepEqual(readMarker(damaged.userData), { damaged: true });
-	const damagedProbe = dependencies(damaged);
-	assert.match((await main({ recover: true, userData: damaged.userData, appDir: damaged.appDir }, damagedProbe.deps)).message, /git status, then npm ci/);
+	const recovered = execFileSync(process.execPath, [path.join(__dirname, "update-helper.cjs"), "--recover", damaged.userData], { encoding: "utf8" });
+	assert.match(recovered, /1\. Open PowerShell[\s\S]*5\. Run: npm run desktop/);
 	assert.equal(readMarker(damaged.userData), null);
-	assert.deepEqual(damagedProbe.launches[0].args, [damaged.appDir, "--build-if-stale"]);
+	fs.unlinkSync(path.join(damaged.userData, "update-result.json"));
+	assert.equal(execFileSync(process.execPath, [path.join(__dirname, "update-helper.cjs"), "--recover", damaged.userData], { encoding: "utf8" }), recovered);
 	originals(damaged);
 	const emptyLock = fixture();
 	stale(emptyLock);
 	write(path.join(emptyLock.userData, "update-recover.lock"), "");
 	assert.equal((await main({ recover: true, userData: emptyLock.userData }, dependencies(emptyLock).deps)).skipped, true);
 	assert.ok(readMarker(emptyLock.userData));
+	const fullLock = fixture();
+	stale(fullLock);
+	const fullLockProbe = dependencies(fullLock);
+	fullLockProbe.deps.fs = new Proxy(fullLockProbe.deps.fs, { get(target, key) {
+		if (key === "writeFileSync") { return () => { throw denial("ENOSPC"); }; }
+		return target[key];
+	} });
+	assert.match((await main({ recover: true, userData: fullLock.userData }, fullLockProbe.deps)).message, /recovery lock couldn't be written[\s\S]*5\. Run: npm run desktop/);
+	assert.equal(fs.existsSync(path.join(fullLock.userData, "update-recover.lock")), false);
 
 	const timed = fixture();
 	stale(timed);
@@ -281,7 +435,7 @@ async function checks() {
 		if (key === "renameSync") { return (source, destination) => { if (source.endsWith("node_modules.update-old")) { throw new Error("fixture old aside locked"); } return target.renameSync(source, destination); }; }
 		return target[key];
 	} });
-	assert.match((await main(failedCleanup.options, failedCleanupProbe.deps)).message, /Nothing was updated/);
+	assert.match((await main(failedCleanup.options, failedCleanupProbe.deps)).message, /The previous version is ready/);
 	originals(failedCleanup);
 	assert.equal(fs.readFileSync(path.join(failedCleanup.appDir, "node_modules.update-old", "sentinel"), "utf8"), "older packages", "a cleanup failure cannot restore a different old install over the intact current install");
 	const interruptedCleanup = fixture();
@@ -303,10 +457,10 @@ async function checks() {
 	const partialMove = fixture();
 	const partialMoveProbe = dependencies(partialMove);
 	partialMoveProbe.deps.fs = new Proxy(partialMoveProbe.deps.fs, { get(target, key) {
-		if (key === "renameSync") { return (source, destination) => { if (source === path.join(partialMove.appDir, "dist")) { throw new Error("fixture dist locked"); } return target.renameSync(source, destination); }; }
+		if (key === "renameSync") { return (source, destination) => { if (source === path.join(partialMove.appDir, "dist")) { throw denial("EPERM"); } return target.renameSync(source, destination); }; }
 		return target[key];
 	} });
-	assert.match((await main(partialMove.options, partialMoveProbe.deps)).message, /Nothing was updated/);
+	assert.match((await main(partialMove.options, partialMoveProbe.deps)).message, /The previous version is ready/);
 	originals(partialMove);
 	for (const won of [true, false]) {
 		const lockRace = fixture();
@@ -356,17 +510,7 @@ async function checks() {
 	assert.ok(readMarker(unsafeStop.userData), "uncertain writers keep the live marker, preventing recovery");
 	assert.equal(git(unsafeStop.appDir, ["rev-parse", "HEAD"]), unsafeStop.target, "unsafe stop cannot reset while children may still write");
 	assert.ok(fs.existsSync(path.join(unsafeStop.appDir, "node_modules.update-old", "sentinel")));
-	assert.ok(fs.existsSync(path.join(unsafeStop.appDir, "dist.update-old", "sentinel")));
-	const unsafeRestore = fixture();
-	const unsafeRestoreProbe = dependencies(unsafeRestore, "npm ci");
-	const restoreRun = unsafeRestoreProbe.deps.run;
-	let restoreHeld = false;
-	unsafeRestoreProbe.deps.run = async (command, args, cwd, timeout) => args.includes("reset") ? { code: -1, out: "", err: "taskkill failed", timedOut: true, unsafeStop: true, stopPid: 654 } : restoreRun(command, args, cwd, timeout);
-	unsafeRestoreProbe.deps.setInterval = () => { restoreHeld = true; };
-	await main(unsafeRestore.options, unsafeRestoreProbe.deps);
-	assert.equal(restoreHeld, true, "a rollback command establishes the same keepalive before propagating an unsafe stop");
-	assert.ok(readMarker(unsafeRestore.userData));
-	assert.equal(unsafeRestoreProbe.launches.length, 0);
+	assert.ok(fs.existsSync(path.join(unsafeStop.appDir, "dist.update-old", "index.html")));
 	console.log("update helper checks passed");
 }
 

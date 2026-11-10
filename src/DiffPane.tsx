@@ -35,7 +35,8 @@ export interface DiffPaneProps {
 	onRefresh: () => void;
 	onRevert: (file: string) => Promise<{ ok: boolean; error?: string }>;
 	onRevertHunk: (file: string, hunk: DiffHunk) => Promise<WriteResult>;
-	onCommit: (input: { paths: string[]; message: string; push: boolean }) => Promise<{ ok: boolean; error?: string; message?: string; committed?: boolean; sha?: string }>;
+	onCommit: (input: { paths: string[]; message: string; push: boolean; sandbox?: boolean; hooks?: boolean }) => Promise<{ ok: boolean; error?: string; message?: string; committed?: boolean; sha?: string }>;
+	sandboxGit?: boolean;
 	busy: boolean;
 	comments: DiffComment[];
 	viewed: Record<string, string>;
@@ -199,7 +200,7 @@ export function DiffPane(props: DiffPaneProps) {
 	const [note, setNote] = useState(``);
 	const [reverting, setReverting] = useState(false);
 	const [compose, setCompose] = useState<Compose | null>(null);
-	const [commitDialog, setCommitDialog] = useState<{ paths: string[]; request: string; count: number; push: boolean; message: string; error?: string } | null>(null);
+	const [commitDialog, setCommitDialog] = useState<{ paths: string[]; request: string; count: number; push: boolean; message: string; hooks?: boolean; error?: string } | null>(null);
 	const [committing, setCommitting] = useState(false);
 	const sendAfterAdd = useRef(false);
 	useEffect(() => {
@@ -224,7 +225,7 @@ export function DiffPane(props: DiffPaneProps) {
 	const [localReview, setReview] = useState(false);
 	const review = layout?.expanded ?? localReview;
 	// Older snapshot readers include new files by default. Progressive lists require explicit inclusion beyond the initial page.
-	const [excluded, setExcluded] = useState<string[]>([]);
+	const [pickOverrides, setPickOverrides] = useState<string[]>([]);
 	const [included, setIncluded] = useState<Set<string> | null>(null);
 	const paneRef = useRef<HTMLElement>(null);
 	const bodyRef = useRef<HTMLDivElement>(null);
@@ -239,18 +240,31 @@ export function DiffPane(props: DiffPaneProps) {
 	const viewedCount = files.filter(isViewed).length;
 	const uncommittedList = snapshot?.ok && snapshot.repo !== false && scope === `uncommitted`;
 	const canCommit = uncommittedList && files.length > 0;
-	const initialPicks = () => new Set(allFiles.slice(0, FILE_PAGE_SIZE).map((file) => file.path));
+	const pickKey = (file: DiffFile) => file.conflicted ? `\0${file.path}` : file.path;
+	const defaultPicked = (file: DiffFile) => !file.conflicted;
+	const initialPicks = () => new Set(allFiles.slice(0, FILE_PAGE_SIZE).filter(defaultPicked).map(pickKey));
 	const currentPicks = progressive ? included ?? initialPicks() : null;
-	const isPicked = (file: DiffFile) => currentPicks ? currentPicks.has(file.path) : !excluded.includes(file.path);
+	const isPicked = (file: DiffFile) => currentPicks ? currentPicks.has(pickKey(file)) : defaultPicked(file) !== pickOverrides.includes(pickKey(file));
 	const picked = files.filter(isPicked);
 	const none = picked.length === 0;
 	const commitBlock = loadingFiles ? `Wait for the changed files to finish loading.` : none ? `Check at least one file.` : undefined;
 	const allPicked = files.length > 0 && picked.length === files.length;
 	useEffect(() => {
-		if (!progressive || !uncommittedList || !snapshot || loadingFiles) { return; }
+		if (scope !== "branch" && scope !== "uncommitted" && !commits.some((commit) => commit.sha === scope)) { onScope("uncommitted"); }
+	}, [scope, commits, onScope]);
+	useEffect(() => {
+		if (!uncommittedList || !snapshot || loadingFiles) { return; }
+		if (!progressive) {
+			setPickOverrides((previous) => {
+				const conflicts = new Set(allFiles.filter((file) => file.conflicted).map(pickKey));
+				const remaining = previous.filter((key) => !key.startsWith(`\0`) || conflicts.has(key));
+				return remaining.length === previous.length ? previous : remaining;
+			});
+			return;
+		}
 		setIncluded((previous) => {
 			if (!previous) { return initialPicks(); }
-			const remaining = new Set(allFiles.filter((file) => previous.has(file.path)).map((file) => file.path));
+			const remaining = new Set(allFiles.map(pickKey).filter((key) => previous.has(key)));
 			return remaining.size === previous.size ? previous : remaining;
 		});
 	}, [progressive, uncommittedList, snapshot, loadingFiles]);
@@ -275,16 +289,17 @@ export function DiffPane(props: DiffPaneProps) {
 		props.onViewed(file.path, isViewed(file) ? null : fileFingerprint(file));
 	}
 
-	function togglePick(file: string) {
+	function togglePick(file: DiffFile) {
+		const key = pickKey(file);
 		if (progressive) {
 			setIncluded((previous) => {
 				const next = new Set(previous ?? initialPicks());
-				if (next.has(file)) { next.delete(file); } else { next.add(file); }
+				if (next.has(key)) { next.delete(key); } else { next.add(key); }
 				return next;
 			});
 			return;
 		}
-		setExcluded((list) => list.includes(file) ? list.filter((item) => item !== file) : [...list, file]);
+		setPickOverrides((list) => list.includes(key) ? list.filter((item) => item !== key) : [...list, key]);
 	}
 
 	function toggleAll() {
@@ -292,16 +307,17 @@ export function DiffPane(props: DiffPaneProps) {
 			setIncluded((previous) => {
 				const next = new Set(previous ?? initialPicks());
 				for (const file of files) {
-					if (allPicked) { next.delete(file.path); } else { next.add(file.path); }
+					if (allPicked) { next.delete(pickKey(file)); } else { next.add(pickKey(file)); }
 				}
 				return next;
 			});
 			return;
 		}
-		setExcluded((previous) => {
-			const listed = new Set(files.map((file) => file.path));
-			const next = previous.filter((file) => !listed.has(file));
-			return allPicked ? [...next, ...listed] : next;
+		setPickOverrides((previous) => {
+			const listed = new Set(files.map(pickKey));
+			const checked = !allPicked;
+			const overrides = files.filter((file) => defaultPicked(file) !== checked).map(pickKey);
+			return [...previous.filter((key) => !listed.has(key)), ...overrides];
 		});
 	}
 
@@ -326,9 +342,9 @@ export function DiffPane(props: DiffPaneProps) {
 		setCommitting(true);
 		setCommitDialog({ ...commitDialog, error: undefined });
 		try {
-			const result = await props.onCommit({ paths: commitDialog.paths, message: commitDialog.message.trim(), push: commitDialog.push });
+			const result = await props.onCommit({ paths: commitDialog.paths, message: commitDialog.message.trim(), push: commitDialog.push, ...(props.sandboxGit ? { sandbox: true, hooks: commitDialog.hooks === true } : {}) });
 			if (result.committed) {
-				setExcluded([]);
+				setPickOverrides([]);
 				setCommitDialog(null);
 			} else {
 				setCommitDialog({ ...commitDialog, error: result.error || `The commit could not be completed.` });
@@ -514,7 +530,7 @@ export function DiffPane(props: DiffPaneProps) {
 					</PopupMenu>
 				</>
 			)}
-			<PrStrip branch={props.branch} pr={props.pr} prError={props.prError} onCreatePr={props.onCreatePr} onMergeWhenReady={props.onMergeWhenReady} />
+			<PrStrip key={props.branch?.branch} branch={props.branch} pr={props.pr} prError={props.prError} onCreatePr={props.onCreatePr} onMergeWhenReady={props.onMergeWhenReady} />
 			<div className={review ? `pane-bd` : `pane-bd dp-side`}>
 				{!progressive && !snapshot && <p className="meta">Reading the working tree…</p>}
 				{progressive && loadingFiles && <div className="dp-load"><span role="status">Reading changed files…</span>{onStopLoad && <button className="texty" onClick={onStopLoad}>Stop loading</button>}</div>}
@@ -545,7 +561,7 @@ export function DiffPane(props: DiffPaneProps) {
 							<div className="file-list">
 								{files.map((file) => (
 									<div className="dp-file" key={file.path}>
-										{canCommit && <input type="checkbox" className="dp-pick" aria-label={`Include ${file.path} in the commit`} checked={isPicked(file)} onChange={() => togglePick(file.path)} />}
+										{canCommit && <input type="checkbox" className="dp-pick" aria-label={`Include ${file.path} in the commit`} checked={isPicked(file)} onChange={() => togglePick(file)} />}
 										<button
 											className={file.path === selected ? `file-row on` : `file-row`}
 											ref={(button) => {
@@ -610,13 +626,17 @@ export function DiffPane(props: DiffPaneProps) {
 				<div className="sheet" role="dialog" aria-modal="true" aria-label={`Commit ${commitDialog.count} file${commitDialog.count === 1 ? `` : `s`}${commitDialog.push ? ` and push` : ``}?`}>
 					<h2>{`Commit ${commitDialog.count} file${commitDialog.count === 1 ? `` : `s`}${commitDialog.push ? ` and push` : ``}?`}</h2>
 					<p className="confirm-body">Only the checked files listed in the pane will be committed. Other changes stay uncommitted.</p>
+					{props.sandboxGit && <>
+						<p className="confirm-body">Git hooks are off by default. This reduces risk, but the sandbox does not contain later host actions. Sandboxed Grok can still change what an unsandboxed Grok loads (.grok or .mcp.json) and what Dev server Start runs. With hooks off, a push can skip uploading Git LFS files.</p>
+						<label className="toggle"><input type="checkbox" checked={commitDialog.hooks === true} disabled={committing} onChange={(event) => setCommitDialog({ ...commitDialog, hooks: event.target.checked })} /> Run Git hooks this time</label>
+					</>}
 					<label>Commit message<textarea className="tool-other" aria-label="Commit message" autoFocus rows={3} value={commitDialog.message} disabled={committing} placeholder="The first line is the summary." onChange={(event) => setCommitDialog({ ...commitDialog, message: event.target.value, error: undefined })} /></label>
 					{props.busy && <p className="note">Grok is still working. Wait for the turn to end, or ask Grok to commit.</p>}
 					{loadingFiles && <p className="note" role="status">Wait for the changed files to finish loading.</p>}
 					{commitDialog.error && <p className="note" role="alert">{commitDialog.error}</p>}
 					<div className="actions" style={{ marginTop: 16 }}>
 						<button type="button" className="texty" disabled={committing} onClick={() => setCommitDialog(null)}>Cancel</button>
-						<button type="button" className="texty" disabled={committing || !!loadingFiles} onClick={() => { onAskGrok(commitDialog.request); setExcluded([]); setCommitDialog(null); }}>Ask Grok to commit</button>
+						<button type="button" className="texty" disabled={committing || !!loadingFiles} onClick={() => { onAskGrok(commitDialog.request); setPickOverrides([]); setCommitDialog(null); }}>Ask Grok to commit</button>
 						<button type="button" className={commitDialog.push ? `yes danger` : `yes`} disabled={committing || props.busy || loadingFiles || !commitDialog.message.trim()} onClick={() => void runCommit()}>{committing ? (commitDialog.push ? `Pushing…` : `Committing…`) : commitDialog.push ? `Commit and push` : `Commit`}</button>
 					</div>
 				</div>
