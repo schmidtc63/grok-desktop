@@ -1,12 +1,12 @@
 # Codewomplers Grok Desktop
 
-Codewomplers Grok Desktop is an unofficial desktop app for the Grok CLI on Windows, macOS and Linux. It brings chat, file editing, diffs, terminals, a browser pane and pull-request tools into one app.
+Codewomplers Grok Desktop is an unofficial desktop app for the Grok CLI on Windows, macOS and Linux. It brings chat, file editing, diffs, terminals, a browser pane, pull-request tools, scheduled routines and sandboxed sessions into one app.
 
 It runs the Grok CLI coding agent on folders on your computer. It is not a wrapper for the grok.com website.
 
 Not affiliated with or endorsed by xAI. Grok is a trademark of its owner.
 
-![A session with Grok's reply beside the Changes pane showing its edit](assets/screenshot.png)
+![A session where Grok added a command to a small CLI, with the Changes pane showing its edit](assets/screenshot.png)
 
 ## A typical task
 
@@ -189,7 +189,7 @@ Sign in under **Settings > General > Grok Bot** to show its sidebar row. Until y
 
 The access token stays in the main process, encrypted with the system keyring. Sign in again when it expires; automatic token refresh is not built. Signing out removes the sign-in from this app, but it stays valid on Cursor's side until it expires. There is no bridge between the Bot and coding sessions.
 
-The conversation view has fake-server and renderer tests. An earlier live Windows check with one Bot covered Cursor sign-in, history, sending and stopping a turn, answering a question, opening an attachment and reconnecting. Several live Bots, macOS and Linux remain untested. Deferred features and known limits are listed in [TODO.md](TODO.md#grok-bot-built-unreleased).
+The conversation view has fake-server and renderer tests. An earlier live Windows check with one Bot covered Cursor sign-in, history, sending and stopping a turn, answering a question, opening an attachment and reconnecting. Several live Bots, macOS and Linux remain untested. Deferred features and known limits are listed in [TODO.md](TODO.md).
 
 ### Showing the real Grok Bot app (Windows, off by default)
 
